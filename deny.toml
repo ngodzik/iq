@@ -1,0 +1,60 @@
+# Configuration for cargo-deny, run by scripts/check.sh.
+#
+# Three questions, none of which the compiler answers: is a dependency subject
+# to a published advisory, is its licence compatible with shipping this under
+# MIT, and did it come from somewhere other than crates.io.
+
+[advisories]
+version = 2
+# An entry here is a decision to live with a known advisory, and it carries
+# the advisory's identifier and the reason.
+ignore = [
+    # ttf-parser is unmaintained, with no replacement released. winit reaches
+    # it through sctk-adwaita, which draws the window's title bar on Wayland
+    # with a font of the system; no font from outside is ever parsed with it.
+    # To revisit when winit or sctk-adwaita moves off it.
+    { id = "RUSTSEC-2026-0192", reason = "winit parses only system fonts with it, for the Wayland title bar" },
+    # ruzstd 0.8 can be made to allocate without bound by a crafted input,
+    # fixed in 0.9.1, which bevy_image 0.20 does not accept yet. bevy_image
+    # uses it only to decompress KTX2 textures, and the window loads none: it
+    # draws with egui. To revisit when Bevy moves to ruzstd 0.9.
+    { id = "RUSTSEC-2026-0344", reason = "bevy_image decompresses only KTX2 textures with it, and none is loaded" },
+]
+
+[licenses]
+version = 2
+# Derived from the dependency tree as it actually stands (cargo deny list -l license),
+# not from a template. A new licence appearing here is a fact worth being told about.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    # foldhash, slotmap and others through Bevy. Permissive and OSI approved.
+    "Zlib",
+    # arrayref, through the drawing of the window's title bar on Wayland.
+    # Permissive and OSI approved, as BSD-3-Clause is.
+    "BSD-2-Clause",
+]
+confidence-threshold = 0.9
+# egui's own fonts, compiled into the window. Both licences let the fonts
+# ship inside a program; only that crate may use them.
+exceptions = [
+    { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts" },
+]
+
+[bans]
+multiple-versions = "warn"
+# A dependency pinned to "*" takes whatever version the registry happens to hold.
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,144 @@
+# The rules every workspace starts with. A person's own rules add to them;
+# of those a command matches, the most restrictive decides. The sandbox holds
+# the rest: these are for what it lets through and cannot take back.
+
+[[rule]]
+prefix = [["sudo", "su", "doas", "pkexec", "run0"]]
+decision = "deny"
+reason = "it runs as another user"
+match = ["sudo rm -rf /", "su - root"]
+not_match = ["sum file"]
+
+[[rule]]
+prefix = ["git", "push"]
+decision = "ask"
+network = true
+reason = "it publishes commits"
+match = ["git push", "git push --force origin main"]
+not_match = ["git pull"]
+
+[[rule]]
+prefix = ["git", "reset", "--hard"]
+decision = "ask"
+reason = "it throws away changes not committed"
+match = ["git reset --hard HEAD~1"]
+not_match = ["git reset HEAD file"]
+
+[[rule]]
+prefix = ["git", "clean"]
+decision = "ask"
+reason = "it deletes files git does not keep"
+match = ["git clean -fdx"]
+
+[[rule]]
+prefix = ["git", "checkout", ["--", "."]]
+decision = "ask"
+reason = "it throws away changes not committed"
+match = ["git checkout -- src/main.rs", "git checkout ."]
+not_match = ["git checkout -b topic"]
+
+[[rule]]
+prefix = ["git", "restore"]
+decision = "ask"
+reason = "it may throw away changes not committed"
+match = ["git restore src/main.rs"]
+
+[[rule]]
+prefix = ["git", "stash", ["drop", "clear"]]
+decision = "ask"
+reason = "it deletes stashed work"
+match = ["git stash drop", "git stash clear"]
+not_match = ["git stash"]
+
+[[rule]]
+prefix = ["git", "branch", ["-D", "--delete"]]
+decision = "ask"
+reason = "it deletes a branch"
+match = ["git branch -D topic"]
+not_match = ["git branch -d topic"]
+
+# What fetches packages and sources is given the internet without asking:
+# a line of these, and of commands that send nothing, is known not to send
+# the workspace away. Their install scripts run with it, as anywhere else.
+
+[[rule]]
+prefix = [["npm", "pnpm", "yarn", "bun"], ["install", "i", "ci", "add", "update", "up", "upgrade", "outdated", "view", "info", "audit"]]
+decision = "allow"
+network = true
+reason = "it fetches packages"
+match = ["npm install", "pnpm add -D vitest", "yarn install --frozen-lockfile", "bun i"]
+not_match = ["npm test", "npm run build"]
+
+[[rule]]
+prefix = ["cargo", ["fetch", "update", "add", "install", "generate-lockfile", "search", "vendor"]]
+decision = "allow"
+network = true
+reason = "it fetches crates"
+match = ["cargo fetch", "cargo add serde --features derive"]
+not_match = ["cargo build", "cargo test"]
+
+[[rule]]
+prefix = [["pip", "pip3", "uv", "poetry", "pipenv", "pdm"], ["install", "download", "sync", "add", "lock", "update"]]
+decision = "allow"
+network = true
+reason = "it fetches packages"
+match = ["pip install -r requirements.txt", "uv sync", "poetry add httpx"]
+not_match = ["pip list", "uv run pytest"]
+
+[[rule]]
+prefix = [["python", "python3"], "-m", "pip", ["install", "download"]]
+decision = "allow"
+network = true
+reason = "it fetches packages"
+match = ["python3 -m pip install requests"]
+
+[[rule]]
+prefix = ["uv", "pip", "install"]
+decision = "allow"
+network = true
+reason = "it fetches packages"
+match = ["uv pip install ruff"]
+
+[[rule]]
+prefix = ["go", ["get", "install"]]
+decision = "allow"
+network = true
+reason = "it fetches modules"
+match = ["go get example.com/x@latest"]
+not_match = ["go test ./..."]
+
+[[rule]]
+prefix = ["go", "mod", ["download", "tidy"]]
+decision = "allow"
+network = true
+reason = "it fetches modules"
+match = ["go mod tidy"]
+
+[[rule]]
+prefix = [["bundle", "gem"], "install"]
+decision = "allow"
+network = true
+reason = "it fetches gems"
+match = ["bundle install"]
+
+[[rule]]
+prefix = ["composer", ["install", "update", "require"]]
+decision = "allow"
+network = true
+reason = "it fetches packages"
+match = ["composer install"]
+
+[[rule]]
+prefix = ["git", ["fetch", "pull", "clone", "ls-remote"]]
+decision = "allow"
+network = true
+reason = "it fetches commits"
+match = ["git fetch origin", "git pull --rebase", "git -C sub fetch"]
+not_match = ["git push"]
+
+[[rule]]
+prefix = ["git", "submodule", "update"]
+decision = "allow"
+network = true
+reason = "it fetches submodules"
+match = ["git submodule update --init"]
