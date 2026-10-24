@@ -2978,6 +2978,8 @@ dependencies = [
  "iq-gate",
  "iq-gui",
  "iq-llm",
+ "iq-memory",
+ "iq-sync",
  "iq-ui",
  "serde",
  "serde_json",
@@ -3068,6 +3070,28 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "iq-memory"
+version = "0.1.0"
+dependencies = [
+ "iq-agent",
+ "iq-core",
+ "iq-gate",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "iq-sync"
+version = "0.1.0"
+dependencies = [
+ "iq-gate",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

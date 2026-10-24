@@ -1,0 +1,17 @@
+[package]
+name    = "iq-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "What agents remember of a project between sessions: notes kept by the project's repository, offered to every agent of the crew."
+
+[dependencies]
+iq-core.workspace    = true
+iq-agent.workspace   = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace    = true
+tempfile.workspace = true
+iq-gate.workspace  = true

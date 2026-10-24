@@ -462,6 +462,23 @@ fn status(
             actions.push(Action::Steward);
         }
         let steward_at = steward.rect.left_center() + egui::vec2(6.0, 0.0);
+        if let Some(synced) = board.synced() {
+            let ago = iq_ui::now().saturating_sub(synced.at) / 60;
+            let (text, colour) = if synced.ok {
+                let when = match ago {
+                    0 => "just now".to_owned(),
+                    1 => "a minute ago".to_owned(),
+                    m => format!("{m} min ago"),
+                };
+                (format!("Synced {when}"), p.dim)
+            } else {
+                ("Sync failed".to_owned(), p.warn)
+            };
+            ui.label(small(text, colour)).on_hover_text(format!(
+                "iq's data, synced with this machine's repository: {}",
+                synced.said
+            ));
+        }
         let working = crew.agents().iter().filter(|a| a.working).count();
         let waiting = crew.questions().len();
         let count = crew.agents().len();

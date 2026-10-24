@@ -38,6 +38,26 @@ pub use action::{Action, Approver, Judged, Pending, Permit, Scope};
 pub use error::GateError;
 pub use gate::{Gate, GateBuilder};
 pub use rules::{Decision, Rules};
+/// Whether `path` holds secrets, as its name or its folder says: a file of
+/// variables, a private key, a file of credentials, anything in a folder of
+/// credentials of `home`. The gate never lets a model read one; what keeps
+/// the person's files elsewhere leaves them out by the same rule.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// let home = Path::new("/home/me");
+/// assert!(iq_gate::holds_secrets(Path::new("/home/me/.ssh/config"), Some(home)));
+/// assert!(iq_gate::holds_secrets(Path::new("/w/.env.local"), Some(home)));
+/// assert!(!iq_gate::holds_secrets(Path::new("/home/me/notes/todo.md"), Some(home)));
+/// ```
+#[must_use]
+pub fn holds_secrets(path: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    paths::secret(path, home)
+}
+
 pub use sandbox::{
     HELPER_FLAG, HOLD_FLAG, Helper, Ran, Sandbox, helper_failure, hold_network, sandboxed,
 };

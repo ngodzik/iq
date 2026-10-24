@@ -30,6 +30,11 @@
 //! folder = "~/.local/share/iq/assay"     # its exercises and results, plain files
 //! parallel = 2                           # runs at once
 //!
+//! [sync]                                 # iq's data kept in a private repository of yours, any name
+//! remote = "https://github.com/someone/any-name.git"
+//! branch = "main"                        # another when main must go through pull requests
+//! keep = ["~/notes", "~/.zshrc"]         # files and folders of the home kept too, put back on a new machine
+//!
 //! [mcp.notion]                           # an MCP server, by its name: any server, not only this one
 //! url = "https://mcp.notion.com/mcp"     # over HTTP; or command = "npx", args = [...]
 //! headers = { Authorization = "NOTION_AUTHORIZATION" }  # each value read from that variable
@@ -91,6 +96,22 @@ pub(crate) struct Settings {
     /// MCP servers, by name.
     #[serde(default)]
     mcp: BTreeMap<String, McpFile>,
+    /// Where iq's data is synced.
+    #[serde(default)]
+    sync: SyncFile,
+}
+
+/// The sync as the settings write it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncFile {
+    /// The repository, a private one of the person's.
+    remote: Option<String>,
+    /// Its branch, when not the default.
+    branch: Option<String>,
+    /// The files and folders of the home kept too, each `~/…`.
+    #[serde(default)]
+    keep: Vec<String>,
 }
 
 /// An MCP server as written: a command or an address, and what of iq's
@@ -122,6 +143,17 @@ struct AssayFile {
     candidates: Option<Vec<String>>,
     folder: Option<String>,
     parallel: Option<usize>,
+}
+
+/// iq's folder of data: the assay, the projects' memory, a copy of the
+/// settings and what the person keeps, synced when the machine names a
+/// repository. Out of `~/.iq`, which agents' tools cannot reach.
+pub(crate) fn data_folder(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|data| data.is_absolute())
+        .unwrap_or_else(|| home.join(".local/share"))
+        .join("iq")
 }
 
 /// How many runs of the assay go at once unless the settings say.
@@ -210,11 +242,7 @@ impl Settings {
                 Some(rest) => home.join(rest),
                 None => PathBuf::from(folder),
             },
-            None => std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .filter(|data| data.is_absolute())
-                .unwrap_or_else(|| home.join(".local/share"))
-                .join("iq/assay"),
+            None => data_folder(home).join("assay"),
         }
     }
 
@@ -243,6 +271,24 @@ impl Settings {
     /// Which candidates the assay may test.
     pub(crate) fn assay_allowed(&self) -> iq_assay::Allowed {
         iq_assay::Allowed::from_words(self.assay.candidates.as_deref().unwrap_or_default())
+    }
+
+    /// The machine's sync of iq's folder of data `data`, with the settings
+    /// and rules of iq's `folder` mirrored in it and the files of `home`
+    /// they list kept; none without a repository.
+    pub(crate) fn sync(&self, folder: &Path, data: &Path, home: &Path) -> Option<iq_sync::Sync> {
+        let remote = self.sync.remote.as_deref()?.trim();
+        if remote.is_empty() {
+            return None;
+        }
+        let mut sync = iq_sync::Sync::new(data, remote, crate::sync::machine())
+            .mirror(folder.join("settings.toml"), "config/settings.toml")
+            .mirror(folder.join("rules.toml"), "config/rules.toml")
+            .keeping(home, self.sync.keep.clone());
+        if let Some(branch) = self.sync.branch.as_deref().filter(|b| !b.trim().is_empty()) {
+            sync = sync.on_branch(branch.trim());
+        }
+        Some(sync)
     }
 
     /// How many of the assay's runs go at once.
@@ -400,6 +446,24 @@ mod tests {
         assert!(set.assay_allowed().allows(iq_assay::Kind::Model, "a/b"));
         assert!(!set.assay_allowed().allows(iq_assay::Kind::Harness, "codex"));
         assert!(toml::from_str::<Settings>("[assay]\njudge = \"x\"").is_err());
+    }
+
+    #[test]
+    fn the_sync_is_set_in_the_settings_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = Settings::default();
+        assert!(none.sync(dir.path(), dir.path(), dir.path()).is_none());
+        let set: Settings = toml::from_str(
+            "[sync]\nremote = \"https://github.com/someone/any-name.git\"\nbranch = \"iq\"\nkeep = [\"~/notes\", \"~/.ssh\"]",
+        )
+        .unwrap();
+        let sync = set
+            .sync(dir.path(), &dir.path().join("data"), dir.path())
+            .unwrap();
+        assert_eq!(sync.remote(), "https://github.com/someone/any-name.git");
+        assert_eq!(sync.kept(), ["~/notes"]);
+        assert_eq!(sync.refused().len(), 1);
+        assert!(toml::from_str::<Settings>("[sync]\nremot = \"x\"").is_err());
     }
 
     #[test]

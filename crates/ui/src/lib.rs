@@ -15,7 +15,7 @@ pub mod look;
 pub mod steward;
 pub mod subscriptions;
 
-pub use board::{Board, PERIODS, Post, Read, Update};
+pub use board::{Board, PERIODS, Post, Read, Synced, Update};
 pub use error::UiError;
 pub use iq_agent::Pattern;
 

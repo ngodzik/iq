@@ -82,6 +82,8 @@ pub enum Update {
     AssayRunning(Vec<Progress>),
     /// iq's tasks, by the kinds of task the assay's rules place them in.
     Tasks(Vec<crate::costs::TaskSpent>),
+    /// A sync of iq's data ended.
+    Synced(Synced),
     /// How the crew starts: the lead's model, the reviewer's, whether
     /// the reviewer answers for the person, and whether every command has
     /// the internet.
@@ -95,6 +97,17 @@ pub enum Update {
         /// Whether the internet is open to every command.
         internet: bool,
     },
+}
+
+/// How the last sync of iq's data with the machine's repository went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Synced {
+    /// When, in seconds since 1970.
+    pub at: u64,
+    /// Whether it succeeded.
+    pub ok: bool,
+    /// What it did, or why it failed.
+    pub said: String,
 }
 
 /// How far back the costs are summed, in seconds, as the window offers it.
@@ -151,6 +164,8 @@ pub struct Board {
     letters: Vec<Post>,
     /// The assay.
     assay: AssayView,
+    /// How the last sync went, when the machine syncs.
+    synced: Option<Synced>,
 }
 
 impl Default for Board {
@@ -187,6 +202,7 @@ impl Board {
             spending: Vec::new(),
             letters: Vec::new(),
             assay: AssayView::default(),
+            synced: None,
         }
     }
 
@@ -516,6 +532,12 @@ impl Board {
         name
     }
 
+    /// How the last sync went, when the machine syncs.
+    #[must_use]
+    pub fn synced(&self) -> Option<&Synced> {
+        self.synced.as_ref()
+    }
+
     /// The assay.
     #[must_use]
     pub fn assay(&self) -> &AssayView {
@@ -667,6 +689,7 @@ impl Board {
             Update::Assay(overview) => self.assay.set(*overview),
             Update::AssayRunning(running) => self.assay.set_running(running),
             Update::Tasks(tasks) => self.costs.tasks_read(tasks),
+            Update::Synced(synced) => self.synced = Some(synced),
             Update::Started {
                 lead,
                 reviewer,

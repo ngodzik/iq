@@ -5,6 +5,7 @@
 mod journal;
 mod ledger;
 mod settings;
+mod sync;
 mod terminal;
 
 use std::io::{BufRead, Write};
@@ -97,6 +98,10 @@ enum Command {
     Subscriptions,
     /// The assay's exercises and their results, as its folder holds them.
     Assay,
+    /// Syncs iq's folder of data now with the repository the settings'
+    /// [sync] names: what changed here sent, what changed elsewhere taken;
+    /// a new machine takes everything first. The window does it on its own.
+    Sync,
     /// Runs a command line in the sandbox, as a model's would be: judged by
     /// the gate, asked when it must be, written to the audit log.
     Run {
@@ -166,10 +171,67 @@ fn crew(
         report,
     );
     crew.set_autopilot(settings.autopilot);
+    // What the agents remember of this project, kept with iq's data.
+    let memory = iq_memory::Memory::open(
+        &settings::data_folder(&home_dir()?).join("memory"),
+        &std::env::current_dir().context("reading the current folder")?,
+    );
+    crew.extend(Arc::new(memory));
     let program = std::env::current_exe().context("finding iq's own program")?;
     crew.serve(program, folder.join("run"))
         .context("opening the bridge for the other agents")?;
     Ok(crew)
+}
+
+/// The person's home.
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")
+}
+
+/// This machine's sync, when its settings name a repository.
+fn machine_sync() -> Result<Option<Arc<iq_sync::Sync>>> {
+    let folder = home_folder()?;
+    let home = home_dir()?;
+    Ok(Settings::load(&folder)?
+        .sync(&folder, &settings::data_folder(&home), &home)
+        .map(Arc::new))
+}
+
+/// Syncs once; on a machine new to the repository, the files of the home
+/// that the settings it took keep are put back too, what it had kept
+/// beside.
+async fn sync_now(sync: &iq_sync::Sync) -> Result<iq_sync::Outcome, iq_sync::SyncError> {
+    let outcome = sync.run().await?;
+    if outcome.fresh
+        && outcome.taken.iter().any(|f| f.starts_with("config/"))
+        && let Some(taken) = machine_sync().ok().flatten()
+    {
+        taken.put_back()?;
+    }
+    Ok(outcome)
+}
+
+/// How a sync went, as the window shows it.
+fn synced(result: &Result<iq_sync::Outcome, iq_sync::SyncError>) -> iq_ui::Synced {
+    iq_ui::Synced {
+        at: iq_ui::now(),
+        ok: result.is_ok(),
+        said: match result {
+            Ok(outcome) => outcome.said(),
+            Err(error) => {
+                let mut text = error.to_string();
+                let mut source = std::error::Error::source(error);
+                while let Some(cause) = source {
+                    text.push_str(": ");
+                    text.push_str(&cause.to_string());
+                    source = cause.source();
+                }
+                text
+            }
+        },
+    }
 }
 
 /// The provider's models, with its key when there is one.
@@ -413,6 +475,24 @@ async fn work(
 /// as the system wants it.
 fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let folder = home_folder()?;
+    // What other machines sent comes first, the settings among it: a new
+    // machine takes everything before it sends anything.
+    let sync = machine_sync()?;
+    let first = sync.as_ref().map(|sync| {
+        eprintln!("iq: syncing with {}…", sync.remote());
+        let result = runtime
+            .block_on(async { tokio::time::timeout(sync::OPENING, sync_now(sync)).await })
+            .unwrap_or_else(|_| {
+                Err(iq_sync::SyncError::Refused(
+                    "it took too long; iq opened without it".into(),
+                ))
+            });
+        match &result {
+            Ok(outcome) => eprintln!("iq: synced, {}", outcome.said()),
+            Err(error) => eprintln!("iq: the sync failed, iq opens without it: {error}"),
+        }
+        synced(&result)
+    });
     let (settings, lead) = chosen(cli, &folder)?;
     let keyed = cli.api_key.is_some();
     let prices = runtime
@@ -440,6 +520,30 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         provider: ledger.billed(billed_since),
         quotas: ledger.quotas(),
     });
+    if let Some(first) = first {
+        let _ = send.send(Update::Synced(first));
+    }
+    // While iq runs, what changed is sent every few minutes, and what
+    // other machines sent is taken now and then.
+    if let Some(sync) = sync.clone() {
+        let send = send.clone();
+        let waker = waker.clone();
+        runtime.spawn(async move {
+            let mut last = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(sync::LOOK_EVERY).await;
+                if !sync.pending().await && last.elapsed() < sync::TAKE_EVERY {
+                    continue;
+                }
+                let result = sync.run().await;
+                last = std::time::Instant::now();
+                if send.send(Update::Synced(synced(&result))).is_err() {
+                    return;
+                }
+                waker.wake();
+            }
+        });
+    }
 
     let report: Report = {
         let send = send.clone();
@@ -636,6 +740,16 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         }
         assay_crew.end().await;
         crew.end().await;
+        // What changed since the last sync leaves with iq.
+        if let Some(sync) = &sync
+            && sync.pending().await
+        {
+            match tokio::time::timeout(sync::CLOSING, sync.run()).await {
+                Ok(Ok(outcome)) => eprintln!("iq: synced, {}", outcome.said()),
+                Ok(Err(error)) => eprintln!("iq: the last sync failed: {error}"),
+                Err(_) => eprintln!("iq: the last sync took too long and was left"),
+            }
+        }
     });
     Ok(())
 }
@@ -800,6 +914,34 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
                         println!("{agent:?} {}: {:.0}% used", window.name, window.used);
                     }
                 }
+            }
+        }
+        Command::Sync => {
+            let Some(sync) = machine_sync()? else {
+                bail!(
+                    "the settings name no repository to sync with: make a private one \
+                     (gh repo create <name> --private) and give it in ~/.iq/settings.toml, \
+                     [sync] remote = \"<its address>\""
+                );
+            };
+            for why in sync.refused() {
+                println!("Not kept: {why}.");
+            }
+            println!("Syncing {} with {}…", sync.root().display(), sync.remote());
+            let outcome = sync_now(&sync).await?;
+            if outcome.fresh && !outcome.taken.is_empty() {
+                println!("This machine was new to it: it took what was there first.");
+            }
+            println!("Synced: {}.", outcome.said());
+            for file in &outcome.taken {
+                println!("  taken: {file}");
+            }
+            for file in &outcome.sent {
+                println!("  sent: {file}");
+            }
+            let kept = sync.kept();
+            if !kept.is_empty() {
+                println!("Kept from the home: {}", kept.join(", "));
             }
         }
         Command::Assay => {
