@@ -43,10 +43,12 @@ const BASE: &str = r#"(version 1)
 "#;
 
 /// Where the system keeps what is not its own: the homes, other disks, and
-/// the temporary files of every program. Read only where the policy says.
+/// the temporary files of every program, and the data volume that holds
+/// them all under another path. Read only where the policy says.
 const PRIVATE: &[&str] = &[
     "/Users",
     "/Volumes",
+    crate::sandbox::DATA_VOLUME,
     "/private/var/folders",
     "/private/tmp",
     "/private/var/tmp",
@@ -174,6 +176,7 @@ mod tests {
         assert!(!profile.contains("READ_1"), "a missing folder is left out");
         assert!(profile.contains("(subpath (param \"WRITE_0\"))"));
         assert!(profile.contains("(require-not (subpath \"/Users\"))"));
+        assert!(profile.contains("(require-not (subpath \"/System/Volumes/Data\"))"));
         assert!(!profile.contains("(allow network-outbound)"));
         assert!(profile.contains("(remote ip \"localhost:*\")"));
         assert_eq!(text[2], "-DREAD_0=/usr");

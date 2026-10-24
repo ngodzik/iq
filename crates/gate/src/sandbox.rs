@@ -133,6 +133,11 @@ const PASSED: &[&str] = &[
     "PKG_CONFIG_PATH",
 ];
 
+/// Where macOS keeps the person's data, the homes and other disks among
+/// it, which their own paths (`/Users`, `/Volumes`, `/home`) reach too: a
+/// folder of the system's never stands for what is there.
+pub(crate) const DATA_VOLUME: &str = "/System/Volumes/Data";
+
 /// What the sandbox lets a command reach, beside the workspace.
 #[derive(Debug, Clone)]
 pub(crate) struct Bounds {
@@ -169,14 +174,14 @@ impl Bounds {
         }
     }
 
-    /// Whether a command may read `path`.
+    /// Whether a command may read `path`. `/System` lets it read the
+    /// system, not the data volume under it.
     pub(crate) fn reads(&self, path: &Path) -> bool {
+        let data = Path::new(DATA_VOLUME);
         path.starts_with(&self.workspace)
-            || self
-                .readable
-                .iter()
-                .chain(&self.writable)
-                .any(|root| path.starts_with(root))
+            || self.readable.iter().chain(&self.writable).any(|root| {
+                path.starts_with(root) && !(data.starts_with(root) && path.starts_with(data))
+            })
     }
 }
 
@@ -568,4 +573,23 @@ pub fn hold_network() -> GateError {
 /// reads it as its own failure, not the command's.
 pub fn helper_failure(error: &GateError) -> String {
     format!("{HELPER_PREFIX}{error}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_data_volume_is_read_only_where_the_policy_names_it() {
+        let home = PathBuf::from("/System/Volumes/Data/home/me");
+        let bounds = Bounds::new(home.join("project"), Some(home), Vec::new(), Vec::new());
+        assert!(bounds.reads(Path::new("/System/Library/Frameworks/x")));
+        assert!(bounds.reads(Path::new("/usr/bin/git")));
+        assert!(!bounds.reads(Path::new("/System/Volumes/Data/Users/me/.ssh/config")));
+        assert!(!bounds.reads(Path::new("/System/Volumes/Data/home/me/notes.txt")));
+        assert!(bounds.reads(Path::new(
+            "/System/Volumes/Data/home/me/project/src/main.rs"
+        )));
+        assert!(bounds.reads(Path::new("/System/Volumes/Data/home/me/.cargo/bin/cargo")));
+    }
 }

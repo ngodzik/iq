@@ -139,7 +139,15 @@ impl GateBuilder {
                 source,
             })?;
         Ok(Gate {
-            bounds: Bounds::new(workspace, self.home, self.readable, self.writable),
+            // The home resolved as the paths judged are: a link on its way,
+            // as macOS' /home is, would keep its folders of credentials
+            // from being known.
+            bounds: Bounds::new(
+                workspace,
+                self.home.map(|home| paths::resolve(&home, Path::new("/"))),
+                self.readable,
+                self.writable,
+            ),
             rules: self.rules,
             audit: self.audit.map(Audit::new),
             internet: Arc::new(AtomicBool::new(self.internet)),
@@ -551,6 +559,26 @@ mod tests {
             reason(&fetch),
             ("asked", "it reaches the internet".to_owned(), true)
         );
+    }
+
+    #[test]
+    fn a_home_reached_through_a_link_keeps_its_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real-home");
+        std::fs::create_dir_all(real.join(".ssh")).unwrap();
+        std::fs::create_dir_all(real.join("work")).unwrap();
+        let linked = dir.path().join("home");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let gate = Gate::builder(real.join("work"))
+            .home(Some(linked.clone()))
+            .build()
+            .unwrap();
+        let judged = gate
+            .judge(Action::Read {
+                path: linked.join(".ssh/config"),
+            })
+            .unwrap();
+        assert!(matches!(judged, Judged::Denied { .. }));
     }
 
     #[test]
