@@ -55,6 +55,13 @@ const PEER_SPAN: Duration = Duration::from_secs(10 * 60);
 /// one window shows several.
 static CREWS: AtomicU64 = AtomicU64::new(0);
 
+/// The files a project's rules for agents are read from, the first found:
+/// the shared format, then Claude Code's, which may import the other.
+const RULES_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+
+/// The most of a project's rules an agent is given, in bytes.
+const RULES_MOST: usize = 40_000;
+
 /// What a payer is called when it is closed: Claude Code's and Codex's
 /// subscriptions by their agents' names, the provider by this.
 pub const PROVIDER: &str = "provider";
@@ -1605,9 +1612,61 @@ where
              in a line, with send_message to steward, and do as it asks.\n\n\
              Read before you change, check your work with the project's own tools (its build, \
              tests, linters), and be brief. When the task is done, answer with what you did and \
-             call no tool.{}",
+             call no tool.{}{}",
+            self.project_rules()
+                .map(|(file, rules)| format!(
+                    "\n\nThe project's rules for agents, from its {file}, which you follow:\n\n{rules}"
+                ))
+                .unwrap_or_default(),
             self.extended(name)
         )
+    }
+
+    /// The project's rules for agents, and the file they came from: its
+    /// `AGENTS.md`, else its `CLAUDE.md`, whose `@file` lines are the
+    /// files they import. Read through the gate, as an agent's reads are,
+    /// and never asked of the person: what the gate does not allow at once
+    /// is left out. Claude Code and Codex read them on their own.
+    fn project_rules(&self) -> Option<(&'static str, String)> {
+        let workspace = self.inner.gate.workspace().to_path_buf();
+        let read = |path: std::path::PathBuf| -> Option<String> {
+            match self.inner.gate.judge(Action::Read { path }).ok()? {
+                Judged::Allowed(permit) => String::from_utf8(permit.read().ok()?).ok(),
+                Judged::Asked { .. } | Judged::Denied { .. } => None,
+            }
+        };
+        RULES_FILES.into_iter().find_map(|file| {
+            let path = workspace.join(file);
+            if !path.is_file() {
+                return None;
+            }
+            let text = read(path)?;
+            let text: String = text
+                .lines()
+                .map(|line| {
+                    let imported = line
+                        .trim()
+                        .strip_prefix('@')
+                        .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+                        .and_then(|name| read(workspace.join(name)));
+                    imported.unwrap_or_else(|| line.to_owned()) + "\n"
+                })
+                .collect();
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let mut cut = text.len().min(RULES_MOST);
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let more = if cut < text.len() {
+                "\n[the rest of the file is left out: read it whole with read_file]"
+            } else {
+                ""
+            };
+            Some((file, format!("{}{more}", &text[..cut])))
+        })
     }
 
     /// What an agent with tools of its own is told of the crew.

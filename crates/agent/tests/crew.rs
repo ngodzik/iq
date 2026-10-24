@@ -440,6 +440,36 @@ async fn the_autopilot_gives_the_internet_when_let_and_asks_the_person_otherwise
 }
 
 #[tokio::test]
+async fn an_agent_follows_the_projects_rules_from_agents_md_or_claude_md() {
+    let f = fixture(&[], Settings::default());
+    std::fs::write(f.root.join("AGENTS.md"), "# Rules\n\nNo dashes in prose.\n").unwrap();
+    f.crew
+        .start("lead", &model("cheap/model"), "go".into(), PERSON);
+    f.settled().await;
+    let seen = f.model.seen_by("lead");
+    assert!(seen.contains("from its AGENTS.md") && seen.contains("No dashes in prose."));
+
+    // Claude Code's file, importing another, when there is no AGENTS.md.
+    let g = fixture(&[], Settings::default());
+    std::fs::write(g.root.join("CLAUDE.md"), "Read these:\n@docs/rules.md\n").unwrap();
+    std::fs::create_dir_all(g.root.join("docs")).unwrap();
+    std::fs::write(g.root.join("docs/rules.md"), "Tests first.\n").unwrap();
+    g.crew
+        .start("lead", &model("cheap/model"), "go".into(), PERSON);
+    g.settled().await;
+    let seen = g.model.seen_by("lead");
+    assert!(seen.contains("from its CLAUDE.md") && seen.contains("Tests first."));
+    assert!(!seen.contains("@docs/rules.md"));
+
+    // None: nothing is said of rules.
+    let h = fixture(&[], Settings::default());
+    h.crew
+        .start("lead", &model("cheap/model"), "go".into(), PERSON);
+    h.settled().await;
+    assert!(!h.model.seen_by("lead").contains("rules for agents"));
+}
+
+#[tokio::test]
 async fn an_agent_given_a_role_is_told_to_keep_to_it() {
     let f = fixture(
         &[(
