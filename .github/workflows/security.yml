@@ -1,0 +1,51 @@
+name: Security
+
+# Dependencies do not have to change for the news about them to change, hence
+# the schedule on top of push.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The version of cargo-deny installed, from crates.io, with its own lock
+  # file: no action of someone else's runs here.
+  CARGO_DENY: 0.20.2
+
+jobs:
+  deny:
+    name: Advisories, licences, sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: A Rust workspace to check
+        id: workspace
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Cargo.toml: nothing to check."
+          fi
+      - name: cargo-deny, kept between runs
+        if: steps.workspace.outputs.rust == 'true'
+        id: kept
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ env.CARGO_DENY }}-${{ runner.os }}
+      - name: cargo-deny
+        if: steps.workspace.outputs.rust == 'true' && steps.kept.outputs.cache-hit != 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install --locked "cargo-deny@$CARGO_DENY"
+      - name: Advisories, licences, bans and sources
+        if: steps.workspace.outputs.rust == 'true'
+        run: cargo deny check

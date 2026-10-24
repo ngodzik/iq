@@ -1,0 +1,184 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push replaces the run it supersedes instead of queueing behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The workflow only reads the repository. Nothing here needs write access.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning that nobody reads is a warning that does not exist.
+  RUSTFLAGS: -D warnings
+
+# Only GitHub's own actions run here, each pinned to the commit of its
+# release, as the repository's settings require: Rust comes from rustup,
+# which the runners carry, rather than from someone else's action. A branch
+# without a Rust workspace yet, as main began, passes every job with nothing
+# to check.
+
+jobs:
+  lint:
+    name: Format, lints and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: A Rust workspace to check
+        id: workspace
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Cargo.toml: nothing to check."
+          fi
+      - name: Rust, with rustfmt and clippy
+        if: steps.workspace.outputs.rust == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      # The window links Wayland's client library.
+      - name: Wayland's headers
+        if: steps.workspace.outputs.rust == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+      - name: Cargo's downloads and builds, kept between runs
+        if: steps.workspace.outputs.rust == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: lint-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: lint-${{ runner.os }}-
+
+      - name: Formatting
+        if: steps.workspace.outputs.rust == 'true'
+        run: cargo fmt --all -- --check
+
+      - name: Lints
+        if: steps.workspace.outputs.rust == 'true'
+        run: cargo clippy --workspace --all-targets --all-features
+
+      # iq's rules require a doc-comment on every public item. This is what
+      # checks that the promise is kept, and it catches broken intra-doc links
+      # at the same time.
+      - name: Documentation
+        if: steps.workspace.outputs.rust == 'true'
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux, where the sandbox is Landlock and seccomp, and macOS, where it
+        # is Seatbelt: its tests run real commands, so each system tests its
+        # own. Not Windows: commands are refused there until its sandbox is
+        # written.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: A Rust workspace to check
+        id: workspace
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Cargo.toml: nothing to check."
+          fi
+      - name: Rust
+        if: steps.workspace.outputs.rust == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Wayland's headers
+        if: steps.workspace.outputs.rust == 'true' && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+      # The sandbox gives commands a network of their own, in a user
+      # namespace, which Ubuntu's AppArmor keeps from unprivileged programs
+      # by default. The runner is thrown away after the job.
+      - name: User namespaces for the sandbox's network
+        if: steps.workspace.outputs.rust == 'true' && runner.os == 'Linux'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Cargo's downloads and builds, kept between runs
+        if: steps.workspace.outputs.rust == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-
+      - name: Tests
+        if: steps.workspace.outputs.rust == 'true'
+        run: cargo test --workspace --all-features
+
+  msrv:
+    name: Oldest supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The toolchain is read from rust-version in Cargo.toml, the value that
+      # binds, so that the two never drift apart.
+      - name: The toolchain the manifest promises
+        id: workspace
+        run: |
+          if [ ! -f Cargo.toml ]; then
+            echo "No Cargo.toml: nothing to check."
+            exit 0
+          fi
+          declared=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          if [ -z "$declared" ]; then
+            echo "::error::no rust-version found in Cargo.toml"
+            exit 1
+          fi
+          echo "Cargo.toml promises Rust $declared"
+          echo "rust=$declared" >> "$GITHUB_OUTPUT"
+      - name: Rust, as promised
+        if: steps.workspace.outputs.rust != ''
+        env:
+          TOOLCHAIN: ${{ steps.workspace.outputs.rust }}
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal
+          rustup default "$TOOLCHAIN"
+      - name: Wayland's headers
+        if: steps.workspace.outputs.rust != ''
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+      - name: Cargo's downloads and builds, kept between runs
+        if: steps.workspace.outputs.rust != ''
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: msrv-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: msrv-${{ runner.os }}-
+      - name: Build
+        if: steps.workspace.outputs.rust != ''
+        run: cargo check --workspace --all-targets --all-features
