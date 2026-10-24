@@ -39,6 +39,11 @@ pub struct Spent {
     /// What it cost, `None` when the model's price is unknown: never
     /// guessed.
     pub cost: Option<Usd>,
+    /// The tokens it read and wrote, its cache's included.
+    pub tokens: u64,
+    /// Whether iq made it: else the person did, in a session of Claude
+    /// Code or Codex of their own, which their agent's files also keep.
+    pub by_iq: bool,
 }
 
 /// What one payer's calls to one model cost over a period.
@@ -54,6 +59,8 @@ pub struct Total {
     pub cost: Usd,
     /// The calls whose price is unknown, left out of `cost`.
     pub unpriced: usize,
+    /// The tokens they read and wrote.
+    pub tokens: u64,
 }
 
 /// Every call known, oldest first.
@@ -75,19 +82,19 @@ impl Costs {
         self.provider.push(spent);
     }
 
-    fn since(&self, since: u64) -> impl Iterator<Item = &Spent> {
+    fn since(&self, since: u64, everyone: bool) -> impl Iterator<Item = &Spent> {
         self.provider
             .iter()
             .chain(&self.subscriptions)
-            .filter(move |s| s.at >= since)
+            .filter(move |s| s.at >= since && (everyone || s.by_iq))
     }
 
     /// What was spent since `since`, by payer and model, the dearest
-    /// first.
+    /// first: by iq, or by `everyone`, the person's own sessions too.
     #[must_use]
-    pub fn totals(&self, since: u64) -> Vec<Total> {
+    pub fn totals(&self, since: u64, everyone: bool) -> Vec<Total> {
         let mut by: BTreeMap<(Payer, String), Total> = BTreeMap::new();
-        for spent in self.since(since) {
+        for spent in self.since(since, everyone) {
             let total = by
                 .entry((spent.payer, spent.model.clone()))
                 .or_insert_with(|| Total {
@@ -96,8 +103,10 @@ impl Costs {
                     calls: 0,
                     cost: Usd(0.0),
                     unpriced: 0,
+                    tokens: 0,
                 });
             total.calls += 1;
+            total.tokens += spent.tokens;
             match spent.cost {
                 Some(cost) => total.cost += cost,
                 None => total.unpriced += 1,
@@ -109,10 +118,11 @@ impl Costs {
     }
 
     /// What each payer spent since `since`, summed as time goes: one line
-    /// of points, when and how much by then, per payer.
+    /// of points, when and how much by then, per payer; by iq, or by
+    /// `everyone`.
     #[must_use]
-    pub fn running(&self, since: u64) -> Vec<(Payer, Vec<(u64, f64)>)> {
-        let mut spent: Vec<&Spent> = self.since(since).collect();
+    pub fn running(&self, since: u64, everyone: bool) -> Vec<(Payer, Vec<(u64, f64)>)> {
+        let mut spent: Vec<&Spent> = self.since(since, everyone).collect();
         spent.sort_by_key(|s| s.at);
         let mut lines: BTreeMap<Payer, Vec<(u64, f64)>> = BTreeMap::new();
         for s in spent {
@@ -134,7 +144,22 @@ mod tests {
             payer,
             model: model.to_owned(),
             cost: cost.map(Usd),
+            tokens: 100,
+            by_iq: true,
         }
+    }
+
+    #[test]
+    fn the_persons_own_sessions_count_only_when_asked() {
+        let mut costs = Costs::default();
+        let claude = Payer::Subscription(Agent::ClaudeCode);
+        let mut theirs = spent(10, claude, "opus", Some(40.0));
+        theirs.by_iq = false;
+        costs.subscriptions_read(vec![theirs, spent(12, claude, "haiku", Some(0.01))]);
+        let cost = |everyone| -> f64 { costs.totals(0, everyone).iter().map(|t| t.cost.0).sum() };
+        assert!((cost(false) - 0.01).abs() < 1e-9);
+        assert!((cost(true) - 40.01).abs() < 1e-9);
+        assert_eq!(costs.running(0, false)[0].1.len(), 2);
     }
 
     #[test]
@@ -148,12 +173,12 @@ mod tests {
             spent(1, claude, "opus", Some(9.0)),
         ]);
         costs.add(spent(15, Payer::Provider, "glm", Some(0.01)));
-        let totals = costs.totals(5);
+        let totals = costs.totals(5, true);
         assert_eq!(totals.len(), 3);
         assert_eq!((totals[0].model.as_str(), totals[0].calls), ("opus", 2));
         assert!((totals[0].cost.0 - 0.75).abs() < 1e-9);
         assert_eq!((totals[2].model.as_str(), totals[2].unpriced), ("haiku", 1));
-        let running = costs.running(5);
+        let running = costs.running(5, true);
         let (_, line) = running.iter().find(|(payer, _)| *payer == claude).unwrap();
         assert_eq!(line, &[(5, 0.0), (10, 0.25), (20, 0.75), (30, 0.75)]);
     }

@@ -1,0 +1,228 @@
+//! How a team works on a task: the patterns the person may start one in,
+//! and the turns iq hands between its agents. The handing is iq's, not a
+//! model's: who works next, on what, is decided here from what each turn
+//! ended with.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
+
+/// The most rounds a writer and a reviewer go before the person decides.
+pub(crate) const PAIR_ROUNDS: usize = 3;
+
+/// How a team works on a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pattern {
+    /// One agent.
+    #[default]
+    Solo,
+    /// A lead that splits the task among agents it starts, each with its
+    /// part, and puts their work together.
+    Lead,
+    /// A writer, and a reviewer that reads each of its changes until it
+    /// approves, a few rounds at most.
+    Pair,
+    /// Several agents answer the same task alone, then each reads the
+    /// others' answers and revises its own, and the first sums them up.
+    Debate,
+}
+
+impl Pattern {
+    /// Every pattern, in the order offered.
+    pub const ALL: [Pattern; 4] = [Pattern::Solo, Pattern::Lead, Pattern::Pair, Pattern::Debate];
+
+    /// Its name, as the command line and the window write it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Pattern::Solo => "solo",
+            Pattern::Lead => "lead",
+            Pattern::Pair => "pair",
+            Pattern::Debate => "debate",
+        }
+    }
+
+    /// What it does, in a line.
+    #[must_use]
+    pub fn what(self) -> &'static str {
+        match self {
+            Pattern::Solo => "one agent",
+            Pattern::Lead => "a lead that splits the work among agents it starts",
+            Pattern::Pair => "a writer, and a reviewer until it approves",
+            Pattern::Debate => "agents answer alone, then read each other and revise",
+        }
+    }
+
+    /// Whether it needs a second model: the reviewer's, or a second
+    /// voice's.
+    #[must_use]
+    pub fn takes_partner(self) -> bool {
+        matches!(self, Pattern::Pair | Pattern::Debate)
+    }
+}
+
+impl fmt::Display for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for Pattern {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        let wanted = text.trim().to_ascii_lowercase();
+        Pattern::ALL
+            .into_iter()
+            .find(|p| p.name() == wanted)
+            .ok_or_else(|| {
+                let names: Vec<&str> = Pattern::ALL.iter().map(|p| p.name()).collect();
+                format!("no pattern `{text}`; the patterns are {}", names.join(", "))
+            })
+    }
+}
+
+/// The lead's part, the cheaper models it may give its agents named.
+pub(crate) fn lead_role(cheaper: &[String]) -> String {
+    let workers = if cheaper.is_empty() {
+        "claude-code/haiku, or a cheap model of the provider".to_owned()
+    } else {
+        cheaper.join(", ")
+    };
+    format!(
+        "lead. Split the task among agents you start with start_agent, each with a role and the \
+         files it owns, so that no two edit the same file; put workers on cheaper models when the \
+         work allows ({workers}). Give each all it needs, wait for their answers, put the work \
+         together and check the whole with the project's tools. Do little of the work yourself"
+    )
+}
+
+/// The writer's part, in a pair.
+pub(crate) const WRITER_ROLE: &str = "writer. A reviewer reads each of your changes once your turn ends, and its remarks come back \
+     to you: take them, or say why not";
+
+/// The reviewer's part, in a pair.
+pub(crate) const REVIEWER_ROLE: &str = "reviewer. You read, you never change a file. Answer with APPROVE or CHANGES first, then, for \
+     CHANGES, what to change and why, in a short list";
+
+/// A debater's part, one of `count`.
+pub(crate) fn debater_role(count: usize) -> String {
+    format!(
+        "one of {count} agents who answer the same task alone first. Do not write to the others: \
+         their answers come to you once all have answered"
+    )
+}
+
+/// What the reviewer is asked, round `round`, of `writer`'s work on `task`.
+pub(crate) fn review_prompt(writer: &str, task: &str, round: usize) -> String {
+    let again = if round == 0 {
+        String::new()
+    } else {
+        " It changed it again after your last review: review the new state the same way.".to_owned()
+    };
+    format!(
+        "Review what {writer} changed for this task: {task}.{again} Read the changes with git diff, \
+         and git status for new files; run the project's checks if they only read. Answer with \
+         APPROVE or CHANGES first."
+    )
+}
+
+/// Whether a reviewer's answer approves: its first word, whatever its case
+/// and marks.
+pub(crate) fn approves(answer: &str) -> bool {
+    answer
+        .split_whitespace()
+        .next()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric())
+                .eq_ignore_ascii_case("approve")
+        })
+        .unwrap_or(false)
+}
+
+/// What a debater reads once all have answered alone: the others' answers.
+pub(crate) fn others_prompt(me: &str, answers: &BTreeMap<String, String>) -> String {
+    let others: Vec<String> = answers
+        .iter()
+        .filter(|(name, _)| name.as_str() != me)
+        .map(|(name, answer)| format!("{name} answered:\n{answer}"))
+        .collect();
+    format!(
+        "All have answered alone. {}\n\nSay where they are wrong, or better than you, then give \
+         your answer again, revised.",
+        others.join("\n\n")
+    )
+}
+
+/// What the first debater reads to sum up the revised answers.
+pub(crate) fn summing_prompt(answers: &BTreeMap<String, String>) -> String {
+    let all: Vec<String> = answers
+        .iter()
+        .map(|(name, answer)| format!("{name}, revised:\n{answer}"))
+        .collect();
+    format!(
+        "{}\n\nSum these up into one answer for the person: what holds, where you still disagree, \
+         and what you would do.",
+        all.join("\n\n")
+    )
+}
+
+/// Where a debate is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// Each answers alone.
+    Alone,
+    /// Each revises, having read the others.
+    Revising,
+    /// The first sums up.
+    Summing,
+    /// Done.
+    Over,
+}
+
+/// A team at work.
+#[derive(Debug, Clone)]
+pub(crate) enum Team {
+    /// A writer and its reviewer.
+    Pair {
+        writer: String,
+        reviewer: Option<String>,
+        reviewer_model: iq_core::ModelId,
+        task: String,
+        rounds: usize,
+        over: bool,
+    },
+    /// Agents on one task, then on each other's answers.
+    Debate {
+        members: Vec<String>,
+        phase: Phase,
+        answers: BTreeMap<String, String>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_review_approves_by_its_first_word_only() {
+        assert!(approves("APPROVE: it does what the task asks."));
+        assert!(approves("**Approve** with one remark"));
+        assert!(!approves("CHANGES: approve once the test passes"));
+        assert!(!approves(""));
+        assert_eq!("Pair".parse::<Pattern>().unwrap(), Pattern::Pair);
+        assert!("swarm".parse::<Pattern>().is_err());
+    }
+
+    #[test]
+    fn a_debater_reads_the_others_answers_not_its_own() {
+        let answers: BTreeMap<String, String> = [
+            ("a".to_owned(), "use a map".to_owned()),
+            ("b".to_owned(), "use a list".to_owned()),
+        ]
+        .into();
+        let prompt = others_prompt("a", &answers);
+        assert!(prompt.contains("use a list") && !prompt.contains("use a map"));
+        assert!(summing_prompt(&answers).contains("use a map"));
+    }
+}

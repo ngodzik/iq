@@ -34,7 +34,7 @@ mod seatbelt;
 mod shell;
 mod watch;
 
-pub use action::{Action, Approver, Judged, Pending, Permit};
+pub use action::{Action, Approver, Judged, Pending, Permit, Scope};
 pub use error::GateError;
 pub use gate::{Gate, GateBuilder};
 pub use rules::{Decision, Rules};

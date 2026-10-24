@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iq_agent::{Crew, Event, PERSON, Settings};
+use iq_agent::{Crew, Event, PERSON, Pattern, Settings};
 use iq_core::{
     Agent, ChatModel, ChatRequest, ChatResponse, CoreError, Delegate, DelegateEvent, DelegateReply,
     DelegateRequest, Message, ModelId, TokenCount, ToolCall, Usage, Usd,
@@ -386,6 +386,275 @@ async fn agents_hand_work_to_each_other_on_the_board() {
     f.settled().await;
     assert!(f.model.seen_by("lead").contains("and now?"));
     assert!(f.crew.tell("nobody", "hi".into()).is_err());
+}
+
+#[tokio::test]
+async fn the_autopilot_gives_the_internet_when_let_and_asks_the_person_otherwise() {
+    let script = || {
+        vec![
+            calls(
+                "run",
+                serde_json::json!({"command": "curl -s https://example.com", "network": true}),
+            ),
+            say("Fetched."),
+        ]
+    };
+    let settings = || Settings {
+        reviewer: model("claude-code/haiku"),
+        ..Settings::default()
+    };
+    // Let: the reviewer answers, the person is not asked.
+    let f = fixture(&[("lead", script())], settings());
+    f.crew.set_autopilot(true);
+    f.crew.set_autopilot_internet(true);
+    f.crew.start(
+        "lead",
+        &model("cheap/model"),
+        "read the page".into(),
+        PERSON,
+    );
+    f.settled().await;
+    assert!(
+        f.events()
+            .iter()
+            .any(|e| matches!(e, Event::Reviewed { approved: true, .. }))
+    );
+    assert!(!f.events().iter().any(|e| matches!(e, Event::Asked { .. })));
+    // Not let: the person is asked, as without the autopilot.
+    let f = fixture(&[("lead", script())], settings());
+    f.crew.set_autopilot(true);
+    f.crew.start(
+        "lead",
+        &model("cheap/model"),
+        "read the page".into(),
+        PERSON,
+    );
+    let id = f.question().await;
+    f.crew.answer(id, false);
+    f.settled().await;
+    assert!(
+        !f.events()
+            .iter()
+            .any(|e| matches!(e, Event::Reviewed { .. }))
+    );
+}
+
+#[tokio::test]
+async fn an_agent_given_a_role_is_told_to_keep_to_it() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "start_agent",
+                    serde_json::json!({"name": "checker", "model": "cheap/model", "task": "check", "role": "tests"}),
+                ),
+                say("Started."),
+            ],
+        )],
+        Settings::default(),
+    );
+    f.crew.start(
+        "lead",
+        &model("cheap/model"),
+        "split the work".into(),
+        PERSON,
+    );
+    f.settled().await;
+    assert!(
+        f.model
+            .seen_by("checker")
+            .contains("Your role in the crew: tests")
+    );
+    let listed = f.crew.list();
+    let checker = listed.iter().find(|a| a.name == "checker").unwrap();
+    assert_eq!(checker.role.as_deref(), Some("tests"));
+}
+
+#[tokio::test]
+async fn a_writer_and_its_reviewer_go_round_until_it_approves() {
+    let f = fixture(
+        &[
+            (
+                "writer",
+                vec![say("first try"), say("second try, with a test")],
+            ),
+            (
+                "review",
+                vec![
+                    say("CHANGES: add a test"),
+                    say("APPROVE: it has its test now"),
+                ],
+            ),
+        ],
+        Settings::default(),
+    );
+    f.crew.launch(
+        Pattern::Pair,
+        "writer",
+        &[model("cheap/model"), model("cheap/other")],
+        "make it work".into(),
+        None,
+    );
+    for _ in 0..4 {
+        f.settled().await;
+    }
+    assert!(
+        f.model
+            .seen_by("review")
+            .contains("Review what writer changed")
+    );
+    assert!(f.model.seen_by("writer").contains("CHANGES: add a test"));
+    let to_person: Vec<String> = f
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Posted { from, to, text } if from == "review" && to == PERSON => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(to_person, vec!["APPROVE: it has its test now".to_owned()]);
+    assert!(f.events().iter().any(
+        |e| matches!(e, Event::Notice { text, .. } if text.contains("approved it after 2 round"))
+    ));
+}
+
+#[tokio::test]
+async fn debaters_answer_alone_then_read_each_other_and_the_first_sums_up() {
+    let f = fixture(
+        &[
+            (
+                "think",
+                vec![
+                    say("use a map"),
+                    say("a map, still"),
+                    say("we agree on a map"),
+                ],
+            ),
+            ("think-2", vec![say("use a list"), say("a map is better")]),
+        ],
+        Settings::default(),
+    );
+    let first = f.crew.launch(
+        Pattern::Debate,
+        "think",
+        &[model("cheap/model"), model("cheap/other")],
+        "how to store it".into(),
+        None,
+    );
+    assert_eq!(first, "think");
+    for _ in 0..4 {
+        f.settled().await;
+    }
+    assert!(f.model.seen_by("think-2").contains("use a map"));
+    assert!(f.model.seen_by("think").contains("a map is better"));
+    let done: Vec<String> = f
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Done {
+                agent,
+                outcome: Ok(text),
+            } if agent == "think" => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(done.last().map(String::as_str), Some("we agree on a map"));
+}
+
+#[tokio::test]
+async fn an_answer_written_back_is_not_sent_twice() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"name": "helper", "model": "cheap/model", "task": "count"}),
+                    ),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 5})),
+                    say("Counted."),
+                ],
+            ),
+            (
+                "helper",
+                vec![
+                    calls(
+                        "send_message",
+                        serde_json::json!({"to": "lead", "text": "three"}),
+                    ),
+                    say("three"),
+                ],
+            ),
+        ],
+        Settings::default(),
+    );
+    f.crew.start(
+        "lead",
+        &model("cheap/model"),
+        "count with a helper".into(),
+        PERSON,
+    );
+    f.settled().await;
+    let posted = f
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Posted { from, to, .. } if from == "helper" && to == "lead"))
+        .count();
+    assert_eq!(posted, 1);
+}
+
+#[tokio::test]
+async fn agents_wake_each_other_a_few_times_then_wait_for_the_person() {
+    // Two agents the person started, writing to each other at each turn.
+    let ping = |to: &str| {
+        (0..10)
+            .flat_map(|_| {
+                [
+                    calls(
+                        "send_message",
+                        serde_json::json!({"to": to, "text": "your turn"}),
+                    ),
+                    say("over"),
+                ]
+            })
+            .collect::<Vec<_>>()
+    };
+    let f = fixture(
+        &[("alpha", ping("beta")), ("beta", ping("alpha"))],
+        Settings::default(),
+    );
+    f.crew
+        .start("beta", &model("cheap/model"), "wait".into(), PERSON);
+    f.settled().await;
+    f.crew.start(
+        "alpha",
+        &model("cheap/model"),
+        "start the talk".into(),
+        PERSON,
+    );
+    f.settled().await;
+    let turns = |agent: &str| {
+        f.events()
+            .iter()
+            .filter(|e| matches!(e, Event::Working { agent: a, .. } if a == agent))
+            .count()
+    };
+    // Each started once by the person, then woken by the other, at most
+    // four times between them.
+    assert!(
+        turns("alpha") + turns("beta") <= 2 + 4,
+        "{} {}",
+        turns("alpha"),
+        turns("beta")
+    );
+    assert!(turns("alpha") + turns("beta") > 2);
+    assert!(
+        f.events()
+            .iter()
+            .any(|e| matches!(e, Event::Notice { text, .. } if text.contains("woke each other")))
+    );
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
-use crate::action::{Action, Approver, Judged, Pending, Permit};
+use crate::action::{Action, Approver, Judged, Pending, Permit, Scope};
 use crate::audit::Audit;
 use crate::error::GateError;
 use crate::paths;
@@ -20,7 +20,7 @@ use crate::shell;
 #[serde(tag = "verdict", rename_all = "snake_case")]
 enum Verdict {
     Allow,
-    Ask { reason: String, widens: bool },
+    Ask { reason: String, scope: Scope },
     Deny { reason: String },
 }
 
@@ -56,6 +56,8 @@ pub struct Gate {
     rules: Rules,
     audit: Option<Audit>,
     internet: Arc<AtomicBool>,
+    /// Whether a reviewer may give the internet, the autopilot on.
+    reviewer_internet: Arc<AtomicBool>,
 }
 
 /// Builds a [`Gate`].
@@ -68,9 +70,18 @@ pub struct GateBuilder {
     readable: Vec<PathBuf>,
     writable: Vec<PathBuf>,
     internet: bool,
+    reviewer_internet: bool,
 }
 
 impl GateBuilder {
+    /// Lets a reviewer give a command the internet, and only that: files
+    /// stay held, secrets out, publishing waits for the person.
+    #[must_use]
+    pub fn reviewer_internet(mut self, may: bool) -> Self {
+        self.reviewer_internet = may;
+        self
+    }
+
     /// Gives every command the internet, rather than to those a rule gives
     /// it to and those the person allows: files stay held, secrets out.
     #[must_use]
@@ -132,6 +143,7 @@ impl GateBuilder {
             rules: self.rules,
             audit: self.audit.map(Audit::new),
             internet: Arc::new(AtomicBool::new(self.internet)),
+            reviewer_internet: Arc::new(AtomicBool::new(self.reviewer_internet)),
         })
     }
 }
@@ -147,7 +159,18 @@ impl Gate {
             readable: Vec::new(),
             writable: Vec::new(),
             internet: false,
+            reviewer_internet: false,
         }
+    }
+
+    /// Whether a reviewer may give a command the internet.
+    pub fn reviewer_internet(&self) -> bool {
+        self.reviewer_internet.load(Ordering::Relaxed)
+    }
+
+    /// Lets a reviewer give a command the internet, or not.
+    pub fn set_reviewer_internet(&self, may: bool) {
+        self.reviewer_internet.store(may, Ordering::Relaxed);
     }
 
     /// Whether every command has the internet.
@@ -230,7 +253,7 @@ impl Gate {
                 Action::Fetch { target },
                 Verdict::Ask {
                     reason: "it reaches the internet".to_owned(),
-                    widens: true,
+                    scope: Scope::Internet,
                 },
             ),
         };
@@ -243,18 +266,24 @@ impl Gate {
         let permit = Permit { action };
         Ok(match verdict {
             Verdict::Allow => Judged::Allowed(permit),
-            Verdict::Ask { reason, widens } => Judged::Asked {
+            Verdict::Ask { reason, scope } => Judged::Asked {
                 reason,
-                pending: Pending { permit, widens },
+                pending: Pending { permit, scope },
             },
             Verdict::Deny { reason } => Judged::Denied { reason },
         })
     }
 
     /// Approves an action that was asked. A reviewer may approve only what
-    /// stays within the sandbox.
+    /// stays within the sandbox, and what only reaches the internet when
+    /// the person lets it.
     pub fn approve(&self, pending: Pending, by: Approver) -> Result<Permit, GateError> {
-        if by == Approver::Reviewer && pending.widens {
+        let reviewable = match pending.scope {
+            Scope::Sandbox => true,
+            Scope::Internet => self.reviewer_internet(),
+            Scope::Beyond => false,
+        };
+        if by == Approver::Reviewer && !reviewable {
             return Err(GateError::Widens);
         }
         if let Some(audit) = &self.audit {
@@ -283,13 +312,13 @@ impl Gate {
         if paths::secret(path, self.bounds.home.as_deref()) {
             return Verdict::Ask {
                 reason: "it is a file of secrets".to_owned(),
-                widens: true,
+                scope: Scope::Beyond,
             };
         }
         match path.strip_prefix(&self.bounds.workspace) {
             Ok(within) if paths::runs_later(within) => Verdict::Ask {
                 reason: "code written there runs later on its own, outside the sandbox".to_owned(),
-                widens: true,
+                scope: Scope::Beyond,
             },
             Ok(_) => Verdict::Allow,
             Err(_) => outside(),
@@ -335,21 +364,27 @@ impl Gate {
         // waits for the person, open internet or not.
         let publishes = rules().any(|rule| rule.decision == Decision::Ask && rule.network);
         let outside_workspace = !folder.starts_with(&self.bounds.workspace);
-        let widens = publishes || (network && !given) || outside_workspace;
+        let scope = if publishes || outside_workspace {
+            Scope::Beyond
+        } else if network && !given {
+            Scope::Internet
+        } else {
+            Scope::Sandbox
+        };
         let verdict = if let Some(rule) = rules().find(|rule| rule.decision == Decision::Ask) {
             Verdict::Ask {
                 reason: rule.reason(),
-                widens,
+                scope,
             }
         } else if network && !given {
             Verdict::Ask {
                 reason: "it reaches the internet".to_owned(),
-                widens,
+                scope,
             }
         } else if outside_workspace {
             Verdict::Ask {
                 reason: "it runs outside the workspace".to_owned(),
-                widens,
+                scope,
             }
         } else {
             Verdict::Allow
@@ -361,7 +396,7 @@ impl Gate {
 fn outside() -> Verdict {
     Verdict::Ask {
         reason: "it is outside the workspace".to_owned(),
-        widens: true,
+        scope: Scope::Beyond,
     }
 }
 
@@ -538,6 +573,46 @@ mod tests {
                 path: outside.path().canonicalize().unwrap().join("x")
             }
         );
+    }
+
+    #[test]
+    fn a_reviewer_gives_the_internet_only_when_let_and_never_more() {
+        let f = fixture("");
+        let asked = |line: &str, network: bool| match run(&f, line, network) {
+            Judged::Asked { pending, .. } => pending,
+            judged => panic!("{judged:?}"),
+        };
+        let fetch = asked("curl -s https://example.com", true);
+        assert_eq!(fetch.scope(), Scope::Internet);
+        assert!(matches!(
+            f.gate.approve(fetch, Approver::Reviewer),
+            Err(GateError::Widens)
+        ));
+        f.gate.set_reviewer_internet(true);
+        assert!(f.gate.reviewer_internet());
+        let fetch = asked("curl -s https://example.com", true);
+        assert!(f.gate.approve(fetch, Approver::Reviewer).is_ok());
+        // Publishing and leaving the workspace stay the person's.
+        let push = asked("git push", false);
+        assert_eq!(push.scope(), Scope::Beyond);
+        assert!(matches!(
+            f.gate.approve(push, Approver::Reviewer),
+            Err(GateError::Widens)
+        ));
+        let away = match f
+            .gate
+            .judge(Action::Run {
+                line: "ls".into(),
+                folder: PathBuf::from("/tmp"),
+                network: false,
+            })
+            .unwrap()
+        {
+            Judged::Asked { pending, .. } => pending,
+            judged => panic!("{judged:?}"),
+        };
+        assert_eq!(away.scope(), Scope::Beyond);
+        assert_eq!(asked("git reset --hard", false).scope(), Scope::Sandbox);
     }
 
     #[test]

@@ -94,9 +94,26 @@ pub(crate) fn read(input: &Value, workspace: &Path) -> Call {
     }
 }
 
+/// The most of the messages a hook's answer carries: Claude Code keeps
+/// 10,000 characters of it, and puts the rest in a file it does not read.
+const CONTEXT_CHARS: usize = 8_000;
+
+/// The messages for the agent, as context beside the call's result: how
+/// they reach Claude Code while it works. Cut to what it keeps.
+fn with_context(mut output: Value, news: Option<&str>) -> String {
+    if let Some(news) = news {
+        let mut text: String = news.chars().take(CONTEXT_CHARS).collect();
+        if news.chars().count() > CONTEXT_CHARS {
+            text.push_str("\n[cut: call wait_for_messages for the rest]");
+        }
+        output["additionalContext"] = Value::from(format!("On iq's board, for you:\n\n{text}"));
+    }
+    json!({ "hookSpecificOutput": output }).to_string()
+}
+
 /// The hook's answer letting a call through, changed to `input` when
-/// given.
-pub(crate) fn allow(input: Option<Value>) -> String {
+/// given, with the messages for the agent.
+pub(crate) fn allow(input: Option<Value>, news: Option<&str>) -> String {
     let mut output = json!({
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
@@ -105,19 +122,29 @@ pub(crate) fn allow(input: Option<Value>) -> String {
     if let Some(input) = input {
         output["updatedInput"] = input;
     }
-    json!({ "hookSpecificOutput": output }).to_string()
+    with_context(output, news)
 }
 
-/// The hook's answer refusing a call, the reason for the agent to read.
-pub(crate) fn deny(reason: &str) -> String {
-    json!({
-        "hookSpecificOutput": {
+/// The hook's answer refusing a call, the reason for the agent to read,
+/// with the messages for it.
+pub(crate) fn deny(reason: &str, news: Option<&str>) -> String {
+    with_context(
+        json!({
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": format!("iq refused it: {reason}"),
-        }
-    })
-    .to_string()
+        }),
+        news,
+    )
+}
+
+/// The hook's answer leaving the call to Claude Code's own rules, with the
+/// messages for the agent, if any: nothing at all else.
+pub(crate) fn defer(news: Option<&str>) -> String {
+    match news {
+        Some(_) => with_context(json!({ "hookEventName": "PreToolUse" }), news),
+        None => String::new(),
+    }
 }
 
 /// A command's input changed to run `program` with `args` instead: iq's,
@@ -134,6 +161,34 @@ pub(crate) fn through(mut input: Value, program: &Path, args: &[&str]) -> Value 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn messages_ride_on_the_hooks_answers_and_are_cut_to_what_is_kept() {
+        let allowed: Value =
+            serde_json::from_str(&allow(None, Some("Message from tests: done"))).unwrap();
+        let context = allowed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.ends_with("Message from tests: done"));
+        assert_eq!(defer(None), "");
+        let long = "x".repeat(20_000);
+        let deferred: Value = serde_json::from_str(&defer(Some(&long))).unwrap();
+        let context = deferred["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.chars().count() < 10_000);
+        assert!(
+            deferred["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none()
+        );
+        let denied: Value = serde_json::from_str(&deny("no", None)).unwrap();
+        assert!(
+            denied["hookSpecificOutput"]
+                .get("additionalContext")
+                .is_none()
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -215,13 +270,13 @@ mod tests {
             input,
             json!({"command": "'/opt/it'\\''s/iq' '--iq-exec' 'ab12'", "description": "clean"})
         );
-        let answer: Value = serde_json::from_str(&allow(Some(input))).unwrap();
+        let answer: Value = serde_json::from_str(&allow(Some(input), None)).unwrap();
         assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "allow");
         assert_eq!(
             answer["hookSpecificOutput"]["updatedInput"]["description"],
             "clean"
         );
-        let answer: Value = serde_json::from_str(&deny("it publishes commits")).unwrap();
+        let answer: Value = serde_json::from_str(&deny("it publishes commits", None)).unwrap();
         assert_eq!(
             answer["hookSpecificOutput"]["permissionDecisionReason"],
             "iq refused it: it publishes commits"

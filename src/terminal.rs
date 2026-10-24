@@ -10,18 +10,27 @@ use iq_core::Usd;
 #[derive(Debug, Default)]
 pub(crate) struct Tally {
     billed: Usd,
-    estimated: Usd,
     unpriced: usize,
+    /// Calls under a subscription, and their tokens: paid for by the
+    /// month, they are counted, not priced.
+    subscribed: usize,
+    tokens: u64,
 }
 
 impl Tally {
     /// What the session cost, as its last line says it.
     pub(crate) fn summary(&self) -> String {
         let mut text = format!("Billed to the provider: {}", self.billed);
-        if self.estimated.0 > 0.0 {
+        if self.subscribed > 0 {
+            let calls = if self.subscribed == 1 {
+                "call"
+            } else {
+                "calls"
+            };
             text.push_str(&format!(
-                ", and ~{} at list prices under subscriptions",
-                self.estimated
+                ", and {} {calls} under subscriptions, {} tokens",
+                self.subscribed,
+                iq_core::TokenCount(self.tokens)
             ));
         }
         if self.unpriced > 0 {
@@ -55,11 +64,19 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
         Event::Working { agent, prompt } => writeln!(out, "→ {agent}: {}", first(prompt, 100)),
         Event::TextStart { agent } => write!(out, "\n{agent}: "),
         Event::Text { text, .. } => write!(out, "{text}"),
-        Event::Spent { cost, billed, .. } => {
+        Event::Spent {
+            cost,
+            billed,
+            usage,
+            ..
+        } => {
             match (cost, billed) {
                 (Some(cost), true) => tally.billed += *cost,
-                (Some(cost), false) => tally.estimated += *cost,
-                (None, _) => tally.unpriced += 1,
+                (None, true) => tally.unpriced += 1,
+                (_, false) => {
+                    tally.subscribed += 1;
+                    tally.tokens += usage.input.0 + usage.output.0;
+                }
             }
             Ok(())
         }

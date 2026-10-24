@@ -7,9 +7,25 @@
 //! budget = 2.0                           # the most the provider is billed per session, in dollars
 //! effort = "high"
 //! autopilot = false
+//! autopilot_internet = true              # the reviewer also answers what only reaches the internet
 //! internet = false                       # true: every command reaches the internet
+//! theme = "graphite"                     # or "ink", "porcelain"; Ctrl-T goes through them
+//! opacity = 0.86                         # how much of the desktop shows through, 0.3 to 1
+//!
+//! steward = true                         # the steward writes to who spends too fast; Ctrl-G
+//!
+//! [keys]                                 # any shortcut moved, "" for none
+//! costs = "ctrl+o"
+//!
+//! [limits]                               # what iq may use; what you spend outside iq counts too
+//! requesty_month = 20.0                  # dollars the provider may bill in a month
+//! claude_5h = 80                         # percent of Claude Code's five hours
+//! claude_week = 70
+//! codex_5h = 80
+//! codex_week = 70
 //! ```
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -37,10 +53,38 @@ pub(crate) struct Settings {
     effort: Option<Effort>,
     #[serde(default)]
     pub(crate) autopilot: bool,
+    /// Whether the autopilot's reviewer also answers what only reaches the
+    /// internet, rather than the person; true unless set.
+    autopilot_internet: Option<bool>,
     /// Every command reaches the internet, rather than what a rule gives
     /// it to and what the person allows.
     #[serde(default)]
     pub(crate) internet: bool,
+    /// The window's theme.
+    theme: Option<String>,
+    /// How opaque the window is.
+    opacity: Option<f32>,
+    /// The shortcuts moved: an action's name and its key.
+    #[serde(default)]
+    keys: BTreeMap<String, String>,
+    /// Whether the steward writes to the agents that spend too fast.
+    #[serde(default)]
+    pub(crate) steward: bool,
+    /// What iq may use of each payer.
+    #[serde(default)]
+    limits: LimitsFile,
+}
+
+/// The limits as the settings write them, each left to its default when
+/// unset.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsFile {
+    requesty_month: Option<f64>,
+    claude_5h: Option<f64>,
+    claude_week: Option<f64>,
+    codex_5h: Option<f64>,
+    codex_week: Option<f64>,
 }
 
 impl Settings {
@@ -58,6 +102,52 @@ impl Settings {
     pub(crate) fn lead(&self, keyed: bool) -> Result<ModelId> {
         let default = if keyed { LEAD } else { LEAD_WITHOUT_KEY };
         Ok(ModelId::new(self.model.as_deref().unwrap_or(default))?)
+    }
+
+    /// The window's look: its theme and opacity, as set.
+    pub(crate) fn look(&self) -> Result<iq_ui::look::Look> {
+        let theme = match &self.theme {
+            Some(name) => name.parse()?,
+            None => iq_ui::look::Theme::default(),
+        };
+        let opacity = self.opacity.unwrap_or(iq_ui::look::OPACITIES[0]);
+        Ok(iq_ui::look::Look::new(theme, opacity))
+    }
+
+    /// Whether the autopilot's reviewer answers what only reaches the
+    /// internet.
+    pub(crate) fn autopilot_internet(&self) -> bool {
+        self.autopilot_internet.unwrap_or(true)
+    }
+
+    /// The limits, the defaults changed as set.
+    pub(crate) fn limits(&self) -> iq_ui::steward::Limits {
+        use iq_core::Agent;
+        let mut limits = iq_ui::steward::Limits {
+            provider_month: self.limits.requesty_month.map(Usd),
+            ..iq_ui::steward::Limits::default()
+        };
+        for (agent, short, week) in [
+            (
+                Agent::ClaudeCode,
+                self.limits.claude_5h,
+                self.limits.claude_week,
+            ),
+            (Agent::Codex, self.limits.codex_5h, self.limits.codex_week),
+        ] {
+            if let Some(share) = short {
+                limits.short.insert(agent, share);
+            }
+            if let Some(share) = week {
+                limits.week.insert(agent, share);
+            }
+        }
+        limits
+    }
+
+    /// The window's shortcuts, the defaults moved as set.
+    pub(crate) fn keymap(&self) -> Result<iq_ui::keys::Keymap> {
+        Ok(iq_ui::keys::Keymap::with(&self.keys)?)
     }
 
     /// What the crew starts with.
@@ -97,5 +187,27 @@ mod tests {
         assert_eq!(set.crew(true).unwrap().budget, Some(Usd(1.5)));
         assert!(set.autopilot && set.internet);
         assert!(toml::from_str::<Settings>("modle = \"x\"").is_err());
+        let looks: Settings =
+            toml::from_str("theme = \"Ink\"\nopacity = 0.6\n[keys]\ncosts = \"ctrl+u\"").unwrap();
+        let look = looks.look().unwrap();
+        assert_eq!((look.theme().name(), look.opacity()), ("ink", 0.6));
+        assert!(
+            looks
+                .keymap()
+                .unwrap()
+                .chord(iq_ui::keys::Action::Costs)
+                .is_some()
+        );
+        let wrong: Settings = toml::from_str("theme = \"neon\"").unwrap();
+        assert!(wrong.look().is_err());
+        let limited: Settings =
+            toml::from_str("steward = true\n[limits]\nrequesty_month = 20.0\nclaude_5h = 50")
+                .unwrap();
+        let limits = limited.limits();
+        assert!(limited.steward);
+        assert_eq!(limits.provider_month, Some(Usd(20.0)));
+        assert_eq!(limits.short[&iq_core::Agent::ClaudeCode], 50.0);
+        assert_eq!(limits.week[&iq_core::Agent::Codex], 70.0);
+        assert!(toml::from_str::<Settings>("[limits]\nclaude_6h = 1").is_err());
     }
 }

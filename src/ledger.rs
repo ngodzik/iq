@@ -13,6 +13,10 @@ use iq_ui::costs::{Payer, Spent};
 use iq_ui::subscriptions::{KEEP_SECS, Seen};
 use serde::{Deserialize, Serialize};
 
+/// How long the calls billed to the provider are kept: a month and a few
+/// days, so that the month the steward holds the provider to is whole.
+pub(crate) const BILLED_KEEP_SECS: u64 = 35 * 24 * 60 * 60;
+
 /// One call billed to the provider, as kept.
 #[derive(Debug, Serialize, Deserialize)]
 struct Line {
@@ -57,6 +61,9 @@ impl Ledger {
                 payer: Payer::Provider,
                 model: line.model,
                 cost: line.cost.map(Usd),
+                tokens: 0,
+                // What the ledger keeps is what iq's key paid for.
+                by_iq: true,
             })
             .collect()
     }
@@ -126,7 +133,9 @@ impl Ledger {
     /// Drops calls older than the history kept, so that the file does not
     /// grow without end.
     pub(crate) fn trim(&self) {
-        let since = iq_ui::now().saturating_sub(KEEP_SECS);
+        // A month and some, for the steward's month: longer than the
+        // subscriptions' history.
+        let since = iq_ui::now().saturating_sub(BILLED_KEEP_SECS.max(KEEP_SECS));
         let Ok(text) = std::fs::read_to_string(&self.calls) else {
             return;
         };

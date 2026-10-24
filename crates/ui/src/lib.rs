@@ -7,9 +7,16 @@
 pub mod board;
 pub mod costs;
 pub mod crew;
+pub mod error;
+pub mod keys;
+pub mod layout;
+pub mod look;
+pub mod steward;
 pub mod subscriptions;
 
-pub use board::{Board, PERIODS, Page, Read, Update};
+pub use board::{Board, PERIODS, Post, Read, Update};
+pub use error::UiError;
+pub use iq_agent::Pattern;
 
 /// Seconds since 1970.
 #[must_use]

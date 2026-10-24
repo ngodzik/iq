@@ -80,7 +80,21 @@ impl Permit {
 #[must_use]
 pub struct Pending {
     pub(crate) permit: Permit,
-    pub(crate) widens: bool,
+    pub(crate) scope: Scope,
+}
+
+/// What approving an action gives beyond what the sandbox holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// Nothing: it stays within the sandbox.
+    Sandbox,
+    /// The internet, and nothing else: files stay held, secrets out. A
+    /// reviewer may give it when the person lets it.
+    Internet,
+    /// More: publishing, a file outside the workspace, where code runs
+    /// later, secrets. Only the person may give it.
+    Beyond,
 }
 
 impl Pending {
@@ -89,11 +103,15 @@ impl Pending {
         &self.permit.action
     }
 
+    /// What approving it gives beyond the sandbox.
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
     /// Whether approving it gives more than the sandbox holds (the network,
-    /// a file outside the workspace, where code runs later): only the person
-    /// may approve that.
+    /// a file outside the workspace, where code runs later).
     pub fn widens(&self) -> bool {
-        self.widens
+        self.scope != Scope::Sandbox
     }
 }
 

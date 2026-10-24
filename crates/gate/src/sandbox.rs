@@ -248,9 +248,10 @@ pub struct Sandbox {
     /// The process holding the commands' own network, started with the
     /// first command without the internet, on Linux.
     holder: Arc<Mutex<Option<Holder>>>,
-    /// The process groups of commands that left something running when
-    /// they ended, as a server started in the background: stopped when the
-    /// sandbox ends.
+    /// The process groups of commands still running, and of those that
+    /// left something running when they ended, as a server started in the
+    /// background: stopped when the sandbox ends, whether their turn ended
+    /// or was cut short.
     leftovers: Arc<Mutex<Vec<u32>>>,
 }
 
@@ -422,14 +423,22 @@ impl Sandbox {
         let watch = Watch::take(workspace);
         let child = command.spawn().map_err(GateError::Spawn)?;
         let group = child.id();
+        // Kept from the start: a turn stopped while the command runs drops
+        // this wait, and only the sandbox's end is left to stop it.
+        if let Some(group) = group
+            && let Ok(mut leftovers) = self.leftovers.lock()
+        {
+            leftovers.push(group);
+        }
         let waited = tokio::time::timeout(self.timeout, child.wait_with_output()).await;
         if let Some(group) = group {
             if waited.is_err() {
                 stop_group(group).await;
-            } else if alive(group).await
+            }
+            if (waited.is_err() || !alive(group).await)
                 && let Ok(mut leftovers) = self.leftovers.lock()
             {
-                leftovers.push(group);
+                leftovers.retain(|kept| *kept != group);
             }
         }
         let settled = watch.settle();

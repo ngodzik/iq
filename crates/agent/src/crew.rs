@@ -13,18 +13,19 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iq_core::{
     Agent, ChatModel, ChatRequest, Delegate, DelegateEvent, DelegateRequest, Effort, Message,
     ModelId, Reach, ToolCall, Usd,
 };
-use iq_gate::{Action, Approver, Gate, Helper, Judged, Pending, Permit, Sandbox};
+use iq_gate::{Action, Approver, Gate, Helper, Judged, Pending, Permit, Sandbox, Scope};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::event::{Event, PERSON};
 use crate::review;
+use crate::team::{self, Pattern, Phase, Team};
 use crate::tools::{self, Args};
 
 /// Reports what the crew does, as it does it.
@@ -32,6 +33,25 @@ pub type Report = Arc<dyn Fn(Event) + Send + Sync>;
 
 /// Everyone on the board: a message to `all` reaches every agent.
 pub const ALL: &str = "all";
+
+/// The steward on the board: it writes to agents that spend too fast, and
+/// they answer it.
+pub const STEWARD: &str = "steward";
+
+/// How often two agents may wake each other in [`PEER_SPAN`], whichever
+/// writes: more, and they talk on without the work moving, on the
+/// person's money.
+const PEER_WAKES: usize = 4;
+
+/// How often agents may wake each other in [`PEER_SPAN`], all of them.
+const CREW_WAKES: usize = 16;
+
+/// The span those wakes are counted over.
+const PEER_SPAN: Duration = Duration::from_secs(10 * 60);
+
+/// What a payer is called when it is closed: Claude Code's and Codex's
+/// subscriptions by their agents' names, the provider by this.
+pub const PROVIDER: &str = "provider";
 
 /// What the crew starts with.
 #[derive(Debug, Clone)]
@@ -124,6 +144,13 @@ struct Inner<M, D> {
     bridge: Mutex<Option<Bridge>>,
     /// Commands Claude Code was allowed, by the number its call runs.
     permits: Mutex<HashMap<String, Permit>>,
+    /// The payers whose limits the person set are reached: no agent starts
+    /// on them, and the provider bills no more.
+    closed: Mutex<Vec<String>>,
+    /// When agents woke each other lately, and which two.
+    peer_wakes: Mutex<Vec<(Instant, (String, String))>>,
+    /// The teams at work, and where each stands.
+    teams: Mutex<Vec<Team>>,
 }
 
 #[derive(Default)]
@@ -146,6 +173,8 @@ pub struct Posted {
 struct Member {
     model: ModelId,
     by: String,
+    /// What it does in the crew, when it was given a part.
+    role: Option<String>,
     task: String,
     /// The first message it has not read.
     read: usize,
@@ -177,6 +206,8 @@ pub struct Listed {
     pub by: String,
     /// Whether it works.
     pub working: bool,
+    /// What it does in the crew, when it was given a part.
+    pub role: Option<String>,
 }
 
 impl<M, D> Crew<M, D>
@@ -213,6 +244,9 @@ where
                 billed: Mutex::new(Usd(0.0)),
                 bridge: Mutex::new(None),
                 permits: Mutex::new(HashMap::new()),
+                closed: Mutex::new(Vec::new()),
+                peer_wakes: Mutex::new(Vec::new()),
+                teams: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -283,13 +317,202 @@ where
                 model: member.model.to_string(),
                 by: member.by.clone(),
                 working: member.turn.as_ref().is_some_and(|turn| !turn.is_finished()),
+                role: member.role.clone(),
             })
             .collect()
+    }
+
+    /// Starts a team on the person's `task`, as `pattern` works: one agent
+    /// on the first of `models`, a lead that may give its agents the
+    /// others, a writer with a reviewer on the second, or as many debaters
+    /// as models, two at the least. Returns the first agent's name: `name`,
+    /// made unique.
+    pub fn launch(
+        &self,
+        pattern: Pattern,
+        name: &str,
+        models: &[ModelId],
+        task: String,
+        role: Option<String>,
+    ) -> String {
+        let Some(first) = models.first() else {
+            return String::new();
+        };
+        // Held while the team starts, so that a turn ending at once finds
+        // its team.
+        let mut teams = lock(&self.inner.teams);
+        match pattern {
+            Pattern::Solo => self.start_as(name, first, task, PERSON, role),
+            Pattern::Lead => {
+                let cheaper: Vec<String> = models[1..].iter().map(ToString::to_string).collect();
+                self.start_as(name, first, task, PERSON, Some(team::lead_role(&cheaper)))
+            }
+            Pattern::Pair => {
+                let writer = self.start_as(
+                    name,
+                    first,
+                    task.clone(),
+                    PERSON,
+                    Some(team::WRITER_ROLE.to_owned()),
+                );
+                teams.push(Team::Pair {
+                    writer: writer.clone(),
+                    reviewer: None,
+                    reviewer_model: models
+                        .get(1)
+                        .cloned()
+                        .unwrap_or_else(|| self.inner.settings.reviewer.clone()),
+                    task,
+                    rounds: 0,
+                    over: false,
+                });
+                writer
+            }
+            Pattern::Debate => {
+                let count = models.len().max(2);
+                let members: Vec<String> = (0..count)
+                    .map(|at| {
+                        self.start_as(
+                            name,
+                            &models[at % models.len()],
+                            task.clone(),
+                            PERSON,
+                            Some(team::debater_role(count)),
+                        )
+                    })
+                    .collect();
+                let first = members[0].clone();
+                teams.push(Team::Debate {
+                    members,
+                    phase: Phase::Alone,
+                    answers: BTreeMap::new(),
+                });
+                first
+            }
+        }
+    }
+
+    /// Hands the work on, when `name`'s turn ended with `outcome` in a
+    /// team: the writer's changes to its reviewer, the review back to the
+    /// writer or, approved, to the person; a debate to its next phase.
+    /// Returns whether the answer was handled, and is not to be sent to
+    /// whoever started the agent.
+    fn after_turn(&self, name: &str, outcome: &Result<String, String>) -> bool {
+        let mut teams = lock(&self.inner.teams);
+        for team in teams.iter_mut() {
+            match team {
+                Team::Pair {
+                    writer,
+                    reviewer,
+                    reviewer_model,
+                    task,
+                    rounds,
+                    over,
+                } if !*over => {
+                    if name == writer.as_str() {
+                        if outcome.is_err() {
+                            *over = true;
+                            return false;
+                        }
+                        let prompt = team::review_prompt(writer, task, *rounds);
+                        match reviewer {
+                            Some(reviewer) => self.wake(reviewer, prompt),
+                            None => {
+                                let started = self.start_as(
+                                    "review",
+                                    reviewer_model,
+                                    prompt,
+                                    writer,
+                                    Some(team::REVIEWER_ROLE.to_owned()),
+                                );
+                                *reviewer = Some(started);
+                            }
+                        }
+                        return false;
+                    }
+                    if reviewer.as_deref() != Some(name) {
+                        continue;
+                    }
+                    let Ok(review) = outcome else {
+                        *over = true;
+                        return false;
+                    };
+                    *rounds += 1;
+                    if team::approves(review) {
+                        *over = true;
+                        let _ = self.post(name, PERSON, review.clone());
+                        self.report(Event::Notice {
+                            agent: writer.clone(),
+                            text: format!("{name} approved it after {rounds} round(s)"),
+                        });
+                    } else if *rounds >= team::PAIR_ROUNDS {
+                        *over = true;
+                        let _ = self.post(name, PERSON, review.clone());
+                        self.report(Event::Notice {
+                            agent: writer.clone(),
+                            text: format!(
+                                "after {rounds} rounds, {name} still asks for changes: over to you"
+                            ),
+                        });
+                    } else {
+                        // Back to the writer, which it wakes.
+                        let _ = self.post(name, writer, review.clone());
+                    }
+                    return true;
+                }
+                Team::Debate {
+                    members,
+                    phase,
+                    answers,
+                } if members.iter().any(|m| m == name) && *phase != Phase::Over => {
+                    let said = match outcome {
+                        Ok(text) => text.clone(),
+                        Err(error) => format!("(it stopped: {error})"),
+                    };
+                    match *phase {
+                        Phase::Alone | Phase::Revising => {
+                            answers.insert(name.to_owned(), said);
+                            if answers.len() < members.len() {
+                                return false;
+                            }
+                            let all = std::mem::take(answers);
+                            if *phase == Phase::Alone {
+                                *phase = Phase::Revising;
+                                for member in members.iter() {
+                                    self.wake(member, team::others_prompt(member, &all));
+                                }
+                            } else {
+                                *phase = Phase::Summing;
+                                self.wake(&members[0], team::summing_prompt(&all));
+                            }
+                        }
+                        Phase::Summing if name == members[0] => *phase = Phase::Over,
+                        Phase::Summing | Phase::Over => {}
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Starts an agent on `task`, started `by` the person or another agent.
     /// Returns its name: `name`, made unique.
     pub fn start(&self, name: &str, model: &ModelId, task: String, by: &str) -> String {
+        self.start_as(name, model, task, by, None)
+    }
+
+    /// Starts an agent as [`Self::start`] does, with a `role` in the crew:
+    /// what it does, which its instructions tell it to keep to.
+    pub fn start_as(
+        &self,
+        name: &str,
+        model: &ModelId,
+        task: String,
+        by: &str,
+        role: Option<String>,
+    ) -> String {
         let mut board = lock(&self.inner.board);
         let base: String = name
             .trim()
@@ -320,7 +543,11 @@ where
                 session: None,
             },
             None => Kind::Own {
-                messages: vec![Message::system(self.instructions(&name, by))],
+                messages: vec![Message::system(self.instructions(
+                    &name,
+                    by,
+                    role.as_deref(),
+                ))],
             },
         };
         let read = board.messages.len();
@@ -329,6 +556,7 @@ where
             Member {
                 model: model.clone(),
                 by: by.to_owned(),
+                role,
                 task: task.clone(),
                 read,
                 turn: None,
@@ -383,13 +611,33 @@ where
         }
     }
 
-    /// Posts a message on the board. A message from the person, or the
-    /// answer of an agent to the one that started it, wakes its reader
-    /// when it rests; others wait to be read.
+    /// Whether `from` may wake `to` now: two agents a few times in a while,
+    /// the crew some more; counted when it may.
+    fn peer_may_wake(&self, from: &str, to: &str) -> bool {
+        let now = Instant::now();
+        let pair = if from < to {
+            (from.to_owned(), to.to_owned())
+        } else {
+            (to.to_owned(), from.to_owned())
+        };
+        let mut wakes = lock(&self.inner.peer_wakes);
+        wakes.retain(|(at, _)| now.duration_since(*at) < PEER_SPAN);
+        let ours = wakes.iter().filter(|(_, p)| *p == pair).count();
+        if ours >= PEER_WAKES || wakes.len() >= CREW_WAKES {
+            return false;
+        }
+        wakes.push((now, pair));
+        true
+    }
+
+    /// Posts a message on the board. A message from the person wakes its
+    /// reader when it rests, as does the answer of an agent to the one
+    /// that started it, and a message from another agent, a few times in a
+    /// while; others wait to be read.
     pub(crate) fn post(&self, from: &str, to: &str, text: String) -> Result<(), String> {
         let wakes = {
             let mut board = lock(&self.inner.board);
-            if to != ALL && to != PERSON && !board.members.contains_key(to) {
+            if to != ALL && to != PERSON && to != STEWARD && !board.members.contains_key(to) {
                 let names: Vec<&str> = board.members.keys().map(String::as_str).collect();
                 return Err(format!(
                     "no agent is named {to:?}: the agents are {}",
@@ -406,7 +654,27 @@ where
                 .members
                 .get(to)
                 .is_some_and(|m| m.turn.as_ref().is_none_or(JoinHandle::is_finished));
-            (from == PERSON || started_it) && resting
+            let peer =
+                !started_it && board.members.contains_key(from) && board.members.contains_key(to);
+            (resting, from == PERSON || started_it, peer)
+        };
+        let wakes = match wakes {
+            (false, _, _) => false,
+            (true, true, _) => true,
+            (true, false, true) => {
+                let may = self.peer_may_wake(from, to);
+                if !may {
+                    self.report(Event::Notice {
+                        agent: to.to_owned(),
+                        text: format!(
+                            "{from} wrote while it rested, but they woke each other often lately: \
+                             the message waits until you write to it"
+                        ),
+                    });
+                }
+                may
+            }
+            (true, false, false) => false,
         };
         self.inner.posted.send_modify(|count| *count += 1);
         self.report(Event::Posted {
@@ -487,10 +755,14 @@ where
     /// was, and kept again only when the turn ends: a turn stopped halfway
     /// leaves the agent as it was before it.
     async fn turn(self, name: String, prompt: String) {
-        let taken = lock(&self.inner.board)
-            .members
-            .get(&name)
-            .map(|member| (member.kind.clone(), member.model.clone(), member.by.clone()));
+        let (taken, posted_before) = {
+            let board = lock(&self.inner.board);
+            let taken = board
+                .members
+                .get(&name)
+                .map(|member| (member.kind.clone(), member.model.clone(), member.by.clone()));
+            (taken, board.messages.len())
+        };
         let Some((kind, model, by)) = taken else {
             return;
         };
@@ -526,7 +798,14 @@ where
             agent: name.clone(),
             outcome: outcome.clone(),
         });
-        if by != PERSON {
+        // Its answer goes to the agent that started it, unless it wrote it
+        // there itself during the turn: once is enough.
+        let wrote_back = lock(&self.inner.board)
+            .messages
+            .get(posted_before..)
+            .is_some_and(|new| new.iter().any(|m| m.from == name && m.to == by));
+        let handled = self.after_turn(&name, &outcome);
+        if by != PERSON && !handled && !(wrote_back && outcome.is_ok()) {
             let text = match outcome {
                 Ok(text) => text,
                 Err(error) => format!("I stopped: {error}"),
@@ -637,10 +916,10 @@ where
             ],
             folder: bridge.folder.clone(),
         });
-        let by = lock(&self.inner.board)
+        let (by, role) = lock(&self.inner.board)
             .members
             .get(name)
-            .map(|member| member.by.clone())
+            .map(|member| (member.by.clone(), member.role.clone()))
             .unwrap_or_default();
         let request = DelegateRequest {
             agent,
@@ -648,7 +927,7 @@ where
             effort: self.inner.settings.effort,
             model: model.to_owned(),
             prompt,
-            instructions: self.instructions_for_other(name, &by, reach.is_some()),
+            instructions: self.instructions_for_other(name, &by, role.as_deref(), reach.is_some()),
             resume: session.clone(),
             fork: false,
             ephemeral: false,
@@ -805,11 +1084,19 @@ where
         match name {
             "start_agent" => {
                 let model = ModelId::new(args.text("model")?).map_err(|e| e.to_string())?;
-                let started = self.start(
+                self.open_for(&model)?;
+                let role = args
+                    .text("role")
+                    .ok()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(str::to_owned);
+                let started = self.start_as(
                     args.text("name")?,
                     &model,
                     args.text("task")?.to_owned(),
                     agent,
+                    role,
                 );
                 Ok(format!(
                     "{started} started on {model}. Its answer will come to you as a message."
@@ -831,7 +1118,15 @@ where
                 .iter()
                 .map(|a| {
                     let state = if a.working { "working" } else { "resting" };
-                    format!("{} ({}), started by {}, {state}", a.name, a.model, a.by)
+                    let role = a
+                        .role
+                        .as_deref()
+                        .map(|r| format!(", its role: {r}"))
+                        .unwrap_or_default();
+                    format!(
+                        "{} ({}), started by {}, {state}{role}",
+                        a.name, a.model, a.by
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n")),
@@ -894,7 +1189,14 @@ where
     /// within the sandbox, else the person.
     async fn ask(&self, agent: &str, reason: String, pending: Pending) -> Result<Permit, String> {
         let action = describe(pending.action());
-        if self.autopilot() && !pending.widens() {
+        // The reviewer answers what stays within the sandbox, and what only
+        // reaches the internet when the person lets it; never more.
+        let reviewable = match pending.scope() {
+            Scope::Sandbox => true,
+            Scope::Internet => self.inner.gate.reviewer_internet(),
+            Scope::Beyond => false,
+        };
+        if self.autopilot() && reviewable {
             match self.review(agent, &action, &reason).await {
                 Ok((approved, why)) => {
                     self.report(Event::Reviewed {
@@ -1028,9 +1330,14 @@ where
     /// hook's output, empty to leave the call to Claude Code's own mode.
     pub(crate) async fn hook(&self, agent: &str, input: &serde_json::Value) -> String {
         let workspace = self.inner.gate.workspace().to_path_buf();
-        match crate::hook::read(input, &workspace) {
-            crate::hook::Call::Defer => String::new(),
-            crate::hook::Call::Refuse(reason) => crate::hook::deny(&reason),
+        let call = crate::hook::read(input, &workspace);
+        // What others wrote to it since it last looked rides on the answer:
+        // between two of its calls is when Claude Code can read it.
+        let news = self.unread(agent);
+        let news = news.as_deref();
+        match call {
+            crate::hook::Call::Defer => crate::hook::defer(news),
+            crate::hook::Call::Refuse(reason) => crate::hook::deny(&reason, news),
             crate::hook::Call::Judge { action, command } => match self.act(agent, action).await {
                 Ok(permit) => match command {
                     Some(input) => {
@@ -1038,19 +1345,18 @@ where
                             .as_ref()
                             .map(|bridge| bridge.program.clone());
                         let Some(program) = program else {
-                            return crate::hook::deny("iq's bridge is closed");
+                            return crate::hook::deny("iq's bridge is closed", news);
                         };
                         let id = crate::bridge::token();
                         lock(&self.inner.permits).insert(id.clone(), permit);
-                        crate::hook::allow(Some(crate::hook::through(
-                            input,
-                            &program,
-                            &[EXEC_FLAG, &id],
-                        )))
+                        crate::hook::allow(
+                            Some(crate::hook::through(input, &program, &[EXEC_FLAG, &id])),
+                            news,
+                        )
                     }
-                    None => crate::hook::allow(None),
+                    None => crate::hook::allow(None, news),
                 },
-                Err(reason) => crate::hook::deny(&reason),
+                Err(reason) => crate::hook::deny(&reason, news),
             },
         }
     }
@@ -1063,8 +1369,59 @@ where
         self.run(permit, CLAUDE_ASK).await
     }
 
-    /// Fails once the provider's key was billed the budget.
+    /// Lets the reviewer give a command the internet, the autopilot on, or
+    /// leaves that to the person. Publishing and what leaves the workspace
+    /// are always the person's.
+    pub fn set_autopilot_internet(&self, may: bool) {
+        self.inner.gate.set_reviewer_internet(may);
+    }
+
+    /// Closes the payers named, whose limits are reached, and opens the
+    /// others: `claude-code`, `codex`, or the provider.
+    pub fn close_payers(&self, payers: Vec<String>) {
+        *lock(&self.inner.closed) = payers;
+    }
+
+    /// Writes to `to` as the steward.
+    ///
+    /// # Errors
+    ///
+    /// No agent of that name.
+    pub fn advise(&self, to: &str, text: String) -> Result<(), String> {
+        self.post(STEWARD, to, text)
+    }
+
+    /// Refuses a model whose payer is closed, saying which are open.
+    fn open_for(&self, model: &ModelId) -> Result<(), String> {
+        let closed = lock(&self.inner.closed).clone();
+        let payer = model
+            .delegate()
+            .map_or(PROVIDER, |(agent, _)| agent.prefix());
+        if !closed.iter().any(|c| c == payer) {
+            return Ok(());
+        }
+        let open: Vec<&str> = [Agent::ClaudeCode.prefix(), Agent::Codex.prefix(), PROVIDER]
+            .into_iter()
+            .filter(|p| !closed.iter().any(|c| c == p))
+            .collect();
+        Err(format!(
+            "{payer} has reached the limit the person set; start the agent on another: {}",
+            if open.is_empty() {
+                "none is open".to_owned()
+            } else {
+                open.join(", ")
+            }
+        ))
+    }
+
+    /// Fails once the provider's key was billed the budget, or the
+    /// provider's limit for the month is reached.
     fn within_budget(&self) -> Result<(), String> {
+        if lock(&self.inner.closed).iter().any(|c| c == PROVIDER) {
+            return Err(
+                "the provider's limit for the month, as the person set it, is reached".to_owned(),
+            );
+        }
         match self.inner.settings.budget {
             Some(budget) if self.billed() >= budget => Err(format!(
                 "the budget of {budget} for the provider is spent; raise it to go on"
@@ -1098,15 +1455,16 @@ where
     }
 
     /// The standing instructions of one of iq's agents.
-    fn instructions(&self, name: &str, by: &str) -> String {
+    fn instructions(&self, name: &str, by: &str, role: Option<&str>) -> String {
         let workspace = self.inner.gate.workspace().display();
         let started = if by == PERSON {
             "The person gave you your task.".to_owned()
         } else {
             format!("The agent {by} started you and gets your answer.")
         };
+        let part = role_line(role);
         format!(
-            "You are {name}, an agent of iq, a coding harness, working in {workspace}. {started}\n\n\
+            "You are {name}, an agent of iq, a coding harness, working in {workspace}. {started}{part}\n\n\
              Your tools act on the machine through iq's gate: files are read and written in the \
              workspace, and commands run in a sandbox that writes only the workspace. Commands \
              reach localhost (servers you start, the tests that talk to them); the internet is \
@@ -1117,7 +1475,9 @@ where
              or say what you need.\n\n\
              Other agents may work beside you. start_agent hands a task to a new one, \
              send_message writes to one, to all, or to the person, and wait_for_messages waits \
-             for an answer. Messages to you also arrive between your calls.\n\n\
+             for an answer. Messages to you also arrive between your calls. The steward watches \
+             what the crew spends against the person's limits: when it writes to you, answer it \
+             in a line, with send_message to steward, and do as it asks.\n\n\
              Read before you change, check your work with the project's own tools (its build, \
              tests, linters), and be brief. When the task is done, answer with what you did and \
              call no tool."
@@ -1125,21 +1485,42 @@ where
     }
 
     /// What an agent with tools of its own is told of the crew.
-    fn instructions_for_other(&self, name: &str, by: &str, reaches: bool) -> String {
+    fn instructions_for_other(
+        &self,
+        name: &str,
+        by: &str,
+        role: Option<&str>,
+        reaches: bool,
+    ) -> String {
+        let part = role_line(role);
         if !reaches {
-            return format!("You are {name}, an agent of iq's, started by {by}.");
+            return format!("You are {name}, an agent of iq's, started by {by}.{part}");
         }
         format!(
-            "You are {name}, an agent of iq's, started by {by}. Your commands run in iq's \
+            "You are {name}, an agent of iq's, started by {by}.{part} Your commands run in iq's \
              sandbox, which writes only this folder. They reach localhost; the internet is \
              given to what fetches packages and sources (npm install, cargo fetch, pip install, \
              git fetch), and to ask the person for it for another command, start its line with \
              IQ_NETWORK=1. What iq's gate holds waits for the person. iq's tools (send_message, wait_for_messages, \
              start_agent, list_agents) let you write to the other agents and to the person, and \
-             hand tasks to new agents. Look for messages to you with wait_for_messages when \
-             your work depends on others."
+             hand tasks to new agents. Messages written to you while you work arrive beside \
+             your tools' results; wait for one with wait_for_messages when your work depends on \
+             others. The steward watches what the crew spends against the person's limits: when \
+             it writes to you, answer it in a line, with send_message to steward, and do as it \
+             asks."
         )
     }
+}
+
+/// The line of an agent's instructions that gives it its part, if any.
+fn role_line(role: Option<&str>) -> String {
+    role.map(|role| {
+        format!(
+            " Your role in the crew: {role}. Keep to it, and hand what lies outside it to the \
+             agent whose part it is, or to the one that started you."
+        )
+    })
+    .unwrap_or_default()
 }
 
 /// What a command prints when it needed the internet and had none.

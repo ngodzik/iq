@@ -2,16 +2,27 @@
 //! the questions waiting for the person, the messages on the board, and
 //! what the person writes.
 
-use iq_agent::{Event, PERSON};
-use iq_core::Usd;
+use iq_agent::{Event, PERSON, Pattern};
+use iq_core::{TokenCount, Usd};
 
 /// What the person asks of the crew, for the program to carry out.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
-    /// Start the lead agent on a task.
+    /// Start an agent on a task.
     Start {
+        /// The name asked for it.
+        name: String,
+        /// Its model: one of the provider's, or `claude-code`, `codex`.
+        model: String,
         /// The task.
         task: String,
+        /// Its part in the crew, when given one.
+        role: Option<String>,
+        /// How its team works.
+        pattern: Pattern,
+        /// The second model, for a pattern that takes one: the reviewer's,
+        /// a second voice's.
+        partner: Option<String>,
     },
     /// Write to an agent.
     Tell {
@@ -37,6 +48,16 @@ pub enum Request {
         /// The agent.
         agent: String,
     },
+    /// Write to an agent as the steward.
+    Advise {
+        /// The agent.
+        to: String,
+        /// What the steward says.
+        text: String,
+    },
+    /// Close the payers named, whose limits are reached, and open the
+    /// others: `claude-code`, `codex`, `provider`.
+    Closed(Vec<String>),
 }
 
 /// One thing in an agent's thread.
@@ -107,8 +128,10 @@ pub struct AgentView {
     pub thread: Vec<Entry>,
     /// What its calls were billed.
     pub billed: Usd,
-    /// What its calls under a subscription would cost at list prices.
-    pub estimated: Usd,
+    /// The tokens its calls under a subscription read and wrote: a
+    /// subscription is paid for by the month, so what counts is how much
+    /// of it they use, not dollars.
+    pub subscription: TokenCount,
 }
 
 /// A question waiting for the person.
@@ -130,11 +153,9 @@ pub struct Question {
 #[derive(Debug, Clone, Default)]
 pub struct CrewView {
     agents: Vec<AgentView>,
-    selected: usize,
     questions: Vec<Question>,
     autopilot: bool,
     internet: bool,
-    input: String,
     /// The lead's model and the reviewer's, as the program starts them.
     lead: String,
     reviewer: String,
@@ -169,17 +190,10 @@ impl CrewView {
         &self.agents
     }
 
-    /// The agent shown, when there is one.
+    /// The agent named `name`.
     #[must_use]
-    pub fn selected(&self) -> Option<&AgentView> {
-        self.agents.get(self.selected)
-    }
-
-    /// Shows the agent at `index`.
-    pub fn select(&mut self, index: usize) {
-        if index < self.agents.len() {
-            self.selected = index;
-        }
+    pub fn agent(&self, name: &str) -> Option<&AgentView> {
+        self.agents.iter().find(|a| a.name == name)
     }
 
     /// The questions waiting for the person, oldest first.
@@ -213,48 +227,26 @@ impl CrewView {
         Request::Internet(self.internet)
     }
 
-    /// What the person is writing, for the window to edit.
-    pub fn input_mut(&mut self) -> &mut String {
-        &mut self.input
-    }
-
-    /// Sends what the person wrote: the lead's task when no agent works
-    /// yet, else a message to the agent shown.
-    pub fn send(&mut self) -> Option<Request> {
-        let text = self.input.trim().to_owned();
-        if text.is_empty() {
-            return None;
-        }
-        self.input.clear();
-        Some(match self.selected() {
-            None => Request::Start { task: text },
-            Some(agent) => Request::Tell {
-                to: agent.name.clone(),
-                text,
-            },
-        })
-    }
-
     /// Answers question `id`.
     pub fn answer(&mut self, id: u64, approved: bool) -> Request {
         self.questions.retain(|q| q.id != id);
         Request::Answer { id, approved }
     }
 
-    /// Stops the agent shown.
-    pub fn stop(&self) -> Option<Request> {
-        self.selected().map(|agent| Request::Stop {
-            agent: agent.name.clone(),
-        })
+    /// Stops `agent`.
+    #[must_use]
+    pub fn stop(&self, agent: &str) -> Option<Request> {
+        self.agent(agent)
+            .filter(|a| a.working)
+            .map(|a| Request::Stop {
+                agent: a.name.clone(),
+            })
     }
 
     /// What the crew just did.
     pub fn event(&mut self, event: Event) {
         match event {
             Event::Joined { agent, model, by } => {
-                if self.agents.is_empty() || by == PERSON {
-                    self.selected = self.agents.len();
-                }
                 self.agents.push(AgentView {
                     name: agent,
                     model,
@@ -262,22 +254,22 @@ impl CrewView {
                     working: false,
                     thread: Vec::new(),
                     billed: Usd(0.0),
-                    estimated: Usd(0.0),
+                    subscription: TokenCount(0),
                 });
             }
             Event::Working { agent, prompt } => {
-                if let Some(view) = self.agent(&agent) {
+                if let Some(view) = self.agent_mut(&agent) {
                     view.working = true;
                     view.thread.push(Entry::Prompt(prompt));
                 }
             }
             Event::TextStart { agent } => {
-                if let Some(view) = self.agent(&agent) {
+                if let Some(view) = self.agent_mut(&agent) {
                     view.thread.push(Entry::Text(String::new()));
                 }
             }
             Event::Text { agent, text } => {
-                if let Some(view) = self.agent(&agent) {
+                if let Some(view) = self.agent_mut(&agent) {
                     match view.thread.last_mut() {
                         Some(Entry::Text(current)) => current.push_str(&text),
                         _ => view.thread.push(Entry::Text(text)),
@@ -288,13 +280,17 @@ impl CrewView {
                 agent,
                 cost,
                 billed,
+                usage,
                 ..
             } => {
-                if let (Some(view), Some(cost)) = (self.agent(&agent), cost) {
+                if let Some(view) = self.agent_mut(&agent) {
                     if billed {
-                        view.billed += cost;
+                        if let Some(cost) = cost {
+                            view.billed += cost;
+                        }
                     } else {
-                        view.estimated += cost;
+                        view.subscription =
+                            TokenCount(view.subscription.0 + usage.input.0 + usage.output.0);
                     }
                 }
             }
@@ -305,7 +301,7 @@ impl CrewView {
                 output,
                 ok,
             } => {
-                if let Some(view) = self.agent(&agent) {
+                if let Some(view) = self.agent_mut(&agent) {
                     view.thread.push(Entry::Tool {
                         name,
                         input,
@@ -321,7 +317,7 @@ impl CrewView {
                 reason,
                 widens,
             } => {
-                if let Some(view) = self.agent(&agent) {
+                if let Some(view) = self.agent_mut(&agent) {
                     view.thread.push(Entry::Asked {
                         id,
                         action: action.clone(),
@@ -358,7 +354,7 @@ impl CrewView {
                 why,
                 ..
             } => {
-                if let Some(view) = self.agent(&agent) {
+                if let Some(view) = self.agent_mut(&agent) {
                     view.thread.push(Entry::Reviewed {
                         action,
                         approved,
@@ -376,24 +372,24 @@ impl CrewView {
                 // agent; a message of the person's shows as the prompt it
                 // wakes, or in the reader's thread.
                 if from != PERSON
-                    && let Some(view) = self.agent(&from)
+                    && let Some(view) = self.agent_mut(&from)
                 {
                     view.thread.push(entry.clone());
                 }
                 if to != from
-                    && let Some(view) = self.agent(&to)
+                    && let Some(view) = self.agent_mut(&to)
                 {
                     view.thread.push(entry);
                 }
             }
             Event::Done { agent, outcome } => {
-                if let Some(view) = self.agent(&agent) {
+                if let Some(view) = self.agent_mut(&agent) {
                     view.working = false;
                     view.thread.push(Entry::Done(outcome));
                 }
             }
             Event::Notice { agent, text } => {
-                if let Some(view) = self.agent(&agent) {
+                if let Some(view) = self.agent_mut(&agent) {
                     view.thread.push(Entry::Notice(text));
                 }
             }
@@ -401,7 +397,7 @@ impl CrewView {
         }
     }
 
-    fn agent(&mut self, name: &str) -> Option<&mut AgentView> {
+    fn agent_mut(&mut self, name: &str) -> Option<&mut AgentView> {
         self.agents.iter_mut().find(|a| a.name == name)
     }
 }
@@ -409,39 +405,6 @@ impl CrewView {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_first_message_starts_the_lead_and_the_next_go_to_the_agent_shown() {
-        let mut crew = CrewView::default();
-        crew.input_mut().push_str("  fix the build ");
-        assert_eq!(
-            crew.send(),
-            Some(Request::Start {
-                task: "fix the build".into()
-            })
-        );
-        assert_eq!(crew.send(), None);
-        crew.event(Event::Joined {
-            agent: "lead".into(),
-            model: "m".into(),
-            by: PERSON.into(),
-        });
-        crew.event(Event::Joined {
-            agent: "helper".into(),
-            model: "m".into(),
-            by: "lead".into(),
-        });
-        // The lead stays shown: the helper was started by an agent.
-        assert_eq!(crew.selected().unwrap().name, "lead");
-        crew.input_mut().push_str("and the tests");
-        assert_eq!(
-            crew.send(),
-            Some(Request::Tell {
-                to: "lead".into(),
-                text: "and the tests".into()
-            })
-        );
-    }
 
     #[test]
     fn a_thread_gathers_text_tools_questions_and_costs() {
@@ -490,12 +453,15 @@ mod tests {
             crew.event(Event::Spent {
                 agent: "lead".into(),
                 model: "m".into(),
-                usage: iq_core::Usage::default(),
+                usage: iq_core::Usage {
+                    input: TokenCount(1200),
+                    output: TokenCount(300),
+                },
                 cost: Some(Usd(cost)),
                 billed,
             });
         }
-        let lead = crew.selected().unwrap();
+        let lead = crew.agent("lead").unwrap();
         assert!(lead.working);
         assert_eq!(lead.thread[1], Entry::Text("Hello".into()));
         assert!(matches!(
@@ -505,9 +471,20 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!((lead.billed, lead.estimated), (Usd(0.25), Usd(1.0)));
+        // Billed calls count in dollars, a subscription's in tokens.
+        assert_eq!(
+            (lead.billed, lead.subscription),
+            (Usd(0.25), TokenCount(1500))
+        );
         assert_eq!(crew.toggle_autopilot(), Request::Autopilot(true));
         assert_eq!(crew.toggle_internet(), Request::Internet(true));
         assert!(crew.internet());
+        assert_eq!(
+            crew.stop("lead"),
+            Some(Request::Stop {
+                agent: "lead".into()
+            })
+        );
+        assert_eq!(crew.stop("nobody"), None);
     }
 }

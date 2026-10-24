@@ -10,7 +10,7 @@ use iq_ui::subscriptions::{
     RequestView, SessionView, Subscriptions, WindowView, back_at, local_time, percent, short, span,
 };
 
-use crate::theme::{ACCENT, CYAN, DIM, EDGE, RAISED, RED, TEXT, YELLOW};
+use crate::theme::Palette;
 
 /// How many requests are listed.
 const REQUESTS: usize = 24;
@@ -19,13 +19,12 @@ const REQUESTS: usize = 24;
 const SESSIONS: usize = 6;
 
 /// Draws the page.
-pub(crate) fn show(ui: &mut Ui, subscriptions: &Subscriptions) {
+pub(crate) fn show(ui: &mut Ui, subscriptions: &Subscriptions, p: &Palette) {
     let now = iq_ui::now();
     ui.label(
         RichText::new("Subscriptions")
-            .size(20.0)
-            .strong()
-            .color(TEXT),
+            .font(crate::theme::bold(15.0))
+            .color(p.text),
     );
     ui.label(
         RichText::new(
@@ -33,7 +32,7 @@ pub(crate) fn show(ui: &mut Ui, subscriptions: &Subscriptions) {
              estimated from each call's tokens.",
         )
         .small()
-        .color(DIM),
+        .color(p.dim),
     );
     let windows = subscriptions.windows(now);
     if windows.is_empty() {
@@ -44,62 +43,62 @@ pub(crate) fn show(ui: &mut Ui, subscriptions: &Subscriptions) {
                     "Nothing heard yet: a subscription's windows show once Claude Code or Codex \
                      answers under it.",
                 )
-                .color(DIM),
+                .color(p.dim),
             );
         });
         return;
     }
     ui.add_space(8.0);
     for window in &windows {
-        window_card(ui, window, now);
+        window_card(ui, window, now, p);
         ui.add_space(6.0);
     }
     ui.add_space(10.0);
-    heading(ui, "Requests", "the latest first, and what each took");
+    heading(ui, "Requests", "the latest first, and what each took", p);
     let requests = subscriptions.requests(REQUESTS);
     if requests.is_empty() {
         ui.label(
             RichText::new("Their calls are being read…")
                 .small()
-                .color(DIM),
+                .color(p.dim),
         );
     }
     for request in &requests {
-        request_row(ui, request);
+        request_row(ui, request, p);
     }
     ui.add_space(10.0);
-    heading(ui, "Sessions", "the context each call read");
+    heading(ui, "Sessions", "the context each call read", p);
     for session in subscriptions.sessions(SESSIONS) {
-        session_plot(ui, &session);
+        session_plot(ui, &session, p);
     }
 }
 
-fn heading(ui: &mut Ui, title: &str, what: &str) {
+fn heading(ui: &mut Ui, title: &str, what: &str, p: &Palette) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(title).strong().color(TEXT));
-        ui.label(RichText::new(what).small().color(DIM));
+        ui.label(RichText::new(title).strong().color(p.text));
+        ui.label(RichText::new(what).small().color(p.dim));
     });
     ui.add_space(2.0);
 }
 
 /// How full a share is, as a colour.
-fn fill(share: f64) -> Color32 {
+fn fill(share: f64, p: &Palette) -> Color32 {
     if share >= 90.0 {
-        RED
+        p.bad
     } else if share >= 70.0 {
-        YELLOW
+        p.warn
     } else {
-        CYAN
+        p.info
     }
 }
 
 /// One window: its share in large, a bar, when it starts again, and its
 /// reports over the period.
-fn window_card(ui: &mut Ui, window: &WindowView, now: u64) {
+fn window_card(ui: &mut Ui, window: &WindowView, now: u64, p: &Palette) {
     let share = window.estimate.unwrap_or(window.reported);
     Frame::new()
-        .fill(RAISED)
-        .stroke(egui::Stroke::new(1.0, EDGE))
+        .fill(p.card)
+        .stroke(egui::Stroke::new(1.0, p.edge))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
@@ -112,38 +111,43 @@ fn window_card(ui: &mut Ui, window: &WindowView, now: u64) {
                         span(window.minutes)
                     ))
                     .strong()
-                    .color(TEXT),
+                    .color(p.text),
                 );
                 let shown = match window.estimate {
                     Some(estimate) => format!("~{}", percent(estimate)),
                     None => percent(window.reported),
                 };
-                ui.label(RichText::new(shown).size(18.0).strong().color(fill(share)));
+                ui.label(
+                    RichText::new(shown)
+                        .size(18.0)
+                        .strong()
+                        .color(fill(share, p)),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let back = match window.resets_at {
                         Some(at) => format!("starts again {}", back_at(at, window.minutes)),
                         None => "ended: starts again at the next use".to_owned(),
                     };
-                    ui.label(RichText::new(back).small().color(DIM));
+                    ui.label(RichText::new(back).small().color(p.dim));
                 });
             });
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, 3.0, EDGE);
+            ui.painter().rect_filled(rect, 3.0, p.track);
             let mut used = rect;
             used.set_width(rect.width() * (share / 100.0).clamp(0.0, 1.0) as f32);
-            ui.painter().rect_filled(used, 3.0, fill(share));
+            ui.painter().rect_filled(used, 3.0, fill(share, p));
             if let Some(end) = window.resets_at
                 && window.reports.len() > 1
             {
-                period_plot(ui, window, end, now);
+                period_plot(ui, window, end, now, p);
             }
         });
 }
 
 /// The shares reported over the period, in hours from its start, and the
 /// estimate now.
-fn period_plot(ui: &mut Ui, window: &WindowView, end: u64, now: u64) {
+fn period_plot(ui: &mut Ui, window: &WindowView, end: u64, now: u64, p: &Palette) {
     let start = end.saturating_sub(window.minutes * 60);
     let hours = |at: u64| at.saturating_sub(start) as f64 / 3600.0;
     let reports: Vec<[f64; 2]> = window
@@ -164,6 +168,7 @@ fn period_plot(ui: &mut Ui, window: &WindowView, end: u64, now: u64) {
     ))
     .height(80.0)
     .show_background(false)
+    .show_grid(false)
     .allow_drag(false)
     .allow_zoom(false)
     .allow_scroll(false)
@@ -178,7 +183,7 @@ fn period_plot(ui: &mut Ui, window: &WindowView, end: u64, now: u64) {
     .show(ui, |plot| {
         plot.line(
             Line::new("reported", PlotPoints::from(reports.clone()))
-                .color(CYAN)
+                .color(p.info)
                 .width(1.5),
         );
         if let Some(estimate) = window.estimate {
@@ -187,7 +192,7 @@ fn period_plot(ui: &mut Ui, window: &WindowView, end: u64, now: u64) {
                     "now, estimated",
                     PlotPoints::from(vec![[hours(now), estimate]]),
                 )
-                .color(ACCENT)
+                .color(p.accent)
                 .radius(4.0),
             );
         }
@@ -196,7 +201,7 @@ fn period_plot(ui: &mut Ui, window: &WindowView, end: u64, now: u64) {
 
 /// One request: when, by whom and where, its tokens, its share of each
 /// window, and whether it found the cache gone.
-fn request_row(ui: &mut Ui, request: &RequestView) {
+fn request_row(ui: &mut Ui, request: &RequestView, p: &Palette) {
     let folder = request.folder.rsplit('/').next().unwrap_or(&request.folder);
     let who = if request.by_iq { "iq" } else { "by you" };
     ui.horizontal_wrapped(|ui| {
@@ -204,19 +209,23 @@ fn request_row(ui: &mut Ui, request: &RequestView) {
             RichText::new(local_time(request.at))
                 .small()
                 .monospace()
-                .color(DIM),
+                .color(p.dim),
         );
         ui.label(
             RichText::new(short(request.agent))
                 .small()
                 .strong()
-                .color(TEXT),
+                .color(p.text),
         );
-        ui.label(RichText::new(request.models.join(", ")).small().color(TEXT));
+        ui.label(
+            RichText::new(request.models.join(", "))
+                .small()
+                .color(p.text),
+        );
         ui.label(
             RichText::new(format!("{folder} · {who}"))
                 .small()
-                .color(DIM),
+                .color(p.dim),
         );
         let shares: Vec<String> = request
             .shares
@@ -227,7 +236,7 @@ fn request_row(ui: &mut Ui, request: &RequestView) {
             })
             .collect();
         if !shares.is_empty() {
-            ui.label(RichText::new(shares.join(" · ")).small().color(CYAN))
+            ui.label(RichText::new(shares.join(" · ")).small().color(p.info))
                 .on_hover_text(
                     "Its share of each window, from the rates learnt; ? until its plan has \
                      added a whole percent",
@@ -243,13 +252,13 @@ fn request_row(ui: &mut Ui, request: &RequestView) {
                 TokenCount(request.output)
             ))
             .small()
-            .color(DIM),
+            .color(p.dim),
         );
         if let Some(tokens) = request.cache_gone {
             ui.label(
                 RichText::new(format!("cache gone: {} read again", TokenCount(tokens)))
                     .small()
-                    .color(YELLOW),
+                    .color(p.warn),
             )
             .on_hover_text(
                 "Its session had been idle longer than the cache lives: about twenty minutes for \
@@ -260,7 +269,7 @@ fn request_row(ui: &mut Ui, request: &RequestView) {
 }
 
 /// One session's calls: the context each read, over time.
-fn session_plot(ui: &mut Ui, session: &SessionView) {
+fn session_plot(ui: &mut Ui, session: &SessionView, p: &Palette) {
     let folder = session.folder.rsplit('/').next().unwrap_or(&session.folder);
     ui.label(
         RichText::new(format!(
@@ -270,7 +279,7 @@ fn session_plot(ui: &mut Ui, session: &SessionView) {
             session.context.len()
         ))
         .small()
-        .color(TEXT),
+        .color(p.text),
     );
     let Some(first) = session.context.first().map(|c| c.0) else {
         return;
@@ -283,6 +292,7 @@ fn session_plot(ui: &mut Ui, session: &SessionView) {
     Plot::new(format!("session-{}-{first}", short(session.agent)))
         .height(50.0)
         .show_background(false)
+        .show_grid(false)
         .show_axes([false, true])
         .allow_drag(false)
         .allow_zoom(false)
@@ -294,7 +304,7 @@ fn session_plot(ui: &mut Ui, session: &SessionView) {
         .show(ui, |plot| {
             plot.line(
                 Line::new("context", PlotPoints::from(points))
-                    .color(ACCENT)
+                    .color(p.accent)
                     .width(1.2),
             );
         });

@@ -89,6 +89,16 @@ pub struct WindowView {
     pub reports: Vec<(u64, f64)>,
 }
 
+impl WindowView {
+    /// When its current period started, in seconds since 1970; `None`
+    /// once it ended.
+    #[must_use]
+    pub fn started_at(&self) -> Option<u64> {
+        self.resets_at
+            .map(|ends| ends.saturating_sub(self.minutes * 60))
+    }
+}
+
 /// One request an agent worked on, as shown.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestView {
@@ -334,6 +344,33 @@ impl Subscriptions {
         Some(used + added.min(0.99))
     }
 
+    /// What iq's own calls took of `agent`'s window `window` since `since`,
+    /// in percent, when the rates are learnt: the rest of what the window
+    /// reports, the person spent outside iq.
+    #[must_use]
+    pub fn iq_share(&self, agent: Agent, window: &str, since: u64) -> Option<f64> {
+        let rates = self.rates();
+        rates
+            .get(&(agent, window.to_owned()))
+            .filter(|models| !models.is_empty())?;
+        let mut share = 0.0;
+        for call in self
+            .calls
+            .iter()
+            .filter(|c| c.agent == agent && c.by_iq && c.at > since)
+        {
+            share += Self::rate(&rates, agent, window, &call.model)? * weight(call);
+        }
+        Some(share)
+    }
+
+    /// What iq's own calls took of `view`'s current period, in percent,
+    /// when the rates are learnt and the period has not ended.
+    #[must_use]
+    pub fn iq_part(&self, view: &WindowView) -> Option<f64> {
+        self.iq_share(view.agent, &view.name, view.started_at()?)
+    }
+
     /// The requests of the agents, the latest first, `limit` at most.
     #[must_use]
     pub fn requests(&self, limit: usize) -> Vec<RequestView> {
@@ -575,6 +612,27 @@ mod tests {
             call(350, "a", 50_000, "r3"),
         ]);
         assert!(subscriptions.windows(400)[0].estimate.unwrap() < 7.0);
+    }
+
+    #[test]
+    fn iq_s_part_of_a_window_leaves_out_the_person_s_own_calls() {
+        let mut subscriptions = Subscriptions::default();
+        subscriptions.add(quota(100, 3.0, 10_000));
+        subscriptions.add(quota(200, 4.0, 10_000));
+        subscriptions.add(quota(300, 6.0, 10_000));
+        let mut own = call(250, "b", 1_000, "r2");
+        own.by_iq = false;
+        subscriptions.calls_read(vec![
+            call(150, "a", 1_000, "r1"),
+            own,
+            call(350, "a", 500, "r3"),
+        ]);
+        let window = &subscriptions.windows(400)[0];
+        let part = subscriptions.iq_part(window).unwrap();
+        assert!((part - 1.5).abs() < 1e-9, "{part}");
+        // An ended period has no part left.
+        let ended = &subscriptions.windows(20_000)[0];
+        assert_eq!(subscriptions.iq_part(ended), None);
     }
 
     #[test]

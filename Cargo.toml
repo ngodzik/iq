@@ -67,6 +67,9 @@ bevy       = { version = "0.20.0", default-features = false, features = [
 ] }
 bevy_egui  = { version = "0.43.1", default-features = false, features = ["render", "default_fonts"] }
 egui_plot  = "0.37.0"
+# What models write, drawn as the Markdown it is: headings, lists, code,
+# links. 0.25 is the release built on egui 0.36; no images are fetched.
+egui_commonmark = { version = "0.25.0", default-features = false, features = ["pulldown_cmark"] }
 
 [package]
 name    = "iq"
@@ -88,7 +91,7 @@ iq-ui.workspace              = true
 iq-gui.workspace             = true
 anyhow.workspace             = true
 clap.workspace               = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "signal"] }
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 serde.workspace              = true
@@ -98,9 +101,16 @@ toml.workspace               = true
 [dev-dependencies]
 tempfile.workspace = true
 
+# Unoptimised, the window redrawn while an agent works took a core of its
+# own and lagged behind the keys: Bevy, egui and wgpu are built optimised
+# once, iq's own crates lightly, so that they still build fast.
+[profile.dev]
+opt-level = 1
+
 # Bevy's crates with their debug information take gigabytes, and are not
 # what is debugged here.
 [profile.dev.package."*"]
+opt-level = 3
 debug = false
 
 [profile.release]

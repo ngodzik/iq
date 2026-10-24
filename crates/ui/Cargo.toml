@@ -10,4 +10,5 @@ description = "The state of iq's window: what it shows and what the person did w
 iq-core.workspace  = true
 iq-agent.workspace = true
 serde.workspace   = true
+thiserror.workspace = true
 jiff.workspace    = true

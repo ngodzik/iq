@@ -21,13 +21,15 @@ mod event;
 mod hook;
 mod mcp;
 mod review;
+mod team;
 mod tools;
 
 pub use bridge::{exec_main, hook_main};
 pub use crew::{
-    AGENT_VAR, ALL, BRIDGE_VAR, Bridge, Crew, EXEC_FLAG, HOOK_FLAG, Listed, MCP_FLAG, Posted,
-    Report, Settings,
+    AGENT_VAR, ALL, BRIDGE_VAR, Bridge, Crew, EXEC_FLAG, HOOK_FLAG, Listed, MCP_FLAG, PROVIDER,
+    Posted, Report, STEWARD, Settings,
 };
 pub use event::{Event, PERSON};
 pub use mcp::mcp_main;
+pub use team::Pattern;
 pub use tools::board as board_tools;

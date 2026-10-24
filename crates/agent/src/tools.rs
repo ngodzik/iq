@@ -102,6 +102,7 @@ pub fn board() -> Vec<ToolSpec> {
                     "name": {"type": "string", "description": "A short name for it, one word."},
                     "model": {"type": "string"},
                     "task": {"type": "string", "description": "All it needs to know: it sees nothing of your conversation."},
+                    "role": {"type": "string", "description": "Its part in the crew, which it keeps to: tests, review, the front end."},
                 },
                 "required": ["name", "model", "task"],
             }),

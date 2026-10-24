@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use iq_agent::{Crew, EXEC_FLAG, Event, HOOK_FLAG, MCP_FLAG, PERSON, Report};
+use iq_agent::{Crew, EXEC_FLAG, Event, HOOK_FLAG, MCP_FLAG, Report};
 use iq_core::{Delegate, ModelId};
 use iq_gate::{Action, Approver, Gate, HELPER_FLAG, HOLD_FLAG, Helper, Judged, Rules};
 use iq_llm::{Agents, OpenAiCompatible, PriceTable, Tokens};
@@ -78,6 +78,14 @@ enum Command {
     Do {
         /// The task.
         task: String,
+        /// How the team works: solo, lead, pair (a writer and a reviewer),
+        /// debate (agents answer alone, then read each other).
+        #[arg(long, default_value = "solo")]
+        pattern: iq_agent::Pattern,
+        /// The second model, for pair (the reviewer) or debate (a second
+        /// voice); for lead, a cheaper one its agents may use.
+        #[arg(long)]
+        partner: Option<String>,
     },
     /// The provider's models, with what they charge per million tokens.
     Models,
@@ -124,7 +132,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
     match &cli.command {
-        Some(Command::Do { task }) => runtime.block_on(work(&cli, task)),
+        Some(Command::Do {
+            task,
+            pattern,
+            partner,
+        }) => runtime.block_on(work(&cli, task, *pattern, partner.as_deref())),
         Some(command) => runtime.block_on(run(command, &cli)),
         None => window(&runtime, &cli),
     }
@@ -150,7 +162,7 @@ fn crew(
     let crew = Crew::new(
         provider,
         agents,
-        gate(settings.internet)?,
+        gate(settings.internet, settings.autopilot_internet())?,
         Helper::this_program()?,
         settings.crew(cli.api_key.is_some())?,
         report,
@@ -190,8 +202,14 @@ fn chosen(cli: &Cli, folder: &std::path::Path) -> Result<(Settings, ModelId)> {
     Ok((settings, lead))
 }
 
-/// Hands `task` to the crew in the terminal, until it answers.
-async fn work(cli: &Cli, task: &str) -> Result<()> {
+/// Hands `task` to the crew in the terminal, a team working as `pattern`
+/// says, until it answers.
+async fn work(
+    cli: &Cli,
+    task: &str,
+    pattern: iq_agent::Pattern,
+    partner: Option<&str>,
+) -> Result<()> {
     let folder = home_folder()?;
     let (settings, lead) = chosen(cli, &folder)?;
     let prices = iq_llm::load_prices(&folder.join("prices.json"))
@@ -209,7 +227,11 @@ async fn work(cli: &Cli, task: &str) -> Result<()> {
             let _ = send.send(event);
         }),
     )?;
-    crew.start(LEAD, &lead, task.to_owned(), PERSON);
+    let mut models = vec![lead];
+    if let Some(partner) = partner {
+        models.push(ModelId::new(partner)?);
+    }
+    crew.launch(pattern, LEAD, &models, task.to_owned(), None);
     let mut tally = terminal::Tally::default();
     let handle = |event: Event, tally: &mut terminal::Tally| {
         if let Some((id, question)) = terminal::show(&event, tally) {
@@ -217,6 +239,7 @@ async fn work(cli: &Cli, task: &str) -> Result<()> {
             tokio::task::spawn_blocking(move || crew.answer(id, terminal::ask(&question)));
         }
     };
+    let mut stopped = std::pin::pin!(stop_asked());
     loop {
         tokio::select! {
             Some(event) = events.recv() => handle(event, &mut tally),
@@ -224,6 +247,11 @@ async fn work(cli: &Cli, task: &str) -> Result<()> {
                 while let Ok(event) = events.try_recv() {
                     handle(event, &mut tally);
                 }
+                break;
+            }
+            () = &mut stopped => {
+                println!("\nStopped: the agents are stopped with iq.");
+                crew.stop_all();
                 break;
             }
         }
@@ -247,9 +275,13 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let ledger = Arc::new(Ledger::open(&folder));
     ledger.trim();
     let (send, feed) = std::sync::mpsc::channel();
+    let quit = send.clone();
     let (ask, requests) = std::sync::mpsc::channel::<Request>();
     let waker = iq_gui::Waker::default();
     let since = iq_ui::now().saturating_sub(iq_ui::subscriptions::KEEP_SECS);
+    // The provider's calls of the whole month too, for the steward.
+    let billed_since =
+        iq_ui::steward::month(iq_ui::now()).map_or(since, |(start, _)| start.min(since));
     let _ = send.send(Update::Started {
         lead: lead.to_string(),
         reviewer: settings.crew(keyed)?.reviewer.to_string(),
@@ -257,7 +289,7 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         internet: settings.internet,
     });
     let _ = send.send(Update::Kept {
-        provider: ledger.billed(since),
+        provider: ledger.billed(billed_since),
         quotas: ledger.quotas(),
     });
 
@@ -300,15 +332,37 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     };
     std::thread::spawn(files);
 
+    // Asked to stop from outside, the window closes as if the person had
+    // closed it, so that the agents are stopped with it.
+    {
+        let waker = waker.clone();
+        runtime.spawn(async move {
+            stop_asked().await;
+            let _ = quit.send(Update::Quit);
+            waker.wake();
+        });
+    }
     let handle = runtime.handle().clone();
     let working = crew.clone();
     std::thread::spawn(move || {
         let _inside = handle.enter();
         for request in requests {
             match request {
-                Request::Start { task } => {
-                    working.start(LEAD, &lead, task, PERSON);
-                }
+                Request::Start {
+                    name,
+                    model,
+                    task,
+                    role,
+                    pattern,
+                    partner,
+                } => match ModelId::new(&model) {
+                    Ok(model) => {
+                        let mut models = vec![model];
+                        models.extend(partner.and_then(|p| ModelId::new(&p).ok()));
+                        working.launch(pattern, &name, &models, task, role);
+                    }
+                    Err(error) => tracing::warn!("no chat on `{model}`: {error}"),
+                },
                 Request::Tell { to, text } => {
                     let _ = working.tell(&to, text);
                 }
@@ -316,13 +370,47 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                 Request::Autopilot(on) => working.set_autopilot(on),
                 Request::Internet(open) => working.set_internet(open),
                 Request::Stop { agent } => working.stop(&agent),
+                Request::Advise { to, text } => {
+                    let _ = working.advise(&to, text);
+                }
+                Request::Closed(payers) => working.close_payers(payers),
             }
         }
     });
 
-    iq_gui::run(feed, ask, waker);
+    let board = iq_ui::Board::new(settings.keymap()?, settings.look()?)
+        .with_limits(settings.limits(), settings.steward);
+    iq_gui::run(feed, ask, waker, board);
     runtime.block_on(crew.end());
     Ok(())
+}
+
+/// Resolves once the person or the system asks iq to stop: Ctrl-C in its
+/// terminal, the terminal closed, or a termination asked. iq then stops
+/// its agents before it ends: killed outright, it would leave them working
+/// on, spending the person's subscription.
+async fn stop_asked() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            // Without them, iq stops as the system kills it.
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// What a subscription's call would cost at the API's list prices.
@@ -338,6 +426,8 @@ fn spent(call: &iq_core::SubscriptionCall, prices: Option<&PriceTable>) -> Spent
         payer: Payer::Subscription(call.agent),
         model: call.model.clone(),
         cost: prices.and_then(|prices| prices.cost(&call.model, tokens)),
+        tokens: call.input + call.cache_read + call.cache_written + call.output,
+        by_iq: call.by_iq,
     }
 }
 
@@ -356,11 +446,12 @@ fn home_folder() -> Result<PathBuf> {
 /// The gate of the current folder, with the person's rules when they wrote
 /// some, the internet open to every command or not. Rules are never read
 /// from the workspace: a command could write them there.
-fn gate(internet: bool) -> Result<Gate> {
+fn gate(internet: bool, reviewer_internet: bool) -> Result<Gate> {
     let folder = home_folder()?;
     let mut gate = Gate::builder(std::env::current_dir().context("reading the current folder")?)
         .audit(folder.join("audit.log"))
-        .internet(internet);
+        .internet(internet)
+        .reviewer_internet(reviewer_internet);
     let rules = folder.join("rules.toml");
     if rules.exists() {
         let text = std::fs::read_to_string(&rules)
@@ -427,7 +518,7 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
             }
         }
         Command::Run { line, network } => {
-            let gate = gate(cli.internet)?;
+            let gate = gate(cli.internet, false)?;
             let action = Action::Run {
                 line: line.clone(),
                 folder: gate.workspace().to_path_buf(),

@@ -203,11 +203,18 @@ pub fn hook_main() -> i32 {
                 input,
             }) {
                 Ok(reply) => reply.text,
-                Err(error) => crate::hook::deny(&format!("iq is not there to judge it ({error})")),
+                Err(error) => {
+                    crate::hook::deny(&format!("iq is not there to judge it ({error})"), None)
+                }
             },
-            Err(error) => crate::hook::deny(&format!("the hook's input is not JSON ({error})")),
+            Err(error) => {
+                crate::hook::deny(&format!("the hook's input is not JSON ({error})"), None)
+            }
         },
-        Err(error) => crate::hook::deny(&format!("the hook's input could not be read ({error})")),
+        Err(error) => crate::hook::deny(
+            &format!("the hook's input could not be read ({error})"),
+            None,
+        ),
     };
     println!("{answer}");
     0
