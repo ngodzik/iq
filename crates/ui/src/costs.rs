@@ -63,11 +63,43 @@ pub struct Total {
     pub tokens: u64,
 }
 
-/// Every call known, oldest first.
+/// One task of iq's agents, by the kind of task the assay's rules place
+/// it in: the kinds are the person's, written with the judge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskSpent {
+    /// When it started, in seconds since 1970.
+    pub at: u64,
+    /// Its kind, `None` when no rule places it.
+    pub kind: Option<String>,
+    /// What the provider billed it.
+    pub billed: Usd,
+    /// What its calls under a subscription would cost at list prices.
+    pub listed: Usd,
+    /// The tokens it read and wrote.
+    pub tokens: u64,
+}
+
+/// What one kind of task spent over a period.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KindTotal {
+    /// The kind, `None` for the tasks no rule places.
+    pub kind: Option<String>,
+    /// How many tasks.
+    pub tasks: usize,
+    /// What the provider billed them.
+    pub billed: Usd,
+    /// What their calls under a subscription would cost at list prices.
+    pub listed: Usd,
+    /// The tokens they read and wrote.
+    pub tokens: u64,
+}
+
+/// Every call known, oldest first, and iq's tasks.
 #[derive(Debug, Clone, Default)]
 pub struct Costs {
     provider: Vec<Spent>,
     subscriptions: Vec<Spent>,
+    tasks: Vec<TaskSpent>,
 }
 
 impl Costs {
@@ -80,6 +112,47 @@ impl Costs {
     /// A call iq made with the provider's key.
     pub fn add(&mut self, spent: Spent) {
         self.provider.push(spent);
+    }
+
+    /// iq's tasks, as just read from its journal and placed by the
+    /// assay's rules.
+    pub fn tasks_read(&mut self, tasks: Vec<TaskSpent>) {
+        self.tasks = tasks;
+    }
+
+    /// What each kind of task spent since `since`, the dearest first,
+    /// those of no kind last: dollars billed and list prices under a
+    /// subscription weigh alike, as both are what the work is worth.
+    #[must_use]
+    pub fn by_kind(&self, since: u64) -> Vec<KindTotal> {
+        let mut totals: Vec<KindTotal> = Vec::new();
+        for task in self.tasks.iter().filter(|t| t.at >= since) {
+            let at = match totals.iter().position(|t| t.kind == task.kind) {
+                Some(at) => at,
+                None => {
+                    totals.push(KindTotal {
+                        kind: task.kind.clone(),
+                        tasks: 0,
+                        billed: Usd(0.0),
+                        listed: Usd(0.0),
+                        tokens: 0,
+                    });
+                    totals.len() - 1
+                }
+            };
+            let total = &mut totals[at];
+            total.tasks += 1;
+            total.billed += task.billed;
+            total.listed += task.listed;
+            total.tokens += task.tokens;
+        }
+        totals.sort_by(|a, b| {
+            a.kind
+                .is_none()
+                .cmp(&b.kind.is_none())
+                .then((b.billed.0 + b.listed.0).total_cmp(&(a.billed.0 + a.listed.0)))
+        });
+        totals
     }
 
     fn since(&self, since: u64, everyone: bool) -> impl Iterator<Item = &Spent> {
@@ -160,6 +233,30 @@ mod tests {
         assert!((cost(false) - 0.01).abs() < 1e-9);
         assert!((cost(true) - 40.01).abs() < 1e-9);
         assert_eq!(costs.running(0, false)[0].1.len(), 2);
+    }
+
+    #[test]
+    fn kinds_of_task_are_summed_over_the_period_the_dearest_first() {
+        let mut costs = Costs::default();
+        let task = |at, kind: Option<&str>, billed, listed| TaskSpent {
+            at,
+            kind: kind.map(Into::into),
+            billed: Usd(billed),
+            listed: Usd(listed),
+            tokens: 10,
+        };
+        costs.tasks_read(vec![
+            task(1, Some("Rebase"), 5.0, 0.0),
+            task(10, None, 9.0, 0.0),
+            task(11, Some("Python"), 0.2, 0.5),
+            task(12, Some("Rebase"), 0.1, 0.0),
+            task(13, Some("Python"), 0.1, 0.0),
+        ]);
+        let kinds = costs.by_kind(5);
+        let names: Vec<Option<&str>> = kinds.iter().map(|k| k.kind.as_deref()).collect();
+        assert_eq!(names, [Some("Python"), Some("Rebase"), None]);
+        assert_eq!(kinds[0].tasks, 2);
+        assert!((kinds[0].listed.0 - 0.5).abs() < 1e-9);
     }
 
     #[test]

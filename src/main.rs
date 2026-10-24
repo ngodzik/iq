@@ -2,27 +2,30 @@
 
 #![deny(unsafe_code)]
 
+mod journal;
 mod ledger;
 mod settings;
 mod terminal;
 
 use std::io::{BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use iq_agent::{Crew, EXEC_FLAG, Event, HOOK_FLAG, MCP_FLAG, Report};
-use iq_core::{Delegate, ModelId};
+use iq_agent::{Crew, EXEC_FLAG, Event, HOOK_FLAG, MCP_FLAG, PERSON, Report};
+use iq_assay::{Assay, Told};
+use iq_core::{Agent, Delegate, ModelId};
 use iq_gate::{Action, Approver, Gate, HELPER_FLAG, HOLD_FLAG, Helper, Judged, Rules};
 use iq_llm::{Agents, OpenAiCompatible, PriceTable, Tokens};
 use iq_ui::Update;
 use iq_ui::costs::{Payer, Spent};
-use iq_ui::crew::Request;
+use iq_ui::crew::{AssayAsk, Request};
 use tracing_subscriber::EnvFilter;
 
+use crate::journal::Journal;
 use crate::ledger::Ledger;
 use crate::settings::Settings;
 
@@ -92,6 +95,8 @@ enum Command {
     /// What Claude Code's and Codex's subscriptions spent over the last day,
     /// as their own files keep it.
     Subscriptions,
+    /// The assay's exercises and their results, as its folder holds them.
+    Assay,
     /// Runs a command line in the sandbox, as a model's would be: judged by
     /// the gate, asked when it must be, written to the audit log.
     Run {
@@ -152,16 +157,9 @@ fn crew(
     report: Report,
 ) -> Result<Crew<OpenAiCompatible, Agents>> {
     let folder = home_folder()?;
-    let provider = match &cli.api_key {
-        Some(key) => OpenAiCompatible::new(&cli.base_url, key),
-        None => OpenAiCompatible::without_key(&cli.base_url),
-    };
-    let mut agents = Agents::find();
-    agents.claude = agents.claude.with_prices(prices.clone());
-    agents.codex = agents.codex.with_prices(prices);
     let crew = Crew::new(
-        provider,
-        agents,
+        provider(cli),
+        agents(prices),
         gate(settings.internet, settings.autopilot_internet())?,
         Helper::this_program()?,
         settings.crew(cli.api_key.is_some())?,
@@ -174,9 +172,155 @@ fn crew(
     Ok(crew)
 }
 
+/// The provider's models, with its key when there is one.
+fn provider(cli: &Cli) -> OpenAiCompatible {
+    match &cli.api_key {
+        Some(key) => OpenAiCompatible::new(&cli.base_url, key),
+        None => OpenAiCompatible::without_key(&cli.base_url),
+    }
+}
+
+/// The agents with tools of their own, their messages priced at `prices`.
+fn agents(prices: Option<Arc<PriceTable>>) -> Agents {
+    let mut agents = Agents::find();
+    agents.claude = agents.claude.with_prices(prices.clone());
+    agents.codex = agents.codex.with_prices(prices);
+    agents
+}
+
+/// The agents with tools of their own installed on the machine.
+fn installed() -> Vec<Agent> {
+    let mut found = Vec::new();
+    if iq_llm::ClaudeCode::find().is_some() {
+        found.push(Agent::ClaudeCode);
+    }
+    if iq_llm::Codex::find().is_some() {
+        found.push(Agent::Codex);
+    }
+    found
+}
+
+/// The assay of the settings' folder, and the crew its judge works in,
+/// in that folder: its runs' gates hold the person's rules, its costs go
+/// to `report` with the rest, what changes in it is told on `told`. Must
+/// run within the runtime.
+#[allow(clippy::too_many_arguments)]
+fn assay(
+    cli: &Cli,
+    settings: &Settings,
+    lead: &ModelId,
+    installed: &[Agent],
+    prices: Option<Arc<PriceTable>>,
+    report: Report,
+    told: std::sync::mpsc::Sender<Told>,
+    journal: &Path,
+) -> Result<(
+    Assay<OpenAiCompatible, Agents>,
+    Crew<OpenAiCompatible, Agents>,
+)> {
+    let folder = home_folder()?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    let store = iq_assay::Store::open(settings.assay_folder(&home))
+        .context("opening the assay's folder")?;
+    let keyed = cli.api_key.is_some();
+    let provider = provider(cli);
+    let agents = agents(prices);
+    let program = std::env::current_exe().context("finding iq's own program")?;
+    let crew_settings = settings.crew(keyed)?;
+    let (mirrors, notices) = settings.mirrors(|name| std::env::var(name).ok());
+    let runner = iq_assay::Runner {
+        provider: provider.clone(),
+        provider_name: Some(provider.name()),
+        agents: agents.clone(),
+        helper: Helper::this_program()?,
+        gate: Arc::new(|work: &Path| gate_in(work, false, false).map_err(|e| format!("{e:#}"))),
+        reach: Some(iq_assay::Reach {
+            program: program.clone(),
+            folder: folder.join("run"),
+        }),
+        effort: crew_settings.effort,
+    };
+    let assay = Assay::new(
+        store,
+        runner,
+        iq_assay::Settings {
+            judges: settings.assay_judges(installed, lead)?,
+            allowed: settings.assay_allowed(),
+            reference: lead.clone(),
+            parallel: settings.assay_parallel(),
+            mirrors: mirrors
+                .iter()
+                .map(|(server, place)| format!("{}: {place}", server.name))
+                .collect(),
+            servers: mirrors.into_iter().map(|(server, _)| server).collect(),
+            journal: Some(journal.to_path_buf()),
+            notices,
+        },
+        Arc::clone(&report),
+        Arc::new(move |news| {
+            let _ = told.send(news);
+        }),
+    );
+    let crew = Crew::new(
+        provider,
+        agents,
+        gate_in(
+            assay.store().root(),
+            settings.internet,
+            settings.autopilot_internet(),
+        )?,
+        Helper::this_program()?,
+        crew_settings,
+        report,
+    );
+    crew.set_autopilot(settings.autopilot);
+    crew.serve(program, folder.join("run"))
+        .context("opening the bridge for the assay's judge")?;
+    assay.serve(iq_assay::JUDGE);
+    crew.extend(Arc::new(assay.clone()));
+    Ok((assay, crew))
+}
+
+/// Who the assay may test: the provider's models as it lists them, with
+/// their prices, and the agents installed.
+async fn roster(provider: &OpenAiCompatible, keyed: bool, installed: &[Agent]) -> iq_assay::Roster {
+    let mut roster = iq_assay::Roster {
+        provider: Some(provider.name()),
+        harnesses: iq_assay::Roster::harnesses_of(installed),
+        ..iq_assay::Roster::default()
+    };
+    if !keyed {
+        roster.missing =
+            Some("there is no key for the provider: iq reads it from REQUESTY_API_KEY".into());
+        return roster;
+    }
+    match provider.list().await {
+        Ok(listed) => {
+            roster.models = listed
+                .into_iter()
+                .map(|model| iq_assay::Offer {
+                    id: model.id,
+                    canonical: model.canonical,
+                    input: model.input_price,
+                    output: model.output_price,
+                    context: model.context_window,
+                    tools: model.tool_calling,
+                    description: model.description,
+                })
+                .collect();
+        }
+        Err(error) => roster.missing = Some(format!("{:#}", anyhow::Error::new(error))),
+    }
+    roster
+}
+
 /// What the crew does, kept in iq's folder as it happens: the calls billed
-/// to the provider, the quotas reported.
-fn keep(ledger: &Ledger, event: &Event) {
+/// to the provider, the quotas reported, each task's files, commands and
+/// costs.
+fn keep(ledger: &Ledger, journal: &Journal, event: &Event) {
+    journal.event(event);
     match event {
         Event::Spent {
             agent,
@@ -216,14 +360,16 @@ async fn work(
         .await
         .map(Arc::new);
     let ledger = Arc::new(Ledger::open(&folder));
+    let journal = Arc::new(Journal::open(&folder));
     let (send, mut events) = tokio::sync::mpsc::unbounded_channel();
     let kept = Arc::clone(&ledger);
+    let noted = Arc::clone(&journal);
     let crew = crew(
         cli,
         &settings,
         prices,
         Arc::new(move |event: Event| {
-            keep(&kept, &event);
+            keep(&kept, &noted, &event);
             let _ = send.send(event);
         }),
     )?;
@@ -274,6 +420,8 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         .map(Arc::new);
     let ledger = Arc::new(Ledger::open(&folder));
     ledger.trim();
+    let journal = Arc::new(Journal::open(&folder));
+    journal.trim();
     let (send, feed) = std::sync::mpsc::channel();
     let quit = send.clone();
     let (ask, requests) = std::sync::mpsc::channel::<Request>();
@@ -297,22 +445,73 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         let send = send.clone();
         let waker = waker.clone();
         let ledger = Arc::clone(&ledger);
+        let journal = Arc::clone(&journal);
         Arc::new(move |event: Event| {
-            keep(&ledger, &event);
+            keep(&ledger, &journal, &event);
             let _ = send.send(Update::Crew(event));
             waker.wake();
         })
     };
     let crew = {
         let _inside = runtime.enter();
-        crew(cli, &settings, prices.clone(), report)?
+        crew(cli, &settings, prices.clone(), Arc::clone(&report))?
     };
+    let installed = installed();
+    let (told, heard) = std::sync::mpsc::channel::<Told>();
+    let (assay, assay_crew) = {
+        let _inside = runtime.enter();
+        assay(
+            cli,
+            &settings,
+            &lead,
+            &installed,
+            prices.clone(),
+            report,
+            told,
+            journal.file(),
+        )?
+    };
+    // What the assay's folder holds is read on a thread of its own, never
+    // in the window, at once and whenever it changes.
+    {
+        let send = send.clone();
+        let waker = waker.clone();
+        let assay = assay.clone();
+        std::thread::spawn(move || {
+            let _ = send.send(Update::Assay(Box::new(assay.overview())));
+            waker.wake();
+            for news in heard {
+                let update = match news {
+                    Told::Store => Update::Assay(Box::new(assay.overview())),
+                    Told::Running(running) => Update::AssayRunning(running),
+                };
+                if send.send(update).is_err() {
+                    return;
+                }
+                waker.wake();
+            }
+        });
+    }
+    {
+        let assay = assay.clone();
+        let provider = provider(cli);
+        let installed = installed.clone();
+        runtime.spawn(async move {
+            assay.set_roster(roster(&provider, keyed, &installed).await);
+        });
+    }
 
     let files = {
         let waker = waker.clone();
+        let journal = journal.file().to_path_buf();
+        let categories = assay.store().root().join("categories.toml");
         move || {
             let agents = Agents::find();
             loop {
+                let tasks = tasks(&journal, &categories);
+                if send.send(Update::Tasks(tasks)).is_err() {
+                    return;
+                }
                 let since = iq_ui::now().saturating_sub(iq_ui::subscriptions::KEEP_SECS);
                 let calls = agents.subscription_calls(since);
                 let spent = calls
@@ -344,8 +543,13 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     }
     let handle = runtime.handle().clone();
     let working = crew.clone();
+    let judging = assay_crew.clone();
+    let assaying = assay.clone();
     std::thread::spawn(move || {
         let _inside = handle.enter();
+        // The judge works in a crew of its own, in the assay's folder:
+        // what is asked of an agent goes to the crew it is in.
+        let judge_has = |name: &str| judging.list().iter().any(|a| a.name == name);
         for request in requests {
             match request {
                 Request::Start {
@@ -364,16 +568,56 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     Err(error) => tracing::warn!("no chat on `{model}`: {error}"),
                 },
                 Request::Tell { to, text } => {
-                    let _ = working.tell(&to, text);
+                    let _ = if judge_has(&to) {
+                        judging.tell(&to, text)
+                    } else {
+                        working.tell(&to, text)
+                    };
                 }
-                Request::Answer { id, approved } => working.answer(id, approved),
-                Request::Autopilot(on) => working.set_autopilot(on),
-                Request::Internet(open) => working.set_internet(open),
-                Request::Stop { agent } => working.stop(&agent),
+                // Each crew numbers its questions apart: the one that
+                // asked takes the answer.
+                Request::Answer { id, approved } => {
+                    working.answer(id, approved);
+                    judging.answer(id, approved);
+                }
+                Request::Autopilot(on) => {
+                    working.set_autopilot(on);
+                    judging.set_autopilot(on);
+                }
+                Request::Internet(open) => {
+                    working.set_internet(open);
+                    judging.set_internet(open);
+                }
+                Request::Stop { agent } => {
+                    if judge_has(&agent) {
+                        judging.stop(&agent);
+                    } else {
+                        working.stop(&agent);
+                    }
+                }
                 Request::Advise { to, text } => {
-                    let _ = working.advise(&to, text);
+                    let _ = if judge_has(&to) {
+                        judging.advise(&to, text)
+                    } else {
+                        working.advise(&to, text)
+                    };
                 }
-                Request::Closed(payers) => working.close_payers(payers),
+                Request::Closed(payers) => {
+                    working.close_payers(payers.clone());
+                    judging.close_payers(payers.clone());
+                    assaying.close_payers(payers);
+                }
+                Request::Assay(AssayAsk::Talk) => {
+                    if !judge_has(iq_assay::JUDGE) {
+                        judging.start(
+                            iq_assay::JUDGE,
+                            assaying.judge(),
+                            assaying.opening(),
+                            PERSON,
+                        );
+                    }
+                }
+                Request::Assay(AssayAsk::Stop) => assaying.stop(),
             }
         }
     });
@@ -381,7 +625,18 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let board = iq_ui::Board::new(settings.keymap()?, settings.look()?)
         .with_limits(settings.limits(), settings.steward);
     iq_gui::run(feed, ask, waker, board);
-    runtime.block_on(crew.end());
+    runtime.block_on(async {
+        // The runs stop, and end their crews, before iq does.
+        assay.stop();
+        for _ in 0..100 {
+            if assay.running().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assay_crew.end().await;
+        crew.end().await;
+    });
     Ok(())
 }
 
@@ -411,6 +666,27 @@ async fn stop_asked() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// iq's tasks of the longest period the costs offer, each placed by the
+/// assay's rules in `categories`, its kinds of task.
+fn tasks(journal: &Path, categories: &Path) -> Vec<iq_ui::costs::TaskSpent> {
+    let longest = iq_ui::PERIODS.iter().max().copied().unwrap_or(0);
+    let since = iq_ui::now().saturating_sub(longest);
+    let rules = std::fs::read_to_string(categories)
+        .ok()
+        .and_then(|text| iq_assay::usage::Rules::parse(&text).ok())
+        .unwrap_or_default();
+    iq_assay::usage::read(journal, since)
+        .iter()
+        .map(|task| iq_ui::costs::TaskSpent {
+            at: task.at,
+            kind: rules.classify(task).map(str::to_owned),
+            billed: iq_core::Usd(task.billed),
+            listed: iq_core::Usd(task.listed),
+            tokens: task.tokens,
+        })
+        .collect()
 }
 
 /// What a subscription's call would cost at the API's list prices.
@@ -444,11 +720,20 @@ fn home_folder() -> Result<PathBuf> {
 }
 
 /// The gate of the current folder, with the person's rules when they wrote
-/// some, the internet open to every command or not. Rules are never read
-/// from the workspace: a command could write them there.
+/// some, the internet open to every command or not.
 fn gate(internet: bool, reviewer_internet: bool) -> Result<Gate> {
+    gate_in(
+        &std::env::current_dir().context("reading the current folder")?,
+        internet,
+        reviewer_internet,
+    )
+}
+
+/// The gate of `workspace`, as [`gate`]'s. Rules are never read from the
+/// workspace: a command could write them there.
+fn gate_in(workspace: &Path, internet: bool, reviewer_internet: bool) -> Result<Gate> {
     let folder = home_folder()?;
-    let mut gate = Gate::builder(std::env::current_dir().context("reading the current folder")?)
+    let mut gate = Gate::builder(workspace)
         .audit(folder.join("audit.log"))
         .internet(internet)
         .reviewer_internet(reviewer_internet);
@@ -514,6 +799,33 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
                     for window in &quota.windows {
                         println!("{agent:?} {}: {:.0}% used", window.name, window.used);
                     }
+                }
+            }
+        }
+        Command::Assay => {
+            let folder = home_folder()?;
+            let settings = Settings::load(&folder)?;
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is not set")?;
+            let store = iq_assay::Store::open(settings.assay_folder(&home))?;
+            println!("The assay's folder: {}", store.root().display());
+            let exercises = store.exercises()?;
+            if exercises.is_empty() {
+                println!("No exercise yet: talk to the judge in the window's assay (Ctrl-L).");
+            }
+            for exercise in &exercises {
+                let state = match &exercise.state {
+                    iq_assay::State::Draft => "draft".to_owned(),
+                    iq_assay::State::Frozen(v) => format!("frozen, version {v}"),
+                    iq_assay::State::Changed(v) => format!("changed since version {v}"),
+                    iq_assay::State::Broken(why) => format!("broken: {why}"),
+                };
+                println!("\n{} ({}): {state}", exercise.id, exercise.title);
+                let records = store.records(&exercise.id);
+                if !records.is_empty() {
+                    let table = iq_assay::table(exercise, &records);
+                    print!("{}", iq_assay::report::text(&table.rows));
                 }
             }
         }

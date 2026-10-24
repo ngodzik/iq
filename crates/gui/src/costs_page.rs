@@ -165,6 +165,69 @@ pub(crate) fn show(ui: &mut Ui, board: &mut Board, titled: bool, p: &Palette) {
         .small()
         .color(p.dim),
     );
+    by_kind(ui, board, since, p);
+}
+
+/// What each kind of task iq's agents did spent over the period, as the
+/// assay's rules place them: the kinds are the person's, written with
+/// its judge.
+fn by_kind(ui: &mut Ui, board: &Board, since: u64, p: &Palette) {
+    let kinds = board.costs().by_kind(since);
+    if kinds.is_empty() {
+        return;
+    }
+    ui.add_space(8.0);
+    ui.label(RichText::new("By kind of task").small().color(p.dim));
+    if kinds.iter().all(|k| k.kind.is_none()) {
+        ui.label(
+            RichText::new(
+                "No kind of task is written yet: the assay's judge proposes them with you (Ctrl-L).",
+            )
+            .small()
+            .color(p.dim),
+        );
+    }
+    let most = kinds
+        .iter()
+        .map(|k| k.billed.0 + k.listed.0)
+        .fold(0.0, f64::max);
+    egui::Grid::new("costs-by-kind")
+        .num_columns(5)
+        .spacing([14.0, 3.0])
+        .show(ui, |ui| {
+            for kind in &kinds {
+                let name = kind.kind.as_deref().unwrap_or("no kind");
+                ui.label(RichText::new(name).small().color(if kind.kind.is_some() {
+                    p.text
+                } else {
+                    p.dim
+                }));
+                ui.label(
+                    RichText::new(format!("{} tasks", kind.tasks))
+                        .small()
+                        .color(p.dim),
+                );
+                ui.label(RichText::new(kind.billed.to_string()).font(theme::mono_medium(12.0)))
+                    .on_hover_text("billed by the provider");
+                ui.label(
+                    RichText::new(format!("{} listed", kind.listed))
+                        .font(theme::mono(11.5))
+                        .color(p.dim),
+                )
+                .on_hover_text("what the subscriptions' calls would cost at list prices");
+                let share = if most > 0.0 {
+                    ((kind.billed.0 + kind.listed.0) / most) as f32
+                } else {
+                    0.0
+                };
+                let (bar, _) = ui.allocate_exact_size(egui::vec2(80.0, 6.0), egui::Sense::hover());
+                ui.painter().rect_filled(bar, 3.0, p.track);
+                let mut filled = bar;
+                filled.set_width(bar.width() * share.clamp(0.0, 1.0));
+                ui.painter().rect_filled(filled, 3.0, p.accent);
+                ui.end_row();
+            }
+        });
 }
 
 /// The payers among `totals`, in a fixed order.

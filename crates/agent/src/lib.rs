@@ -18,6 +18,7 @@
 mod bridge;
 mod crew;
 mod event;
+mod extension;
 mod hook;
 mod mcp;
 mod review;
@@ -30,6 +31,7 @@ pub use crew::{
     Posted, Report, STEWARD, Settings,
 };
 pub use event::{Event, PERSON};
+pub use extension::{Called, Extension};
 pub use mcp::mcp_main;
 pub use team::Pattern;
 pub use tools::board as board_tools;

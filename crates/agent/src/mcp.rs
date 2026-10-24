@@ -55,16 +55,17 @@ fn answer(
         })),
         "ping" => Ok(json!({})),
         "tools/list" => {
-            let tools: Vec<Value> = crate::tools::board()
-                .into_iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "inputSchema": tool.parameters,
-                    })
-                })
-                .collect();
+            // The running iq says which tools this agent has; without it,
+            // the board's are listed, and their calls say iq is not there.
+            let asked = bridge(&Request::Tools {
+                agent: agent.to_owned(),
+            });
+            let tools = asked
+                .ok()
+                .filter(|reply| reply.ok)
+                .and_then(|reply| serde_json::from_str::<Value>(&reply.text).ok())
+                .filter(Value::is_array)
+                .unwrap_or_else(|| crate::tools::specs_json(&crate::tools::board()));
             Ok(json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -103,10 +104,21 @@ mod tests {
         let asked = std::cell::RefCell::new(Vec::new());
         let mut bridge = |request: &Request| {
             asked.borrow_mut().push(format!("{request:?}"));
-            Ok(Reply {
-                text: "Sent.".into(),
-                ok: true,
-            })
+            // The running iq lists the board's tools and those an
+            // extension gives this agent.
+            let text = match request {
+                Request::Tools { .. } => {
+                    let mut tools = crate::tools::board();
+                    tools.push(iq_core::ToolSpec {
+                        name: "assay_run".into(),
+                        description: "Runs.".into(),
+                        parameters: json!({"type": "object"}),
+                    });
+                    crate::tools::specs_json(&tools).to_string()
+                }
+                _ => "Sent.".into(),
+            };
+            Ok(Reply { text, ok: true })
         };
         let start = answer(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#,
@@ -141,7 +153,8 @@ mod tests {
                 "start_agent",
                 "send_message",
                 "wait_for_messages",
-                "list_agents"
+                "list_agents",
+                "assay_run"
             ]
         );
         let call = answer(
@@ -153,7 +166,17 @@ mod tests {
         assert_eq!(call["id"], "c");
         assert_eq!(call["result"]["content"][0]["text"], "Sent.");
         assert_eq!(call["result"]["isError"], false);
-        assert!(asked.borrow()[0].contains("tester") && asked.borrow()[0].contains("send_message"));
+        assert!(asked.borrow()[0].contains("Tools") && asked.borrow()[0].contains("tester"));
+        assert!(asked.borrow()[1].contains("tester") && asked.borrow()[1].contains("send_message"));
+        // Without the running iq, the board's tools are listed still.
+        let mut gone = |_: &Request| Err(std::io::Error::other("no iq"));
+        let alone = answer(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
+            "tester",
+            &mut gone,
+        )
+        .unwrap();
+        assert_eq!(alone["result"]["tools"].as_array().unwrap().len(), 4);
         let unknown = answer(
             r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#,
             "tester",

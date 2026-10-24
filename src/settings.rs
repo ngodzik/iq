@@ -23,13 +23,25 @@
 //! claude_week = 70
 //! codex_5h = 80
 //! codex_week = 70
+//!
+//! [assay]                                # agents tried on the same exercises; Ctrl-L
+//! judges = ["claude-code/opus", "codex"] # the first talks with you, all grade; subscriptions first
+//! candidates = ["models"]                # "models", "harnesses", "teams", or names; all when unset
+//! folder = "~/.local/share/iq/assay"     # its exercises and results, plain files
+//! parallel = 2                           # runs at once
+//!
+//! [mcp.notion]                           # an MCP server, by its name: any server, not only this one
+//! url = "https://mcp.notion.com/mcp"     # over HTTP; or command = "npx", args = [...]
+//! headers = { Authorization = "NOTION_AUTHORIZATION" }  # each value read from that variable
+//! env = ["NOTION_TOKEN"]                 # for a command: variables passed from iq's environment
+//! mirror = "a page named Assay"          # the assay's judge keeps a copy of its results there
 //! ```
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use iq_core::{Effort, ModelId, Usd};
+use iq_core::{Agent, Effort, ModelId, Usd};
 use serde::Deserialize;
 
 /// The lead's model when a key for the provider is there and the settings
@@ -73,7 +85,47 @@ pub(crate) struct Settings {
     /// What iq may use of each payer.
     #[serde(default)]
     limits: LimitsFile,
+    /// The assay.
+    #[serde(default)]
+    assay: AssayFile,
+    /// MCP servers, by name.
+    #[serde(default)]
+    mcp: BTreeMap<String, McpFile>,
 }
+
+/// An MCP server as written: a command or an address, and what of iq's
+/// environment it gets. Values never go in the settings: only the names
+/// of the variables that hold them.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpFile {
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    url: Option<String>,
+    /// For a command: the variables passed from iq's environment.
+    #[serde(default)]
+    env: Vec<String>,
+    /// For an address: each header, and the variable its value is read
+    /// from.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    /// Where in it the assay's judge keeps a copy of the assay.
+    mirror: Option<String>,
+}
+
+/// The assay's settings as written.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssayFile {
+    judges: Option<Vec<String>>,
+    candidates: Option<Vec<String>>,
+    folder: Option<String>,
+    parallel: Option<usize>,
+}
+
+/// How many runs of the assay go at once unless the settings say.
+const PARALLEL: usize = 2;
 
 /// The limits as the settings write them, each left to its default when
 /// unset.
@@ -150,6 +202,117 @@ impl Settings {
         Ok(iq_ui::keys::Keymap::with(&self.keys)?)
     }
 
+    /// The assay's folder: as set, a leading `~` the home, else iq's data
+    /// folder, out of `~/.iq`, where the agents' tools cannot reach.
+    pub(crate) fn assay_folder(&self, home: &Path) -> PathBuf {
+        match &self.assay.folder {
+            Some(folder) => match folder.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(folder),
+            },
+            None => std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .filter(|data| data.is_absolute())
+                .unwrap_or_else(|| home.join(".local/share"))
+                .join("iq/assay"),
+        }
+    }
+
+    /// The assay's judges: as set, else those a subscription pays for,
+    /// as they cost less, the strongest of each, else the lead.
+    pub(crate) fn assay_judges(&self, installed: &[Agent], lead: &ModelId) -> Result<Vec<ModelId>> {
+        if let Some(judges) = self.assay.judges.as_ref().filter(|j| !j.is_empty()) {
+            return judges
+                .iter()
+                .map(|j| Ok(ModelId::new(j.as_str())?))
+                .collect();
+        }
+        let mut judges: Vec<ModelId> = installed
+            .iter()
+            .map(|agent| match agent {
+                Agent::ClaudeCode => ModelId::new("claude-code/opus"),
+                Agent::Codex => Ok(ModelId::agent(Agent::Codex)),
+            })
+            .collect::<Result<_, _>>()?;
+        if judges.is_empty() {
+            judges.push(lead.clone());
+        }
+        Ok(judges)
+    }
+
+    /// Which candidates the assay may test.
+    pub(crate) fn assay_allowed(&self) -> iq_assay::Allowed {
+        iq_assay::Allowed::from_words(self.assay.candidates.as_deref().unwrap_or_default())
+    }
+
+    /// How many of the assay's runs go at once.
+    pub(crate) fn assay_parallel(&self) -> usize {
+        self.assay.parallel.unwrap_or(PARALLEL).clamp(1, 8)
+    }
+
+    /// The servers the assay's judge keeps a copy in, with where in each,
+    /// their variables read through `var`; and what is wrong with those
+    /// that cannot be handed, for the person to see.
+    pub(crate) fn mirrors(
+        &self,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> (Vec<(iq_core::McpServer, String)>, Vec<String>) {
+        let mut mirrors = Vec::new();
+        let mut wrong = Vec::new();
+        for (name, server) in &self.mcp {
+            let Some(place) = server.mirror.as_ref().filter(|m| !m.trim().is_empty()) else {
+                continue;
+            };
+            let mut missing = Vec::new();
+            let mut read = |variable: &str| -> String {
+                var(variable).unwrap_or_else(|| {
+                    missing.push(variable.to_owned());
+                    String::new()
+                })
+            };
+            let reach = match (&server.command, &server.url) {
+                (Some(program), None) => iq_core::McpReach::Command {
+                    program: program.clone(),
+                    args: server.args.clone(),
+                    env: server
+                        .env
+                        .iter()
+                        .map(|variable| (variable.clone(), read(variable)))
+                        .collect(),
+                },
+                (None, Some(url)) => iq_core::McpReach::Http {
+                    url: url.clone(),
+                    headers: server
+                        .headers
+                        .iter()
+                        .map(|(header, variable)| (header.clone(), read(variable)))
+                        .collect(),
+                },
+                _ => {
+                    wrong.push(format!(
+                        "[mcp.{name}] needs a command or a url, one of them"
+                    ));
+                    continue;
+                }
+            };
+            if !missing.is_empty() {
+                wrong.push(format!(
+                    "[mcp.{name}]: iq's environment does not set {}",
+                    missing.join(", ")
+                ));
+                continue;
+            }
+            mirrors.push((
+                iq_core::McpServer {
+                    name: name.clone(),
+                    reach,
+                },
+                place.clone(),
+            ));
+        }
+        (mirrors, wrong)
+    }
+
     /// What the crew starts with.
     pub(crate) fn crew(&self, keyed: bool) -> Result<iq_agent::Settings> {
         let default = if keyed {
@@ -209,5 +372,67 @@ mod tests {
         assert_eq!(limits.short[&iq_core::Agent::ClaudeCode], 50.0);
         assert_eq!(limits.week[&iq_core::Agent::Codex], 70.0);
         assert!(toml::from_str::<Settings>("[limits]\nclaude_6h = 1").is_err());
+    }
+
+    #[test]
+    fn the_assay_judges_with_subscriptions_first() {
+        let lead = ModelId::new("anthropic/claude-sonnet-4-5").unwrap();
+        let unset = Settings::default();
+        let judges = |s: &Settings, installed: &[Agent]| -> Vec<String> {
+            s.assay_judges(installed, &lead)
+                .unwrap()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(
+            judges(&unset, &[Agent::ClaudeCode, Agent::Codex]),
+            ["claude-code/opus", "codex"]
+        );
+        assert_eq!(judges(&unset, &[]), ["anthropic/claude-sonnet-4-5"]);
+        let set: Settings = toml::from_str(
+            "[assay]\njudges = [\"codex\"]\ncandidates = [\"models\"]\nfolder = \"~/lab\"\nparallel = 40",
+        )
+        .unwrap();
+        assert_eq!(judges(&set, &[Agent::ClaudeCode]), ["codex"]);
+        assert_eq!(set.assay_folder(Path::new("/h")), PathBuf::from("/h/lab"));
+        assert_eq!(set.assay_parallel(), 8);
+        assert!(set.assay_allowed().allows(iq_assay::Kind::Model, "a/b"));
+        assert!(!set.assay_allowed().allows(iq_assay::Kind::Harness, "codex"));
+        assert!(toml::from_str::<Settings>("[assay]\njudge = \"x\"").is_err());
+    }
+
+    #[test]
+    fn a_server_is_handed_with_values_read_from_the_environment_only() {
+        let set: Settings = toml::from_str(
+            r#"
+[mcp.notes]
+url = "https://notes.example/mcp"
+headers = { Authorization = "NOTES_AUTH" }
+mirror = "a page named Assay"
+
+[mcp.local]
+command = "notes-server"
+env = ["NOTES_TOKEN"]
+mirror = "the assay notebook"
+
+[mcp.other]
+command = "x"
+"#,
+        )
+        .unwrap();
+        let var = |name: &str| (name == "NOTES_AUTH").then(|| "Bearer secret".to_owned());
+        let (mirrors, wrong) = set.mirrors(var);
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(mirrors[0].0.name, "notes");
+        assert_eq!(mirrors[0].1, "a page named Assay");
+        assert!(
+            matches!(&mirrors[0].0.reach, iq_core::McpReach::Http { headers, .. } if headers[0].1 == "Bearer secret")
+        );
+        assert_eq!(
+            wrong,
+            ["[mcp.local]: iq's environment does not set NOTES_TOKEN"]
+        );
+        assert!(toml::from_str::<Settings>("[mcp.x]\ntoken = \"t\"").is_err());
     }
 }

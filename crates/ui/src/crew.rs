@@ -58,6 +58,17 @@ pub enum Request {
     /// Close the payers named, whose limits are reached, and open the
     /// others: `claude-code`, `codex`, `provider`.
     Closed(Vec<String>),
+    /// Something of the assay.
+    Assay(AssayAsk),
+}
+
+/// What the person asks of the assay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssayAsk {
+    /// Start its judge, to talk with it.
+    Talk,
+    /// Stop the runs at work, and those waiting.
+    Stop,
 }
 
 /// One thing in an agent's thread.

@@ -25,7 +25,7 @@ use iq_ui::layout::{NewChat, Shows, Split};
 
 use crate::chat::{self, Done};
 use crate::theme::{self, MONO_SIZE, Palette};
-use crate::{costs_page, subscriptions_page};
+use crate::{assay_page, costs_page, subscriptions_page};
 
 /// The room between panes, where their lines are dragged.
 const GAP: f32 = 10.0;
@@ -93,6 +93,7 @@ fn key(board: &Board, index: usize) -> String {
         Some(Shows::New(_)) => format!("new:{index}"),
         Some(Shows::Costs) => format!("costs:{index}"),
         Some(Shows::Subscriptions) => format!("subscriptions:{index}"),
+        Some(Shows::Assay) => format!("assay:{index}"),
         None => format!("none:{index}"),
     }
 }
@@ -653,6 +654,15 @@ fn pane(
                     });
             });
         }
+        Some(Shows::Assay) => {
+            inside.with_layout(Layout::top_down(Align::Min), |ui| {
+                questions_only(ui, board, index, p, &mut done);
+                egui::ScrollArea::vertical()
+                    .id_salt(("assay", index))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| assay_page::show(ui, board, index, p, asked));
+            });
+        }
         None => {}
     }
     for (id, approved) in done.answered {
@@ -734,6 +744,7 @@ fn title(ui: &mut Ui, board: &mut Board, index: usize, head: Rect, paint: &Paint
         },
         Some(Shows::Costs) => "Costs".to_owned(),
         Some(Shows::Subscriptions) => "Subscriptions".to_owned(),
+        Some(Shows::Assay) => "Assay".to_owned(),
         None => String::new(),
     };
     let names: Vec<String> = board
@@ -765,6 +776,9 @@ fn title(ui: &mut Ui, board: &mut Board, index: usize, head: Rect, paint: &Paint
             }
             if ui.button("Subscriptions").clicked() {
                 chosen = Some(Shows::Subscriptions);
+            }
+            if ui.button("Assay").clicked() {
+                chosen = Some(Shows::Assay);
             }
         },
     );

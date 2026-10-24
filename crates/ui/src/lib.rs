@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod assay;
 pub mod board;
 pub mod costs;
 pub mod crew;

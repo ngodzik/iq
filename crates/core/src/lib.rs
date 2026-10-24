@@ -7,16 +7,18 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod change;
 mod error;
 mod subscription;
 mod traits;
 mod types;
 
+pub use change::{Change, DiffLine, Hunk};
 pub use error::CoreError;
 pub use subscription::{Quota, QuotaWindow, SubscriptionCall};
 pub use traits::{ChatModel, Delegate};
 pub use types::{
     Agent, CacheTtl, CacheUse, ChatRequest, ChatResponse, ContextUse, DelegateEvent, DelegateReply,
-    DelegateRequest, Effort, Message, ModelId, Pricing, Reach, TokenCount, ToolCall, ToolSpec,
-    Usage, Usd,
+    DelegateRequest, Effort, McpReach, McpServer, Message, ModelId, Pricing, Reach, TokenCount,
+    ToolCall, ToolSpec, Usage, Usd,
 };

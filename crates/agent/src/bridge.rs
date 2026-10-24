@@ -36,6 +36,8 @@ pub(crate) enum Request {
     },
     /// The command the gate allowed under `id`.
     Exec { id: String },
+    /// The tools an agent finds through iq, as a JSON list of specs.
+    Tools { agent: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,6 +148,10 @@ where
             Request::Exec { id } => match self.exec(&id).await {
                 Ok((text, ok)) => Reply { text, ok },
                 Err(text) => Reply { text, ok: false },
+            },
+            Request::Tools { agent } => Reply {
+                text: crate::tools::specs_json(&self.tools_for(&agent)).to_string(),
+                ok: true,
             },
         }
     }

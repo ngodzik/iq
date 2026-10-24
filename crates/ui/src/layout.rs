@@ -18,6 +18,8 @@ pub enum Shows {
     Costs,
     /// The subscriptions.
     Subscriptions,
+    /// The assay: its exercises, its runs, its results.
+    Assay,
 }
 
 /// A chat not started yet: the model it will run on, and the name asked

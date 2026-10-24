@@ -5,8 +5,9 @@
 use iq_agent::{Event, PERSON, PROVIDER, STEWARD};
 use iq_core::{ModelId, SubscriptionCall};
 
+use crate::assay::{AssayView, JUDGE, Overview, Progress};
 use crate::costs::{Costs, Payer, Spent};
-use crate::crew::{CrewView, Question, Request};
+use crate::crew::{AssayAsk, CrewView, Question, Request};
 use crate::keys::{Action, Keymap};
 #[cfg(test)]
 use crate::layout::Pane;
@@ -75,6 +76,12 @@ pub enum Update {
     },
     /// iq is asked to stop: the window closes, its agents with it.
     Quit,
+    /// The assay's store, as just read.
+    Assay(Box<Overview>),
+    /// The assay's runs at work, as they go.
+    AssayRunning(Vec<Progress>),
+    /// iq's tasks, by the kinds of task the assay's rules place them in.
+    Tasks(Vec<crate::costs::TaskSpent>),
     /// How the crew starts: the lead's model, the reviewer's, whether
     /// the reviewer answers for the person, and whether every command has
     /// the internet.
@@ -142,6 +149,8 @@ pub struct Board {
     spending: Vec<(u64, String, Payer, f64)>,
     /// The steward's exchanges with the agents, oldest first.
     letters: Vec<Post>,
+    /// The assay.
+    assay: AssayView,
 }
 
 impl Default for Board {
@@ -177,6 +186,7 @@ impl Board {
             closed: Vec::new(),
             spending: Vec::new(),
             letters: Vec::new(),
+            assay: AssayView::default(),
         }
     }
 
@@ -368,6 +378,7 @@ impl Board {
                 let at = PERIODS.iter().position(|p| *p == self.period).unwrap_or(0);
                 self.period = PERIODS[(at + 1) % PERIODS.len()];
             }
+            Action::Assay => self.layout.show(focus, Shows::Assay),
             Action::Theme => self.look.next_theme(),
             Action::Opacity => self.look.next_opacity(),
             Action::Menu => self.menu = !self.menu,
@@ -505,6 +516,45 @@ impl Board {
         name
     }
 
+    /// The assay.
+    #[must_use]
+    pub fn assay(&self) -> &AssayView {
+        &self.assay
+    }
+
+    /// Opens the chat with the assay's judge, from the pane at `pane`: in
+    /// another pane shown when there is one, so that the assay stays in
+    /// sight, else in this one. Starts the judge when it is not there yet.
+    pub fn talk_to_judge(&mut self, pane: usize) -> Option<Request> {
+        let target = self
+            .layout
+            .shown()
+            .into_iter()
+            .find(|at| *at != pane)
+            .unwrap_or(pane);
+        self.layout.set_focus(target);
+        if self.crew.agent(JUDGE).is_some() {
+            self.layout.show(target, Shows::Chat(JUDGE.to_owned()));
+            return None;
+        }
+        let model = self.assay.judge().unwrap_or_default().to_owned();
+        self.layout.show(
+            target,
+            Shows::New(NewChat {
+                model,
+                starting: Some(JUDGE.to_owned()),
+                ..NewChat::default()
+            }),
+        );
+        Some(Request::Assay(AssayAsk::Talk))
+    }
+
+    /// Stops the assay's runs.
+    #[must_use]
+    pub fn stop_runs(&self) -> Option<Request> {
+        (!self.assay.running().is_empty()).then_some(Request::Assay(AssayAsk::Stop))
+    }
+
     /// The costs.
     #[must_use]
     pub fn costs(&self) -> &Costs {
@@ -614,6 +664,9 @@ impl Board {
                 self.subscriptions.loaded(quotas);
             }
             Update::Quit => self.quitting = true,
+            Update::Assay(overview) => self.assay.set(*overview),
+            Update::AssayRunning(running) => self.assay.set_running(running),
+            Update::Tasks(tasks) => self.costs.tasks_read(tasks),
             Update::Started {
                 lead,
                 reviewer,
@@ -825,6 +878,33 @@ mod tests {
         assert_eq!(board.letters().len(), 1);
         board.act(Action::Steward);
         assert!(!board.steward().on());
+    }
+
+    #[test]
+    fn the_judge_is_talked_to_beside_the_assay() {
+        let mut board = Board::default();
+        board.update(Update::Assay(Box::new(crate::assay::Overview {
+            judges: vec!["claude-code/opus".into()],
+            ..crate::assay::Overview::default()
+        })));
+        assert!(board.assay().told());
+        board.act(Action::Split);
+        board.act(Action::Assay);
+        assert_eq!(board.layout().pane(0).unwrap().shows, Shows::Assay);
+        // Started in the other pane, so that the assay stays in sight.
+        assert_eq!(board.talk_to_judge(0), Some(Request::Assay(AssayAsk::Talk)));
+        assert_eq!(board.layout().focus(), 1);
+        assert!(matches!(
+            &board.layout().pane(1).unwrap().shows,
+            Shows::New(chat) if chat.model == "claude-code/opus" && chat.starting.as_deref() == Some(JUDGE)
+        ));
+        joined(&mut board, JUDGE, PERSON);
+        assert_eq!(board.agent_in(1), Some(JUDGE));
+        // Once there, it is only shown.
+        board.layout_mut().show(1, Shows::Costs);
+        assert_eq!(board.talk_to_judge(0), None);
+        assert_eq!(board.agent_in(1), Some(JUDGE));
+        assert_eq!(board.stop_runs(), None);
     }
 
     #[test]

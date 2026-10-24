@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use iq_core::{
-    CacheUse, ContextUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, Reach,
+    CacheUse, ContextUse, Delegate, DelegateEvent, DelegateReply, DelegateRequest, McpReach, Reach,
     TokenCount, Usage, Usd,
 };
 use serde_json::Value;
@@ -161,14 +161,41 @@ impl ReachFiles {
             .iter()
             .map(|(name, value)| (name.clone(), Value::from(value.as_str())))
             .collect();
-        let mcp = serde_json::json!({
-            "mcpServers": {"iq": {
+        let mut servers = serde_json::Map::new();
+        servers.insert(
+            "iq".to_owned(),
+            serde_json::json!({
                 "type": "stdio",
                 "command": reach.program,
                 "args": reach.mcp_args,
                 "env": env,
-            }},
-        });
+            }),
+        );
+        // The servers the person's settings hand it, by their own names;
+        // iq's keeps its own.
+        for server in reach.servers.iter().filter(|s| s.name != "iq") {
+            let pairs = |pairs: &[(String, String)]| -> serde_json::Map<String, Value> {
+                pairs
+                    .iter()
+                    .map(|(name, value)| (name.clone(), Value::from(value.as_str())))
+                    .collect()
+            };
+            let config = match &server.reach {
+                McpReach::Command { program, args, env } => serde_json::json!({
+                    "type": "stdio",
+                    "command": program,
+                    "args": args,
+                    "env": pairs(env),
+                }),
+                McpReach::Http { url, headers } => serde_json::json!({
+                    "type": "http",
+                    "url": url,
+                    "headers": pairs(headers),
+                }),
+            };
+            servers.insert(server.name.clone(), config);
+        }
+        let mcp = serde_json::json!({ "mcpServers": servers });
         let file = |value: &Value| -> std::io::Result<tempfile::NamedTempFile> {
             let mut file = tempfile::Builder::new()
                 .prefix("claude-")
@@ -853,6 +880,24 @@ mod tests {
                 mcp_args: vec!["--iq-mcp".into()],
                 env: vec![("IQ_AGENT".into(), "lead".into())],
                 folder: folder.path().to_path_buf(),
+                servers: vec![
+                    iq_core::McpServer {
+                        name: "notes".into(),
+                        reach: McpReach::Http {
+                            url: "https://notes.example/mcp".into(),
+                            headers: vec![("Authorization".into(), "Bearer t".into())],
+                        },
+                    },
+                    // iq's own name stays iq's.
+                    iq_core::McpServer {
+                        name: "iq".into(),
+                        reach: McpReach::Command {
+                            program: "/bin/false".into(),
+                            args: Vec::new(),
+                            env: Vec::new(),
+                        },
+                    },
+                ],
             }),
             network: false,
         };
@@ -881,6 +926,14 @@ mod tests {
                 .unwrap();
         assert_eq!(mcp["mcpServers"]["iq"]["args"][0], "--iq-mcp");
         assert_eq!(mcp["mcpServers"]["iq"]["env"]["IQ_AGENT"], "lead");
+        assert_eq!(mcp["mcpServers"]["notes"]["type"], "http");
+        assert_eq!(
+            mcp["mcpServers"]["notes"]["headers"]["Authorization"],
+            "Bearer t"
+        );
+        // Never a value in a log line.
+        let shown = format!("{:?}", request.reach.as_ref().unwrap().servers);
+        assert!(shown.contains("Authorization=<redacted>") && !shown.contains("Bearer"));
         let env: Vec<_> = command.as_std().get_envs().collect();
         assert!(env.contains(&("IQ_AGENT".as_ref(), Some("lead".as_ref()))));
         // The files go with the run.

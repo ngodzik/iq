@@ -1,0 +1,42 @@
+//! Tools a part of iq offers some of the crew's agents beside the crew's
+//! own, such as the assay's to its judge: which agents get them, what they
+//! are told of them, and what a call does. A call acts through the crew it
+//! is given, so through the gate, and asks the person through it.
+
+use std::future::Future;
+use std::pin::Pin;
+
+use iq_core::{McpServer, ToolSpec};
+use serde_json::Value;
+
+use crate::crew::Crew;
+
+/// What a call of an extension's tool comes to: its text for the model,
+/// or why it failed.
+pub type Called = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
+
+/// Tools offered to some agents of a crew. Most agents get none of them:
+/// an extension knows the agents it serves by their names.
+pub trait Extension<M, D>: Send + Sync {
+    /// The tools `agent` gets, none for most.
+    fn tools(&self, agent: &str) -> Vec<ToolSpec>;
+
+    /// What `agent` is told of them, added to its standing instructions.
+    fn instructions(&self, agent: &str) -> Option<String> {
+        let _ = agent;
+        None
+    }
+
+    /// The MCP servers `agent` is given beside iq's, when it is an agent
+    /// with tools of its own that takes them.
+    fn servers(&self, agent: &str) -> Vec<McpServer> {
+        let _ = agent;
+        Vec::new()
+    }
+
+    /// Runs the tool `name` for `agent` with `args`, a JSON object. The
+    /// crew is the one the agent works in: what the call does on the
+    /// machine, it asks of the crew's gate, and what it must ask the
+    /// person, it asks through the crew.
+    fn call(&self, crew: Crew<M, D>, agent: String, name: String, args: Value) -> Called;
+}

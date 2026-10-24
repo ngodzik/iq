@@ -719,6 +719,7 @@ mod tests {
             mcp_args: vec!["--iq-mcp".into()],
             env: vec![("IQ_AGENT".into(), "tester".into())],
             folder: PathBuf::from("/tmp"),
+            servers: Vec::new(),
         };
         assert_eq!(
             mcp_servers(Some(&reach)),

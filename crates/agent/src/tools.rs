@@ -140,6 +140,22 @@ pub fn board() -> Vec<ToolSpec> {
     ]
 }
 
+/// `tools` as MCP lists them.
+pub(crate) fn specs_json(tools: &[ToolSpec]) -> Value {
+    Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": tool.parameters,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// A call's arguments, read from the JSON text the model wrote.
 #[derive(Debug)]
 pub(crate) struct Args(Value);
@@ -179,6 +195,11 @@ impl Args {
     /// A yes or no, no when not given.
     pub(crate) fn flag(&self, name: &str) -> bool {
         self.0[name].as_bool().unwrap_or(false)
+    }
+
+    /// The arguments whole, as an extension reads them.
+    pub(crate) fn value(&self) -> &Value {
+        &self.0
     }
 }
 

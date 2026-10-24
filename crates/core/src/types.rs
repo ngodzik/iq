@@ -524,6 +524,75 @@ pub struct Reach {
     /// A folder of iq's own, out of reach of the agent's commands, where
     /// its settings for the run are written.
     pub folder: std::path::PathBuf,
+    /// Other MCP servers the person's settings hand it beside iq's, such as
+    /// a notebook's for the assay's judge to keep a copy in.
+    pub servers: Vec<McpServer>,
+}
+
+/// An MCP server the person's settings hand an agent beside iq's own.
+#[derive(Clone, PartialEq, Eq)]
+pub struct McpServer {
+    /// Its name among the agent's servers.
+    pub name: String,
+    /// How it is reached.
+    pub reach: McpReach,
+}
+
+/// How an MCP server is reached. Its variables and headers may hold
+/// secrets: they are never written to a log.
+#[derive(Clone, PartialEq, Eq)]
+pub enum McpReach {
+    /// A program speaking MCP on its input and output.
+    Command {
+        /// The program.
+        program: String,
+        /// Its arguments.
+        args: Vec<String>,
+        /// The variables it gets, read from iq's environment.
+        env: Vec<(String, String)>,
+    },
+    /// A server over streamable HTTP.
+    Http {
+        /// Its address.
+        url: String,
+        /// The headers sent to it, read from iq's environment.
+        headers: Vec<(String, String)>,
+    },
+}
+
+impl fmt::Debug for McpServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("McpServer")
+            .field("name", &self.name)
+            .field("reach", &self.reach)
+            .finish()
+    }
+}
+
+impl fmt::Debug for McpReach {
+    // Written by hand so that no variable's or header's value reaches a
+    // log line: only their names.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = |pairs: &[(String, String)]| -> Vec<String> {
+            pairs
+                .iter()
+                .map(|(name, _)| format!("{name}=<redacted>"))
+                .collect()
+        };
+        match self {
+            Self::Command { program, args, env } => f
+                .debug_struct("Command")
+                .field("program", program)
+                .field("args", args)
+                .field("env", &names(env))
+                .finish(),
+            Self::Http { url, headers } => f
+                .debug_struct("Http")
+                .field("url", url)
+                .field("headers", &names(headers))
+                .finish(),
+        }
+    }
 }
 
 /// Something an external agent did, reported as it happens.

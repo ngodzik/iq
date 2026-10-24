@@ -17,13 +17,14 @@ use std::time::{Duration, Instant};
 
 use iq_core::{
     Agent, ChatModel, ChatRequest, Delegate, DelegateEvent, DelegateRequest, Effort, Message,
-    ModelId, Reach, ToolCall, Usd,
+    ModelId, Reach, ToolCall, ToolSpec, Usd,
 };
 use iq_gate::{Action, Approver, Gate, Helper, Judged, Pending, Permit, Sandbox, Scope};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::event::{Event, PERSON};
+use crate::extension::Extension;
 use crate::review;
 use crate::team::{self, Pattern, Phase, Team};
 use crate::tools::{self, Args};
@@ -48,6 +49,11 @@ const CREW_WAKES: usize = 16;
 
 /// The span those wakes are counted over.
 const PEER_SPAN: Duration = Duration::from_secs(10 * 60);
+
+/// How many crews this program made: each numbers its questions apart
+/// from the others', so that an answer reaches the crew that asked when
+/// one window shows several.
+static CREWS: AtomicU64 = AtomicU64::new(0);
 
 /// What a payer is called when it is closed: Claude Code's and Codex's
 /// subscriptions by their agents' names, the provider by this.
@@ -151,6 +157,8 @@ struct Inner<M, D> {
     peer_wakes: Mutex<Vec<(Instant, (String, String))>>,
     /// The teams at work, and where each stands.
     teams: Mutex<Vec<Team>>,
+    /// The tools other parts of iq offer some agents.
+    extensions: Mutex<Vec<Arc<dyn Extension<M, D>>>>,
 }
 
 #[derive(Default)]
@@ -237,7 +245,7 @@ where
                 report,
                 autopilot: AtomicBool::new(false),
                 busy: AtomicUsize::new(0),
-                next_question: AtomicU64::new(1),
+                next_question: AtomicU64::new((CREWS.fetch_add(1, Ordering::Relaxed) << 32) | 1),
                 questions: Mutex::new(HashMap::new()),
                 board: Mutex::new(Board::default()),
                 posted: watch::Sender::new(0),
@@ -247,8 +255,40 @@ where
                 closed: Mutex::new(Vec::new()),
                 peer_wakes: Mutex::new(Vec::new()),
                 teams: Mutex::new(Vec::new()),
+                extensions: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Offers `extension`'s tools to the agents it serves, from their
+    /// next turn.
+    pub fn extend(&self, extension: Arc<dyn Extension<M, D>>) {
+        lock(&self.inner.extensions).push(extension);
+    }
+
+    /// The extensions, taken out of their lock to be called.
+    fn extensions(&self) -> Vec<Arc<dyn Extension<M, D>>> {
+        lock(&self.inner.extensions).clone()
+    }
+
+    /// The tools `agent` finds through iq: the board's, and those
+    /// extensions offer it.
+    pub fn tools_for(&self, agent: &str) -> Vec<ToolSpec> {
+        let mut tools = tools::board();
+        for extension in self.extensions() {
+            tools.extend(extension.tools(agent));
+        }
+        tools
+    }
+
+    /// What extensions tell `agent` of their tools, as a paragraph of its
+    /// instructions, if any does.
+    fn extended(&self, agent: &str) -> String {
+        self.extensions()
+            .iter()
+            .filter_map(|extension| extension.instructions(agent))
+            .map(|text| format!("\n\n{text}"))
+            .collect()
     }
 
     /// The gate the crew acts through.
@@ -841,7 +881,7 @@ where
     ) -> (Vec<Message>, Result<String, String>) {
         messages.push(Message::user(prompt));
         let mut tools = tools::work();
-        tools.extend(tools::board());
+        tools.extend(self.tools_for(name));
         for _ in 0..self.inner.settings.steps {
             if let Some(news) = self.unread(name) {
                 messages.push(Message::user(news));
@@ -906,6 +946,11 @@ where
         session: Option<String>,
         prompt: String,
     ) -> (Option<String>, Result<String, String>) {
+        let servers: Vec<iq_core::McpServer> = self
+            .extensions()
+            .iter()
+            .flat_map(|extension| extension.servers(name))
+            .collect();
         let reach = lock(&self.inner.bridge).as_ref().map(|bridge| Reach {
             program: bridge.program.clone(),
             hook_args: vec![HOOK_FLAG.to_owned()],
@@ -915,6 +960,7 @@ where
                 (AGENT_VAR.to_owned(), name.to_owned()),
             ],
             folder: bridge.folder.clone(),
+            servers,
         });
         let (by, role) = lock(&self.inner.board)
             .members
@@ -1130,7 +1176,25 @@ where
                 })
                 .collect::<Vec<_>>()
                 .join("\n")),
-            _ => Err(format!("there is no tool named {name:?}")),
+            _ => {
+                let extension = self
+                    .extensions()
+                    .into_iter()
+                    .find(|extension| extension.tools(agent).iter().any(|t| t.name == name));
+                match extension {
+                    Some(extension) => {
+                        extension
+                            .call(
+                                self.clone(),
+                                agent.to_owned(),
+                                name.to_owned(),
+                                args.value().clone(),
+                            )
+                            .await
+                    }
+                    None => Err(format!("there is no tool named {name:?}")),
+                }
+            }
         }
     }
 
@@ -1391,6 +1455,67 @@ where
         self.post(STEWARD, to, text)
     }
 
+    /// Asks the person whether `agent` may do `action`, which the gate
+    /// does not judge, such as spending on a run of agents: `reason` says
+    /// what it costs. The person alone answers, autopilot or not; nobody
+    /// answering in time is a no.
+    pub async fn confirm(&self, agent: &str, action: String, reason: String) -> bool {
+        let id = self.inner.next_question.fetch_add(1, Ordering::Relaxed);
+        let (reply, answer) = oneshot::channel();
+        lock(&self.inner.questions).insert(id, reply);
+        self.report(Event::Asked {
+            id,
+            agent: agent.to_owned(),
+            action,
+            reason,
+            widens: false,
+        });
+        let answer = tokio::time::timeout(self.inner.settings.patience, answer).await;
+        lock(&self.inner.questions).remove(&id);
+        let approved = matches!(answer, Ok(Ok(true)));
+        self.report(Event::Answered { id, approved });
+        approved
+    }
+
+    /// Judges `action` for `agent` as one of its own tools would be: the
+    /// gate allows it, asks whoever answers for the person, or denies it.
+    ///
+    /// # Errors
+    ///
+    /// Why it was refused.
+    pub async fn permit(&self, agent: &str, action: Action) -> Result<Permit, String> {
+        self.act(agent, action).await
+    }
+
+    /// Writes to `to` as `from`, a part of iq rather than an agent, and
+    /// wakes it if it rests: what it waited for has come.
+    ///
+    /// # Errors
+    ///
+    /// No agent of that name.
+    pub fn deliver(&self, from: &str, to: &str, text: String) -> Result<(), String> {
+        let resting = lock(&self.inner.board)
+            .members
+            .get(to)
+            .is_some_and(|m| m.turn.as_ref().is_none_or(JoinHandle::is_finished));
+        self.post(from, to, text)?;
+        if resting && let Some(news) = self.unread(to) {
+            self.wake(to, news);
+        }
+        Ok(())
+    }
+
+    /// Runs the command `permit` allows in the crew's sandbox, as its
+    /// agents' commands run: what it printed, with how it ended, and
+    /// whether it succeeded.
+    ///
+    /// # Errors
+    ///
+    /// The sandbox could not run it.
+    pub async fn run_permitted(&self, permit: Permit) -> Result<(String, bool), String> {
+        self.run(permit, OWN_ASK).await
+    }
+
     /// Refuses a model whose payer is closed, saying which are open.
     fn open_for(&self, model: &ModelId) -> Result<(), String> {
         let closed = lock(&self.inner.closed).clone();
@@ -1480,7 +1605,8 @@ where
              in a line, with send_message to steward, and do as it asks.\n\n\
              Read before you change, check your work with the project's own tools (its build, \
              tests, linters), and be brief. When the task is done, answer with what you did and \
-             call no tool."
+             call no tool.{}",
+            self.extended(name)
         )
     }
 
@@ -1493,8 +1619,9 @@ where
         reaches: bool,
     ) -> String {
         let part = role_line(role);
+        let extended = self.extended(name);
         if !reaches {
-            return format!("You are {name}, an agent of iq's, started by {by}.{part}");
+            return format!("You are {name}, an agent of iq's, started by {by}.{part}{extended}");
         }
         format!(
             "You are {name}, an agent of iq's, started by {by}.{part} Your commands run in iq's \
@@ -1507,7 +1634,7 @@ where
              your tools' results; wait for one with wait_for_messages when your work depends on \
              others. The steward watches what the crew spends against the person's limits: when \
              it writes to you, answer it in a line, with send_message to steward, and do as it \
-             asks."
+             asks.{extended}"
         )
     }
 }

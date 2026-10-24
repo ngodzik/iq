@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod assay_page;
 mod chat;
 mod costs_page;
 mod panes;
@@ -555,6 +556,7 @@ fn menu(ui: &mut egui::Ui, board: &Board, p: &Palette, actions: &mut Vec<Action>
             (Action::Zoom, "Zoom".to_owned()),
             (Action::NewChat, "New chat".to_owned()),
             (Action::Costs, "Costs".to_owned()),
+            (Action::Assay, "Assay".to_owned()),
             (Action::Theme, format!("Theme: {}", look.theme())),
             (
                 Action::Opacity,

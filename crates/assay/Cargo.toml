@@ -1,0 +1,22 @@
+[package]
+name    = "iq-assay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The assay: the same frozen exercises given to agents, checked by their hidden tests, then judged blind, to find the cheapest agent that does each kind of task well."
+
+[dependencies]
+iq-core.workspace    = true
+iq-gate.workspace    = true
+iq-agent.workspace   = true
+thiserror.workspace  = true
+serde.workspace      = true
+serde_json.workspace = true
+toml.workspace       = true
+tracing.workspace    = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "process", "io-util"] }
+
+[dev-dependencies]
+tokio.workspace    = true
+tempfile.workspace = true
