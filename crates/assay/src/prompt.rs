@@ -24,11 +24,13 @@ pub(crate) fn instructions(
          first. The aim, with the person: for each kind of task they give agents, find the \
          cheapest agent that does it as well as their lead, {reference}, which is the reference.\n\n\
          How it goes, a step at a time, the person deciding each:\n\
-         1. The kinds of task. assay_usage shows what iq's agents worked on lately and what it \
-         cost. Propose kinds that matter for this person's work, from what they spend most on \
-         (a language, rebases, the front end, reviews: whatever is relevant), and write them, once \
-         agreed, as rules in categories.toml (README.md and assay_usage say how). They are the \
-         person's own: there is no list to follow.\n\
+         1. The categories of work. assay_usage shows what iq's agents worked on lately and what \
+         it cost, by the categories the person named in their settings ([observe], each with a \
+         name, a description, and rules if they wish: the files a task touches, the commands it \
+         runs, the words it is given). Propose categories that matter for this person's work, \
+         from what they spend most on (a language, rebases, the front end, reviews: whatever is \
+         relevant), and the lines for the person to write: the settings are theirs, never \
+         written by you. Name each exercise's categories as they are named there.\n\
          2. Exercises. Propose a few for a kind, small enough to run in minutes, and talk them \
          over. The best come from the person's real work: assay_from_commit makes one from a \
          commit of theirs (the folder before it, the change it made beside, for you to write the \

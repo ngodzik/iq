@@ -77,6 +77,18 @@ pub struct TaskSpent {
     pub listed: Usd,
     /// The tokens it read and wrote.
     pub tokens: u64,
+    /// The model it ran on.
+    pub model: String,
+    /// The agent.
+    pub agent: String,
+    /// The project it worked in.
+    pub project: String,
+    /// How long it worked, in seconds.
+    pub seconds: u64,
+    /// Whether it ended with an answer, rather than an error.
+    pub ok: bool,
+    /// The start of what it was given.
+    pub prompt: String,
 }
 
 /// What one kind of task spent over a period.
@@ -114,10 +126,16 @@ impl Costs {
         self.provider.push(spent);
     }
 
-    /// iq's tasks, as just read from its journal and placed by the
-    /// assay's rules.
+    /// iq's tasks, as just read from its journal and placed in the
+    /// person's categories.
     pub fn tasks_read(&mut self, tasks: Vec<TaskSpent>) {
         self.tasks = tasks;
+    }
+
+    /// iq's tasks, oldest first.
+    #[must_use]
+    pub fn tasks(&self) -> &[TaskSpent] {
+        &self.tasks
     }
 
     /// What each kind of task spent since `since`, the dearest first,
@@ -244,6 +262,12 @@ mod tests {
             billed: Usd(billed),
             listed: Usd(listed),
             tokens: 10,
+            model: "m".into(),
+            agent: "lead".into(),
+            project: "p".into(),
+            seconds: 5,
+            ok: true,
+            prompt: String::new(),
         };
         costs.tasks_read(vec![
             task(1, Some("Rebase"), 5.0, 0.0),

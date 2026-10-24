@@ -4,7 +4,6 @@
 //!
 //! ```text
 //! README.md          this layout, for whoever opens the folder
-//! categories.toml    the kinds of task, and how a task is known as one
 //! exercises/<id>/    see `exercise`
 //! runs/<id>/<batch>/<label>/
 //!   run.json         the record
@@ -24,7 +23,6 @@ const README: &str = "# iq's assay
 
 The same exercises given to agents, checked by hidden tests, then judged blind, to find the cheapest agent that does each kind of task well. These files are the reference: a copy kept elsewhere only receives them.
 
-- `categories.toml`: the kinds of task, and how a task iq did is known as one (the files it touched, the commands it ran, the words it was given).
 - `exercises/<id>/`: `exercise.toml` (title, categories, the `check` command, `minutes`, `dollars`), `task.md` (what every candidate is told), `rubric.md` (what the judges grade beyond the checks), `start/` (the files a candidate starts from), `checks/` (hidden tests, put in once the candidate is done), `frozen.json` (its versions). Change a frozen exercise and freeze it again: it is a new version, and its results start anew.
 - `runs/<id>/<batch>/<label>/`: `run.json` (the record), `transcript.md`, `changes.diff`, `work/` (the folder the candidate worked in).
 ";
@@ -182,12 +180,6 @@ impl Store {
         records
             .sort_by(|a, b| (a.started, &a.batch, &a.label).cmp(&(b.started, &b.batch, &b.label)));
         records
-    }
-
-    /// The kinds of task, as written: empty when there is no file yet.
-    #[must_use]
-    pub fn categories_text(&self) -> String {
-        std::fs::read_to_string(self.root.join("categories.toml")).unwrap_or_default()
     }
 }
 

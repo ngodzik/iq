@@ -21,6 +21,7 @@ mod event;
 mod extension;
 mod hook;
 mod mcp;
+mod once;
 mod review;
 mod team;
 mod tools;
@@ -33,5 +34,6 @@ pub use crew::{
 pub use event::{Event, PERSON};
 pub use extension::{Called, Extension};
 pub use mcp::mcp_main;
+pub use once::{Asked, ask_once};
 pub use team::Pattern;
 pub use tools::board as board_tools;

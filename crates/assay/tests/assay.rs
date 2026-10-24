@@ -142,6 +142,8 @@ fn fixture_allowing(model: Scripted, allowed: &[&str]) -> Fixture {
             mirrors: Vec::new(),
             servers: Vec::new(),
             journal: None,
+            labels: None,
+            categories: iq_observe::Categories::default(),
             notices: Vec::new(),
         },
         Arc::new(move |event| kept.lock().unwrap().push(event)),

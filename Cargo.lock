@@ -2979,6 +2979,7 @@ dependencies = [
  "iq-gui",
  "iq-llm",
  "iq-memory",
+ "iq-observe",
  "iq-sync",
  "iq-ui",
  "serde",
@@ -3011,6 +3012,7 @@ dependencies = [
  "iq-agent",
  "iq-core",
  "iq-gate",
+ "iq-observe",
  "serde",
  "serde_json",
  "tempfile",
@@ -3079,6 +3081,18 @@ dependencies = [
  "iq-agent",
  "iq-core",
  "iq-gate",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "iq-observe"
+version = "0.1.0"
+dependencies = [
+ "iq-agent",
+ "iq-core",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

@@ -318,6 +318,8 @@ fn assay(
                 .collect(),
             servers: mirrors.into_iter().map(|(server, _)| server).collect(),
             journal: Some(journal.to_path_buf()),
+            labels: Some(journal.with_file_name(LABELS)),
+            categories: settings.categories(),
             notices,
         },
         Arc::clone(&report),
@@ -380,9 +382,9 @@ async fn roster(provider: &OpenAiCompatible, keyed: bool, installed: &[Agent]) -
 
 /// What the crew does, kept in iq's folder as it happens: the calls billed
 /// to the provider, the quotas reported, each task's files, commands and
-/// costs.
-fn keep(ledger: &Ledger, journal: &Journal, event: &Event) {
-    journal.event(event);
+/// costs. Gives the task that `event` ended, if it ended one.
+fn keep(ledger: &Ledger, journal: &Journal, event: &Event) -> Option<iq_observe::Task> {
+    let ended = journal.event(event);
     match event {
         Event::Spent {
             agent,
@@ -394,6 +396,14 @@ fn keep(ledger: &Ledger, journal: &Journal, event: &Event) {
         Event::Quota(quota) => ledger.quota(quota.clone()),
         _ => {}
     }
+    ended
+}
+
+/// The project iq works in, as its memory and its tasks are kept under.
+fn project() -> String {
+    std::env::current_dir()
+        .map(|folder| iq_memory::project(&folder))
+        .unwrap_or_default()
 }
 
 /// The settings, as the command line changes them, and the lead's model.
@@ -422,7 +432,7 @@ async fn work(
         .await
         .map(Arc::new);
     let ledger = Arc::new(Ledger::open(&folder));
-    let journal = Arc::new(Journal::open(&folder));
+    let journal = Arc::new(Journal::open(&folder, &project()));
     let (send, mut events) = tokio::sync::mpsc::unbounded_channel();
     let kept = Arc::clone(&ledger);
     let noted = Arc::clone(&journal);
@@ -431,7 +441,7 @@ async fn work(
         &settings,
         prices,
         Arc::new(move |event: Event| {
-            keep(&kept, &noted, &event);
+            let _ = keep(&kept, &noted, &event);
             let _ = send.send(event);
         }),
     )?;
@@ -500,7 +510,7 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         .map(Arc::new);
     let ledger = Arc::new(Ledger::open(&folder));
     ledger.trim();
-    let journal = Arc::new(Journal::open(&folder));
+    let journal = Arc::new(Journal::open(&folder, &project()));
     journal.trim();
     let (send, feed) = std::sync::mpsc::channel();
     let quit = send.clone();
@@ -545,13 +555,54 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         });
     }
 
+    // As each task ends, the person's rules place it, or a cheap model in
+    // the background; what that model spends is counted as any call.
+    let observer = {
+        let costs: Report = {
+            let send = send.clone();
+            let waker = waker.clone();
+            let ledger = Arc::clone(&ledger);
+            Arc::new(move |event: Event| {
+                if let Event::Spent {
+                    agent,
+                    model,
+                    cost,
+                    billed: true,
+                    ..
+                } = &event
+                {
+                    ledger.bill(agent, model, *cost);
+                }
+                let _ = send.send(Update::Crew(event));
+                waker.wake();
+            })
+        };
+        iq_observe::Observer::new(
+            provider(cli),
+            agents(prices.clone()),
+            settings.observing(keyed)?,
+            journal.file().to_path_buf(),
+            iq_observe::Labels::at(folder.join(LABELS)),
+            costs,
+            std::env::temp_dir(),
+        )
+    };
+    {
+        // What iq left unplaced while it was away, or what the categories
+        // no longer fit, a week back.
+        let _inside = runtime.enter();
+        observer.catch_up(iq_ui::now().saturating_sub(7 * 24 * 3600));
+    }
     let report: Report = {
         let send = send.clone();
         let waker = waker.clone();
         let ledger = Arc::clone(&ledger);
         let journal = Arc::clone(&journal);
+        let observer = observer.clone();
         Arc::new(move |event: Event| {
-            keep(&ledger, &journal, &event);
+            if let Some(task) = keep(&ledger, &journal, &event) {
+                observer.done(task);
+            }
             let _ = send.send(Update::Crew(event));
             waker.wake();
         })
@@ -608,13 +659,23 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let files = {
         let waker = waker.clone();
         let journal = journal.file().to_path_buf();
-        let categories = assay.store().root().join("categories.toml");
+        let categories = settings.categories();
+        let labels = iq_observe::Labels::at(folder.join(LABELS));
+        let mut seen = None;
         move || {
             let agents = Agents::find();
             loop {
-                let tasks = tasks(&journal, &categories);
-                if send.send(Update::Tasks(tasks)).is_err() {
-                    return;
+                // Read again only once the journal or the labels changed.
+                let changed = [&journal, labels.file()]
+                    .iter()
+                    .map(|file| std::fs::metadata(file).and_then(|m| m.modified()).ok())
+                    .collect::<Vec<_>>();
+                if seen.as_ref() != Some(&changed) {
+                    seen = Some(changed);
+                    let tasks = tasks(&journal, &categories, &labels);
+                    if send.send(Update::Tasks(tasks)).is_err() {
+                        return;
+                    }
                 }
                 let since = iq_ui::now().saturating_sub(iq_ui::subscriptions::KEEP_SECS);
                 let calls = agents.subscription_calls(since);
@@ -782,23 +843,31 @@ async fn stop_asked() {
     }
 }
 
-/// iq's tasks of the longest period the costs offer, each placed by the
-/// assay's rules in `categories`, its kinds of task.
-fn tasks(journal: &Path, categories: &Path) -> Vec<iq_ui::costs::TaskSpent> {
-    let longest = iq_ui::PERIODS.iter().max().copied().unwrap_or(0);
-    let since = iq_ui::now().saturating_sub(longest);
-    let rules = std::fs::read_to_string(categories)
-        .ok()
-        .and_then(|text| iq_assay::usage::Rules::parse(&text).ok())
-        .unwrap_or_default();
-    iq_assay::usage::read(journal, since)
+/// Where the categories models gave tasks are kept, beside the journal.
+const LABELS: &str = "labels.jsonl";
+
+/// iq's tasks, all the journal keeps, each in its category: by the rules
+/// of `categories`, else as a model placed it.
+fn tasks(
+    journal: &Path,
+    categories: &iq_observe::Categories,
+    labels: &iq_observe::Labels,
+) -> Vec<iq_ui::costs::TaskSpent> {
+    let placed = labels.load();
+    iq_observe::read(journal, 0)
         .iter()
         .map(|task| iq_ui::costs::TaskSpent {
             at: task.at,
-            kind: rules.classify(task).map(str::to_owned),
+            kind: iq_observe::category_of(task, categories, &placed),
             billed: iq_core::Usd(task.billed),
             listed: iq_core::Usd(task.listed),
             tokens: task.tokens,
+            model: task.model.clone(),
+            agent: task.agent.clone(),
+            project: task.project.clone(),
+            seconds: task.seconds,
+            ok: task.ok,
+            prompt: task.prompt.chars().take(160).collect(),
         })
         .collect()
 }

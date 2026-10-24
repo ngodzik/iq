@@ -21,7 +21,6 @@ use crate::report::{self, Row, Table};
 use crate::roster::{Allowed, Roster};
 use crate::run::{Around, Order, Phase, Progress, Runner, lock};
 use crate::store::{Store, batch_name};
-use crate::usage;
 
 /// The judge's name on the board, the agent the person talks with.
 pub const JUDGE: &str = "assay";
@@ -60,8 +59,12 @@ pub struct Settings {
     /// The MCP servers the copies are made through, handed to the judge
     /// when it is Claude Code, which takes them.
     pub servers: Vec<iq_core::McpServer>,
-    /// The journal of iq's tasks, for what each kind of task spent.
+    /// The journal of iq's tasks, for what each category of work spent.
     pub journal: Option<PathBuf>,
+    /// Where the categories models gave tasks are kept.
+    pub labels: Option<PathBuf>,
+    /// The person's categories of work.
+    pub categories: iq_observe::Categories,
     /// What is wrong in the settings the assay was made from, for the
     /// person to see: a server that cannot be handed.
     pub notices: Vec<String>,
@@ -1209,36 +1212,57 @@ where
         };
         let days = args["days"].as_u64().unwrap_or(14).clamp(1, 35);
         let since = crate::now().saturating_sub(days * 86_400);
-        let tasks = usage::read(journal, since);
-        let written = self.inner.store.categories_text();
-        let (rules, trouble) = match usage::Rules::parse(&written) {
-            Ok(rules) => (rules, None),
-            Err(why) => (usage::Rules::default(), Some(why)),
-        };
+        let tasks = iq_observe::read(journal, since);
+        let categories = &self.inner.settings.categories;
+        let labels = self
+            .inner
+            .settings
+            .labels
+            .as_ref()
+            .map(|file| iq_observe::Labels::at(file).load())
+            .unwrap_or_default();
         let mut out = format!("iq's tasks of the last {days} days: {}.\n", tasks.len());
-        if let Some(why) = trouble {
-            out.push_str(&format!("categories.toml cannot be read: {why}\n"));
-        } else if rules.categories.is_empty() {
-            out.push_str("categories.toml writes no kind of task yet.\n");
+        if categories.is_empty() {
+            out.push_str(
+                "The person's settings name no category of work yet ([observe], each with a name, \
+                 a description, and rules if they wish).\n",
+            );
         }
-        for sum in usage::spent(&tasks, &rules) {
+        let mut sums: Vec<(Option<String>, usize, f64, f64, u64)> = Vec::new();
+        let mut unplaced = Vec::new();
+        for task in &tasks {
+            let category = iq_observe::category_of(task, categories, &labels);
+            if category.is_none() {
+                unplaced.push(task);
+            }
+            match sums.iter_mut().find(|sum| sum.0 == category) {
+                Some(sum) => {
+                    sum.1 += 1;
+                    sum.2 += task.billed;
+                    sum.3 += task.listed;
+                    sum.4 += task.tokens;
+                }
+                None => sums.push((category, 1, task.billed, task.listed, task.tokens)),
+            }
+        }
+        sums.sort_by(|a, b| {
+            a.0.is_none()
+                .cmp(&b.0.is_none())
+                .then((b.2 + b.3).total_cmp(&(a.2 + a.3)))
+        });
+        for (category, count, billed, listed, tokens) in &sums {
             out.push_str(&format!(
-                "- {}: {} tasks, {} billed, {} at list prices under subscriptions, {} tokens\n",
-                sum.category.as_deref().unwrap_or("(no kind)"),
-                sum.tasks,
-                iq_core::Usd(sum.billed),
-                iq_core::Usd(sum.listed),
-                iq_core::TokenCount(sum.tokens)
+                "- {}: {count} tasks, {} billed, {} at list prices under subscriptions, {} tokens\n",
+                category.as_deref().unwrap_or("(not placed yet)"),
+                iq_core::Usd(*billed),
+                iq_core::Usd(*listed),
+                iq_core::TokenCount(*tokens)
             ));
         }
-        let unplaced: Vec<&usage::Task> = tasks
-            .iter()
-            .filter(|task| rules.classify(task).is_none())
-            .collect();
         if !unplaced.is_empty() {
-            out.push_str("\nTasks no kind places, the latest first:\n");
+            out.push_str("\nTasks not placed yet, the latest first:\n");
             for task in unplaced.iter().rev().take(40) {
-                let mut kinds: Vec<String> = task
+                let mut files: Vec<String> = task
                     .files
                     .iter()
                     .map(|f| {
@@ -1250,8 +1274,8 @@ where
                             .unwrap_or_else(|| f.clone())
                     })
                     .collect();
-                kinds.sort();
-                kinds.dedup();
+                files.sort();
+                files.dedup();
                 let mut commands: Vec<String> = task
                     .commands
                     .iter()
@@ -1266,10 +1290,10 @@ where
                     task.model,
                     iq_core::Usd(task.billed),
                     iq_core::Usd(task.listed),
-                    if kinds.is_empty() {
+                    if files.is_empty() {
                         "none".into()
                     } else {
-                        kinds.join(" ")
+                        files.join(" ")
                     },
                     if commands.is_empty() {
                         "none".into()
@@ -1422,7 +1446,7 @@ fn tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "assay_usage".into(),
-            description: "What iq's agents worked on lately and what it cost, by the kinds of task categories.toml writes, and the tasks none places: to propose kinds of task, and rules for them.".into(),
+            description: "What iq's agents worked on lately and what it cost, by the person's categories of work, and the tasks not placed yet: to propose categories, and rules for them, for the person to write in their settings.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

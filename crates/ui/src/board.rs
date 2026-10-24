@@ -166,6 +166,8 @@ pub struct Board {
     assay: AssayView,
     /// How the last sync went, when the machine syncs.
     synced: Option<Synced>,
+    /// How the work is looked at.
+    lens: crate::observations::Lens,
 }
 
 impl Default for Board {
@@ -203,6 +205,7 @@ impl Board {
             letters: Vec::new(),
             assay: AssayView::default(),
             synced: None,
+            lens: crate::observations::Lens::default(),
         }
     }
 
@@ -395,6 +398,7 @@ impl Board {
                 self.period = PERIODS[(at + 1) % PERIODS.len()];
             }
             Action::Assay => self.layout.show(focus, Shows::Assay),
+            Action::Observations => self.layout.show(focus, Shows::Observations),
             Action::Theme => self.look.next_theme(),
             Action::Opacity => self.look.next_opacity(),
             Action::Menu => self.menu = !self.menu,
@@ -530,6 +534,28 @@ impl Board {
             n += 1;
         }
         name
+    }
+
+    /// How the work is looked at.
+    #[must_use]
+    pub fn lens(&self) -> crate::observations::Lens {
+        self.lens
+    }
+
+    /// Looks at the work as `lens` says.
+    pub fn look_at(&mut self, lens: crate::observations::Lens) {
+        self.lens = lens;
+    }
+
+    /// The work as the lens shows it, now, in the person's time zone.
+    #[must_use]
+    pub fn seen(&self) -> crate::observations::Seen {
+        crate::observations::see(
+            self.costs.tasks(),
+            self.lens,
+            crate::now(),
+            &jiff::tz::TimeZone::system(),
+        )
     }
 
     /// How the last sync went, when the machine syncs.

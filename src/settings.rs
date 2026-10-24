@@ -30,6 +30,17 @@
 //! folder = "~/.local/share/iq/assay"     # its exercises and results, plain files
 //! parallel = 2                           # runs at once
 //!
+//! [observe]                              # what your work goes to; iq's own, never synced
+//! model = "openai/gpt-5-mini"            # who places what no rule places: a cheap one; claude-code/haiku without a key
+//! every = 1                              # tasks placed at once: more pays less per task with Claude Code
+//!
+//! [[observe.category]]                   # your categories of work, any number
+//! name = "Python"
+//! description = "code in Python: the back end, the scripts"
+//! files = ["*.py"]                       # rules iq applies itself before any model, all optional
+//! commands = ["pytest"]
+//! words = ["django"]
+//!
 //! [sync]                                 # iq's data kept in a private repository of yours, any name
 //! remote = "https://github.com/someone/any-name.git"
 //! branch = "main"                        # another when main must go through pull requests
@@ -99,7 +110,31 @@ pub(crate) struct Settings {
     /// Where iq's data is synced.
     #[serde(default)]
     sync: SyncFile,
+    /// What the work goes to.
+    #[serde(default)]
+    observe: ObserveFile,
 }
+
+/// The observations as the settings write them.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObserveFile {
+    /// The model that places what no rule places.
+    model: Option<String>,
+    /// How many tasks wait before it is asked.
+    every: Option<usize>,
+    /// The person's categories of work.
+    #[serde(default)]
+    category: Vec<iq_observe::Category>,
+}
+
+/// How many tasks wait before a model of the provider places them: one,
+/// as each call is small.
+const OBSERVE_EVERY: usize = 1;
+
+/// The same for an agent with tools of its own, each of whose calls
+/// carries its own large context: a batch, to pay it once for several.
+const OBSERVE_EVERY_AGENT: usize = 10;
 
 /// The sync as the settings write it.
 #[derive(Debug, Default, Deserialize)]
@@ -271,6 +306,35 @@ impl Settings {
     /// Which candidates the assay may test.
     pub(crate) fn assay_allowed(&self) -> iq_assay::Allowed {
         iq_assay::Allowed::from_words(self.assay.candidates.as_deref().unwrap_or_default())
+    }
+
+    /// The person's categories of work.
+    pub(crate) fn categories(&self) -> iq_observe::Categories {
+        iq_observe::Categories::new(self.observe.category.clone())
+    }
+
+    /// What the observer is set with: the model that places what no rule
+    /// places (as set, else the reviewer's cheap one), and how many tasks
+    /// wait for it.
+    pub(crate) fn observing(&self, keyed: bool) -> Result<iq_observe::Settings> {
+        let model = match &self.observe.model {
+            Some(model) => ModelId::new(model.as_str())?,
+            None => ModelId::new(if keyed {
+                REVIEWER
+            } else {
+                REVIEWER_WITHOUT_KEY
+            })?,
+        };
+        let every = self.observe.every.unwrap_or(if model.delegate().is_some() {
+            OBSERVE_EVERY_AGENT
+        } else {
+            OBSERVE_EVERY
+        });
+        Ok(iq_observe::Settings {
+            model,
+            every: every.clamp(1, 50),
+            categories: self.categories(),
+        })
     }
 
     /// The machine's sync of iq's folder of data `data`, with the settings
@@ -446,6 +510,30 @@ mod tests {
         assert!(set.assay_allowed().allows(iq_assay::Kind::Model, "a/b"));
         assert!(!set.assay_allowed().allows(iq_assay::Kind::Harness, "codex"));
         assert!(toml::from_str::<Settings>("[assay]\njudge = \"x\"").is_err());
+    }
+
+    #[test]
+    fn the_categories_and_who_places_tasks_are_set_in_the_settings() {
+        let none = Settings::default();
+        assert!(none.categories().is_empty());
+        assert_eq!(
+            none.observing(true).unwrap().model.as_str(),
+            "openai/gpt-5-mini"
+        );
+        let without_key = none.observing(false).unwrap();
+        assert_eq!(without_key.model.as_str(), "claude-code/haiku");
+        assert_eq!(without_key.every, 10);
+        let set: Settings = toml::from_str(
+            "[observe]\nmodel = \"cheap/one\"\n\n[[observe.category]]\nname = \"Python\"\nfiles = [\"*.py\"]\n\n[[observe.category]]\nname = \"Reviews\"\ndescription = \"reading others' changes\"",
+        )
+        .unwrap();
+        let observing = set.observing(true).unwrap();
+        assert_eq!(
+            (observing.model.as_str(), observing.every),
+            ("cheap/one", 1)
+        );
+        assert_eq!(observing.categories.categories.len(), 2);
+        assert!(toml::from_str::<Settings>("[[observe.category]]\nnom = \"x\"").is_err());
     }
 
     #[test]

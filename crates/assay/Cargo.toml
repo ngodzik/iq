@@ -10,6 +10,7 @@ description = "The assay: the same frozen exercises given to agents, checked by 
 iq-core.workspace    = true
 iq-gate.workspace    = true
 iq-agent.workspace   = true
+iq-observe.workspace = true
 thiserror.workspace  = true
 serde.workspace      = true
 serde_json.workspace = true

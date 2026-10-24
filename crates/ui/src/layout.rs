@@ -20,6 +20,8 @@ pub enum Shows {
     Subscriptions,
     /// The assay: its exercises, its runs, its results.
     Assay,
+    /// What iq's work went to, over time.
+    Observations,
 }
 
 /// A chat not started yet: the model it will run on, and the name asked

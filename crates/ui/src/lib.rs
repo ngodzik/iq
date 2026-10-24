@@ -12,6 +12,7 @@ pub mod error;
 pub mod keys;
 pub mod layout;
 pub mod look;
+pub mod observations;
 pub mod steward;
 pub mod subscriptions;
 

@@ -48,13 +48,15 @@ pub enum Action {
     Steward,
     /// The assay in the pane with the focus.
     Assay,
+    /// What the work went to, in the pane with the focus.
+    Observations,
     /// Quits.
     Quit,
 }
 
 impl Action {
     /// Every action, in the order the list of shortcuts gives them.
-    pub const ALL: [Action; 18] = [
+    pub const ALL: [Action; 19] = [
         Action::Split,
         Action::NextPane,
         Action::Zoom,
@@ -72,6 +74,7 @@ impl Action {
         Action::Stop,
         Action::Steward,
         Action::Assay,
+        Action::Observations,
         Action::Quit,
     ];
 
@@ -96,6 +99,7 @@ impl Action {
             Action::Stop => "stop",
             Action::Steward => "steward",
             Action::Assay => "assay",
+            Action::Observations => "observations",
             Action::Quit => "quit",
         }
     }
@@ -121,6 +125,7 @@ impl Action {
             Action::Stop => "stop this pane's agent",
             Action::Steward => "the steward writing to who spends too fast",
             Action::Assay => "the assay: agents tried on the same exercises",
+            Action::Observations => "what the work went to, over time",
             Action::Quit => "quit",
         }
     }
@@ -145,6 +150,7 @@ impl Action {
             Action::Stop => "escape",
             Action::Steward => "ctrl+g",
             Action::Assay => "ctrl+l",
+            Action::Observations => "ctrl+j",
             // Where each system quits.
             Action::Quit if cfg!(target_os = "macos") => "cmd+q",
             Action::Quit => "ctrl+q",

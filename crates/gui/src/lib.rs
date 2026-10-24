@@ -13,6 +13,7 @@
 mod assay_page;
 mod chat;
 mod costs_page;
+mod observations_page;
 mod panes;
 mod steward_view;
 mod subscriptions_page;
@@ -574,6 +575,7 @@ fn menu(ui: &mut egui::Ui, board: &Board, p: &Palette, actions: &mut Vec<Action>
             (Action::NewChat, "New chat".to_owned()),
             (Action::Costs, "Costs".to_owned()),
             (Action::Assay, "Assay".to_owned()),
+            (Action::Observations, "Observations".to_owned()),
             (Action::Theme, format!("Theme: {}", look.theme())),
             (
                 Action::Opacity,

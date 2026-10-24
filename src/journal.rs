@@ -11,10 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use iq_agent::Event;
-use iq_assay::usage::Task;
+use iq_observe::Task;
 
-/// How long tasks are kept: as long as the calls billed.
-const KEEP_SECS: u64 = crate::ledger::BILLED_KEEP_SECS;
+/// How long tasks are kept: a year and some, for the observations to look
+/// back over a year.
+const KEEP_SECS: u64 = 400 * 24 * 60 * 60;
 
 /// How much of a task's prompt is kept.
 const PROMPT_CHARS: usize = 300;
@@ -39,15 +40,18 @@ const RUNNING: &[&str] = &["run", "Bash"];
 /// The journal.
 pub(crate) struct Journal {
     file: PathBuf,
+    /// The project iq works in, as its memory is kept under.
+    project: String,
     /// The tasks under way, by agent, and each agent's model.
     open: Mutex<(HashMap<String, Task>, HashMap<String, String>)>,
 }
 
 impl Journal {
-    /// The journal of `folder`.
-    pub(crate) fn open(folder: &Path) -> Self {
+    /// The journal of `folder`, its tasks done in `project`.
+    pub(crate) fn open(folder: &Path, project: &str) -> Self {
         Self {
             file: folder.join("tasks.jsonl"),
+            project: project.to_owned(),
             open: Mutex::new((HashMap::new(), HashMap::new())),
         }
     }
@@ -58,10 +62,10 @@ impl Journal {
     }
 
     /// Notes what `event` says of a task, and keeps the task once its turn
-    /// ends.
-    pub(crate) fn event(&self, event: &Event) {
+    /// ends, which it gives.
+    pub(crate) fn event(&self, event: &Event) -> Option<Task> {
         let Ok(mut open) = self.open.lock() else {
-            return;
+            return None;
         };
         let (tasks, models) = &mut *open;
         match event {
@@ -73,13 +77,9 @@ impl Journal {
                     at: iq_ui::now(),
                     agent: agent.clone(),
                     model: models.get(agent).cloned().unwrap_or_default(),
+                    project: self.project.clone(),
                     prompt: prompt.chars().take(PROMPT_CHARS).collect(),
-                    files: Vec::new(),
-                    commands: Vec::new(),
-                    billed: 0.0,
-                    listed: 0.0,
-                    tokens: 0,
-                    seconds: 0,
+                    ..Task::default()
                 });
             }
             Event::Tool {
@@ -118,14 +118,17 @@ impl Journal {
                     }
                 }
             }
-            Event::Done { agent, .. } => {
+            Event::Done { agent, outcome } => {
                 if let Some(mut task) = tasks.remove(agent) {
                     task.seconds = iq_ui::now().saturating_sub(task.at);
+                    task.ok = outcome.is_ok();
                     self.keep(&task);
+                    return Some(task);
                 }
             }
             _ => {}
         }
+        None
     }
 
     fn keep(&self, task: &Task) {
@@ -171,7 +174,7 @@ mod tests {
     #[test]
     fn a_turn_is_kept_with_its_files_commands_and_costs() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Journal::open(dir.path());
+        let journal = Journal::open(dir.path(), "github.com/org/repo");
         let events = [
             Event::Joined {
                 agent: "lead".into(),
@@ -218,18 +221,19 @@ mod tests {
                 outcome: Ok("done".into()),
             },
         ];
-        for event in &events {
-            journal.event(event);
-        }
-        let tasks = iq_assay::usage::read(journal.file(), 0);
+        let ended: Vec<Task> = events.iter().filter_map(|e| journal.event(e)).collect();
+        assert_eq!(ended.len(), 1);
+        let tasks = iq_observe::read(journal.file(), 0);
         assert_eq!(tasks.len(), 1);
         let task = &tasks[0];
         assert_eq!(task.model, "z-ai/glm-5");
         assert_eq!(task.files, ["calc.py"]);
         assert_eq!(task.commands, ["pytest -q"]);
         assert_eq!(task.tokens, 1_000);
+        assert_eq!(task.project, "github.com/org/repo");
+        assert!(task.ok);
         assert!((task.billed - 0.01).abs() < 1e-12);
         journal.trim();
-        assert_eq!(iq_assay::usage::read(journal.file(), 0).len(), 1);
+        assert_eq!(iq_observe::read(journal.file(), 0).len(), 1);
     }
 }

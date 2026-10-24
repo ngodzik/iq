@@ -32,7 +32,6 @@ mod run;
 mod store;
 mod tally;
 mod tree;
-pub mod usage;
 
 pub use assay::{Assay, JUDGE, Overview, Settings, Summary, Told};
 pub use candidate::{Candidate, Kind};

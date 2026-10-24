@@ -5,10 +5,8 @@
 
 use std::path::Path;
 
-use iq_agent::{Event, Report};
-use iq_core::{
-    ChatModel, ChatRequest, Delegate, DelegateEvent, DelegateRequest, Effort, Message, ModelId,
-};
+use iq_agent::Report;
+use iq_core::{ChatModel, Delegate, Effort, ModelId};
 use serde::Deserialize;
 
 use crate::exercise::Exercise;
@@ -301,75 +299,20 @@ where
     M: ChatModel,
     D: Delegate,
 {
-    let shown = judge.to_string();
-    match judge.delegate() {
-        Some((agent, model)) => {
-            let request = DelegateRequest {
-                agent,
-                read_only: true,
-                effort: Some(Effort::High),
-                model: model.to_owned(),
-                prompt,
-                instructions: INSTRUCTIONS.to_owned(),
-                resume: None,
-                fork: false,
-                ephemeral: true,
-                directory: directory.to_path_buf(),
-                reach: None,
-                network: false,
-            };
-            let costs = costs.clone();
-            let mut on_event = move |event: DelegateEvent| {
-                if let DelegateEvent::Usage {
-                    usage,
-                    cost,
-                    billed,
-                    ..
-                } = event
-                {
-                    costs(Event::Spent {
-                        agent: "assay judge".into(),
-                        model: shown.clone(),
-                        usage,
-                        cost,
-                        billed,
-                    });
-                }
-            };
-            agents
-                .run(&request, &mut on_event)
-                .await
-                .map(|reply| reply.text)
-                .map_err(|e| crate::exercise::error_text(&e))
-        }
-        None => {
-            let request = ChatRequest {
-                model: judge.clone(),
-                messages: vec![Message::system(INSTRUCTIONS), Message::user(prompt)],
-                tools: Vec::new(),
-                effort: Some(Effort::High),
-            };
-            let response = provider
-                .complete(&request)
-                .await
-                .map_err(|e| crate::exercise::error_text(&e))?;
-            let cost = match response.cost {
-                Some(cost) => Some(cost),
-                None => provider
-                    .pricing(judge)
-                    .await
-                    .map(|pricing| pricing.cost(&response.usage)),
-            };
-            costs(Event::Spent {
-                agent: "assay judge".into(),
-                model: shown,
-                usage: response.usage,
-                cost,
-                billed: true,
-            });
-            Ok(response.content.unwrap_or_default())
-        }
-    }
+    iq_agent::ask_once(
+        provider,
+        agents,
+        judge,
+        INSTRUCTIONS,
+        prompt,
+        iq_agent::Asked {
+            agent: "assay judge",
+            directory,
+            effort: Effort::High,
+            costs,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
