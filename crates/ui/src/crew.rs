@@ -25,6 +25,9 @@ pub enum Request {
         partner: Option<String>,
         /// Whether it is the chat in the assay's folder.
         assay: bool,
+        /// The models the person named in the task: the first is the one
+        /// it starts on.
+        named: Vec<String>,
     },
     /// Write to an agent.
     Tell {
@@ -32,6 +35,9 @@ pub enum Request {
         to: String,
         /// The message.
         text: String,
+        /// The models the person named in it, for the agent to use them:
+        /// "with opus".
+        named: Vec<String>,
     },
     /// Answer a question.
     Answer {

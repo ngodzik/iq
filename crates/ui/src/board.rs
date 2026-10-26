@@ -87,6 +87,8 @@ pub enum Update {
     Tasks(Vec<crate::costs::TaskSpent>),
     /// A sync of iq's data ended.
     Synced(Synced),
+    /// The provider's models, as it lists them: what the person may name.
+    Models(Vec<String>),
     /// How the crew starts: the lead's model, the reviewer's, whether
     /// the reviewer answers for the person, and whether every command has
     /// the internet.
@@ -166,6 +168,8 @@ pub struct Board {
     synced: Option<Synced>,
     /// How the work is looked at.
     lens: crate::observations::Lens,
+    /// The provider's models, as it lists them.
+    models: Vec<String>,
 }
 
 impl Default for Board {
@@ -201,6 +205,7 @@ impl Board {
             assay: AssayView::default(),
             synced: None,
             lens: crate::observations::Lens::default(),
+            models: Vec::new(),
         }
     }
 
@@ -707,9 +712,11 @@ impl Board {
                 return Vec::new();
             }
             self.screen.editor_mut().take();
+            let text = message.trim().to_owned();
             return vec![Request::Tell {
                 to: name.to_owned(),
-                text: message.trim().to_owned(),
+                named: crate::named::named(&text, &self.models),
+                text,
             }];
         }
         let request = match self.screen.talk().clone() {
@@ -719,7 +726,11 @@ impl Board {
                         .notice(format!("{agent} is gone: /new starts a chat"), now);
                     return Vec::new();
                 }
-                Request::Tell { to: agent, text }
+                Request::Tell {
+                    to: agent,
+                    named: crate::named::named(&text, &self.models),
+                    text,
+                }
             }
             Talk::New(chat) => {
                 if chat.model.trim().is_empty() {
@@ -728,16 +739,22 @@ impl Board {
                     return Vec::new();
                 }
                 let role = Some(chat.role.trim().to_owned()).filter(|r| !r.is_empty());
+                // A model named in the task is the one it starts on.
+                let named = crate::named::named(&text, &self.models);
+                let model = named
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| chat.model.trim().to_owned());
                 // A one-word role names the agent, else its model does; the
                 // assay's chat is the assay's.
-                let named = match &role {
+                let base = match &role {
                     Some(role) if !role.contains(char::is_whitespace) => role.clone(),
-                    _ => chat.model.clone(),
+                    _ => model.clone(),
                 };
                 let name = if chat.assay {
                     CHAT.to_owned()
                 } else {
-                    self.name_for(&named)
+                    self.name_for(&base)
                 };
                 let partner = Some(chat.partner.trim().to_owned())
                     .filter(|p| !p.is_empty() && chat.pattern.takes_partner());
@@ -745,12 +762,13 @@ impl Board {
                 self.screen.talk_to(&name);
                 Request::Start {
                     name,
-                    model: chat.model.trim().to_owned(),
+                    model,
                     task: text,
                     role,
                     pattern: chat.pattern,
                     partner,
                     assay: chat.assay,
+                    named,
                 }
             }
         };
@@ -1038,6 +1056,7 @@ impl Board {
             Update::AssayRunning(running) => self.assay.set_running(running),
             Update::Tasks(tasks) => self.costs.tasks_read(tasks),
             Update::Synced(synced) => self.synced = Some(synced),
+            Update::Models(models) => self.models = models,
             Update::Started {
                 lead,
                 reviewer,
@@ -1119,6 +1138,7 @@ mod tests {
                 pattern: iq_agent::Pattern::Solo,
                 partner: None,
                 assay: false,
+                named: Vec::new(),
             }]
         );
         assert_eq!(board.screen().talking_to(), Some("opus"));
@@ -1163,7 +1183,8 @@ mod tests {
             key(&mut board, "enter"),
             vec![Request::Tell {
                 to: "helper".into(),
-                text: "read the tests".into()
+                text: "read the tests".into(),
+                named: Vec::new(),
             }]
         );
         // Shift-Enter and a trailing backslash go to a new line.
@@ -1177,7 +1198,8 @@ mod tests {
             key(&mut board, "enter"),
             vec![Request::Tell {
                 to: "lead".into(),
-                text: "one\ntwo\nthree".into()
+                text: "one\ntwo\nthree".into(),
+                named: Vec::new(),
             }]
         );
         // An agent no one has is said so, and the message stays.
@@ -1199,6 +1221,30 @@ mod tests {
         assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "codex"));
         key(&mut board, "ctrl+n");
         assert_eq!(board.screen().talking_to(), Some("lead"));
+    }
+
+    #[test]
+    fn a_model_named_in_a_message_starts_the_chat_or_goes_with_it() {
+        let mut board = Board::default();
+        started(&mut board, "claude-code/opus");
+        board.update(Update::Models(vec!["z-ai/glm-5.3-flash".into()]));
+        write(&mut board, "avec haiku, corrige le test");
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Start { model, named, .. }]
+                if model == "claude-code/haiku" && named == &["claude-code/haiku"]
+        ));
+        assert_eq!(board.screen().talking_to(), Some("haiku"));
+        joined(&mut board, "haiku", PERSON);
+        write(
+            &mut board,
+            "fais la conception avec opus et le code avec glm-5.3-flash",
+        );
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Tell { named, .. }]
+                if named == &["claude-code/opus", "z-ai/glm-5.3-flash"]
+        ));
     }
 
     #[test]

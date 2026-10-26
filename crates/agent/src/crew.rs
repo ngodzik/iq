@@ -158,6 +158,8 @@ struct Inner<M, D> {
     posted: watch::Sender<usize>,
     /// What the provider's key was billed so far.
     billed: Mutex<Usd>,
+    /// The models the person named in what they wrote.
+    named: Mutex<Vec<ModelId>>,
     bridge: Mutex<Option<Bridge>>,
     /// Commands Claude Code was allowed, by the number its call runs.
     permits: Mutex<HashMap<String, Permit>>,
@@ -261,6 +263,7 @@ where
                 board: Mutex::new(Board::default()),
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
+                named: Mutex::new(Vec::new()),
                 bridge: Mutex::new(None),
                 permits: Mutex::new(HashMap::new()),
                 closed: Mutex::new(Vec::new()),
@@ -1586,6 +1589,23 @@ where
                 open.join(", ")
             }
         ))
+    }
+
+    /// The models the person named in what they wrote: agents may start
+    /// others on them, whatever else would choose for them.
+    pub fn name_models(&self, models: &[ModelId]) {
+        let mut named = lock(&self.inner.named);
+        for model in models {
+            if !named.contains(model) {
+                named.push(model.clone());
+            }
+        }
+    }
+
+    /// The models the person named so far.
+    #[must_use]
+    pub fn named_models(&self) -> Vec<ModelId> {
+        lock(&self.inner.named).clone()
     }
 
     /// Fails when the crew is held to other models than `model`.

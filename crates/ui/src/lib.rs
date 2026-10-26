@@ -13,6 +13,7 @@ pub mod error;
 pub mod input;
 pub mod keys;
 pub mod look;
+pub mod named;
 pub mod observations;
 pub mod screen;
 pub mod steward;

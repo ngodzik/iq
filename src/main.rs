@@ -701,8 +701,14 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         let assay = assay.clone();
         let provider = provider(cli);
         let installed = installed.clone();
+        let send = send.clone();
         runtime.spawn(async move {
-            assay.set_roster(roster(&provider, keyed, &installed).await);
+            let roster = roster(&provider, keyed, &installed).await;
+            // The models the person may name in what they write.
+            let _ = send.send(Update::Models(
+                roster.models.iter().map(|offer| offer.id.clone()).collect(),
+            ));
+            assay.set_roster(roster);
         });
     }
 
@@ -771,6 +777,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     pattern,
                     partner,
                     assay,
+                    named,
                 } => match ModelId::new(&model) {
                     Ok(model) => {
                         let mut models = vec![model];
@@ -778,16 +785,15 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                         // The assay's chat works in the assay's folder, in
                         // a crew of its own, with the assay's tools.
                         let crew = if assay { &judging } else { &working };
+                        let task = with_named(task, crew, &named[named.len().min(1)..], assay);
                         crew.launch(pattern, &name, &models, task, role);
                     }
                     Err(error) => tracing::warn!("no chat on `{model}`: {error}"),
                 },
-                Request::Tell { to, text } => {
-                    let _ = if judge_has(&to) {
-                        judging.tell(&to, text)
-                    } else {
-                        working.tell(&to, text)
-                    };
+                Request::Tell { to, text, named } => {
+                    let assay = judge_has(&to);
+                    let crew = if assay { &judging } else { &working };
+                    let _ = crew.tell(&to, with_named(text, crew, &named, assay));
                 }
                 // Each crew numbers its questions apart: the one that
                 // asked takes the answer.
@@ -853,6 +859,35 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         }
     });
     ran
+}
+
+/// `text`, the models the person named in it told to the agent, which
+/// `crew` lets it start others on: "with opus" is the person's choice, and
+/// what they name is what works. In the assay's chat, a model named is one
+/// to test: only its whole name is told.
+fn with_named(
+    text: String,
+    crew: &Crew<OpenAiCompatible, Agents>,
+    named: &[String],
+    assay: bool,
+) -> String {
+    let models: Vec<ModelId> = named.iter().filter_map(|m| ModelId::new(m).ok()).collect();
+    if models.is_empty() {
+        return text;
+    }
+    let list = models
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if assay {
+        return format!("{text}\n\n(iq: the models named are, whole: {list}.)");
+    }
+    crew.name_models(&models);
+    format!(
+        "{text}\n\n(iq: the person names {list} for this. Do as they say with them: start an agent \
+         on each, with start_agent, for the part they name it for.)"
+    )
 }
 
 /// Resolves once the person or the system asks iq to stop: Ctrl-C in its

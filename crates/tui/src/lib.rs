@@ -220,7 +220,35 @@ impl Iq {
         }
     }
 
-    fn ask(&self, request: Request) {
+    fn ask(&mut self, request: Request) {
+        // What the person named is said under what they wrote, as it
+        // decides who works.
+        match &request {
+            Request::Start {
+                name, model, named, ..
+            } if !named.is_empty() => {
+                let mut said = format!("→ on {model}, as you named it");
+                if named.len() > 1 {
+                    said.push_str(&format!(
+                        "; it may start agents on {}",
+                        named[1..].join(", ")
+                    ));
+                }
+                self.history.after_message(name, said);
+            }
+            Request::Tell { to, named, .. } if !named.is_empty() => {
+                let said = if to == iq_ui::assay::CHAT {
+                    format!("→ {}, as you named it", named.join(", "))
+                } else {
+                    format!(
+                        "→ {to} may start agents on {}, as you named them",
+                        named.join(", ")
+                    )
+                };
+                self.history.after_message(to, said);
+            }
+            _ => {}
+        }
         // The program is gone only as iq ends.
         let _ = self.requests.send(request);
     }

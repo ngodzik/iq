@@ -99,6 +99,9 @@ pub(crate) struct History {
     tasked: HashSet<String>,
     /// What each question waiting asks, to say it once answered.
     asked: HashMap<u64, (String, String)>,
+    /// What to say after the person's next message to an agent: the models
+    /// they named in it.
+    after: HashMap<String, String>,
 }
 
 impl History {
@@ -367,6 +370,11 @@ impl History {
         ));
     }
 
+    /// Says `text` right after the person's next message to `agent`.
+    pub(crate) fn after_message(&mut self, agent: &str, text: String) {
+        self.after.insert(agent.to_owned(), text);
+    }
+
     /// What the person wrote, to `agent`.
     fn person(&mut self, text: &str, agent: &str, board: &Board, p: &Palette) {
         self.paras.push(Para::blank());
@@ -383,6 +391,10 @@ impl History {
             rest: vec![Span::raw("  ")],
             body,
         });
+        if let Some(said) = self.after.remove(agent) {
+            self.paras
+                .push(Para::indented("  ", vec![Span::styled(said, p.fg(p.info))]));
+        }
         self.speaker = Some(PERSON.to_owned());
     }
 
@@ -665,6 +677,42 @@ mod tests {
             ]
         );
         assert!(!history.waiting());
+    }
+
+    #[test]
+    fn the_models_named_are_said_under_the_message_that_named_them() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        history.after_message("haiku", "→ on claude-code/haiku, as you named it".into());
+        crew(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: "haiku".into(),
+                model: "claude-code/haiku".into(),
+                by: PERSON.into(),
+            },
+            &p,
+        );
+        crew(
+            &mut board,
+            &mut history,
+            Event::Working {
+                agent: "haiku".into(),
+                prompt: "avec haiku, corrige le test".into(),
+            },
+            &p,
+        );
+        let lines: Vec<String> = history.take(80).iter().map(ToString::to_string).collect();
+        assert_eq!(
+            lines,
+            [
+                "",
+                "› avec haiku, corrige le test",
+                "  → on claude-code/haiku, as you named it",
+            ]
+        );
     }
 
     #[test]

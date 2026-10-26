@@ -77,6 +77,12 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
             Span::styled(what, p.fg(p.text)),
         ]));
     }
+    seen.heading(&mut lines, "Naming a model", "");
+    seen.said(
+        &mut lines,
+        " Write \"with opus\", \"avec haiku\" or \"sur <a model of the provider>\" in a message: a new chat starts on the first model named, and an agent may start others on those named, which it is told. Only after such a word does a name count.",
+        p.dim,
+    );
     seen.heading(&mut lines, "On a page", "");
     seen.said(
         &mut lines,
