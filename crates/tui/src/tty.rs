@@ -3,10 +3,16 @@
 //! bracketed, so that a pasted line is never sent; its keys told apart
 //! where the terminal can (Shift-Enter from Enter); the mouse taken only on
 //! a page, so that the conversation is selected and scrolled as the
-//! terminal's own output.
+//! terminal's own output. iq watches the terminal itself for its keys: once
+//! its window is closed, crossterm would read nothing from it forever.
 
+use std::fs::File;
 use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -22,11 +28,27 @@ static ENHANCED: AtomicBool = AtomicBool::new(false);
 static PAGED: AtomicBool = AtomicBool::new(false);
 
 /// The terminal, taken.
-pub(crate) struct Tty(());
+pub(crate) struct Tty {
+    /// The terminal itself, as the system names it for this process,
+    /// watched for keys.
+    tty: File,
+}
+
+/// What a wait for the terminal found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wait {
+    /// Something to read.
+    Ready,
+    /// Nothing, in the time given.
+    Nothing,
+    /// No terminal any more: its window was closed.
+    Gone,
+}
 
 impl Tty {
     /// Takes the terminal.
     pub(crate) fn take() -> io::Result<Tty> {
+        let tty = File::open("/dev/tty")?;
         terminal::enable_raw_mode()?;
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -44,7 +66,25 @@ impl Tty {
         }
         out.flush()?;
         ENHANCED.store(enhanced, Ordering::SeqCst);
-        Ok(Tty(()))
+        Ok(Tty { tty })
+    }
+
+    /// Waits up to `wait` for something to read from the terminal.
+    pub(crate) fn wait(&self, wait: Duration) -> Wait {
+        let millis = u16::try_from(wait.as_millis()).unwrap_or(u16::MAX);
+        let mut watched = [PollFd::new(self.tty.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut watched, PollTimeout::from(millis)) {
+            Ok(0) | Err(nix::errno::Errno::EINTR) => Wait::Nothing,
+            Ok(_) => {
+                let seen = watched[0].revents().unwrap_or(PollFlags::empty());
+                if seen.intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL) {
+                    Wait::Gone
+                } else {
+                    Wait::Ready
+                }
+            }
+            Err(_) => Wait::Gone,
+        }
     }
 
     /// Shows a page on the terminal's other screen, the mouse taken for

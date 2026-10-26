@@ -47,7 +47,7 @@ use crate::inline::Inline;
 use crate::live::Live;
 use crate::motion::Motion;
 use crate::theme::{Depth, Palette};
-use crate::tty::Tty;
+use crate::tty::{Tty, Wait};
 
 /// How long the loop waits for a key while something moves.
 const MOVING: Duration = Duration::from_millis(33);
@@ -69,15 +69,20 @@ const CLOCK: Duration = Duration::from_secs(1);
 pub fn run(feed: Receiver<Update>, requests: Sender<Request>, board: Board) -> io::Result<()> {
     let tty = Tty::take()?;
     let (cols, rows) = terminal::size()?;
+    // What the shell showed goes into the scrollback: iq opens on a clean
+    // screen, the live part at its bottom.
     let (_, row) = cursor::position()?;
+    let mut out = io::stdout();
+    Inline::clear_above(&mut out, row, rows)?;
+    out.flush()?;
     let screen = Screen {
         tty,
-        out: io::stdout(),
-        inline: Inline::new(row, cols, rows),
+        out,
+        inline: Inline::new(cols, rows),
         terminal: Terminal::with_options(
             CrosstermBackend::new(io::stdout()),
             TerminalOptions {
-                viewport: Viewport::Fixed(Rect::new(0, row, cols, 1)),
+                viewport: Viewport::Fixed(Rect::new(0, rows.saturating_sub(1), cols, 1)),
             },
         )?,
         paged: false,
@@ -95,7 +100,6 @@ pub fn run(feed: Receiver<Update>, requests: Sender<Request>, board: Board) -> i
         p,
         requests,
     };
-    iq.motion.arrive(&iq.p);
     let ran = iq.run(&feed);
     let ended = iq.end();
     ran.and(ended)
@@ -234,7 +238,6 @@ impl Iq {
         if open {
             let (cols, rows) = terminal::size()?;
             screen.refit(Rect::new(0, 0, cols, rows))?;
-            self.motion.open_page(&self.p);
         } else if let Some(narrower) = screen.away.take() {
             let (cols, rows) = terminal::size()?;
             self.fit(cols, rows, narrower)?;
@@ -259,21 +262,17 @@ impl Iq {
     fn draw(&mut self, now: u64) -> io::Result<()> {
         let screen = &mut self.screen;
         if screen.paged {
-            let (board, motion, p) = (&mut self.board, &mut self.motion, &self.p);
+            let (board, p) = (&mut self.board, &self.p);
             screen
                 .terminal
-                .draw(|frame| pages::draw(frame, board, motion, p, now))?;
+                .draw(|frame| pages::draw(frame, board, p, now))?;
             return Ok(());
         }
         if self.history.waiting() {
             let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
             let lines = self.history.take(width);
-            let moved = screen.inline.insert(&mut screen.out, &lines)?;
+            screen.inline.insert(&mut screen.out, &lines)?;
             screen.out.flush()?;
-            if moved {
-                let area = screen.inline.area();
-                screen.refit(area)?;
-            }
         }
         let live = Live {
             board: &self.board,
@@ -299,10 +298,20 @@ impl Iq {
     /// Waits up to `wait` for keys, pastes, the wheel and resizes, and
     /// takes them all. Returns whether any came.
     fn keys(&mut self, wait: Duration) -> io::Result<bool> {
-        if !event::poll(wait)? {
-            return Ok(false);
+        match self.screen.tty.wait(wait) {
+            Wait::Nothing => return Ok(false),
+            Wait::Gone => {
+                // Its window closed: nobody is there to answer, and the
+                // agents stop with iq.
+                self.board.act(iq_ui::keys::Action::Quit);
+                return Ok(true);
+            }
+            Wait::Ready => {}
         }
         loop {
+            if !event::poll(Duration::ZERO)? {
+                return Ok(true);
+            }
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let (chord, typed) = keys::chord(&key);
@@ -327,9 +336,6 @@ impl Iq {
                 }
                 _ => {}
             }
-            if !event::poll(Duration::ZERO)? {
-                return Ok(true);
-            }
         }
     }
 
@@ -341,11 +347,8 @@ impl Iq {
     fn fit(&mut self, cols: u16, rows: u16, narrower: bool) -> io::Result<()> {
         if narrower {
             let screen = &mut self.screen;
-            queue!(screen.out, MoveTo(0, rows.saturating_sub(1)))?;
-            for _ in 0..rows {
-                screen.out.write_all(b"\n")?;
-            }
-            screen.inline = Inline::new(0, cols, rows);
+            Inline::clear_above(&mut screen.out, rows, rows)?;
+            screen.inline = Inline::new(cols, rows);
             let live = Live {
                 board: &self.board,
                 history: &self.history,
@@ -356,6 +359,7 @@ impl Iq {
             let width = usize::from(cols.saturating_sub(1)).max(10);
             let room = usize::from(rows.saturating_sub(height + 1));
             let recent = self.history.recent(width, room);
+            screen.inline.place(&mut screen.out, height)?;
             screen.inline.insert(&mut screen.out, &recent)?;
         } else {
             let top = self.caret_top();
@@ -397,7 +401,6 @@ impl Iq {
         let screen = &mut self.screen;
         let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
         let lines = self.history.take(width);
-        screen.inline.leave(&mut screen.out)?;
         screen.inline.insert(&mut screen.out, &lines)?;
         screen.inline.leave(&mut screen.out)?;
         screen.out.flush()

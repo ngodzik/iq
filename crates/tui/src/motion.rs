@@ -1,8 +1,9 @@
 //! What moves in the live part: the spinner of an agent at work, a light
 //! running along the words that say it works, a message's spark running
 //! along the status line from its writer to its reader, whose mark then
-//! glows, and the effects that open a page. Nothing moves while nothing
-//! happens, and the terminal is then drawn only when something changes.
+//! glows. Nothing moves while nothing happens, and the terminal is then
+//! drawn only when something changes. Pages open at once: an effect in
+//! the way of what the person asked for only makes it feel slow.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -12,7 +13,6 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Span;
-use tachyonfx::{Effect, Interpolation, Motion as Sweep, fx};
 
 use crate::theme::{Palette, Rgb};
 
@@ -48,10 +48,6 @@ pub(crate) struct Motion {
     flights: Vec<Flight>,
     /// When each mark last had a spark land on it.
     landed: HashMap<String, Instant>,
-    /// The effect over the page that opens, or the live part as iq starts.
-    effect: Option<Effect>,
-    /// When the effects were last moved on.
-    last: Instant,
 }
 
 impl Default for Motion {
@@ -61,8 +57,6 @@ impl Default for Motion {
             started: now,
             flights: Vec::new(),
             landed: HashMap::new(),
-            effect: None,
-            last: now,
         }
     }
 }
@@ -174,43 +168,9 @@ impl Motion {
         self.landed.retain(|_, at| at.elapsed() < GLOW);
     }
 
-    /// The live part comes in, as iq starts.
-    pub(crate) fn arrive(&mut self, p: &Palette) {
-        self.effect = Some(fx::fade_from_fg(
-            p.color(p.ground),
-            (420, Interpolation::QuadOut),
-        ));
-        self.last = Instant::now();
-    }
-
-    /// A page opens: it sweeps in from the left.
-    pub(crate) fn open_page(&mut self, p: &Palette) {
-        self.effect = Some(fx::sweep_in(
-            Sweep::LeftToRight,
-            24,
-            0,
-            p.color(p.ground),
-            (360, Interpolation::QuadOut),
-        ));
-        self.last = Instant::now();
-    }
-
-    /// Moves the effect on over `area` of `buf`, as long as it runs.
-    pub(crate) fn effects(&mut self, buf: &mut Buffer, area: Rect) {
-        let now = Instant::now();
-        let elapsed = now - self.last;
-        self.last = now;
-        if let Some(effect) = &mut self.effect {
-            effect.process(elapsed, buf, area);
-            if effect.done() {
-                self.effect = None;
-            }
-        }
-    }
-
     /// Whether anything moves: the terminal is then drawn often.
     pub(crate) fn moving(&self) -> bool {
-        !self.flights.is_empty() || !self.landed.is_empty() || self.effect.is_some()
+        !self.flights.is_empty() || !self.landed.is_empty()
     }
 }
 

@@ -115,7 +115,6 @@ impl Live<'_> {
             let marks = self.status(frame, row, motion);
             motion.fly(frame.buffer_mut(), row, &marks, self.p);
         }
-        motion.effects(frame.buffer_mut(), area);
         if let Some(at) = cursor {
             frame.set_cursor_position(at);
         }

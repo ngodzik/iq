@@ -1,9 +1,10 @@
-//! Where the live part stands on the terminal's screen: just below the
-//! conversation, which iq writes above it. While there is room under it,
-//! a line written moves it down; once it reaches the bottom, the rows
-//! above it scroll, and their top line goes into the terminal's own
-//! scrollback, as any output does. The live part itself never scrolls: it
-//! is drawn again where it stands.
+//! Where the live part stands on the terminal's screen: at its bottom,
+//! the conversation above it, its last line just above. A line written
+//! scrolls the rows above the live part up, and their top line goes into
+//! the terminal's own scrollback, as any output does; the live part itself
+//! never scrolls, it is drawn again where it stands. As it grows, the
+//! conversation above goes up to make room; as it shrinks, the
+//! conversation comes down with it, so that nothing gapes between them.
 //!
 //! The rows above are scrolled within a scrolling region that starts at
 //! the top of the screen, which terminals keep in their scrollback as they
@@ -22,7 +23,7 @@ use ratatui::text::Line;
 /// The live part's place on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Inline {
-    /// Its first row.
+    /// Its first row: the screen's height less its own.
     top: u16,
     /// How many rows it takes.
     height: u16,
@@ -31,15 +32,25 @@ pub(crate) struct Inline {
 }
 
 impl Inline {
-    /// The live part starting at `top`, empty, on a screen of `cols` by
-    /// `rows`.
-    pub(crate) fn new(top: u16, cols: u16, rows: u16) -> Inline {
+    /// The live part on a screen of `cols` by `rows`, empty, at its bottom.
+    pub(crate) fn new(cols: u16, rows: u16) -> Inline {
         Inline {
-            top: top.min(rows.saturating_sub(1)),
+            top: rows,
             height: 0,
             cols,
             rows,
         }
+    }
+
+    /// Sends the `rows` at the top of the screen into the terminal's
+    /// scrollback, as iq opens: what the shell showed is scrolled away,
+    /// not lost.
+    pub(crate) fn clear_above(out: &mut impl Write, rows: u16, screen_rows: u16) -> io::Result<()> {
+        queue!(out, MoveTo(0, screen_rows.saturating_sub(1)))?;
+        for _ in 0..rows {
+            out.write_all(b"\n")?;
+        }
+        queue!(out, MoveTo(0, 0))
     }
 
     /// Where it is.
@@ -52,67 +63,67 @@ impl Inline {
         self.cols
     }
 
-    /// Gives the live part `height` rows, at least one row of the screen
-    /// left above it: when there is no room below it, the screen scrolls
-    /// up to make it. Returns whether it moved or changed its size, to be
-    /// drawn again whole.
+    /// Gives the live part `height` rows at the bottom, at least one row
+    /// of the screen left above it, the conversation moved to stay just
+    /// above it. Returns whether it changed, to be drawn again whole.
     pub(crate) fn place(&mut self, out: &mut impl Write, height: u16) -> io::Result<bool> {
         let height = height.clamp(1, self.rows.saturating_sub(1).max(1));
         let before = (self.top, self.height);
-        if self.top + height > self.rows {
-            let over = self.top + height - self.rows;
-            queue!(out, MoveTo(0, self.rows.saturating_sub(1)))?;
-            for _ in 0..over {
-                out.write_all(b"\n")?;
-            }
-            self.top = self.top.saturating_sub(over);
-        }
-        if height < self.height {
-            // What it left below itself goes.
-            for y in self.top + height..(self.top + self.height).min(self.rows) {
-                queue!(out, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
-            }
-        }
+        let top = self.rows - height;
+        self.follow(out, self.top.min(self.rows), top)?;
+        self.top = top;
         self.height = height;
         Ok((self.top, self.height) != before)
     }
 
-    /// Writes `lines` above the live part. Returns whether it moved down,
-    /// to be drawn again where it now stands.
-    pub(crate) fn insert(&mut self, out: &mut impl Write, lines: &[Line<'_>]) -> io::Result<bool> {
-        if lines.is_empty() {
-            return Ok(false);
-        }
-        let below = self.rows.saturating_sub(self.top + self.height);
-        let direct = lines.len().min(usize::from(below));
-        for (at, line) in lines[..direct].iter().enumerate() {
-            queue!(
-                out,
-                MoveTo(0, self.top + at as u16),
-                Clear(ClearType::CurrentLine)
-            )?;
-            write_line(out, line)?;
-        }
-        self.top += direct as u16;
-        let rest = &lines[direct..];
-        if !rest.is_empty() && self.top > 0 {
-            // Only the rows above the live part scroll.
-            write!(out, "\x1b[1;{}r", self.top)?;
-            queue!(out, MoveTo(0, self.top - 1))?;
-            for line in rest {
-                out.write_all(b"\n\r")?;
-                queue!(out, Clear(ClearType::CurrentLine))?;
-                write_line(out, line)?;
+    /// Moves the conversation, whose last line is above row `from`, to end
+    /// above row `to`: up, its top lines into the scrollback, or down, the
+    /// rows between cleared first.
+    fn follow(&self, out: &mut impl Write, from: u16, to: u16) -> io::Result<()> {
+        if to < from {
+            write!(out, "\x1b[1;{from}r")?;
+            queue!(out, MoveTo(0, from - 1))?;
+            for _ in to..from {
+                out.write_all(b"\n")?;
+            }
+            out.write_all(b"\x1b[r")?;
+        } else if to > from {
+            for y in from..to {
+                queue!(out, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
+            }
+            // A reverse index at the region's top scrolls it down.
+            write!(out, "\x1b[1;{to}r")?;
+            queue!(out, MoveTo(0, 0))?;
+            for _ in from..to {
+                out.write_all(b"\x1bM")?;
             }
             out.write_all(b"\x1b[r")?;
         }
-        Ok(direct > 0)
+        Ok(())
+    }
+
+    /// Writes `lines` just above the live part, the rows above it scrolled
+    /// up to make room.
+    pub(crate) fn insert(&mut self, out: &mut impl Write, lines: &[Line<'_>]) -> io::Result<()> {
+        if lines.is_empty() || self.top == 0 {
+            return Ok(());
+        }
+        write!(out, "\x1b[1;{}r", self.top)?;
+        queue!(out, MoveTo(0, self.top - 1))?;
+        for line in lines {
+            out.write_all(b"\n\r")?;
+            queue!(out, Clear(ClearType::CurrentLine))?;
+            write_line(out, line)?;
+        }
+        out.write_all(b"\x1b[r")?;
+        Ok(())
     }
 
     /// The screen is now `cols` by `rows`, the live part's first row at
     /// `top` when the terminal said where its cursor went, which tells
-    /// where it moved what it showed. What the live part showed is cleared,
-    /// to be drawn again.
+    /// where it moved what it showed. What the live part showed is
+    /// cleared, and the conversation moved to end above where it now
+    /// stands, at the bottom.
     pub(crate) fn resized(
         &mut self,
         out: &mut impl Write,
@@ -120,21 +131,25 @@ impl Inline {
         rows: u16,
         top: Option<u16>,
     ) -> io::Result<()> {
+        let was = top.unwrap_or(self.top).min(rows);
+        queue!(out, MoveTo(0, was), Clear(ClearType::FromCursorDown))?;
         self.cols = cols;
         self.rows = rows;
-        if let Some(top) = top {
-            self.top = top;
-        }
-        self.top = self.top.min(rows.saturating_sub(self.height.max(1)));
-        queue!(out, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
+        self.height = self.height.clamp(1, rows.saturating_sub(1).max(1));
+        let top = rows - self.height;
+        self.follow(out, was, top)?;
+        self.top = top;
         Ok(())
     }
 
-    /// Leaves the cursor below the live part, cleared, as iq ends: what
-    /// the shell writes next goes there.
+    /// Clears the live part as iq ends, the cursor where it began: what
+    /// the shell writes next goes just below the conversation.
     pub(crate) fn leave(&mut self, out: &mut impl Write) -> io::Result<()> {
-        queue!(out, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
-        self.height = 0;
+        queue!(
+            out,
+            MoveTo(0, self.top.min(self.rows)),
+            Clear(ClearType::FromCursorDown)
+        )?;
         Ok(())
     }
 }
@@ -161,34 +176,40 @@ mod tests {
     }
 
     #[test]
-    fn lines_go_above_the_live_part_which_goes_down_then_stays() {
+    fn the_live_part_stays_at_the_bottom_the_conversation_just_above() {
         let size = |n: u16| std::num::NonZeroU16::new(n).unwrap();
         let mut parser = vt100::Parser::new(size(6), size(20), 50);
         let mut out = Vec::new();
-        // The shell's prompt, then iq at the next row.
-        parser.process(b"$ iq\r\n");
-        let mut inline = Inline::new(1, 20, 6);
+        // The shell's prompt, scrolled away as iq opens.
+        parser.process(b"$ ls\r\nfile\r\n$ iq\r\n");
+        Inline::clear_above(&mut out, 3, 6).unwrap();
+        let mut inline = Inline::new(20, 6);
         assert!(inline.place(&mut out, 2).unwrap());
+        assert_eq!(inline.area(), Rect::new(0, 4, 20, 2));
         let lines: Vec<Line> = ["one", "two", "three"]
             .into_iter()
             .map(Line::from)
             .collect();
-        assert!(inline.insert(&mut out, &lines).unwrap());
-        assert_eq!(inline.area(), Rect::new(0, 4, 20, 2));
-        // At the bottom: the rows above scroll, the live part stays.
-        assert!(
-            !inline
-                .insert(&mut out, &[Line::from("four"), Line::from("five")])
-                .unwrap()
-        );
-        assert_eq!(inline.area(), Rect::new(0, 4, 20, 2));
+        inline.insert(&mut out, &lines).unwrap();
+        parser.process(&out);
+        assert_eq!(screen(&parser), ["", "one", "two", "three", "", ""]);
+        let mut out = Vec::new();
+        inline
+            .insert(&mut out, &[Line::from("four"), Line::from("five")])
+            .unwrap();
         parser.process(&out);
         assert_eq!(screen(&parser), ["two", "three", "four", "five", "", ""]);
-        // Growing at the bottom scrolls the screen up.
+        // Growing, it pushes the conversation up; shrinking, it brings it
+        // down with it.
         let mut out = Vec::new();
         assert!(inline.place(&mut out, 3).unwrap());
         assert_eq!(inline.area(), Rect::new(0, 3, 20, 3));
         parser.process(&out);
         assert_eq!(screen(&parser)[..3], ["three", "four", "five"]);
+        let mut out = Vec::new();
+        assert!(inline.place(&mut out, 1).unwrap());
+        parser.process(&out);
+        assert_eq!(screen(&parser), ["", "", "three", "four", "five", ""]);
+        assert!(!inline.place(&mut Vec::new(), 1).unwrap());
     }
 }

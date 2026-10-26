@@ -18,7 +18,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::history::short;
-use crate::motion::Motion;
 use crate::theme::Palette;
 use crate::wrap::{cut, spans_width};
 
@@ -91,13 +90,7 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, &'static str) {
 
 /// Draws the page open over the whole screen, and keeps its scroll
 /// within its lines.
-pub(crate) fn draw(
-    frame: &mut Frame<'_>,
-    board: &mut Board,
-    motion: &mut Motion,
-    p: &Palette,
-    now: u64,
-) {
+pub(crate) fn draw(frame: &mut Frame<'_>, board: &mut Board, p: &Palette, now: u64) {
     let Some(page) = board.screen().page().cloned() else {
         return;
     };
@@ -177,7 +170,6 @@ pub(crate) fn draw(
             Rect::new(x, bottom + 1, place.chars().count() as u16, 1),
         );
     }
-    motion.effects(frame.buffer_mut(), body);
     board.screen_mut().drawn(most, usize::from(body_rows));
 }
 

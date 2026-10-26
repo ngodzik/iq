@@ -12,8 +12,9 @@ iq-agent.workspace = true
 iq-ui.workspace    = true
 jiff.workspace     = true
 ratatui.workspace  = true
-tachyonfx.workspace = true
 unicode-width.workspace = true
+# Watching the terminal for keys, which tells when its window is closed.
+nix = { workspace = true, features = ["poll"] }
 
 [dev-dependencies]
 vt100.workspace = true

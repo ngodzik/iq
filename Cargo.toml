@@ -66,10 +66,9 @@ nix         = { version = "0.31.3", default-features = false, features = ["sched
 # time zone read as the platform keeps it.
 jiff       = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 # The terminal: ratatui draws in it, through the crossterm it ships, which
-# reads its keys and pastes on Linux and macOS alike; tachyonfx moves what
-# ratatui drew, as a page opens. Only what iq draws is enabled.
+# reads its keys and pastes on Linux and macOS alike. Only what iq draws
+# is enabled.
 ratatui    = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
-tachyonfx  = { version = "0.25.2", default-features = false, features = ["std", "std-duration"] }
 unicode-width = "0.2.2"
 # A terminal emulated in tests, to read the screen iq's output leaves.
 vt100      = "0.18.1"
