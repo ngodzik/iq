@@ -15,6 +15,7 @@ pub mod keys;
 pub mod look;
 pub mod named;
 pub mod observations;
+pub mod routes;
 pub mod screen;
 pub mod steward;
 pub mod subscriptions;

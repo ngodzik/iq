@@ -129,8 +129,8 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         + 2;
     lines.push(Line::from(Span::styled(
         format!(
-            "   {:<name_width$}{:>6}{:>8}{:>11}{:>13}{:>9}{:>9}",
-            "", "tasks", "failed", "billed", "list prices", "tokens", "time"
+            "   {:<name_width$}{:>6}{:>8}{:>11}{:>13}{:>11}{:>9}{:>9}",
+            "", "tasks", "failed", "billed", "list prices", "a success", "tokens", "time"
         ),
         p.fg(p.faint),
     )));

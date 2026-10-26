@@ -78,7 +78,7 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, &'static str) {
         ),
         Page::Assay => (
             assay::lines(seen),
-            "t talk with the judge · s stop the runs · ↑↓ scroll",
+            "t the assay's chat · s stop the runs · ↑↓ scroll",
         ),
         Page::Observations => (
             observations::lines(seen),

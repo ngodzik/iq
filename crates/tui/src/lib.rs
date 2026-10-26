@@ -225,6 +225,15 @@ impl Iq {
         // decides who works.
         match &request {
             Request::Start {
+                name,
+                model,
+                routed: Some(why),
+                ..
+            } => {
+                self.history
+                    .after_message(name, format!("→ on {model}, {why}"));
+            }
+            Request::Start {
                 name, model, named, ..
             } if !named.is_empty() => {
                 let mut said = format!("→ on {model}, as you named it");

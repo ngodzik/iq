@@ -1,4 +1,4 @@
-//! The assay's page: who judges and what is tested, the runs at work,
+//! The assay's page: who grades and what is tested, the runs at work,
 //! each kind of task with the cheapest candidate that does it as well as
 //! the lead, the exercises, and each one's results, the kinds of
 //! candidates apart.
@@ -68,7 +68,7 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
                 Phase::Waiting => ("waiting", p.faint),
                 Phase::Working => ("working", p.accent),
                 Phase::Checking => ("checking", p.info),
-                Phase::Judging => ("being judged", p.info),
+                Phase::Judging => ("being graded", p.info),
                 Phase::Done(true) => ("passed", p.ok),
                 Phase::Done(false) => ("failed", p.bad),
             };
@@ -89,6 +89,7 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
             ]));
         }
     }
+    routing(seen, &mut lines);
     if !overview.categories.is_empty() {
         seen.heading(&mut lines, "By kind of task", "");
         for (name, rows, fit) in &overview.categories {
@@ -170,6 +171,58 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         results(seen, &table.rows, &mut lines);
     }
     lines
+}
+
+/// The routing: for each kind of task, the agents new tasks of it start on,
+/// the first first, as the records route them and the person's choices
+/// leave them.
+fn routing(seen: &Seen<'_>, lines: &mut Vec<Line<'static>>) {
+    let p = seen.p;
+    let book = seen.board.routes();
+    if book.routing.routes.is_empty() {
+        return;
+    }
+    let what = if book.choices.off {
+        "off, as your settings say: every chat on the model it starts on".to_owned()
+    } else {
+        format!(
+            "graded by {}; a new task of a kind starts on its first",
+            book.routing.grader
+        )
+    };
+    seen.heading(lines, "Routing", &what);
+    for route in &book.routing.routes {
+        let ladder = book.routing.route(&route.category, &book.choices);
+        let mut spans = vec![Span::styled(
+            format!("  {:<14}", route.category),
+            p.fg(p.text),
+        )];
+        match ladder.first() {
+            Some(first) => {
+                spans.push(Span::styled(first.candidate.clone(), p.bold(p.accent)));
+                spans.push(Span::styled(format!("  {}", first.said()), p.fg(p.dim)));
+                if ladder.len() > 1 {
+                    let then: Vec<&str> =
+                        ladder[1..].iter().map(|c| c.candidate.as_str()).collect();
+                    spans.push(Span::styled(
+                        format!("  then {}", then.join(", ")),
+                        p.fg(p.faint),
+                    ));
+                }
+            }
+            None => spans.push(Span::styled(
+                "nobody passes every check yet: the chat's own agent works",
+                p.fg(p.faint),
+            )),
+        }
+        lines.push(Line::from(spans));
+    }
+    for (agent, why) in &book.choices.vetoed {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  never {agent}"), p.fg(p.bad)),
+            Span::styled(format!("  {why}"), p.fg(p.faint)),
+        ]));
+    }
 }
 
 /// Candidates' results, a heading per kind when there are several.

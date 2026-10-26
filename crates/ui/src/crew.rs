@@ -28,6 +28,9 @@ pub enum Request {
         /// The models the person named in the task: the first is the one
         /// it starts on.
         named: Vec<String>,
+        /// Why it starts on its model when the routing chose it: its kind
+        /// of task and the evidence.
+        routed: Option<String>,
     },
     /// Write to an agent.
     Tell {

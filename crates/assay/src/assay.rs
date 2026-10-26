@@ -407,6 +407,28 @@ where
         overview
     }
 
+    /// The routing the records make, each graded by the grader alone,
+    /// written in the assay's folder for iq to read as it starts.
+    pub fn refresh_routing(&self) -> crate::route::Routing {
+        let key = self.grader_key();
+        let exercises: Vec<(Exercise, Vec<Record>)> = self
+            .inner
+            .store
+            .exercises()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|exercise| {
+                let records = graded(self.inner.store.records(&exercise.id), &key);
+                (exercise, records)
+            })
+            .collect();
+        let routing = crate::route::Routing::compute(&exercises, &key, crate::route::MARGIN);
+        if let Err(error) = routing.save(self.inner.store.root()) {
+            tracing::warn!("the routing could not be written: {error}");
+        }
+        routing
+    }
+
     /// Whose grades are compared: the model that answered as the grader
     /// last, across the store, else the grader as the settings name it.
     /// Grades by another model are kept apart, never mixed with these.

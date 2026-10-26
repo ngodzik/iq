@@ -41,6 +41,11 @@
 //! commands = ["pytest"]
 //! words = ["django"]
 //!
+//! [route]                                # the assay's results choose agents by kind of task; your choices
+//! vetoed = { "acme/slow" = "holds requests ten minutes" }  # never routed, why
+//! pinned = { design = "claude-code/opus" }                 # this kind, this agent, whatever the results
+//! off = false                            # true: every chat on the model it starts on
+//!
 //! [sync]                                 # iq's data kept in a private repository of yours, any name
 //! remote = "https://github.com/someone/any-name.git"
 //! branch = "main"                        # another when main must go through pull requests
@@ -113,6 +118,25 @@ pub(crate) struct Settings {
     /// What the work goes to.
     #[serde(default)]
     observe: ObserveFile,
+    /// The person's own choices of routing.
+    #[serde(default)]
+    route: RouteFile,
+}
+
+/// The routing as the settings write it: the person's own choices, beside
+/// what the assay's records route.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteFile {
+    /// No routing: every chat on the model it was started on.
+    #[serde(default)]
+    off: bool,
+    /// Models never routed, each with why.
+    #[serde(default)]
+    vetoed: BTreeMap<String, String>,
+    /// A model pinned to a kind of task.
+    #[serde(default)]
+    pinned: BTreeMap<String, String>,
 }
 
 /// The observations as the settings write them.
@@ -315,6 +339,15 @@ impl Settings {
     /// Which candidates the assay may test.
     pub(crate) fn assay_allowed(&self) -> iq_assay::Allowed {
         iq_assay::Allowed::from_words(self.assay.candidates.as_deref().unwrap_or_default())
+    }
+
+    /// The person's own choices of routing.
+    pub(crate) fn route_choices(&self) -> iq_assay::Choices {
+        iq_assay::Choices {
+            off: self.route.off,
+            vetoed: self.route.vetoed.clone(),
+            pinned: self.route.pinned.clone(),
+        }
     }
 
     /// The person's categories of work.

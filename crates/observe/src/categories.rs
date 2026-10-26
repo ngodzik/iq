@@ -88,6 +88,48 @@ impl Categories {
     }
 }
 
+impl Categories {
+    /// The kind a task given as `text` is of by the rules, before it ran:
+    /// its words, and the files it names.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use iq_observe::{Categories, Category};
+    ///
+    /// let python = Category {
+    ///     name: "python".into(),
+    ///     files: vec!["*.py".into()],
+    ///     ..Category::default()
+    /// };
+    /// let kinds = Categories::new(vec![python]);
+    /// assert_eq!(kinds.of_text("Fix add() in calc.py"), Some("python"));
+    /// assert_eq!(kinds.of_text("Rebase the branch"), None);
+    /// ```
+    #[must_use]
+    pub fn of_text(&self, text: &str) -> Option<&str> {
+        let files: Vec<String> = text
+            .split_whitespace()
+            .map(|word| {
+                word.trim_matches(|c: char| !(c.is_alphanumeric() || "/._-".contains(c)))
+                    .trim_end_matches('.')
+                    .to_owned()
+            })
+            .filter(|word| {
+                word.rsplit_once('.').is_some_and(|(stem, ext)| {
+                    !stem.is_empty() && !ext.is_empty() && ext.chars().all(char::is_alphanumeric)
+                })
+            })
+            .collect();
+        let task = Task {
+            prompt: text.to_owned(),
+            files,
+            ..Task::default()
+        };
+        self.by_rule(&task)
+    }
+}
+
 /// Whether `command` starts with the words of `start`.
 fn starts(command: &str, start: &str) -> bool {
     let mut words = command.split_whitespace();

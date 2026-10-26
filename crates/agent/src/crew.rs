@@ -66,6 +66,11 @@ const RULES_MOST: usize = 40_000;
 /// subscriptions by their agents' names, the provider by this.
 pub const PROVIDER: &str = "provider";
 
+/// What decides whether an agent may start another on a model for a
+/// task: the task, and the model. The person's named models are allowed
+/// before it is asked.
+pub type StartGuard = Arc<dyn Fn(&str, &ModelId) -> Result<(), String> + Send + Sync>;
+
 /// What the crew starts with.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -160,6 +165,9 @@ struct Inner<M, D> {
     billed: Mutex<Usd>,
     /// The models the person named in what they wrote.
     named: Mutex<Vec<ModelId>>,
+    /// What decides the models agents start others on, when something
+    /// does: the routing.
+    guard: Mutex<Option<StartGuard>>,
     bridge: Mutex<Option<Bridge>>,
     /// Commands Claude Code was allowed, by the number its call runs.
     permits: Mutex<HashMap<String, Permit>>,
@@ -264,6 +272,7 @@ where
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
                 named: Mutex::new(Vec::new()),
+                guard: Mutex::new(None),
                 bridge: Mutex::new(None),
                 permits: Mutex::new(HashMap::new()),
                 closed: Mutex::new(Vec::new()),
@@ -1183,6 +1192,12 @@ where
                 let model = ModelId::new(args.text("model")?).map_err(|e| e.to_string())?;
                 self.open_for(&model)?;
                 self.held_to(&model)?;
+                let guard = lock(&self.inner.guard).clone();
+                if let Some(guard) = guard
+                    && !lock(&self.inner.named).contains(&model)
+                {
+                    guard(args.text("task")?, &model)?;
+                }
                 let role = args
                     .text("role")
                     .ok()
@@ -1600,6 +1615,12 @@ where
                 named.push(model.clone());
             }
         }
+    }
+
+    /// Has `guard` decide the models agents start others on: the person's
+    /// named models aside, what it refuses is refused, with its reason.
+    pub fn guard_starts(&self, guard: StartGuard) {
+        *lock(&self.inner.guard) = Some(guard);
     }
 
     /// The models the person named so far.

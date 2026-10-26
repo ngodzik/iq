@@ -24,6 +24,9 @@ pub struct NewChat {
     /// Whether it is the chat in the assay's folder, with the assay's
     /// tools, rather than one in the project.
     pub assay: bool,
+    /// Whether the person chose its model, with `/new <model>`: the
+    /// routing then leaves it alone.
+    pub chosen: bool,
 }
 
 /// Where what the person writes goes.

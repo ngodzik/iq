@@ -89,6 +89,8 @@ pub enum Update {
     Synced(Synced),
     /// The provider's models, as it lists them: what the person may name.
     Models(Vec<String>),
+    /// The routing, as the assay's records last made it.
+    Routes(Box<crate::routes::RouteBook>),
     /// How the crew starts: the lead's model, the reviewer's, whether
     /// the reviewer answers for the person, and whether every command has
     /// the internet.
@@ -170,6 +172,8 @@ pub struct Board {
     lens: crate::observations::Lens,
     /// The provider's models, as it lists them.
     models: Vec<String>,
+    /// The routing, once the program read it.
+    routes: crate::routes::RouteBook,
 }
 
 impl Default for Board {
@@ -206,6 +210,7 @@ impl Board {
             synced: None,
             lens: crate::observations::Lens::default(),
             models: Vec::new(),
+            routes: crate::routes::RouteBook::default(),
         }
     }
 
@@ -739,8 +744,41 @@ impl Board {
                     return Vec::new();
                 }
                 let role = Some(chat.role.trim().to_owned()).filter(|r| !r.is_empty());
-                // A model named in the task is the one it starts on.
+                // A model named in the task is the one it starts on; else
+                // the agent its kind of task is routed to, unless the
+                // person chose one; else the chat's.
                 let named = crate::named::named(&text, &self.models);
+                let mut chat = chat;
+                let mut routed = None;
+                if named.is_empty() && !chat.chosen && !chat.assay {
+                    match self.routes.route(&text, &self.closed) {
+                        crate::routes::Routed::Nowhere => {}
+                        crate::routes::Routed::To {
+                            category,
+                            candidate,
+                            said,
+                        } => {
+                            chat.model = candidate.lead().to_string();
+                            chat.pattern = candidate.pattern;
+                            chat.partner = candidate
+                                .models
+                                .get(1)
+                                .map(ToString::to_string)
+                                .unwrap_or_default();
+                            routed = Some(format!("routed for {category}: {said}"));
+                        }
+                        crate::routes::Routed::Closed(category) => {
+                            self.screen.notice(
+                                format!(
+                                    "Every agent routed for {category} tasks is at a limit you set: \
+                                     name one (\"with <model>\"), and it starts on it"
+                                ),
+                                now,
+                            );
+                            return Vec::new();
+                        }
+                    }
+                }
                 let model = named
                     .first()
                     .cloned()
@@ -769,6 +807,7 @@ impl Board {
                     partner,
                     assay: chat.assay,
                     named,
+                    routed,
                 }
             }
         };
@@ -781,8 +820,12 @@ impl Board {
         let open = |board: &mut Self, page: Page| board.screen.open(page);
         match command {
             Command::New(model) => {
+                let chosen = model.is_some();
                 let model = model.unwrap_or_else(|| self.crew.lead().to_owned());
                 self.screen.new_chat(&model);
+                if let Some(chat) = self.screen.new_chat_mut() {
+                    chat.chosen = chosen;
+                }
             }
             Command::Pattern(pattern, partner) => match self.screen.new_chat_mut() {
                 Some(chat) => {
@@ -907,6 +950,12 @@ impl Board {
             crate::now(),
             &jiff::tz::TimeZone::system(),
         )
+    }
+
+    /// The routing, as the program last read it.
+    #[must_use]
+    pub fn routes(&self) -> &crate::routes::RouteBook {
+        &self.routes
     }
 
     /// How the last sync went, when the machine syncs.
@@ -1057,6 +1106,7 @@ impl Board {
             Update::Tasks(tasks) => self.costs.tasks_read(tasks),
             Update::Synced(synced) => self.synced = Some(synced),
             Update::Models(models) => self.models = models,
+            Update::Routes(routes) => self.routes = *routes,
             Update::Started {
                 lead,
                 reviewer,
@@ -1139,6 +1189,7 @@ mod tests {
                 partner: None,
                 assay: false,
                 named: Vec::new(),
+                routed: None,
             }]
         );
         assert_eq!(board.screen().talking_to(), Some("opus"));
@@ -1244,6 +1295,67 @@ mod tests {
             &key(&mut board, "enter")[..],
             [Request::Tell { named, .. }]
                 if named == &["claude-code/opus", "z-ai/glm-5.3-flash"]
+        ));
+    }
+
+    #[test]
+    fn a_new_task_starts_on_the_agent_its_kind_is_routed_to() {
+        let mut board = Board::default();
+        started(&mut board, "claude-code/opus");
+        let python = iq_assay::Category {
+            name: "python".into(),
+            files: vec!["*.py".into()],
+            ..iq_assay::Category::default()
+        };
+        let choice = |candidate: &str| iq_assay::Choice {
+            candidate: candidate.into(),
+            runs: 2,
+            passed: 2,
+            grade: Some(9.0),
+            cost: 0.01,
+            seconds: 60,
+            last: 0,
+        };
+        board.update(Update::Routes(Box::new(crate::routes::RouteBook {
+            categories: iq_assay::Categories::new(vec![python]),
+            routing: iq_assay::Routing {
+                grader: "g".into(),
+                made: 0,
+                routes: vec![iq_assay::Route {
+                    category: "python".into(),
+                    exercises: vec!["bug".into()],
+                    ladder: vec![choice("z-ai/glm-5"), choice("claude-code/sonnet")],
+                }],
+            },
+            choices: iq_assay::Choices::default(),
+        })));
+        write(&mut board, "fix add() in calc.py");
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Start { model, routed: Some(why), .. }]
+                if model == "z-ai/glm-5" && why.starts_with("routed for python: 2/2 passed")
+        ));
+        // A task of no routed kind goes to the chat's own model.
+        board.run(Command::New(None), 100);
+        write(&mut board, "rebase the branch");
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Start { model, routed: None, .. }] if model == "claude-code/opus"
+        ));
+        // A model chosen with /new is left alone.
+        board.run(Command::New(Some("codex".into())), 100);
+        write(&mut board, "fix calc.py");
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Start { model, routed: None, .. }] if model == "codex"
+        ));
+        // At its limit, the first is passed over for the next.
+        board.closed = vec![Payer::Provider];
+        board.run(Command::New(None), 100);
+        write(&mut board, "fix calc.py");
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Start { model, .. }] if model == "claude-code/sonnet"
         ));
     }
 

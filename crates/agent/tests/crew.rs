@@ -778,6 +778,42 @@ async fn a_crew_held_to_its_models_starts_no_agent_on_another() {
 }
 
 #[tokio::test]
+async fn a_guard_decides_the_models_agents_start_others_on_but_the_persons() {
+    let start = |model: &str| {
+        calls(
+            "start_agent",
+            serde_json::json!({"name": "helper", "model": model, "task": "fix calc.py"}),
+        )
+    };
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                start("cheap/other"),
+                start("claude-code/opus"),
+                say("Started."),
+            ],
+        )],
+        Settings::default(),
+    );
+    f.crew.guard_starts(Arc::new(|task: &str, model: &ModelId| {
+        if task.contains("calc.py") && model.as_str() == "cheap/other" {
+            Err("for a python task, start it on cheap/model".into())
+        } else {
+            Ok(())
+        }
+    }));
+    f.crew.name_models(&[model("claude-code/opus")]);
+    f.crew
+        .start("lead", &model("cheap/model"), "go".into(), PERSON);
+    f.settled().await;
+    let seen = f.model.seen_by("lead");
+    assert!(seen.contains("start it on cheap/model"), "{seen}");
+    // The person's named model is started without asking the guard.
+    assert_eq!(f.others.asked.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn the_budget_stops_the_calls() {
     let f = fixture(
         &[(

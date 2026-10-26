@@ -79,7 +79,7 @@ pub struct Total {
 }
 
 /// One task of iq's agents, by the kind of task the assay's rules place
-/// it in: the kinds are the person's, written with the judge.
+/// it in: the kinds are the person's, named in their settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskSpent {
     /// When it started, in seconds since 1970.

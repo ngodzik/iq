@@ -29,7 +29,7 @@ mod tools;
 pub use bridge::{exec_main, hook_main};
 pub use crew::{
     AGENT_VAR, ALL, BRIDGE_VAR, Bridge, Crew, EXEC_FLAG, HOOK_FLAG, Listed, MCP_FLAG, PROVIDER,
-    Posted, Report, STEWARD, Settings,
+    Posted, Report, STEWARD, Settings, StartGuard,
 };
 pub use event::{Event, PERSON};
 pub use extension::{Called, Extension};

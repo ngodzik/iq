@@ -679,16 +679,77 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
             journal.file(),
         )?
     };
+    // The routing, as its file says it: made again only as the assay's
+    // records change, never as iq starts, but for the first time.
+    let routing = Arc::new(std::sync::Mutex::new(
+        iq_assay::Routing::load(assay.store().root()).unwrap_or_else(|| assay.refresh_routing()),
+    ));
+    let book = {
+        let categories = settings.categories();
+        let choices = settings.route_choices();
+        move |routing: &iq_assay::Routing| iq_ui::routes::RouteBook {
+            categories: categories.clone(),
+            routing: routing.clone(),
+            choices: choices.clone(),
+        }
+    };
+    if let Ok(now) = routing.lock() {
+        let _ = send.send(Update::Routes(Box::new(book(&now))));
+    }
+    // Agents are told the routing each turn, and what they start is held to
+    // it, but for the models the person names.
+    {
+        let pace = {
+            let ledger = Arc::clone(&ledger);
+            let limit = settings.limits().provider_month;
+            Arc::new(move || {
+                let limit = limit?;
+                let (start, _) = iq_ui::steward::month(iq_ui::now())?;
+                let billed: f64 = ledger
+                    .billed(start)
+                    .iter()
+                    .filter(|s| s.payer == Payer::Provider)
+                    .filter_map(|s| s.cost.map(|c| c.0))
+                    .sum();
+                Some(format!(
+                    "The provider's month: {:.0}% of the {} the person set.",
+                    billed / limit.0.max(f64::EPSILON) * 100.0,
+                    limit
+                ))
+            })
+        };
+        crew.extend(Arc::new(iq_assay::Card {
+            routing: Arc::clone(&routing),
+            choices: settings.route_choices(),
+            pace,
+        }));
+        let routing = Arc::clone(&routing);
+        let categories = settings.categories();
+        let choices = settings.route_choices();
+        crew.guard_starts(Arc::new(move |task: &str, model: &ModelId| {
+            let routing = routing.lock().map(|r| r.clone()).unwrap_or_default();
+            routing.allows(categories.of_text(task), model.as_str(), &[], &choices)
+        }));
+    }
     // What the assay's folder holds is read on a thread of its own, never
-    // where the terminal is drawn, at once and whenever it changes.
+    // where the terminal is drawn, at once and whenever it changes, the
+    // routing made again with it.
     {
         let send = send.clone();
         let assay = assay.clone();
+        let routing = Arc::clone(&routing);
         std::thread::spawn(move || {
             let _ = send.send(Update::Assay(Box::new(assay.overview())));
             for news in heard {
                 let update = match news {
-                    Told::Store => Update::Assay(Box::new(assay.overview())),
+                    Told::Store => {
+                        let made = assay.refresh_routing();
+                        let _ = send.send(Update::Routes(Box::new(book(&made))));
+                        if let Ok(mut now) = routing.lock() {
+                            *now = made;
+                        }
+                        Update::Assay(Box::new(assay.overview()))
+                    }
                     Told::Running(running) => Update::AssayRunning(running),
                 };
                 if send.send(update).is_err() {
@@ -778,6 +839,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     partner,
                     assay,
                     named,
+                    ..
                 } => match ModelId::new(&model) {
                     Ok(model) => {
                         let mut models = vec![model];
