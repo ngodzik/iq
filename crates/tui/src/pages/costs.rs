@@ -184,7 +184,7 @@ fn payers(seen: &Seen<'_>, totals: &[Total], lines: &mut Vec<Line<'static>>) {
         let tint = p.payer(payer);
         let mut spans = vec![Span::styled(format!("  {:<12}", payer.name()), p.fg(p.dim))];
         match payer {
-            Payer::Provider => {
+            Payer::Provider | Payer::Key(_) => {
                 let mut cost = Usd(0.0);
                 for total in &mine {
                     cost += total.cost;
@@ -302,7 +302,7 @@ fn by_model(seen: &Seen<'_>, totals: &[Total], lines: &mut Vec<Line<'static>>) {
         + 2;
     for total in totals {
         let cost = match total.payer {
-            Payer::Provider => {
+            Payer::Provider | Payer::Key(_) => {
                 let tint = if total.unpriced > 0 { p.warn } else { p.text };
                 let mut said = total.cost.to_string();
                 if total.unpriced > 0 {

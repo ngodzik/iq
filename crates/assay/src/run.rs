@@ -249,6 +249,9 @@ where
             budget: exercise.dollars.map(Usd),
             // Nobody answers for the person during a run.
             patience: Duration::ZERO,
+            // A candidate is what it is: its agents start on its own
+            // models, never on another that would do the work for it.
+            models: Some(order.candidate.models.clone()),
             ..iq_agent::Settings::default()
         };
         let crew = Crew::new(

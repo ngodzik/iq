@@ -33,7 +33,7 @@ mod store;
 mod tally;
 mod tree;
 
-pub use assay::{Assay, JUDGE, Overview, Settings, Summary, Told};
+pub use assay::{Assay, JUDGE, Overview, Plan, Planned, RunPlan, Settings, Summary, Told};
 pub use candidate::{Candidate, Kind};
 pub use error::AssayError;
 pub use estimate::{Guess, guess};

@@ -105,7 +105,7 @@ impl Gauge {
     pub fn name(&self) -> String {
         let who = match self.payer {
             Payer::Provider => "Provider",
-            Payer::Subscription(agent) => short(agent),
+            Payer::Subscription(agent) | Payer::Key(agent) => short(agent),
         };
         format!("{who} · {}", self.period)
     }

@@ -14,6 +14,11 @@ use crate::error::LlmError;
 /// How many more times a request whose connection failed is tried.
 const CONNECT_RETRIES: u32 = 2;
 
+/// The most tokens a call is let write, whatever the model could: enough
+/// for a model that thinks before it answers, and a bound on one call's
+/// cost.
+const MOST_OUTPUT: u64 = 32_768;
+
 /// How long a completion may take, from sending it to its last byte: a
 /// provider that holds a request without answering would keep the agent
 /// waiting for ever.
@@ -156,12 +161,18 @@ impl ChatModel for OpenAiCompatible {
         let url = format!("{}/chat/completions", self.base_url);
         let key = self.key(&url)?;
         let mut payload = wire_request(request);
+        let known = self.known(&request.model).await;
         // Only to models the list does not say cannot reason: a provider may
         // refuse the field from one that cannot.
         if let Some(effort) = request.effort
-            && self.known(&request.model).await.and_then(|k| k.reasoning) != Some(false)
+            && known.and_then(|k| k.reasoning) != Some(false)
         {
             payload["reasoning_effort"] = json!(effort.as_str());
+        }
+        // Some providers default to a couple of thousand tokens, which a
+        // model that thinks spends before it writes a word.
+        if let Some(most) = known.and_then(|k| k.output) {
+            payload["max_tokens"] = json!(most.min(MOST_OUTPUT));
         }
         if self.is_requesty() {
             // Each call of the agent resends the whole conversation, so most
@@ -215,6 +226,8 @@ impl ChatModel for OpenAiCompatible {
 #[derive(Debug, Clone, Copy)]
 struct Known {
     window: Option<u64>,
+    /// The most it writes in one answer.
+    output: Option<u64>,
     pricing: Option<Pricing>,
     reasoning: Option<bool>,
 }
@@ -299,6 +312,7 @@ fn parse_known(body: &str) -> HashMap<String, Known> {
                     };
                     let known = Known {
                         window: m.context_window,
+                        output: m.max_output_tokens,
                         pricing,
                         reasoning: m.supports_reasoning,
                     };
@@ -516,6 +530,8 @@ struct WireModel {
     input_price: Option<f64>,
     output_price: Option<f64>,
     context_window: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
@@ -864,6 +880,15 @@ mod tests {
         assert_eq!(list[1].output_price, None);
         assert_eq!(list[1].tool_calling, None);
         assert!(parse_list(URL, "nope").is_err());
+    }
+
+    #[test]
+    fn the_most_a_model_writes_comes_from_the_model_list() {
+        let known = parse_known(
+            r#"{"data": [{"id": "a/thinker", "max_output_tokens": 128000}, {"id": "a/plain"}]}"#,
+        );
+        assert_eq!(known["a/thinker"].output, Some(128_000));
+        assert_eq!(known["a/plain"].output, None);
     }
 
     #[test]

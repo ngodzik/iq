@@ -710,6 +710,73 @@ async fn an_agent_with_tools_of_its_own_goes_on_with_its_session() {
 }
 
 #[tokio::test]
+async fn a_reply_of_nothing_is_urged_on_once_then_fails_the_turn() {
+    let nothing = || ChatResponse {
+        content: Some("  ".into()),
+        ..calls("none", serde_json::json!({}))
+    };
+    let empty = || ChatResponse {
+        tool_calls: Vec::new(),
+        ..nothing()
+    };
+    let f = fixture(
+        &[
+            ("lead", vec![empty(), say("Here it is.")]),
+            ("idle", vec![empty(), empty(), say("never said")]),
+        ],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "go".into(), PERSON);
+    f.crew
+        .start("idle", &model("cheap/model"), "go".into(), PERSON);
+    f.settled().await;
+    let events = f.events();
+    assert!(events.contains(&Event::Done {
+        agent: "lead".into(),
+        outcome: Ok("Here it is.".into())
+    }));
+    assert!(
+        f.model
+            .seen_by("lead")
+            .contains("neither text nor a tool call")
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Done { agent, outcome: Err(why) } if agent == "idle" && why.contains("nothing")
+    )));
+}
+
+#[tokio::test]
+async fn a_crew_held_to_its_models_starts_no_agent_on_another() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "start_agent",
+                    serde_json::json!({"name": "helper", "model": "claude-code/opus", "task": "help"}),
+                ),
+                say("Alone, then."),
+            ],
+        )],
+        Settings {
+            models: Some(vec![model("cheap/model")]),
+            ..Settings::default()
+        },
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "go".into(), PERSON);
+    f.settled().await;
+    assert!(f.others.asked.lock().unwrap().is_empty());
+    assert!(
+        f.model
+            .seen_by("lead")
+            .contains("starts agents only on cheap/model")
+    );
+}
+
+#[tokio::test]
 async fn the_budget_stops_the_calls() {
     let f = fixture(
         &[(

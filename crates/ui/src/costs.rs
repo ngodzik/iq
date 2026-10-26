@@ -13,6 +13,9 @@ pub enum Payer {
     /// An agent's subscription: the cost is what the API would charge, an
     /// estimate rather than a bill.
     Subscription(Agent),
+    /// An agent's own API key, as Claude Code may run on one: billed, but
+    /// to the agent's vendor, not to the provider.
+    Key(Agent),
 }
 
 impl Payer {
@@ -23,7 +26,19 @@ impl Payer {
             Payer::Provider => "Provider",
             Payer::Subscription(Agent::ClaudeCode) => "Claude Code",
             Payer::Subscription(Agent::Codex) => "Codex",
+            Payer::Key(Agent::ClaudeCode) => "Claude Code's key",
+            Payer::Key(Agent::Codex) => "Codex's key",
         }
+    }
+
+    /// Who paid a call billed for `model`: the agent's own key when it is
+    /// an agent with tools of its own, else the provider.
+    #[must_use]
+    pub fn billed_for(model: &str) -> Payer {
+        iq_core::ModelId::new(model)
+            .ok()
+            .and_then(|model| model.delegate().map(|(agent, _)| agent))
+            .map_or(Payer::Provider, Payer::Key)
     }
 }
 
@@ -112,6 +127,9 @@ pub struct Costs {
     provider: Vec<Spent>,
     subscriptions: Vec<Spent>,
     tasks: Vec<TaskSpent>,
+    /// The agents found billing iq's calls to a key of their own: their
+    /// files keep those calls too, counted once, as billed.
+    keyed: Vec<Agent>,
 }
 
 impl Costs {
@@ -121,8 +139,13 @@ impl Costs {
         self.subscriptions = spent;
     }
 
-    /// A call iq made with the provider's key.
+    /// A call billed: to the provider's key, or to an agent's own.
     pub fn add(&mut self, spent: Spent) {
+        if let Payer::Key(agent) = spent.payer
+            && !self.keyed.contains(&agent)
+        {
+            self.keyed.push(agent);
+        }
         self.provider.push(spent);
     }
 
@@ -174,9 +197,13 @@ impl Costs {
     }
 
     fn since(&self, since: u64, everyone: bool) -> impl Iterator<Item = &Spent> {
+        let keyed = |s: &Spent| match s.payer {
+            Payer::Subscription(agent) => s.by_iq && self.keyed.contains(&agent),
+            _ => false,
+        };
         self.provider
             .iter()
-            .chain(&self.subscriptions)
+            .chain(self.subscriptions.iter().filter(move |s| !keyed(s)))
             .filter(move |s| s.at >= since && (everyone || s.by_iq))
     }
 
@@ -281,6 +308,22 @@ mod tests {
         assert_eq!(names, [Some("Python"), Some("Rebase"), None]);
         assert_eq!(kinds[0].tasks, 2);
         assert!((kinds[0].listed.0 - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_agents_own_key_is_its_payer_and_its_calls_count_once() {
+        assert_eq!(Payer::billed_for("z-ai/glm-5"), Payer::Provider);
+        assert_eq!(
+            Payer::billed_for("claude-code/opus"),
+            Payer::Key(Agent::ClaudeCode)
+        );
+        let mut costs = Costs::default();
+        let claude = Payer::Subscription(Agent::ClaudeCode);
+        costs.subscriptions_read(vec![spent(10, claude, "opus", Some(0.5))]);
+        costs.add(spent(10, Payer::Key(Agent::ClaudeCode), "opus", Some(0.5)));
+        let totals = costs.totals(0, false);
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].payer.name(), "Claude Code's key");
     }
 
     #[test]

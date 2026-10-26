@@ -248,7 +248,7 @@ impl Board {
                     .iter()
                     .map(|payer| match payer {
                         Payer::Provider => PROVIDER.to_owned(),
-                        Payer::Subscription(agent) => agent.prefix().to_owned(),
+                        Payer::Subscription(agent) | Payer::Key(agent) => agent.prefix().to_owned(),
                     })
                     .collect(),
             ));
@@ -977,17 +977,14 @@ impl Board {
                         usage,
                         billed: true,
                     } => {
+                        let payer = Payer::billed_for(model);
                         if let Some(cost) = cost {
-                            self.spending.push((
-                                crate::now(),
-                                agent.clone(),
-                                Payer::Provider,
-                                cost.0,
-                            ));
+                            self.spending
+                                .push((crate::now(), agent.clone(), payer, cost.0));
                         }
                         self.costs.add(Spent {
                             at: crate::now(),
-                            payer: Payer::Provider,
+                            payer,
                             model: model.clone(),
                             cost: *cost,
                             tokens: usage.input.0 + usage.output.0,

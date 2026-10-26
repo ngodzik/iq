@@ -41,15 +41,10 @@ const LEAD: &str = "lead";
 #[derive(Parser)]
 #[command(version, about = "An experimental coding agent")]
 struct Cli {
-    /// Base URL of an OpenAI compatible endpoint: Requesty's router by
-    /// default, which serves hundreds of models behind one key.
-    #[arg(
-        long,
-        env = "IQ_BASE_URL",
-        default_value = "https://router.requesty.ai/v1",
-        global = true
-    )]
-    base_url: String,
+    /// Base URL of an OpenAI compatible endpoint, instead of the settings'
+    /// `base_url`: Requesty's router when neither names one.
+    #[arg(long, env = "IQ_BASE_URL", global = true)]
+    base_url: Option<String>,
 
     /// API key for that endpoint. Read from the environment so that it never
     /// lands in the shell history.
@@ -96,8 +91,12 @@ enum Command {
     /// What Claude Code's and Codex's subscriptions spent over the last day,
     /// as their own files keep it.
     Subscriptions,
-    /// The assay's exercises and their results, as its folder holds them.
-    Assay,
+    /// The assay's exercises and their results, as its folder holds them;
+    /// or, named after it, an exercise frozen or run.
+    Assay {
+        #[command(subcommand)]
+        act: Option<AssayAct>,
+    },
     /// Syncs iq's folder of data now with the repository the settings'
     /// [sync] names: what changed here sent, what changed elsewhere taken;
     /// a new machine takes everything first. iq does it on its own as it runs.
@@ -111,6 +110,31 @@ enum Command {
         /// otherwise.
         #[arg(long)]
         network: bool,
+    },
+}
+
+/// What the assay is asked from the command line.
+#[derive(Subcommand)]
+enum AssayAct {
+    /// Freezes an exercise as it is: from then on every candidate is given
+    /// exactly the same. Asks first.
+    Freeze {
+        /// The exercise.
+        exercise: String,
+    },
+    /// Runs frozen exercises on candidates, each in a folder of its own,
+    /// checked, then judged blind: one exercise, every exercise of a kind
+    /// of task, or `all`. Says what it should cost, and asks first.
+    Run {
+        /// An exercise, a kind of task, or `all`.
+        which: String,
+        /// A model (`z-ai/glm-5`), an agent (`claude-code/sonnet`), or a
+        /// team (`pair: writer + reviewer`).
+        #[arg(required = true)]
+        candidates: Vec<String>,
+        /// Runs of each candidate, 3 at most.
+        #[arg(long, default_value_t = 1)]
+        times: u64,
     },
 }
 
@@ -135,7 +159,15 @@ fn main() -> Result<()> {
         Some(flag) if flag == EXEC_FLAG => std::process::exit(iq_agent::exec_main(args.next())),
         _ => {}
     }
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // The provider's address: as the command line or the environment
+    // names it, else the settings, else Requesty's router.
+    if cli.base_url.is_none() {
+        cli.base_url = home_folder()
+            .ok()
+            .and_then(|folder| Settings::load(&folder).ok())
+            .and_then(|settings| settings.base_url());
+    }
     // In the terminal, what is logged would write over what iq draws: it
     // goes to iq's folder instead.
     let log = cli
@@ -255,8 +287,18 @@ fn synced(result: &Result<iq_sync::Outcome, iq_sync::SyncError>) -> iq_ui::Synce
 /// The provider's models, with its key when there is one.
 fn provider(cli: &Cli) -> OpenAiCompatible {
     match &cli.api_key {
-        Some(key) => OpenAiCompatible::new(&cli.base_url, key),
-        None => OpenAiCompatible::without_key(&cli.base_url),
+        Some(key) => OpenAiCompatible::new(cli.endpoint(), key),
+        None => OpenAiCompatible::without_key(cli.endpoint()),
+    }
+}
+
+/// Requesty's router, which serves hundreds of models behind one key.
+const ROUTER: &str = "https://router.requesty.ai/v1";
+
+impl Cli {
+    /// The provider's address.
+    fn endpoint(&self) -> &str {
+        self.base_url.as_deref().unwrap_or(ROUTER)
     }
 }
 
@@ -933,6 +975,143 @@ fn gate_in(workspace: &Path, internet: bool, reviewer_internet: bool) -> Result<
     Ok(gate.build()?)
 }
 
+/// Freezes or runs exercises of the assay from the command line, each
+/// action told and asked first, what it spends kept as iq keeps any call.
+async fn assay_act(cli: &Cli, act: &AssayAct) -> Result<()> {
+    let folder = home_folder()?;
+    let (settings, lead) = chosen(cli, &folder)?;
+    let prices = iq_llm::load_prices(&folder.join("prices.json"))
+        .await
+        .map(Arc::new);
+    let ledger = Arc::new(Ledger::open(&folder));
+    let journal = Arc::new(Journal::open(&folder, &project()));
+    let report: Report = {
+        let ledger = Arc::clone(&ledger);
+        let journal = Arc::clone(&journal);
+        Arc::new(move |event: Event| {
+            let _ = keep(&ledger, &journal, &event);
+        })
+    };
+    let (told, heard) = std::sync::mpsc::channel::<Told>();
+    let installed = installed();
+    let (assay, crew) = assay(
+        cli,
+        &settings,
+        &lead,
+        &installed,
+        prices,
+        report,
+        told,
+        journal.file(),
+    )?;
+    // Each run's step, said as it changes.
+    std::thread::spawn(move || {
+        let mut said: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for news in heard {
+            let Told::Running(running) = news else {
+                continue;
+            };
+            for progress in running {
+                let phase = format!("{:?}", progress.phase).to_lowercase();
+                let key = format!("{}/{}", progress.batch, progress.label);
+                if said.get(&key) != Some(&phase) {
+                    println!(
+                        "  {} {} on {}: {phase}",
+                        progress.label, progress.candidate, progress.exercise
+                    );
+                    said.insert(key, phase);
+                }
+            }
+        }
+    });
+    match act {
+        AssayAct::Freeze { exercise } => {
+            match assay.plan_freeze(exercise).map_err(anyhow::Error::msg)? {
+                iq_assay::Planned::Done(said) => println!("{said}"),
+                iq_assay::Planned::Ready(plan) => {
+                    if agree(&plan.action, &plan.reason)? {
+                        println!(
+                            "{}",
+                            assay.freeze_now(exercise).map_err(anyhow::Error::msg)?
+                        );
+                    } else {
+                        println!("Not frozen.");
+                    }
+                }
+            }
+        }
+        AssayAct::Run {
+            which,
+            candidates,
+            times,
+        } => {
+            assay.set_roster(roster(&provider(cli), cli.api_key.is_some(), &installed).await);
+            let exercises = assay_exercises(assay.store(), which)?;
+            let named: Vec<&str> = candidates.iter().map(String::as_str).collect();
+            let plans = exercises
+                .iter()
+                .map(|id| assay.plan_run(id, &named, *times))
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(anyhow::Error::msg)?;
+            for plan in &plans {
+                println!("To {}: {}.", plan.plan.action, plan.plan.reason);
+            }
+            if !agree("run them all", "they spend what each says")? {
+                println!("Nothing ran.");
+            } else {
+                for plan in plans {
+                    println!("\n{}", assay.run_now(plan).await);
+                }
+            }
+        }
+    }
+    crew.end().await;
+    ledger.trim();
+    Ok(())
+}
+
+/// The exercises `which` names: one, every frozen one of a kind of task,
+/// or every frozen one.
+fn assay_exercises(store: &iq_assay::Store, which: &str) -> Result<Vec<String>> {
+    let exercises = store.exercises()?;
+    if exercises.iter().any(|e| e.id == which) {
+        return Ok(vec![which.to_owned()]);
+    }
+    let frozen = |e: &&iq_assay::Exercise| matches!(e.state, iq_assay::State::Frozen(_));
+    let chosen: Vec<String> = exercises
+        .iter()
+        .filter(frozen)
+        .filter(|e| which == "all" || e.categories.iter().any(|c| c.eq_ignore_ascii_case(which)))
+        .map(|e| e.id.clone())
+        .collect();
+    if chosen.is_empty() {
+        let names: Vec<&str> = exercises.iter().map(|e| e.id.as_str()).collect();
+        bail!(
+            "`{which}` names no exercise, and no frozen exercise is of that kind of task; the exercises are {}",
+            if names.is_empty() {
+                "none yet".to_owned()
+            } else {
+                names.join(", ")
+            }
+        );
+    }
+    Ok(chosen)
+}
+
+/// Asks the person on the terminal whether `action` may be done.
+fn agree(action: &str, reason: &str) -> Result<bool> {
+    let mut chars = action.chars();
+    let action: String = chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default();
+    print!("{action}? It is asked because {reason}. [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
 /// Asks the person on the terminal whether `reason` may be overridden.
 fn ask(reason: &str, line: &str) -> Result<bool> {
     print!("{line}\nThis is asked because {reason}. Run it? [y/N] ");
@@ -943,7 +1122,7 @@ fn ask(reason: &str, line: &str) -> Result<bool> {
 }
 
 async fn run(command: &Command, cli: &Cli) -> Result<()> {
-    let (base_url, api_key) = (cli.base_url.as_str(), cli.api_key.clone());
+    let (base_url, api_key) = (cli.endpoint(), cli.api_key.clone());
     match command {
         Command::Do { .. } => bail!("a task is handed to the crew"),
         Command::Models => {
@@ -1017,7 +1196,8 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
                 println!("Kept from the home: {}", kept.join(", "));
             }
         }
-        Command::Assay => {
+        Command::Assay { act: Some(act) } => assay_act(cli, act).await?,
+        Command::Assay { act: None } => {
             let folder = home_folder()?;
             let settings = Settings::load(&folder)?;
             let home = std::env::var_os("HOME")
@@ -1027,7 +1207,7 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
             println!("The assay's folder: {}", store.root().display());
             let exercises = store.exercises()?;
             if exercises.is_empty() {
-                println!("No exercise yet: talk to the judge, /judge in iq, or Ctrl-L then t.");
+                println!("No exercise yet: write one with an agent, in iq's assay (Ctrl-L).");
             }
             for exercise in &exercises {
                 let state = match &exercise.state {

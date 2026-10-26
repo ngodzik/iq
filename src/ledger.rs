@@ -58,7 +58,7 @@ impl Ledger {
             .filter(|line| line.at >= since)
             .map(|line| Spent {
                 at: line.at,
-                payer: Payer::Provider,
+                payer: Payer::billed_for(&line.model),
                 model: line.model,
                 cost: line.cost.map(Usd),
                 tokens: 0,

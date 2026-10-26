@@ -81,6 +81,9 @@ pub struct Settings {
     pub patience: Duration,
     /// The most calls to its model one turn of an agent of iq's makes.
     pub steps: usize,
+    /// The only models agents may start others on, when the crew is held
+    /// to them, as a candidate of the assay is to its own; `None` for any.
+    pub models: Option<Vec<ModelId>>,
 }
 
 impl Default for Settings {
@@ -91,6 +94,7 @@ impl Default for Settings {
             budget: None,
             patience: Duration::from_secs(50 * 60),
             steps: 200,
+            models: None,
         }
     }
 }
@@ -889,6 +893,7 @@ where
         messages.push(Message::user(prompt));
         let mut tools = tools::work();
         tools.extend(self.tools_for(name));
+        let mut urged = false;
         for _ in 0..self.inner.settings.steps {
             if let Some(news) = self.unread(name) {
                 messages.push(Message::user(news));
@@ -916,6 +921,31 @@ where
                     .map(|pricing| pricing.cost(&response.usage)),
             };
             self.spent(name, model.as_str(), response.usage, cost, true);
+            let said = response
+                .content
+                .as_ref()
+                .is_some_and(|t| !t.trim().is_empty());
+            if !said && response.tool_calls.is_empty() {
+                // Nothing written and nothing called is no answer: a model
+                // that spent its room thinking, or lost its way. It is
+                // urged on once, then the turn fails saying why.
+                if urged {
+                    return (
+                        messages,
+                        Err("its model answered twice with nothing: no text, no tool call".into()),
+                    );
+                }
+                urged = true;
+                self.report(Event::Notice {
+                    agent: name.to_owned(),
+                    text: "its model answered with nothing; it is told to go on".into(),
+                });
+                messages.push(Message::user(
+                    "Your reply held neither text nor a tool call. Go on with the task: call \
+                     a tool, or give your answer.",
+                ));
+                continue;
+            }
             messages.push(response.to_message());
             if let Some(text) = response.content.as_ref().filter(|t| !t.trim().is_empty()) {
                 self.report(Event::TextStart {
@@ -1138,6 +1168,7 @@ where
             "start_agent" => {
                 let model = ModelId::new(args.text("model")?).map_err(|e| e.to_string())?;
                 self.open_for(&model)?;
+                self.held_to(&model)?;
                 let role = args
                     .text("role")
                     .ok()
@@ -1546,6 +1577,21 @@ where
         ))
     }
 
+    /// Fails when the crew is held to other models than `model`.
+    fn held_to(&self, model: &ModelId) -> Result<(), String> {
+        match &self.inner.settings.models {
+            Some(models) if !models.contains(model) => Err(format!(
+                "this crew starts agents only on {}: start it on one of them",
+                models
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Fails once the provider's key was billed the budget, or the
     /// provider's limit for the month is reached.
     fn within_budget(&self) -> Result<(), String> {
@@ -1570,7 +1616,15 @@ where
         cost: Option<Usd>,
         billed: bool,
     ) {
-        if billed && let Some(cost) = cost {
+        // The session's budget is the provider's: a call an agent bills to
+        // a key of its own is owed elsewhere.
+        let own_key = ModelId::new(model)
+            .ok()
+            .is_some_and(|model| model.delegate().is_some());
+        if billed
+            && !own_key
+            && let Some(cost) = cost
+        {
             *lock(&self.inner.billed) += cost;
         }
         self.report(Event::Spent {

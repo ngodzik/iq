@@ -179,6 +179,7 @@ impl Palette {
             Payer::Provider => self.ok,
             Payer::Subscription(iq_core::Agent::ClaudeCode) => self.accent,
             Payer::Subscription(iq_core::Agent::Codex) => self.info,
+            Payer::Key(_) => self.warn,
         }
     }
 }

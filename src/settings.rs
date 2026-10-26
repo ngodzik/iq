@@ -2,6 +2,7 @@
 //! there: they come from the environment only.
 //!
 //! ```toml
+//! base_url = "https://router.requesty.ai/v1"  # the provider: another region's router, any OpenAI compatible endpoint
 //! model = "anthropic/claude-sonnet-4-5"  # the lead: a model of the provider, or claude-code, codex
 //! reviewer = "openai/gpt-5-mini"         # answers for the person when the autopilot is on
 //! budget = 2.0                           # the most the provider is billed per session, in dollars
@@ -74,6 +75,8 @@ const REVIEWER_WITHOUT_KEY: &str = "claude-code/haiku";
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Settings {
+    /// The provider's address, when not Requesty's router.
+    base_url: Option<String>,
     model: Option<String>,
     reviewer: Option<String>,
     budget: Option<f64>,
@@ -212,6 +215,15 @@ impl Settings {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error).with_context(|| format!("reading {}", file.display())),
         }
+    }
+
+    /// The provider's address, as set.
+    pub(crate) fn base_url(&self) -> Option<String> {
+        self.base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned)
     }
 
     /// The lead's model: as set, else by whether there is a key.
@@ -449,9 +461,10 @@ mod tests {
             "claude-code/haiku"
         );
         let set: Settings = toml::from_str(
-            "model = \"codex\"\nbudget = 1.5\neffort = \"low\"\nautopilot = true\ninternet = true",
+            "model = \"codex\"\nbudget = 1.5\neffort = \"low\"\nautopilot = true\ninternet = true\nbase_url = \" https://router.example/v1 \"",
         )
         .unwrap();
+        assert_eq!(set.base_url().as_deref(), Some("https://router.example/v1"));
         assert_eq!(set.lead(true).unwrap().as_str(), "codex");
         assert_eq!(set.crew(true).unwrap().budget, Some(Usd(1.5)));
         assert!(set.autopilot && set.internet);

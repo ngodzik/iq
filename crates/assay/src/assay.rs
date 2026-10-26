@@ -79,6 +79,42 @@ pub enum Told {
     Running(Vec<Progress>),
 }
 
+/// What an action of the assay will do, for the person to agree to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// The action, in words.
+    pub action: String,
+    /// What it does and costs, said after "held because".
+    pub reason: String,
+}
+
+/// An action ready for the person to agree to, or already done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Planned {
+    /// It waits for the person.
+    Ready(Plan),
+    /// Nothing to do, and why.
+    Done(String),
+}
+
+/// Runs of a frozen exercise, ready for the person to agree to.
+#[derive(Debug, Clone)]
+pub struct RunPlan {
+    exercise: String,
+    candidates: Vec<Candidate>,
+    times: usize,
+    /// What they do and cost.
+    pub plan: Plan,
+}
+
+impl RunPlan {
+    /// How many runs.
+    #[must_use]
+    pub fn runs(&self) -> usize {
+        self.candidates.len() * self.times
+    }
+}
+
 /// The assay. Cheap to clone: every clone is the same.
 pub struct Assay<M, D> {
     inner: Arc<Inner<M, D>>,
@@ -542,6 +578,26 @@ where
 
     async fn freeze(&self, crew: &Crew<M, D>, agent: &str, args: &Value) -> Result<String, String> {
         let id = text(args, "exercise")?;
+        let plan = match self.plan_freeze(id)? {
+            Planned::Ready(plan) => plan,
+            Planned::Done(said) => return Ok(said),
+        };
+        if !crew
+            .confirm(agent, plan.action.clone(), plan.reason.clone())
+            .await
+        {
+            return Ok("The person did not agree: it is not frozen.".into());
+        }
+        self.freeze_now(id)
+    }
+
+    /// What freezing exercise `id` would do, for the person to agree to,
+    /// or why it cannot be frozen.
+    ///
+    /// # Errors
+    ///
+    /// The exercise cannot be read, or is not ready to be frozen.
+    pub fn plan_freeze(&self, id: &str) -> Result<Planned, String> {
         let exercise = self.inner.store.exercise(id).map_err(|e| error_text(&e))?;
         let problems = exercise.problems();
         if !problems.is_empty() {
@@ -551,10 +607,12 @@ where
             ));
         }
         if let State::Frozen(version) = exercise.state {
-            return Ok(format!("{id} is frozen as it is, version {version}."));
+            return Ok(Planned::Done(format!(
+                "{id} is frozen as it is, version {version}."
+            )));
         }
         let next = exercise.versions.last().map_or(1, |v| v.version + 1);
-        // The window reads it after "Held because".
+        // The terminal reads it after "held because".
         let reason = format!(
             "freezing it is for good: every candidate will be told task.md as it is now, start \
              from start/, {} within {} min{}; changed later, it becomes a new version whose \
@@ -575,9 +633,15 @@ where
             "freeze the exercise {id} ({}) as version {next}",
             exercise.title
         );
-        if !crew.confirm(agent, action, reason).await {
-            return Ok("The person did not agree: it is not frozen.".into());
-        }
+        Ok(Planned::Ready(Plan { action, reason }))
+    }
+
+    /// Freezes exercise `id`, which the person agreed to.
+    ///
+    /// # Errors
+    ///
+    /// It cannot be frozen.
+    pub fn freeze_now(&self, id: &str) -> Result<String, String> {
         let frozen = self
             .inner
             .store
@@ -592,13 +656,7 @@ where
 
     /// The candidates `args` names, each checked against the roster and
     /// the settings.
-    fn candidates(&self, args: &Value) -> Result<Vec<Candidate>, String> {
-        let named: Vec<&str> = args["candidates"]
-            .as_array()
-            .ok_or("`candidates` must be a list of candidates")?
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
+    fn candidates(&self, named: &[&str]) -> Result<Vec<Candidate>, String> {
         if named.is_empty() {
             return Err("name a candidate at least".into());
         }
@@ -608,7 +666,7 @@ where
         let roster = lock(&self.inner.roster).clone();
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut refused = Vec::new();
-        for name in named {
+        for &name in named {
             let candidate: Candidate = match name.parse() {
                 Ok(candidate) => candidate,
                 Err(error) => {
@@ -675,23 +733,56 @@ where
 
     async fn run(&self, crew: &Crew<M, D>, agent: &str, args: &Value) -> Result<String, String> {
         let id = text(args, "exercise")?;
+        let named: Vec<&str> = args["candidates"]
+            .as_array()
+            .ok_or("`candidates` must be a list of candidates")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let times = args["times"].as_u64().unwrap_or(1);
+        let plan = self.plan_run(id, &named, times)?;
+        if !crew
+            .confirm(agent, plan.plan.action.clone(), plan.plan.reason.clone())
+            .await
+        {
+            return Ok("The person did not agree: nothing ran.".into());
+        }
+        let runs = plan.runs();
+        let assay = self.clone();
+        let crew = crew.clone();
+        let agent = agent.to_owned();
+        tokio::spawn(async move {
+            let summary = assay.run_now(plan).await;
+            let _ = crew.deliver(WRITER, &agent, summary);
+        });
+        Ok(format!(
+            "Started: {runs} run{}, {} at a time. Their results come to you as a message from {WRITER} once they are judged; meanwhile, talk with the person.",
+            if runs == 1 { "" } else { "s" },
+            self.inner.settings.parallel.max(1)
+        ))
+    }
+
+    /// What running the frozen exercise `id` on the candidates `named`,
+    /// `times` each, would do and cost, for the person to agree to.
+    ///
+    /// # Errors
+    ///
+    /// The exercise is not frozen as it is, a candidate cannot be tested,
+    /// or the provider's limit is reached.
+    pub fn plan_run(&self, id: &str, named: &[&str], times: u64) -> Result<RunPlan, String> {
         let exercise = self.inner.store.exercise(id).map_err(|e| error_text(&e))?;
         let version = match &exercise.state {
             State::Frozen(version) => *version,
             State::Changed(version) => {
                 return Err(format!(
-                    "{id} changed since version {version}: freeze it again with assay_freeze, as a new version"
+                    "{id} changed since version {version}: freeze it again, as a new version"
                 ));
             }
-            State::Draft => {
-                return Err(format!(
-                    "{id} is a draft: freeze it first with assay_freeze"
-                ));
-            }
+            State::Draft => return Err(format!("{id} is a draft: freeze it first")),
             State::Broken(why) => return Err(format!("{id} is broken: {why}")),
         };
-        let candidates = self.candidates(args)?;
-        let times = args["times"].as_u64().unwrap_or(1).clamp(1, MOST_TIMES) as usize;
+        let candidates = self.candidates(named)?;
+        let times = times.clamp(1, MOST_TIMES) as usize;
         if lock(&self.inner.closed)
             .iter()
             .any(|p| p == iq_agent::PROVIDER)
@@ -709,7 +800,7 @@ where
             .collect();
         let runs = candidates.len() * times;
         let names: Vec<String> = candidates.iter().map(ToString::to_string).collect();
-        // The window reads it after "Held because".
+        // The terminal reads it after "held because".
         let reason = format!(
             "it spends {}, and the judges ({}) {}: {} run{} of {id} version {version} ({}), {}{}, \
              each in a folder of its own for up to {} min{}, then {}",
@@ -742,26 +833,25 @@ where
             candidates.len(),
             if candidates.len() == 1 { "" } else { "s" }
         );
-        if !crew.confirm(agent, action, reason).await {
-            return Ok("The person did not agree: nothing ran.".into());
-        }
-        let assay = self.clone();
-        let crew = crew.clone();
-        let agent = agent.to_owned();
-        let id = id.to_owned();
+        Ok(RunPlan {
+            exercise: id.to_owned(),
+            candidates,
+            times,
+            plan: Plan { action, reason },
+        })
+    }
+
+    /// Runs what `plan` says, which the person agreed to, and says how it
+    /// went once every run is checked and judged.
+    pub async fn run_now(&self, plan: RunPlan) -> String {
         self.inner.batches.fetch_add(1, Ordering::SeqCst);
-        tokio::spawn(async move {
-            let summary = assay.batch(&id, &candidates, times).await;
-            if assay.inner.batches.fetch_sub(1, Ordering::SeqCst) == 1 {
-                assay.inner.stopping.store(false, Ordering::SeqCst);
-            }
-            let _ = crew.deliver(WRITER, &agent, summary);
-        });
-        Ok(format!(
-            "Started: {runs} run{}, {} at a time. Their results come to you as a message from {WRITER} once they are judged; meanwhile, talk with the person.",
-            if runs == 1 { "" } else { "s" },
-            self.inner.settings.parallel.max(1)
-        ))
+        let summary = self
+            .batch(&plan.exercise, &plan.candidates, plan.times)
+            .await;
+        if self.inner.batches.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.inner.stopping.store(false, Ordering::SeqCst);
+        }
+        summary
     }
 
     /// Runs `candidates` on exercise `id`, `times` each, judges them, and
