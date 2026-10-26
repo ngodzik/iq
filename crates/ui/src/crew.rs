@@ -23,6 +23,8 @@ pub enum Request {
         /// The second model, for a pattern that takes one: the reviewer's,
         /// a second voice's.
         partner: Option<String>,
+        /// Whether it is the chat in the assay's folder.
+        assay: bool,
     },
     /// Write to an agent.
     Tell {
@@ -65,8 +67,6 @@ pub enum Request {
 /// What the person asks of the assay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssayAsk {
-    /// Start its judge, to talk with it.
-    Talk,
     /// Stop the runs at work, and those waiting.
     Stop,
 }

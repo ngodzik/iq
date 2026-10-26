@@ -1,6 +1,7 @@
-//! The assay against scripted models: a judge that asks for a run, two
+//! The assay against scripted models: a chat that asks for a run, two
 //! candidates in folders of their own, their checks run for real in the
-//! sandbox, and a judge that grades them blind. No network, no provider.
+//! sandbox, and a grader that grades them blind, the reference among them.
+//! No network, no provider.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
@@ -107,7 +108,7 @@ struct Fixture {
     told: Arc<Mutex<Vec<Told>>>,
 }
 
-/// The judge's crew in the store, the assay serving its judge, every
+/// The chat's crew in the store, the assay serving the chat, every
 /// question the person is asked answered yes.
 fn fixture(model: Scripted) -> Fixture {
     fixture_allowing(model, &["models"])
@@ -133,7 +134,7 @@ fn fixture_allowing(model: Scripted, allowed: &[&str]) -> Fixture {
         store.clone(),
         runner,
         Settings {
-            judges: vec![ModelId::new("judge/model").unwrap()],
+            grader: ModelId::new("grader/model").unwrap(),
             allowed: Allowed::from_words(
                 &allowed.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
             ),
@@ -164,8 +165,7 @@ fn fixture_allowing(model: Scripted, allowed: &[&str]) -> Fixture {
             offer("acme/good-coder"),
             offer("acme/bad-coder"),
             offer("acme/reviewer"),
-            offer("judge/model"),
-            offer("judge/two"),
+            offer("grader/model"),
         ],
         harnesses: Vec::new(),
         missing: None,
@@ -197,7 +197,7 @@ fn fixture_allowing(model: Scripted, allowed: &[&str]) -> Fixture {
             }
         });
     }
-    assay.serve(iq_assay::JUDGE);
+    assay.serve(iq_assay::CHAT);
     crew.extend(Arc::new(assay.clone()));
     Fixture {
         _dir: dir,
@@ -244,7 +244,7 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_run_asked_by_the_judge_is_checked_judged_and_told_back() {
+async fn a_run_asked_in_the_chat_is_checked_graded_and_told_back() {
     let grades = r#"{"grades": [{"label": "A", "score": 8, "notes": "fine"}, {"label": "B", "score": 2, "notes": "nothing done"}]}"#;
     let model = Scripted::new(vec![
         (
@@ -270,7 +270,7 @@ async fn a_run_asked_by_the_judge_is_checked_judged_and_told_back() {
         ),
         ("acme/bad-coder", vec![say("Done, I think.")]),
         (
-            "judge/model",
+            "grader/model",
             vec![say(&format!("Here are my grades.\n{grades}"))],
         ),
     ]);
@@ -279,15 +279,15 @@ async fn a_run_asked_by_the_judge_is_checked_judged_and_told_back() {
     f.store.freeze("add-mul", 1).unwrap();
     assert_eq!(f.store.exercise("add-mul").unwrap().state, State::Frozen(1));
     f.crew.start(
-        iq_assay::JUDGE,
+        iq_assay::CHAT,
         &ModelId::new("talk/model").unwrap(),
         "Run add-mul on both.".into(),
         iq_agent::PERSON,
     );
     let events = Arc::clone(&f.events);
-    until("the results told to the judge", || {
+    until("the results told to the chat", || {
         events.lock().unwrap().iter().any(|e| {
-            matches!(e, Event::Posted { from, to, .. } if from == "results" && to == iq_assay::JUDGE)
+            matches!(e, Event::Posted { from, to, .. } if from == "results" && to == iq_assay::CHAT)
         })
     })
     .await;
@@ -307,7 +307,7 @@ async fn a_run_asked_by_the_judge_is_checked_judged_and_told_back() {
         "{asked}"
     );
     assert!(
-        asked.contains("billed") && asked.contains("judge/model"),
+        asked.contains("billed") && asked.contains("grader/model"),
         "{asked}"
     );
     let told = events
@@ -338,7 +338,8 @@ async fn a_run_asked_by_the_judge_is_checked_judged_and_told_back() {
     // Graded blind, by letter.
     for record in &records {
         assert_eq!(record.verdicts.len(), 1, "{record:?}");
-        assert_eq!(record.verdicts[0].judge, "judge/model");
+        assert_eq!(record.verdicts[0].judge, "grader/model");
+        assert_eq!(record.verdicts[0].key(), "grader/model");
         assert_eq!(record.provider.as_deref(), Some("Scripted"));
     }
     let folder = f
@@ -357,7 +358,7 @@ async fn a_run_asked_by_the_judge_is_checked_judged_and_told_back() {
             .unwrap()
             .contains("write_file")
     );
-    // The work the judges read names nobody.
+    // The work the grader reads names nobody.
     let blind = f
         .store
         .root()
@@ -365,7 +366,7 @@ async fn a_run_asked_by_the_judge_is_checked_judged_and_told_back() {
         .join(format!("add-mul-{}", good.batch));
     assert!(blind.join(format!("{}.diff", good.label)).exists());
     assert!(!blind.join("run.json").exists());
-    // Every cost was told, the runs' and the judge's.
+    // Every cost was told, the runs' and the grader's.
     let costs = f.costs.lock().unwrap();
     assert!(
         costs
@@ -375,7 +376,7 @@ async fn a_run_asked_by_the_judge_is_checked_judged_and_told_back() {
     assert!(
         costs
             .iter()
-            .any(|e| matches!(e, Event::Spent { agent, .. } if agent == "assay judge"))
+            .any(|e| matches!(e, Event::Spent { agent, .. } if agent == "assay grader"))
     );
     assert!(
         f.told
@@ -391,7 +392,13 @@ async fn a_run_asked_by_the_judge_is_checked_judged_and_told_back() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_team_runs_as_its_pattern_says_and_a_second_judge_grades_it_later() {
+async fn a_team_runs_as_its_pattern_says_and_is_graded_again_with_its_reference() {
+    // Grades for every letter a batch of one and its reference may take.
+    let grades = |a: u8, b: u8| {
+        say(&format!(
+            r#"{{"grades": [{{"label": "A", "score": {a}, "notes": "one"}}, {{"label": "B", "score": {b}, "notes": "two"}}]}}"#
+        ))
+    };
     let model = Scripted::new(vec![
         (
             "acme/good-coder",
@@ -404,25 +411,19 @@ async fn a_team_runs_as_its_pattern_says_and_a_second_judge_grades_it_later() {
             ],
         ),
         ("acme/reviewer", vec![say("APPROVE: mul is right.")]),
-        (
-            "judge/model",
-            vec![say(
-                r#"{"grades": [{"label": "A", "score": 7, "notes": "works"}]}"#,
-            )],
-        ),
-        (
-            "judge/two",
-            vec![say(
-                r#"{"grades": [{"label": "A", "score": 9, "notes": "clean"}]}"#,
-            )],
-        ),
+        ("grader/model", vec![grades(7, 7), grades(9, 9)]),
     ]);
     let f = fixture_allowing(model, &["teams"]);
-    exercise(&f.store);
+    let folder = exercise(&f.store);
+    write(
+        &folder,
+        "reference/calc.py",
+        "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n",
+    );
     f.store.freeze("add-mul", 1).unwrap();
     let call = |name: &str, args: serde_json::Value| {
         f.assay
-            .call(f.crew.clone(), iq_assay::JUDGE.into(), name.into(), args)
+            .call(f.crew.clone(), iq_assay::CHAT.into(), name.into(), args)
     };
     let started = call(
         "assay_run",
@@ -432,7 +433,7 @@ async fn a_team_runs_as_its_pattern_says_and_a_second_judge_grades_it_later() {
     .unwrap();
     assert!(started.starts_with("Started: 1 run"), "{started}");
     let store = f.store.clone();
-    until("the team's run judged", || {
+    until("the team's run graded", || {
         store
             .records("add-mul")
             .first()
@@ -444,27 +445,34 @@ async fn a_team_runs_as_its_pattern_says_and_a_second_judge_grades_it_later() {
     assert!(record.passed());
     // What the team told the person is its answer: the review.
     assert!(record.answer.starts_with("APPROVE"), "{}", record.answer);
+    // The reference was graded beside it, blind.
+    let reference = f
+        .store
+        .root()
+        .join("runs/add-mul")
+        .join(&record.batch)
+        .join("reference.json");
+    assert!(reference.exists());
+    let overview = f.assay.overview();
+    assert_eq!(overview.exercises[0].reference_grade, Some(7.0));
+    // Graded by its grader, there is nothing left to grade, unless asked.
+    let again = call("assay_grade", serde_json::json!({"exercise": "add-mul"}))
+        .await
+        .unwrap();
+    assert!(again.contains("is graded by grader/model"), "{again}");
     let regraded = call(
         "assay_grade",
-        serde_json::json!({"exercise": "add-mul", "judges": ["judge/two"]}),
+        serde_json::json!({"exercise": "add-mul", "all": true}),
     )
     .await
     .unwrap();
-    assert!(regraded.contains("Judging add-mul"), "{regraded}");
-    until("the second judge's grade", || {
-        store.records("add-mul")[0].verdicts.len() == 2
+    assert!(regraded.contains("Grading add-mul"), "{regraded}");
+    until("the grade given again", || {
+        store.records("add-mul")[0].score() == Some(9.0)
     })
     .await;
-    let record = &f.store.records("add-mul")[0];
-    assert_eq!(record.score(), Some(8.0));
-    // Graded by both, there is nothing left to grade.
-    let again = call(
-        "assay_grade",
-        serde_json::json!({"exercise": "add-mul", "judges": ["judge/two"]}),
-    )
-    .await
-    .unwrap();
-    assert!(again.contains("is judged by judge/two"), "{again}");
+    // The same grader's grade replaces its own.
+    assert_eq!(f.store.records("add-mul")[0].verdicts.len(), 1);
     let results = call(
         "assay_results",
         serde_json::json!({"exercise": "add-mul", "providers": true}),
@@ -472,18 +480,61 @@ async fn a_team_runs_as_its_pattern_says_and_a_second_judge_grades_it_later() {
     .await
     .unwrap();
     assert!(
+        results.starts_with("Scores are grader/model's grades."),
+        "{results}"
+    );
+    assert!(
         results.contains("Teams:\n- pair: acme/good-coder + acme/reviewer [Scripted]: 1/1 passed"),
         "{results}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_judges_tools_refuse_what_is_not_ready_or_allowed() {
+async fn a_freeze_runs_the_check_on_the_start_and_on_the_reference_first() {
+    let f = fixture(Scripted::default());
+    let folder = exercise(&f.store);
+    let planned =
+        |assay: Assay<Scripted, NoAgents>| async move { assay.plan_freeze("add-mul").await };
+    // Without a reference, it fails on the start, and says nothing shows it
+    // can pass.
+    let plan = planned(f.assay.clone()).await.unwrap();
+    assert!(
+        matches!(&plan, iq_assay::Planned::Ready(p) if p.reason.contains("with no reference/")),
+        "{plan:?}"
+    );
+    // A reference that does not pass it is refused.
+    write(&folder, "reference/notes.txt", "not the solution\n");
+    let wrong = planned(f.assay.clone()).await.unwrap_err();
+    assert!(wrong.contains("fails on the reference"), "{wrong}");
+    // One that does, and the exercise is ready, its checks' result kept.
+    write(
+        &folder,
+        "reference/calc.py",
+        "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n",
+    );
+    let plan = planned(f.assay.clone()).await.unwrap();
+    assert!(
+        matches!(&plan, iq_assay::Planned::Ready(p) if p.reason.contains("fails on start/ and passes on the reference")),
+        "{plan:?}"
+    );
+    assert!(folder.join("reference.json").exists());
+    // Checks that pass on the start test nothing.
+    write(
+        &folder,
+        "start/calc.py",
+        "def mul(a, b):\n    return a * b\n",
+    );
+    let empty = planned(f.assay.clone()).await.unwrap_err();
+    assert!(empty.contains("passes on start/ already"), "{empty}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_assays_tools_refuse_what_is_not_ready_or_allowed() {
     let f = fixture(Scripted::default());
     exercise(&f.store);
     let call = |name: &str, args: serde_json::Value| {
         f.assay
-            .call(f.crew.clone(), iq_assay::JUDGE.into(), name.into(), args)
+            .call(f.crew.clone(), iq_assay::CHAT.into(), name.into(), args)
     };
     let draft = call(
         "assay_run",
@@ -522,12 +573,12 @@ async fn the_judges_tools_refuse_what_is_not_ready_or_allowed() {
         "{roster}"
     );
     assert!(
-        !roster.contains("acme/bad-coder") && !roster.contains("- judge/model"),
+        !roster.contains("acme/bad-coder") && !roster.contains("- grader/model"),
         "{roster}"
     );
     // Another agent has none of the assay's tools.
     assert!(f.assay.tools("lead").is_empty());
-    assert_eq!(f.crew.tools_for(iq_assay::JUDGE).len(), 4 + 8);
+    assert_eq!(f.crew.tools_for(iq_assay::CHAT).len(), 4 + 8);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -572,14 +623,14 @@ async fn an_exercise_is_made_from_a_commit_once_the_person_allows_it() {
         .assay
         .call(
             f.crew.clone(),
-            iq_assay::JUDGE.into(),
+            iq_assay::CHAT.into(),
             "assay_from_commit".into(),
             serde_json::json!({"repository": root.to_str().unwrap(), "commit": "HEAD", "exercise": "mul"}),
         )
         .await
         .unwrap();
     assert!(made.contains("tests/test_calc.py"), "{made}");
-    // The gate asked the person to let the judge read the repository.
+    // The gate asked the person to let the chat read the repository.
     assert!(f.events.lock().unwrap().iter().any(
         |e| matches!(e, Event::Asked { reason, .. } if reason.contains("outside the workspace"))
     ));
@@ -604,7 +655,7 @@ async fn an_exercise_is_made_from_a_commit_once_the_person_allows_it() {
             .assay
             .call(
                 f.crew.clone(),
-                iq_assay::JUDGE.into(),
+                iq_assay::CHAT.into(),
                 "assay_from_commit".into(),
                 serde_json::json!({"repository": root.to_str().unwrap(), "commit": commit, "exercise": id}),
             )

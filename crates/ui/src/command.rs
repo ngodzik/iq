@@ -18,7 +18,7 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 16] = [
+pub const COMMANDS: [Spec; 15] = [
     Spec {
         name: "new",
         args: "[model]",
@@ -51,13 +51,8 @@ pub const COMMANDS: [Spec; 16] = [
     },
     Spec {
         name: "assay",
-        args: "",
-        what: "the assay: agents tried on the same exercises",
-    },
-    Spec {
-        name: "judge",
-        args: "",
-        what: "talk with the assay's judge",
+        args: "[chat]",
+        what: "the assay: agents tried on the same exercises; chat, a chat in its folder",
     },
     Spec {
         name: "observations",
@@ -118,8 +113,8 @@ pub enum Command {
     Costs,
     /// The assay's page.
     Assay,
-    /// Talk with the assay's judge.
-    Judge,
+    /// The chat in the assay's folder.
+    AssayChat,
     /// The observations' page.
     Observations,
     /// The shortcuts and the commands.
@@ -192,8 +187,12 @@ pub fn parse(line: &str) -> Result<Command, String> {
             .ok_or_else(|| "/to takes the agent to write to".to_owned()),
         "team" | "agents" => bare(Command::Team),
         "costs" | "cost" => bare(Command::Costs),
-        "assay" => bare(Command::Assay),
-        "judge" => bare(Command::Judge),
+        "assay" => match words.as_slice() {
+            [] => Ok(Command::Assay),
+            ["chat"] => Ok(Command::AssayChat),
+            _ => Err("/assay takes nothing, or chat".to_owned()),
+        },
+        "judge" => bare(Command::AssayChat),
         "observations" | "work" => bare(Command::Observations),
         "keys" | "help" => bare(Command::Keys),
         "autopilot" => bare(Command::Autopilot),
@@ -285,6 +284,10 @@ pub fn complete(line: &str, agents: &[&str], models: &[&str]) -> Vec<Completion>
             .iter()
             .map(|p| (p.name().to_owned(), p.what().to_owned()))
             .collect(),
+        "assay" => vec![(
+            "chat".to_owned(),
+            "a chat in its folder, with its tools".to_owned(),
+        )],
         _ => Vec::new(),
     };
     values

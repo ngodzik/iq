@@ -1,7 +1,9 @@
-//! The judges: models that read the candidates' work blind, each a letter
-//! to them, after the hidden checks said what they could, and grade it by
-//! the exercise's rubric. Their answer is read as JSON and checked before
-//! it is kept: a grade for every letter, within the scale.
+//! The grader: one model, the same for every run so that grades compare,
+//! that reads the candidates' work blind, each a letter to it, after the
+//! hidden checks said what they could, and grades it by the exercise's
+//! rubric; the exercise's reference among them, when it has one, as a
+//! measure of the grader itself. Its answer is read as JSON and checked
+//! before it is kept: a grade for every letter, within the scale.
 
 use std::path::Path;
 
@@ -10,10 +12,10 @@ use iq_core::{ChatModel, Delegate, Effort, ModelId};
 use serde::Deserialize;
 
 use crate::exercise::Exercise;
-use crate::record::Record;
+use crate::record::{Checked, Record};
 
-/// How much of a candidate's changes a judge reads, in bytes: past it,
-/// the diff is cut and the judge told.
+/// How much of a candidate's changes the grader reads, in bytes: past it,
+/// the diff is cut and the grader told.
 const PATCH_MOST: usize = 60_000;
 
 /// How much of what a candidate said last.
@@ -22,7 +24,7 @@ const ANSWER_MOST: usize = 4_000;
 /// How much of the checks' output.
 const CHECKS_MOST: usize = 2_500;
 
-/// What a judge is, standing.
+/// What the grader is, standing.
 pub(crate) const INSTRUCTIONS: &str = "You judge the work of coding agents, each given the same \
 task in the same starting folder. You do not know who did which: each is a letter. Judge only \
 what is in front of you: their changes, what they said, and how the hidden checks went. iq ran \
@@ -32,7 +34,7 @@ you would merge as it is, 7 works and needs small fixes, 4 works in part, 0 is n
 Keep to the rubric when there is one. Be fair to short work that does the task: length is no \
 merit. Answer with the JSON asked for, nothing after it.";
 
-/// One letter's grade, as a judge gave it.
+/// One letter's grade, as the grader gave it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Grade {
     /// The candidate's letter.
@@ -51,7 +53,7 @@ struct Answer {
 
 /// The letters of `count` candidates, in an order of their own: the
 /// candidates' order in the request is not their letters', so that the
-/// judge who asked for them cannot tell who is who. `seed` makes the order
+/// agent that asked for them cannot tell who is who. `seed` makes the order
 /// the same each time for the same batch.
 #[must_use]
 pub fn labels(count: usize, seed: &str) -> Vec<String> {
@@ -80,15 +82,32 @@ fn letter(at: usize) -> String {
     }
 }
 
-/// What the judges read of one run.
+/// What the grader reads of one piece of work: a run, or the reference.
 pub struct Work<'a> {
-    /// Its record.
-    pub record: &'a Record,
+    /// Its letter.
+    pub label: &'a str,
+    /// How it went, when it was a run: how long, how it ended, its tools.
+    pub run: Option<&'a Record>,
+    /// How the checks went on it.
+    pub checked: Option<&'a Checked>,
     /// What it changed, as a unified diff.
     pub patch: String,
 }
 
-/// What a judge is asked: the task, the rubric, then each candidate's
+impl<'a> Work<'a> {
+    /// A run's work.
+    #[must_use]
+    pub fn of(record: &'a Record, patch: String) -> Self {
+        Self {
+            label: &record.label,
+            run: Some(record),
+            checked: record.checked.as_ref(),
+            patch,
+        }
+    }
+}
+
+/// What the grader is asked: the task, the rubric, then each candidate's
 /// work by its letter, in the letters' order.
 #[must_use]
 pub fn prompt(exercise: &Exercise, task: &str, works: &[Work<'_>]) -> String {
@@ -113,20 +132,19 @@ pub fn prompt(exercise: &Exercise, task: &str, works: &[Work<'_>]) -> String {
         None => out.push_str("\n\nThis exercise has no hidden checks.\n"),
     }
     let mut ordered: Vec<&Work<'_>> = works.iter().collect();
-    ordered.sort_by(|a, b| {
-        (a.record.label.len(), &a.record.label).cmp(&(b.record.label.len(), &b.record.label))
-    });
+    ordered.sort_by(|a, b| (a.label.len(), a.label).cmp(&(b.label.len(), b.label)));
     for work in &ordered {
-        let record = work.record;
-        out.push_str(&format!("\n## Candidate {}\n\n", record.label));
-        out.push_str(&format!(
-            "It worked {} and ended: {}. It called {} tools, {} of which failed.\n",
-            minutes(record.seconds),
-            record.ending.said(),
-            record.tools,
-            record.tool_errors
-        ));
-        if let Some(checked) = &record.checked {
+        out.push_str(&format!("\n## Candidate {}\n\n", work.label));
+        if let Some(record) = work.run {
+            out.push_str(&format!(
+                "It worked {} and ended: {}. It called {} tools, {} of which failed.\n",
+                minutes(record.seconds),
+                record.ending.said(),
+                record.tools,
+                record.tool_errors
+            ));
+        }
+        if let Some(checked) = work.checked {
             let tally = checked
                 .tally
                 .map(|(passed, total)| format!(", {passed} of {total} tests"))
@@ -140,7 +158,9 @@ pub fn prompt(exercise: &Exercise, task: &str, works: &[Work<'_>]) -> String {
                 )),
             }
         }
-        if !record.answer.trim().is_empty() {
+        if let Some(record) = work.run
+            && !record.answer.trim().is_empty()
+        {
             out.push_str(&format!(
                 "\nWhat it said last:\n\n{}\n",
                 cut(record.answer.trim(), ANSWER_MOST)
@@ -156,7 +176,7 @@ pub fn prompt(exercise: &Exercise, task: &str, works: &[Work<'_>]) -> String {
             patch.trim_end()
         ));
     }
-    let letters: Vec<&str> = ordered.iter().map(|w| w.record.label.as_str()).collect();
+    let letters: Vec<&str> = ordered.iter().map(|w| w.label).collect();
     out.push_str(&format!(
         "\n## Your answer\n\nOne JSON object, nothing after it, with a grade for each of {}:\n\n\
          {{\"grades\": [{{\"label\": \"{}\", \"score\": 7, \"notes\": \"a sentence or two: what \
@@ -187,11 +207,11 @@ fn cut(text: &str, most: usize) -> String {
     format!("{}\n[… cut: {} more bytes]", &text[..at], text.len() - at)
 }
 
-/// The grades in a judge's answer, one for each of `labels`.
+/// The grades in the grader's answer, one for each of `labels`.
 ///
 /// # Errors
 ///
-/// What is wrong with the answer, to tell the judge.
+/// What is wrong with the answer, to tell the grader.
 ///
 /// # Examples
 ///
@@ -280,33 +300,34 @@ fn escaped(bytes: &[u8], at: usize) -> bool {
     slashes % 2 == 1
 }
 
-/// Asks `judge` for its answer to `prompt`: an agent with tools of its
+/// Asks `grader` for its answer to `prompt`: an agent with tools of its
 /// own reads only, in `directory`, keeping nothing of it; a model of the
-/// provider answers without tools. What it costs goes to `costs`.
+/// provider answers without tools. What it costs goes to `costs`. The
+/// answer says which model gave it, as precisely as its agent says.
 ///
 /// # Errors
 ///
-/// The judge could not answer.
+/// The grader could not answer.
 pub async fn ask<M, D>(
     provider: &M,
     agents: &D,
-    judge: &ModelId,
+    grader: &ModelId,
     prompt: String,
     directory: &Path,
     costs: &Report,
-) -> Result<String, String>
+) -> Result<iq_agent::Answer, String>
 where
     M: ChatModel,
     D: Delegate,
 {
-    iq_agent::ask_once(
+    iq_agent::ask_once_by(
         provider,
         agents,
-        judge,
+        grader,
         INSTRUCTIONS,
         prompt,
         iq_agent::Asked {
-            agent: "assay judge",
+            agent: "assay grader",
             directory,
             effort: Effort::High,
             costs,

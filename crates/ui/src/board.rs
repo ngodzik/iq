@@ -7,7 +7,7 @@
 use iq_agent::{Event, PERSON, PROVIDER, STEWARD};
 use iq_core::{ModelId, SubscriptionCall};
 
-use crate::assay::{AssayView, JUDGE, Overview, Progress};
+use crate::assay::{AssayView, CHAT, Overview, Progress};
 use crate::command::{self, Command, Completion};
 use crate::costs::{Costs, Payer, Spent};
 use crate::crew::{AssayAsk, CrewView, Question, Request};
@@ -598,9 +598,7 @@ impl Board {
                 self.lens = lens;
             }
             Page::Assay => match (key, letter) {
-                ("Enter", _) | (_, Some('t')) => {
-                    return self.talk_to_judge().into_iter().collect();
-                }
+                ("Enter", _) | (_, Some('t')) => self.assay_chat(),
                 (_, Some('s')) => return self.stop_runs().into_iter().collect(),
                 _ => {}
             },
@@ -730,12 +728,17 @@ impl Board {
                     return Vec::new();
                 }
                 let role = Some(chat.role.trim().to_owned()).filter(|r| !r.is_empty());
-                // A one-word role names the agent, else its model does.
+                // A one-word role names the agent, else its model does; the
+                // assay's chat is the assay's.
                 let named = match &role {
                     Some(role) if !role.contains(char::is_whitespace) => role.clone(),
                     _ => chat.model.clone(),
                 };
-                let name = self.name_for(&named);
+                let name = if chat.assay {
+                    CHAT.to_owned()
+                } else {
+                    self.name_for(&named)
+                };
                 let partner = Some(chat.partner.trim().to_owned())
                     .filter(|p| !p.is_empty() && chat.pattern.takes_partner());
                 self.screen.starts(&name);
@@ -747,6 +750,7 @@ impl Board {
                     role,
                     pattern: chat.pattern,
                     partner,
+                    assay: chat.assay,
                 }
             }
         };
@@ -789,7 +793,7 @@ impl Board {
             Command::Assay => open(self, Page::Assay),
             Command::Observations => open(self, Page::Observations),
             Command::Keys => open(self, Page::Keys),
-            Command::Judge => return self.talk_to_judge().into_iter().collect(),
+            Command::AssayChat => self.assay_chat(),
             Command::Autopilot => return self.act(Action::Autopilot).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet).into_iter().collect(),
             Command::Steward => {
@@ -899,16 +903,25 @@ impl Board {
         &self.assay
     }
 
-    /// Writes to the assay's judge from now on, the page closed: starts it
-    /// when it is not there yet.
-    pub fn talk_to_judge(&mut self) -> Option<Request> {
-        self.screen.talk_to(JUDGE);
+    /// Writes to the chat in the assay's folder from now on, the page
+    /// closed: a new one, on the model of the agent the person wrote to,
+    /// else the lead's, when there is none yet. Its first message starts
+    /// it, as any chat's.
+    pub fn assay_chat(&mut self) {
         self.screen.close_all();
-        if self.crew.agent(JUDGE).is_some() || self.screen.starting().iter().any(|n| n == JUDGE) {
-            return None;
+        if self.crew.agent(CHAT).is_some() || self.screen.starting().iter().any(|n| n == CHAT) {
+            self.screen.talk_to(CHAT);
+            return;
         }
-        self.screen.starts(JUDGE);
-        Some(Request::Assay(AssayAsk::Talk))
+        let model = self
+            .screen
+            .talking_to()
+            .and_then(|agent| self.crew.agent(agent))
+            .map_or_else(|| self.crew.lead().to_owned(), |agent| agent.model.clone());
+        self.screen.new_chat(&model);
+        if let Some(chat) = self.screen.new_chat_mut() {
+            chat.assay = true;
+        }
     }
 
     /// Stops the assay's runs.
@@ -1105,6 +1118,7 @@ mod tests {
                 role: None,
                 pattern: iq_agent::Pattern::Solo,
                 partner: None,
+                assay: false,
             }]
         );
         assert_eq!(board.screen().talking_to(), Some("opus"));
@@ -1335,27 +1349,33 @@ mod tests {
     }
 
     #[test]
-    fn the_judge_is_started_once_then_written_to() {
+    fn the_assays_chat_is_a_chat_on_the_model_written_to_then_written_to() {
         let mut board = Board::default();
-        board.update(Update::Assay(Box::new(crate::assay::Overview {
-            judges: vec!["claude-code/opus".into()],
-            ..crate::assay::Overview::default()
-        })));
-        assert!(board.assay().told());
+        started(&mut board, "claude-code/opus");
+        board.update(Update::Crew(Event::Joined {
+            agent: "lead".into(),
+            model: "codex".into(),
+            by: PERSON.into(),
+        }));
+        board.screen_mut().talk_to("lead");
         key(&mut board, "ctrl+l");
         assert_eq!(board.screen().page(), Some(&Page::Assay));
-        assert_eq!(
-            board.press(&Chord::plain("t"), Some('t'), 100),
-            vec![Request::Assay(AssayAsk::Talk)]
-        );
+        assert_eq!(board.press(&Chord::plain("t"), Some('t'), 100), vec![]);
         assert_eq!(board.screen().page(), None);
-        assert_eq!(board.screen().talking_to(), Some(JUDGE));
-        // Asked again before it joined, it is not started twice.
-        assert_eq!(board.talk_to_judge(), None);
-        joined(&mut board, JUDGE, PERSON);
-        board.screen_mut().talk_to("someone");
-        assert_eq!(board.talk_to_judge(), None);
-        assert_eq!(board.screen().talking_to(), Some(JUDGE));
+        assert!(
+            matches!(board.screen().talk(), Talk::New(chat) if chat.assay && chat.model == "codex")
+        );
+        write(&mut board, "test glm on every exercise");
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Start { name, model, assay: true, .. }] if name == CHAT && model == "codex"
+        ));
+        assert_eq!(board.screen().talking_to(), Some(CHAT));
+        // Once there, it is written to.
+        joined(&mut board, CHAT, PERSON);
+        board.screen_mut().talk_to("lead");
+        board.run(Command::AssayChat, 100);
+        assert_eq!(board.screen().talking_to(), Some(CHAT));
         assert_eq!(board.stop_runs(), None);
     }
 

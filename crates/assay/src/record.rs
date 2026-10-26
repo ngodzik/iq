@@ -1,5 +1,5 @@
 //! What iq keeps of one candidate's run of one exercise: who it was, how it
-//! ended, what it spent, what its checks said, and what the judges gave it.
+//! ended, what it spent, what its checks said, and what the grader gave it.
 
 use iq_core::Usd;
 use serde::{Deserialize, Serialize};
@@ -49,17 +49,35 @@ pub struct Checked {
     pub refused: Option<String>,
 }
 
-/// What a judge gave a run.
+/// What the grader gave a run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Verdict {
-    /// The judge's model.
+    /// The grader, as the settings named it: `claude-code/opus`.
     pub judge: String,
+    /// The model that answered, as precisely as its agent said:
+    /// `claude-code/claude-opus-5-5`. Grades compare only when it is the
+    /// same; empty in grades kept before it was told.
+    #[serde(default)]
+    pub model: String,
     /// From 0 to 10.
     pub score: f32,
     /// Why, in its words.
     pub notes: String,
     /// When, in seconds since 1970.
     pub at: u64,
+}
+
+impl Verdict {
+    /// Who gave it, as grades are compared by: the model that answered,
+    /// else the grader as named.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        if self.model.is_empty() {
+            &self.judge
+        } else {
+            &self.model
+        }
+    }
 }
 
 /// What a candidate spent on a run.
@@ -123,7 +141,7 @@ pub struct Record {
     pub changed: (u32, u32, u32),
     /// How its checks went, when the exercise has some.
     pub checked: Option<Checked>,
-    /// What the judges gave it.
+    /// What the grader gave it, each grader's apart.
     #[serde(default)]
     pub verdicts: Vec<Verdict>,
 }
@@ -146,7 +164,8 @@ impl Record {
         (total > 0).then(|| passed as f32 / total as f32)
     }
 
-    /// Its judges' mean score.
+    /// The mean of its grades: of one grader's, once the others are left
+    /// out, as results are summed.
     #[must_use]
     pub fn score(&self) -> Option<f32> {
         if self.verdicts.is_empty() {
@@ -155,9 +174,9 @@ impl Record {
         Some(self.verdicts.iter().map(|v| v.score).sum::<f32>() / self.verdicts.len() as f32)
     }
 
-    /// Whether `judge` graded it.
+    /// Whether the grader `key` names graded it.
     #[must_use]
-    pub fn judged_by(&self, judge: &str) -> bool {
-        self.verdicts.iter().any(|v| v.judge == judge)
+    pub fn graded_by(&self, key: &str) -> bool {
+        self.verdicts.iter().any(|v| v.key() == key)
     }
 }

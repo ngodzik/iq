@@ -319,6 +319,7 @@ mod tests {
             }),
             verdicts: vec![Verdict {
                 judge: "j".into(),
+                model: String::new(),
                 score,
                 notes: String::new(),
                 at: 0,

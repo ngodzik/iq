@@ -21,6 +21,9 @@ pub struct NewChat {
     /// The second model, for a pattern that takes one: empty for the
     /// first's.
     pub partner: String,
+    /// Whether it is the chat in the assay's folder, with the assay's
+    /// tools, rather than one in the project.
+    pub assay: bool,
 }
 
 /// Where what the person writes goes.

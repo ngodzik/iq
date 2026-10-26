@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use iq_agent::{Crew, EXEC_FLAG, Event, HOOK_FLAG, MCP_FLAG, PERSON, Report};
+use iq_agent::{Crew, EXEC_FLAG, Event, HOOK_FLAG, MCP_FLAG, Report};
 use iq_assay::{Assay, Told};
 use iq_core::{Agent, Delegate, ModelId};
 use iq_gate::{Action, Approver, Gate, HELPER_FLAG, HOLD_FLAG, Helper, Judged, Rules};
@@ -368,7 +368,7 @@ fn assay(
         store,
         runner,
         iq_assay::Settings {
-            judges: settings.assay_judges(installed, lead)?,
+            grader: settings.assay_grader(installed, lead)?,
             allowed: settings.assay_allowed(),
             reference: lead.clone(),
             parallel: settings.assay_parallel(),
@@ -402,7 +402,7 @@ fn assay(
     crew.set_autopilot(settings.autopilot);
     crew.serve(program, folder.join("run"))
         .context("opening the bridge for the assay's judge")?;
-    assay.serve(iq_assay::JUDGE);
+    assay.serve(iq_assay::CHAT);
     crew.extend(Arc::new(assay.clone()));
     Ok((assay, crew))
 }
@@ -758,8 +758,8 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let assaying = assay.clone();
     std::thread::spawn(move || {
         let _inside = handle.enter();
-        // The judge works in a crew of its own, in the assay's folder:
-        // what is asked of an agent goes to the crew it is in.
+        // The assay's chat works in a crew of its own, in the assay's
+        // folder: what is asked of an agent goes to the crew it is in.
         let judge_has = |name: &str| judging.list().iter().any(|a| a.name == name);
         for request in requests {
             match request {
@@ -770,11 +770,15 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     role,
                     pattern,
                     partner,
+                    assay,
                 } => match ModelId::new(&model) {
                     Ok(model) => {
                         let mut models = vec![model];
                         models.extend(partner.and_then(|p| ModelId::new(&p).ok()));
-                        working.launch(pattern, &name, &models, task, role);
+                        // The assay's chat works in the assay's folder, in
+                        // a crew of its own, with the assay's tools.
+                        let crew = if assay { &judging } else { &working };
+                        crew.launch(pattern, &name, &models, task, role);
                     }
                     Err(error) => tracing::warn!("no chat on `{model}`: {error}"),
                 },
@@ -817,16 +821,6 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     working.close_payers(payers.clone());
                     judging.close_payers(payers.clone());
                     assaying.close_payers(payers);
-                }
-                Request::Assay(AssayAsk::Talk) => {
-                    if !judge_has(iq_assay::JUDGE) {
-                        judging.start(
-                            iq_assay::JUDGE,
-                            assaying.judge(),
-                            assaying.opening(),
-                            PERSON,
-                        );
-                    }
                 }
                 Request::Assay(AssayAsk::Stop) => assaying.stop(),
             }
@@ -1026,7 +1020,11 @@ async fn assay_act(cli: &Cli, act: &AssayAct) -> Result<()> {
     });
     match act {
         AssayAct::Freeze { exercise } => {
-            match assay.plan_freeze(exercise).map_err(anyhow::Error::msg)? {
+            match assay
+                .plan_freeze(exercise)
+                .await
+                .map_err(anyhow::Error::msg)?
+            {
                 iq_assay::Planned::Done(said) => println!("{said}"),
                 iq_assay::Planned::Ready(plan) => {
                     if agree(&plan.action, &plan.reason)? {

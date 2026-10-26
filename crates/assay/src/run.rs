@@ -359,6 +359,25 @@ where
         Ok(record)
     }
 
+    /// Runs the exercise's checks on `work`, a folder made for it, in a
+    /// gate and a sandbox of its own: to check the checks, on the start
+    /// and on the reference.
+    pub(crate) async fn check_folder(
+        &self,
+        exercise: &Exercise,
+        work: &Path,
+    ) -> Result<Checked, AssayError> {
+        let Some(line) = &exercise.check else {
+            return Err(AssayError::NotReady(format!(
+                "{} has no check to run",
+                exercise.id
+            )));
+        };
+        let gate = (self.gate)(work).map_err(AssayError::NotReady)?;
+        let limit = Duration::from_secs(exercise.minutes * 60);
+        self.check(exercise, &gate, work, line, limit).await
+    }
+
     /// Puts the hidden checks in `work` and runs `line` there, in the
     /// sandbox. The person approved this line with the run, so what the
     /// gate asks of it is theirs, as long as it stays within the sandbox.

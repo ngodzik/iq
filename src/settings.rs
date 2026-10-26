@@ -25,7 +25,7 @@
 //! codex_week = 70
 //!
 //! [assay]                                # agents tried on the same exercises; Ctrl-L
-//! judges = ["claude-code/opus", "codex"] # the first talks with you, all grade; subscriptions first
+//! grader = "claude-code/opus"            # grades every run, always the same so that grades compare
 //! candidates = ["models"]                # "models", "harnesses", "teams", or names; all when unset
 //! folder = "~/.local/share/iq/assay"     # its exercises and results, plain files
 //! parallel = 2                           # runs at once
@@ -174,6 +174,9 @@ struct McpFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AssayFile {
+    /// Who grades every run, always the same so that grades compare.
+    grader: Option<String>,
+    /// Kept from before there was one grader: the first is it.
     judges: Option<Vec<String>>,
     candidates: Option<Vec<String>>,
     folder: Option<String>,
@@ -289,26 +292,24 @@ impl Settings {
         }
     }
 
-    /// The assay's judges: as set, else those a subscription pays for,
-    /// as they cost less, the strongest of each, else the lead.
-    pub(crate) fn assay_judges(&self, installed: &[Agent], lead: &ModelId) -> Result<Vec<ModelId>> {
-        if let Some(judges) = self.assay.judges.as_ref().filter(|j| !j.is_empty()) {
-            return judges
-                .iter()
-                .map(|j| Ok(ModelId::new(j.as_str())?))
-                .collect();
+    /// Who grades the assay's runs: as set, else the strongest model a
+    /// subscription pays for, as it costs less, else the lead. Always the
+    /// same, so that grades compare.
+    pub(crate) fn assay_grader(&self, installed: &[Agent], lead: &ModelId) -> Result<ModelId> {
+        let named = self.assay.grader.clone().or_else(|| {
+            self.assay
+                .judges
+                .as_ref()
+                .and_then(|judges| judges.first().cloned())
+        });
+        if let Some(grader) = named.filter(|g| !g.trim().is_empty()) {
+            return Ok(ModelId::new(grader.trim())?);
         }
-        let mut judges: Vec<ModelId> = installed
-            .iter()
-            .map(|agent| match agent {
-                Agent::ClaudeCode => ModelId::new("claude-code/opus"),
-                Agent::Codex => Ok(ModelId::agent(Agent::Codex)),
-            })
-            .collect::<Result<_, _>>()?;
-        if judges.is_empty() {
-            judges.push(lead.clone());
-        }
-        Ok(judges)
+        Ok(match installed.first() {
+            Some(Agent::ClaudeCode) => ModelId::new("claude-code/opus")?,
+            Some(Agent::Codex) => ModelId::agent(Agent::Codex),
+            None => lead.clone(),
+        })
     }
 
     /// Which candidates the assay may test.
@@ -493,26 +494,24 @@ mod tests {
     }
 
     #[test]
-    fn the_assay_judges_with_subscriptions_first() {
+    fn the_assay_is_graded_by_one_grader_a_subscriptions_first() {
         let lead = ModelId::new("anthropic/claude-sonnet-4-5").unwrap();
         let unset = Settings::default();
-        let judges = |s: &Settings, installed: &[Agent]| -> Vec<String> {
-            s.assay_judges(installed, &lead)
-                .unwrap()
-                .iter()
-                .map(ToString::to_string)
-                .collect()
+        let grader = |s: &Settings, installed: &[Agent]| -> String {
+            s.assay_grader(installed, &lead).unwrap().to_string()
         };
         assert_eq!(
-            judges(&unset, &[Agent::ClaudeCode, Agent::Codex]),
-            ["claude-code/opus", "codex"]
+            grader(&unset, &[Agent::ClaudeCode, Agent::Codex]),
+            "claude-code/opus"
         );
-        assert_eq!(judges(&unset, &[]), ["anthropic/claude-sonnet-4-5"]);
+        assert_eq!(grader(&unset, &[]), "anthropic/claude-sonnet-4-5");
         let set: Settings = toml::from_str(
-            "[assay]\njudges = [\"codex\"]\ncandidates = [\"models\"]\nfolder = \"~/lab\"\nparallel = 40",
+            "[assay]\ngrader = \"codex\"\ncandidates = [\"models\"]\nfolder = \"~/lab\"\nparallel = 40",
         )
         .unwrap();
-        assert_eq!(judges(&set, &[Agent::ClaudeCode]), ["codex"]);
+        assert_eq!(grader(&set, &[Agent::ClaudeCode]), "codex");
+        let before: Settings = toml::from_str("[assay]\njudges = [\"codex\", \"x/y\"]").unwrap();
+        assert_eq!(grader(&before, &[Agent::ClaudeCode]), "codex");
         assert_eq!(set.assay_folder(Path::new("/h")), PathBuf::from("/h/lab"));
         assert_eq!(set.assay_parallel(), 8);
         assert!(set.assay_allowed().allows(iq_assay::Kind::Model, "a/b"));

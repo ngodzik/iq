@@ -221,7 +221,11 @@ impl Live<'_> {
         let p = self.p;
         let assay = self.board.assay();
         let running = assay.running();
-        let grader = assay.overview().judges.join(", ");
+        let grader = assay
+            .overview()
+            .graded_by
+            .clone()
+            .unwrap_or_else(|| assay.grader().to_owned());
         let mut lines: Vec<Line<'static>> = Vec::new();
         for run in running.iter().take(WORKING) {
             let (mark, said, tint) = match run.phase {
@@ -397,7 +401,14 @@ impl Live<'_> {
                     .to_owned();
                 (
                     Line::from(vec![
-                        Span::styled(" new chat", p.bold(p.accent)),
+                        Span::styled(
+                            if chat.assay {
+                                " new chat in the assay"
+                            } else {
+                                " new chat"
+                            },
+                            p.bold(p.accent),
+                        ),
                         Span::styled(said, p.fg(p.faint)),
                     ]),
                     Line::default(),
@@ -772,7 +783,7 @@ mod tests {
         assert!(status.ends_with("you ● lead"));
         // A run of the assay at work says who and what, and who grades it.
         board.update(Update::Assay(Box::new(iq_ui::assay::Overview {
-            judges: vec!["claude-code/opus".into()],
+            grader: "claude-code/opus".into(),
             ..iq_ui::assay::Overview::default()
         })));
         let run = |phase| iq_ui::assay::Progress {

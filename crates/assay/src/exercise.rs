@@ -1,4 +1,4 @@
-//! An exercise: a folder the judge writes with the person, frozen once
+//! An exercise: a folder an agent writes with the person, frozen once
 //! they agree on it, so that every candidate, now or in a month, is given
 //! exactly the same.
 //!
@@ -6,10 +6,12 @@
 //! exercises/<id>/
 //!   exercise.toml   its title, kinds of task, the command that checks it, its limits
 //!   task.md         what every candidate is told, word for word
-//!   rubric.md       what the judges grade beyond the checks
+//!   rubric.md       what the grader grades beyond the checks
 //!   start/          the files a candidate starts from
 //!   checks/         hidden tests, put in only once the candidate is done
-//!   frozen.json     its versions, each with the digest of the above
+//!   reference/      a solution that passes them, laid over start/: never given
+//!   frozen.json     its versions, each with the digest of the above but the reference
+//!   reference.json  how the checks went on the reference, as it was frozen
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -21,9 +23,9 @@ use crate::error::AssayError;
 /// The most a candidate may work on an exercise, in minutes.
 pub const MOST_MINUTES: u64 = 120;
 
-/// What a version's digest covers: all a candidate and its judges are
-/// given. Notes the judge keeps beside them, such as the commit an
-/// exercise came from, are not.
+/// What a version's digest covers: all a candidate and its grader are
+/// given. The reference is not: it only checks the checks, and a better
+/// one changes no candidate's results.
 pub(crate) const FROZEN_PARTS: &[&str] =
     &["exercise.toml", "task.md", "rubric.md", "start", "checks"];
 
@@ -153,7 +155,7 @@ impl Exercise {
         std::fs::read_to_string(&file).map_err(AssayError::io(file))
     }
 
-    /// What the judges grade beyond the checks, empty when not written.
+    /// What the grader grades beyond the checks, empty when not written.
     #[must_use]
     pub fn rubric(&self) -> String {
         std::fs::read_to_string(self.folder.join("rubric.md")).unwrap_or_default()
@@ -169,6 +171,17 @@ impl Exercise {
     #[must_use]
     pub fn checks(&self) -> PathBuf {
         self.folder.join("checks")
+    }
+
+    /// A solution that passes the checks, laid over the start, when the
+    /// exercise has one: `reference/`, or `judge/reference/` as an assay
+    /// graded by hand kept it.
+    #[must_use]
+    pub fn reference(&self) -> Option<PathBuf> {
+        ["reference", "judge/reference"]
+            .iter()
+            .map(|at| self.folder.join(at))
+            .find(|folder| folder.is_dir())
     }
 
     /// What keeps it from being frozen, none when it may be.

@@ -11,7 +11,6 @@ use std::time::Instant;
 use iq_agent::{Event, PERSON};
 use iq_core::{TokenCount, Usd};
 use iq_ui::Board;
-use iq_ui::assay::JUDGE;
 use ratatui::text::{Line, Span};
 
 use crate::markdown::{Markdown, Styled, inline};
@@ -163,9 +162,7 @@ impl History {
                     return;
                 }
                 let by = board.crew().agent(agent).map(|a| a.by.as_str());
-                // The judge opens on what iq tells it, not on the person's
-                // words.
-                if (by == Some(PERSON) || by.is_none()) && agent != JUDGE {
+                if by == Some(PERSON) || by.is_none() {
                     self.person(prompt, agent, board, p);
                 } else {
                     self.header(agent, board, p);

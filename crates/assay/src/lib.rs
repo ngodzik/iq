@@ -1,15 +1,16 @@
 //! The assay: the same frozen exercises given to agents, each in a folder
 //! of its own, checked by hidden tests a deterministic command runs, then
-//! graded blind by judges; summed by iq into what each candidate does and
-//! costs, to find, for each kind of task, the cheapest agent that does it
-//! as well as the person's lead.
+//! graded blind by one grader, always the same so that grades compare;
+//! summed by iq into what each candidate does and costs, to find, for each
+//! kind of task, the cheapest agent that does it as well as the person's
+//! lead.
 //!
-//! A judge, one of the strongest models (a subscription's, as it costs
-//! less), talks with the person through the crew: it proposes the kinds of
-//! task and the exercises, writes them in the store, and asks for runs
-//! through its tools, which ask the person, with what they should cost,
-//! before anything is spent. The store's files are the reference: plain
-//! files, which a copy elsewhere is made from.
+//! The person works on it in a chat like any other, in the assay's
+//! folder, whose agent has the assay's tools: it writes exercises, and
+//! asks for freezes and runs, which ask the person, with what they should
+//! cost, before anything is spent. A freeze runs the check first, which
+//! must fail on the start and pass on the reference. The store's files are
+//! the reference: plain files, which a copy elsewhere is made from.
 //!
 //! The assay knows no provider: it is generic over [`iq_core::ChatModel`]
 //! and [`iq_core::Delegate`], and its candidates are any of them.
@@ -33,7 +34,7 @@ mod store;
 mod tally;
 mod tree;
 
-pub use assay::{Assay, JUDGE, Overview, Plan, Planned, RunPlan, Settings, Summary, Told};
+pub use assay::{Assay, CHAT, Overview, Plan, Planned, RunPlan, Settings, Summary, Told};
 pub use candidate::{Candidate, Kind};
 pub use error::AssayError;
 pub use estimate::{Guess, guess};

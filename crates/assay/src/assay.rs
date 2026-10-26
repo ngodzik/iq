@@ -1,6 +1,7 @@
-//! The assay as iq runs it: the judge's tools, the batches of runs they
-//! start once the person approves, the judging that follows, and what the
-//! window shows of it all.
+//! The assay as iq runs it: the tools of the chat the person opens in its
+//! folder, the batches of runs they start once the person approves, the
+//! grading that follows, by one grader whose grades alone are compared,
+//! and what the terminal shows of it all.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,18 +17,23 @@ use crate::error::AssayError;
 use crate::estimate;
 use crate::exercise::{Exercise, State, error_text, valid_id};
 use crate::judge;
-use crate::record::{Record, Verdict};
+use crate::record::{Checked, Record, Verdict};
 use crate::report::{self, Row, Table};
 use crate::roster::{Allowed, Roster};
 use crate::run::{Around, Order, Phase, Progress, Runner, lock};
 use crate::store::{Store, batch_name};
 
-/// The judge's name on the board, the agent the person talks with.
-pub const JUDGE: &str = "assay";
+/// The name of the chat in the assay's folder, on the board: the agent the
+/// person works on the assay with, which has its tools.
+pub const CHAT: &str = "assay";
 
-/// Who writes to the judge when its runs are done: not the judge's own
+/// Who writes to the chat when its runs are done: not the chat's own
 /// name, which it does not read messages from.
 const WRITER: &str = "results";
+
+/// Below this grade of the reference, the grader is said to be doubtful:
+/// it changed, or the rubric asks what the reference does not do.
+const REFERENCE_LEAST: f32 = 8.0;
 
 /// The most times a candidate runs in one batch.
 const MOST_TIMES: u64 = 3;
@@ -38,25 +44,25 @@ const MOST_CANDIDATES: usize = 12;
 /// The most files of a commit's folder made into an exercise.
 const MOST_FILES: usize = 20_000;
 
-/// What a judge reads of a run, in tokens at a guess, for the cost told
-/// before judging.
+/// What the grader reads of a run, in tokens at a guess, for the cost told
+/// before grading.
 const READ_PER_RUN: u64 = 6_000;
 
 /// The assay's settings.
 #[derive(Debug, Clone)]
 pub struct Settings {
-    /// Who judges: the first talks with the person, all grade.
-    pub judges: Vec<ModelId>,
+    /// Who grades every run, the same for all so that grades compare.
+    pub grader: ModelId,
     /// Which candidates may be tested.
     pub allowed: Allowed,
     /// The reference: the person's lead.
     pub reference: ModelId,
     /// How many runs go at once.
     pub parallel: usize,
-    /// Where a copy of the store is kept, as the judge is told: a server
+    /// Where a copy of the store is kept, as the chat is told: a server
     /// and where in it.
     pub mirrors: Vec<String>,
-    /// The MCP servers the copies are made through, handed to the judge
+    /// The MCP servers the copies are made through, handed to the chat
     /// when it is Claude Code, which takes them.
     pub servers: Vec<iq_core::McpServer>,
     /// The journal of iq's tasks, for what each category of work spent.
@@ -77,6 +83,54 @@ pub enum Told {
     Store,
     /// The runs at work.
     Running(Vec<Progress>),
+}
+
+/// Where a batch keeps what the grader gave the exercise's reference.
+const REFERENCE_FILE: &str = "reference.json";
+
+/// What the grader gave an exercise's reference in one batch, graded
+/// blind beside the runs.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ReferenceGrades {
+    /// Its letter in the batch.
+    label: String,
+    /// Each grader's grade.
+    verdicts: Vec<Verdict>,
+}
+
+/// `records` with only the grades the grader `key` names gave: grades by
+/// another model do not compare with them.
+fn graded(mut records: Vec<Record>, key: &str) -> Vec<Record> {
+    for record in &mut records {
+        record.verdicts.retain(|v| v.key() == key);
+    }
+    records
+}
+
+/// The reference's changes to exercise's start, as a unified diff, as
+/// the grader reads a run's: the start laid with the reference in a
+/// folder made for it under `root`.
+fn reference_patch(
+    exercise: &Exercise,
+    reference: &Path,
+    root: &Path,
+) -> Result<String, AssayError> {
+    let folder = root
+        .join("judging")
+        .join(format!("{}-reference", exercise.id));
+    let _ = std::fs::remove_dir_all(&folder);
+    crate::tree::copy(&exercise.start(), &folder)?;
+    crate::tree::copy(reference, &folder)?;
+    let changed = crate::tree::compare(&exercise.start(), &folder);
+    let _ = std::fs::remove_dir_all(&folder);
+    Ok(changed?.patch())
+}
+
+/// How the checks went on exercise's reference as it was frozen.
+fn reference_checked(exercise: &Exercise) -> Option<Checked> {
+    std::fs::read_to_string(exercise.folder.join(REFERENCE_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
 }
 
 /// What an action of the assay will do, for the person to agree to.
@@ -133,7 +187,7 @@ struct Inner<M, D> {
     runner: Runner<M, D>,
     settings: Settings,
     roster: Mutex<Roster>,
-    /// The agents whose judge it is.
+    /// The agents it gives its tools to.
     served: Mutex<Vec<String>>,
     running: Mutex<Vec<Progress>>,
     active: Mutex<Vec<(String, Crew<M, D>)>>,
@@ -144,7 +198,7 @@ struct Inner<M, D> {
     told: Arc<dyn Fn(Told) + Send + Sync>,
 }
 
-/// An exercise, as the window lists it.
+/// An exercise, as the terminal lists it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Summary {
     /// Its name.
@@ -159,15 +213,21 @@ pub struct Summary {
     pub runs: usize,
     /// What keeps it from being frozen.
     pub problems: Vec<String>,
+    /// What the grader gave its reference solution lately, when it graded
+    /// it beside the runs.
+    pub reference_grade: Option<f32>,
 }
 
-/// The assay as the window shows it.
+/// The assay as the terminal shows it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Overview {
     /// The store's folder.
     pub folder: PathBuf,
-    /// Who judges.
-    pub judges: Vec<String>,
+    /// Who grades, as the settings name it.
+    pub grader: String,
+    /// The model that answered as the grader lately, whose grades are the
+    /// ones compared, when it graded once.
+    pub graded_by: Option<String>,
     /// The reference.
     pub reference: String,
     /// Which candidates may be tested, in words.
@@ -229,14 +289,10 @@ where
         &self.inner.settings
     }
 
-    /// The judge the person talks with: the first of the settings'.
+    /// Who grades every run.
     #[must_use]
-    pub fn judge(&self) -> &ModelId {
-        self.inner
-            .settings
-            .judges
-            .first()
-            .unwrap_or(&self.inner.settings.reference)
+    pub fn grader(&self) -> &ModelId {
+        &self.inner.settings.grader
     }
 
     /// Who may be tested, as the program read it.
@@ -244,7 +300,7 @@ where
         *lock(&self.inner.roster) = roster;
     }
 
-    /// Serves `agent` as the assay's judge: it gets the assay's tools.
+    /// Gives `agent` the assay's tools.
     pub fn serve(&self, agent: &str) {
         let mut served = lock(&self.inner.served);
         if !served.iter().any(|a| a == agent) {
@@ -254,21 +310,6 @@ where
 
     fn serves(&self, agent: &str) -> bool {
         lock(&self.inner.served).iter().any(|a| a == agent)
-    }
-
-    /// Whether the judge the person talks with takes MCP servers beside
-    /// iq's: Claude Code does.
-    fn takes_servers(&self) -> bool {
-        matches!(
-            self.judge().delegate(),
-            Some((iq_core::Agent::ClaudeCode, _))
-        )
-    }
-
-    /// What the judge is given as the person opens the assay.
-    #[must_use]
-    pub fn opening(&self) -> String {
-        crate::prompt::OPENING.to_owned()
     }
 
     /// Closes the payers named, as the person's limits say: no run starts
@@ -297,13 +338,16 @@ where
         lock(&self.inner.running).clone()
     }
 
-    /// The assay as the window shows it, read from the store.
+    /// The assay as the terminal shows it, read from the store, each run's
+    /// grade the grader's alone.
     #[must_use]
     pub fn overview(&self) -> Overview {
         let settings = &self.inner.settings;
+        let key = self.grader_key();
         let mut overview = Overview {
             folder: self.inner.store.root().to_path_buf(),
-            judges: settings.judges.iter().map(ToString::to_string).collect(),
+            grader: settings.grader.to_string(),
+            graded_by: (key != settings.grader.as_str()).then(|| key.clone()),
             reference: settings.reference.to_string(),
             allowed: settings.allowed.said(),
             notices: settings.notices.clone(),
@@ -319,13 +363,21 @@ where
         let with_records: Vec<(Exercise, Vec<Record>)> = exercises
             .into_iter()
             .map(|exercise| {
-                let records = self.inner.store.records(&exercise.id);
+                let records = graded(self.inner.store.records(&exercise.id), &key);
                 (exercise, records)
             })
             .collect();
         let reference = self.reference_key();
         let mut categories: Vec<String> = Vec::new();
         for (exercise, records) in &with_records {
+            let reference_grade = self.reference_grade(&exercise.id, &key);
+            if let Some(grade) = reference_grade.filter(|g| *g < REFERENCE_LEAST) {
+                overview.notices.push(format!(
+                    "The grader gave {}'s reference only {grade:.1}: it may have changed, or \
+                     the rubric asks what the reference does not do",
+                    exercise.id
+                ));
+            }
             overview.exercises.push(Summary {
                 id: exercise.id.clone(),
                 title: exercise.title.clone(),
@@ -333,6 +385,7 @@ where
                 categories: exercise.categories.clone(),
                 runs: records.len(),
                 problems: exercise.problems(),
+                reference_grade,
             });
             if !records.is_empty() {
                 overview.tables.push(report::table(exercise, records));
@@ -352,6 +405,51 @@ where
             overview.categories.push((category, rows, fit));
         }
         overview
+    }
+
+    /// Whose grades are compared: the model that answered as the grader
+    /// last, across the store, else the grader as the settings name it.
+    /// Grades by another model are kept apart, never mixed with these.
+    fn grader_key(&self) -> String {
+        let named = self.inner.settings.grader.as_str();
+        let mut latest: Option<(u64, String)> = None;
+        let mut consider = |verdict: &Verdict| {
+            if verdict.judge == named && latest.as_ref().is_none_or(|(at, _)| verdict.at > *at) {
+                latest = Some((verdict.at, verdict.key().to_owned()));
+            }
+        };
+        for exercise in self.inner.store.exercises().unwrap_or_default() {
+            for record in self.inner.store.records(&exercise.id) {
+                record.verdicts.iter().for_each(&mut consider);
+            }
+            for batch in self.reference_grades(&exercise.id) {
+                batch.verdicts.iter().for_each(&mut consider);
+            }
+        }
+        latest.map_or_else(|| named.to_owned(), |(_, key)| key)
+    }
+
+    /// The grades of exercise `id`'s reference, batch by batch.
+    fn reference_grades(&self, id: &str) -> Vec<ReferenceGrades> {
+        let folder = self.inner.store.root().join("runs").join(id);
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| std::fs::read_to_string(entry.path().join(REFERENCE_FILE)).ok())
+            .filter_map(|text| serde_json::from_str(&text).ok())
+            .collect()
+    }
+
+    /// What the grader `key` names gave exercise `id`'s reference last.
+    fn reference_grade(&self, id: &str, key: &str) -> Option<f32> {
+        self.reference_grades(id)
+            .iter()
+            .flat_map(|batch| batch.verdicts.iter())
+            .filter(|v| v.key() == key)
+            .max_by_key(|v| v.at)
+            .map(|v| v.score)
     }
 
     /// The reference's name as its grades are kept.
@@ -390,14 +488,9 @@ where
         let search = args["search"].as_str().unwrap_or("").to_lowercase();
         let limit = args["limit"].as_u64().unwrap_or(40).clamp(1, 200) as usize;
         let mut out = format!(
-            "The reference: {}. Judges: {}. The settings allow: {}.\n",
+            "The reference: {}. The grader: {}. The settings allow: {}.\n",
             settings.reference,
-            settings
-                .judges
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
+            settings.grader,
             settings.allowed.said()
         );
         out.push_str(&format!(
@@ -517,12 +610,46 @@ where
         Ok(out)
     }
 
+    /// Exercise `id`'s records, each with the grader's grades alone.
+    fn graded_records(&self, id: &str) -> Vec<Record> {
+        graded(self.inner.store.records(id), &self.grader_key())
+    }
+
+    /// What the grades below are, and the runs they leave out.
+    fn grades_said(&self) -> String {
+        let key = self.grader_key();
+        let mut apart = 0;
+        for exercise in self.inner.store.exercises().unwrap_or_default() {
+            apart += self
+                .inner
+                .store
+                .records(&exercise.id)
+                .iter()
+                .filter(|r| !r.verdicts.is_empty() && !r.graded_by(&key))
+                .count();
+        }
+        let mut said = format!("Scores are {key}'s grades.");
+        if apart > 0 {
+            said.push_str(&format!(
+                " {apart} run{} graded by another model only: their scores are left out, as they \
+                 do not compare; grade them again with assay_grade to weigh them.",
+                if apart == 1 { " is" } else { "s are" }
+            ));
+        }
+        said
+    }
+
     fn results(&self, args: &Value) -> Result<String, AssayError> {
+        let said = self.grades_said();
+        self.results_of(args).map(|out| format!("{said}\n\n{out}"))
+    }
+
+    fn results_of(&self, args: &Value) -> Result<String, AssayError> {
         if let Some(id) = args["exercise"].as_str().filter(|s| !s.is_empty()) {
             let exercise = self.inner.store.exercise(id)?;
-            let mut table = report::table(&exercise, &self.inner.store.records(id));
+            let mut table = report::table(&exercise, &self.graded_records(id));
             if args["providers"].as_bool().unwrap_or(false) {
-                let records = self.inner.store.records(id);
+                let records = self.graded_records(id);
                 let kept: Vec<&Record> = records
                     .iter()
                     .filter(|r| Some(r.version) == table.version)
@@ -545,7 +672,7 @@ where
             .exercises()?
             .into_iter()
             .map(|e| {
-                let records = self.inner.store.records(&e.id);
+                let records = self.graded_records(&e.id);
                 (e, records)
             })
             .collect();
@@ -578,7 +705,7 @@ where
 
     async fn freeze(&self, crew: &Crew<M, D>, agent: &str, args: &Value) -> Result<String, String> {
         let id = text(args, "exercise")?;
-        let plan = match self.plan_freeze(id)? {
+        let plan = match self.plan_freeze(id).await? {
             Planned::Ready(plan) => plan,
             Planned::Done(said) => return Ok(said),
         };
@@ -596,8 +723,10 @@ where
     ///
     /// # Errors
     ///
-    /// The exercise cannot be read, or is not ready to be frozen.
-    pub fn plan_freeze(&self, id: &str) -> Result<Planned, String> {
+    /// The exercise cannot be read, is not ready to be frozen, or its
+    /// checks do not hold: they pass on the start, fail on the reference,
+    /// or cannot run in the sandbox.
+    pub async fn plan_freeze(&self, id: &str) -> Result<Planned, String> {
         let exercise = self.inner.store.exercise(id).map_err(|e| error_text(&e))?;
         let problems = exercise.problems();
         if !problems.is_empty() {
@@ -612,11 +741,12 @@ where
             )));
         }
         let next = exercise.versions.last().map_or(1, |v| v.version + 1);
+        let checked = self.check_checks(&exercise).await?;
         // The terminal reads it after "held because".
         let reason = format!(
             "freezing it is for good: every candidate will be told task.md as it is now, start \
              from start/, {} within {} min{}; changed later, it becomes a new version whose \
-             results start anew",
+             results start anew. {checked}",
             exercise
                 .check
                 .as_deref()
@@ -634,6 +764,87 @@ where
             exercise.title
         );
         Ok(Planned::Ready(Plan { action, reason }))
+    }
+
+    /// Runs exercise's check in the sandbox on its start, where it must
+    /// fail, and on its reference laid over the start, where it must pass:
+    /// checks that pass on the start test nothing a candidate has to do,
+    /// and checks the reference fails expect what they should not. What
+    /// the reference's checks said is kept beside the exercise, for the
+    /// grader to read with the reference. Says how it went.
+    async fn check_checks(&self, exercise: &Exercise) -> Result<String, String> {
+        if exercise.check.is_none() {
+            return Ok("It has no check: the grader alone judges it.".into());
+        }
+        let scratch = self.inner.store.root().join("checking").join(format!(
+            "{}-{}",
+            exercise.id,
+            crate::now()
+        ));
+        let checked = self.check_both(exercise, &scratch).await;
+        let _ = std::fs::remove_dir_all(&scratch);
+        checked
+    }
+
+    async fn check_both(&self, exercise: &Exercise, scratch: &Path) -> Result<String, String> {
+        let runner = &self.inner.runner;
+        let on = |name: &str| scratch.join(name);
+        let made = |folder: &Path, over: Option<&Path>| -> Result<(), String> {
+            crate::tree::copy(&exercise.start(), folder).map_err(|e| error_text(&e))?;
+            if let Some(over) = over {
+                crate::tree::copy(over, folder).map_err(|e| error_text(&e))?;
+            }
+            Ok(())
+        };
+        let start = on("start");
+        made(&start, None)?;
+        let first = runner
+            .check_folder(exercise, &start)
+            .await
+            .map_err(|e| error_text(&e))?;
+        if let Some(why) = &first.refused {
+            return Err(format!("its check cannot run in the sandbox: {why}"));
+        }
+        if first.passed {
+            return Err(format!(
+                "its check passes on start/ already: it tests nothing a candidate has to do. It ends:\n{}",
+                crate::run::tail(first.output.trim(), 1_500)
+            ));
+        }
+        let Some(reference) = exercise.reference() else {
+            return Ok(
+                "Its check fails on start/, in the sandbox; with no reference/, nothing shows it can pass."
+                    .into(),
+            );
+        };
+        let solved = on("reference");
+        made(&solved, Some(&reference))?;
+        let second = runner
+            .check_folder(exercise, &solved)
+            .await
+            .map_err(|e| error_text(&e))?;
+        if let Some(why) = &second.refused {
+            return Err(format!(
+                "its check cannot run on the reference in the sandbox: {why}"
+            ));
+        }
+        if !second.passed {
+            return Err(format!(
+                "its check fails on the reference: the tests or the reference are wrong. It ends:\n{}",
+                crate::run::tail(second.output.trim(), 1_500)
+            ));
+        }
+        let file = exercise.folder.join(REFERENCE_FILE);
+        if let Ok(text) = serde_json::to_string_pretty(&second) {
+            let _ = std::fs::write(&file, text + "\n");
+        }
+        let tally = second
+            .tally
+            .map(|(passed, total)| format!(", {passed} of {total} tests"))
+            .unwrap_or_default();
+        Ok(format!(
+            "Its check fails on start/ and passes on the reference{tally}, in the sandbox."
+        ))
     }
 
     /// Freezes exercise `id`, which the person agreed to.
@@ -697,24 +908,20 @@ where
         Ok(candidates)
     }
 
-    /// The judges' cost for `runs` runs, in words.
-    fn judging_said(&self, runs: usize) -> String {
+    /// The grader's cost for `runs` runs, in words.
+    fn grading_said(&self, runs: usize) -> String {
         let roster = lock(&self.inner.roster).clone();
         let read = READ_PER_RUN * runs as u64;
-        let mut dollars = 0.0;
-        let mut tokens = 0;
-        for judge in &self.inner.settings.judges {
-            let prices = if judge.delegate().is_some() {
-                None
-            } else {
-                roster
-                    .offer(judge.as_str())
-                    .and_then(|o| Some((o.input?, o.output?)))
-            };
-            let (billed, subscription) = estimate::judging(read, runs, prices);
-            dollars += billed.map_or(0.0, |b| b.0);
-            tokens += subscription;
-        }
+        let grader = &self.inner.settings.grader;
+        let prices = if grader.delegate().is_some() {
+            None
+        } else {
+            roster
+                .offer(grader.as_str())
+                .and_then(|o| Some((o.input?, o.output?)))
+        };
+        let (billed, tokens) = estimate::judging(read, runs, prices);
+        let dollars = billed.map_or(0.0, |b| b.0);
         let mut parts = Vec::new();
         if dollars > 0.0 {
             parts.push(format!("about {} billed", iq_core::Usd(dollars)));
@@ -756,7 +963,7 @@ where
             let _ = crew.deliver(WRITER, &agent, summary);
         });
         Ok(format!(
-            "Started: {runs} run{}, {} at a time. Their results come to you as a message from {WRITER} once they are judged; meanwhile, talk with the person.",
+            "Started: {runs} run{}, {} at a time. Their results come to you as a message from {WRITER} once they are graded; meanwhile, talk with the person.",
             if runs == 1 { "" } else { "s" },
             self.inner.settings.parallel.max(1)
         ))
@@ -802,11 +1009,11 @@ where
         let names: Vec<String> = candidates.iter().map(ToString::to_string).collect();
         // The terminal reads it after "held because".
         let reason = format!(
-            "it spends {}, and the judges ({}) {}: {} run{} of {id} version {version} ({}), {}{}, \
+            "it spends {}, and the grader ({}) {}: {} run{} of {id} version {version} ({}), {}{}, \
              each in a folder of its own for up to {} min{}, then {}",
             estimate::said(&guesses, times),
-            names_of(&self.inner.settings.judges),
-            self.judging_said(runs),
+            self.inner.settings.grader,
+            self.grading_said(runs),
             runs,
             if runs == 1 { "" } else { "s" },
             exercise.title,
@@ -842,7 +1049,7 @@ where
     }
 
     /// Runs what `plan` says, which the person agreed to, and says how it
-    /// went once every run is checked and judged.
+    /// went once every run is checked and graded.
     pub async fn run_now(&self, plan: RunPlan) -> String {
         self.inner.batches.fetch_add(1, Ordering::SeqCst);
         let summary = self
@@ -854,7 +1061,7 @@ where
         summary
     }
 
-    /// Runs `candidates` on exercise `id`, `times` each, judges them, and
+    /// Runs `candidates` on exercise `id`, `times` each, grades them, and
     /// says how it went.
     async fn batch(&self, id: &str, candidates: &[Candidate], times: usize) -> String {
         let exercise = match self.inner.store.exercise(id) {
@@ -871,7 +1078,9 @@ where
             .iter()
             .flat_map(|c| std::iter::repeat_n(c, times))
             .collect();
-        let labels = judge::labels(orders.len(), &format!("{batch}{}", exercise.digest));
+        // One letter more than runs for the reference, graded among them.
+        let extra = usize::from(exercise.reference().is_some());
+        let labels = judge::labels(orders.len() + extra, &format!("{batch}{}", exercise.digest));
         {
             let mut running = lock(&self.inner.running);
             for (candidate, label) in orders.iter().zip(&labels) {
@@ -950,7 +1159,7 @@ where
             };
             let score = record
                 .score()
-                .map_or("not judged".to_owned(), |s| format!("score {s:.1}"));
+                .map_or("not graded".to_owned(), |s| format!("score {s:.1}"));
             let billed = if record.spent.billed.0 > 0.0 {
                 format!("{} billed, ", record.spent.billed)
             } else {
@@ -965,13 +1174,13 @@ where
                 record.seconds
             ));
             for verdict in &record.verdicts {
-                out.push_str(&format!("  - {}: {}\n", verdict.judge, verdict.notes));
+                out.push_str(&format!("  - {}: {}\n", verdict.key(), verdict.notes));
             }
         }
         for failure in &failures {
             out.push_str(&format!("- {failure}\n"));
         }
-        let all = self.inner.store.records(id);
+        let all = self.graded_records(id);
         let table = report::table(&exercise, &all);
         out.push_str(&format!(
             "\nAll runs of version {}:\n{}",
@@ -1041,20 +1250,20 @@ where
         self.show_running();
     }
 
-    /// Has every judge grade `records`, the runs of one batch, blind, and
-    /// keeps their verdicts. Returns what went wrong.
+    /// Has the grader grade `records`, the runs of one batch, blind, the
+    /// exercise's reference among them when it has one, and keeps its
+    /// grades. Returns what went wrong.
     async fn grade(&self, exercise: &Exercise, records: &mut [Record]) -> Vec<String> {
-        self.grade_by(exercise, records, &self.inner.settings.judges.clone())
-            .await
-    }
-
-    async fn grade_by(
-        &self,
-        exercise: &Exercise,
-        records: &mut [Record],
-        judges: &[ModelId],
-    ) -> Vec<String> {
-        let mut notes = Vec::new();
+        let grader = self.inner.settings.grader.clone();
+        if grader.delegate().is_none()
+            && lock(&self.inner.closed)
+                .iter()
+                .any(|p| p == iq_agent::PROVIDER)
+        {
+            return vec![format!(
+                "{grader} did not grade: the provider's limit is reached"
+            )];
+        }
         let task = match exercise.task() {
             Ok(task) => task,
             Err(error) => {
@@ -1064,14 +1273,7 @@ where
                 )];
             }
         };
-        // Its folder holds the work and nothing that names who did it.
         let batch = records.first().map(|r| r.batch.clone()).unwrap_or_default();
-        let blind = self
-            .inner
-            .store
-            .root()
-            .join("judging")
-            .join(format!("{}-{batch}", exercise.id));
         let patches: Vec<String> = records
             .iter()
             .map(|record| {
@@ -1084,50 +1286,101 @@ where
                 .unwrap_or_default()
             })
             .collect();
+        // The reference, under the batch's letter no run took.
+        let reference = match exercise.reference() {
+            Some(folder) => {
+                let taken: Vec<&str> = records.iter().map(|r| r.label.as_str()).collect();
+                let label =
+                    judge::labels(records.len() + 1, &format!("{batch}{}", exercise.digest))
+                        .into_iter()
+                        .find(|l| !taken.contains(&l.as_str()));
+                let patch = reference_patch(exercise, &folder, self.inner.store.root());
+                let checked = reference_checked(exercise);
+                label
+                    .zip(patch.ok())
+                    .map(|(label, patch)| (label, patch, checked))
+            }
+            None => None,
+        };
+        // Its folder holds the work and nothing that names who did it.
+        let blind = self
+            .inner
+            .store
+            .root()
+            .join("judging")
+            .join(format!("{}-{batch}", exercise.id));
         if std::fs::create_dir_all(&blind).is_ok() {
             for (record, patch) in records.iter().zip(&patches) {
                 let _ = std::fs::write(blind.join(format!("{}.diff", record.label)), patch);
             }
+            if let Some((label, patch, _)) = &reference {
+                let _ = std::fs::write(blind.join(format!("{label}.diff")), patch);
+            }
         }
-        let labels: Vec<String> = records.iter().map(|r| r.label.clone()).collect();
+        let mut labels: Vec<String> = records.iter().map(|r| r.label.clone()).collect();
         let prompt = {
-            let works: Vec<judge::Work<'_>> = records
+            let mut works: Vec<judge::Work<'_>> = records
                 .iter()
                 .zip(&patches)
-                .map(|(record, patch)| judge::Work {
-                    record,
-                    patch: patch.clone(),
-                })
+                .map(|(record, patch)| judge::Work::of(record, patch.clone()))
                 .collect();
+            if let Some((label, patch, checked)) = &reference {
+                labels.push(label.clone());
+                works.push(judge::Work {
+                    label,
+                    run: None,
+                    checked: checked.as_ref(),
+                    patch: patch.clone(),
+                });
+            }
             judge::prompt(exercise, &task, &works)
         };
-        for judge in judges {
-            if judge.delegate().is_none()
-                && lock(&self.inner.closed)
-                    .iter()
-                    .any(|p| p == iq_agent::PROVIDER)
-            {
-                notes.push(format!(
-                    "{judge} did not judge: the provider's limit is reached"
-                ));
-                continue;
-            }
-            match self.ask_judge(judge, &prompt, &labels, &blind).await {
-                Ok(grades) => {
-                    for grade in grades {
-                        if let Some(record) = records.iter_mut().find(|r| r.label == grade.label) {
-                            record.verdicts.retain(|v| v.judge != judge.as_str());
-                            record.verdicts.push(Verdict {
-                                judge: judge.to_string(),
-                                score: grade.score,
-                                notes: grade.notes,
-                                at: crate::now(),
-                            });
-                        }
+        let mut notes = Vec::new();
+        match self.ask_grader(&grader, &prompt, &labels, &blind).await {
+            Ok((grades, model)) => {
+                let verdict = |grade: &judge::Grade| Verdict {
+                    judge: grader.to_string(),
+                    model: model.clone(),
+                    score: grade.score,
+                    notes: grade.notes.clone(),
+                    at: crate::now(),
+                };
+                for grade in &grades {
+                    if let Some(record) = records.iter_mut().find(|r| r.label == grade.label) {
+                        let given = verdict(grade);
+                        record.verdicts.retain(|v| v.key() != given.key());
+                        record.verdicts.push(given);
                     }
                 }
-                Err(why) => notes.push(format!("{judge} could not judge: {why}")),
+                if let Some((label, _, _)) = &reference
+                    && let Some(grade) = grades.iter().find(|g| &g.label == label)
+                {
+                    let file = self
+                        .inner
+                        .store
+                        .run_folder(&exercise.id, &batch, "")
+                        .join(REFERENCE_FILE);
+                    let mut kept: ReferenceGrades = std::fs::read_to_string(&file)
+                        .ok()
+                        .and_then(|text| serde_json::from_str(&text).ok())
+                        .unwrap_or_default();
+                    let given = verdict(grade);
+                    kept.label.clone_from(label);
+                    kept.verdicts.retain(|v| v.key() != given.key());
+                    kept.verdicts.push(given);
+                    if let Ok(text) = serde_json::to_string_pretty(&kept) {
+                        let _ = std::fs::write(&file, text + "\n");
+                    }
+                    if grade.score < REFERENCE_LEAST {
+                        notes.push(format!(
+                            "the grader gave the reference only {:.1}: it may have changed, or the \
+                             rubric asks what the reference does not do",
+                            grade.score
+                        ));
+                    }
+                }
             }
+            Err(why) => notes.push(format!("{grader} could not grade: {why}")),
         }
         for record in records.iter() {
             if let Err(error) = self.inner.store.save(record) {
@@ -1137,27 +1390,27 @@ where
         notes
     }
 
-    /// One judge's grades, asked again once when its answer cannot be
-    /// read.
-    async fn ask_judge(
+    /// The grader's grades, asked again once when its answer cannot be
+    /// read, and the model that answered.
+    async fn ask_grader(
         &self,
-        judge: &ModelId,
+        grader: &ModelId,
         prompt: &str,
         labels: &[String],
         folder: &Path,
-    ) -> Result<Vec<judge::Grade>, String> {
+    ) -> Result<(Vec<judge::Grade>, String), String> {
         let runner = &self.inner.runner;
         let answer = judge::ask(
             &runner.provider,
             &runner.agents,
-            judge,
+            grader,
             prompt.to_owned(),
             folder,
             &self.inner.costs,
         )
         .await?;
-        match judge::read(&answer, labels) {
-            Ok(grades) => Ok(grades),
+        match judge::read(&answer.text, labels) {
+            Ok(grades) => Ok((grades, answer.model)),
             Err(why) => {
                 let again = format!(
                     "{prompt}\n\nAn answer of yours to this could not be read: {why}. Answer with the JSON object only."
@@ -1165,17 +1418,20 @@ where
                 let answer = judge::ask(
                     &runner.provider,
                     &runner.agents,
-                    judge,
+                    grader,
                     again,
                     folder,
                     &self.inner.costs,
                 )
                 .await?;
-                judge::read(&answer, labels)
+                judge::read(&answer.text, labels).map(|grades| (grades, answer.model))
             }
         }
     }
 
+    /// Has the grader grade the runs of an exercise's latest version it did
+    /// not grade yet, or all of them when asked: after it changed, so that
+    /// every grade compared is its own.
     async fn regrade(
         &self,
         crew: &Crew<M, D>,
@@ -1184,36 +1440,29 @@ where
     ) -> Result<String, String> {
         let id = text(args, "exercise")?;
         let exercise = self.inner.store.exercise(id).map_err(|e| error_text(&e))?;
-        let judges: Vec<ModelId> = match args["judges"].as_array() {
-            Some(named) if !named.is_empty() => named
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|j| ModelId::new(j).map_err(|e| e.to_string()))
-                .collect::<Result<_, _>>()?,
-            _ => self.inner.settings.judges.clone(),
-        };
+        let all = args["all"].as_bool().unwrap_or(false);
+        let key = self.grader_key();
+        let grader = self.inner.settings.grader.clone();
         let records = self.inner.store.records(id);
         let version = report::table(&exercise, &records).version;
         let waiting: Vec<Record> = records
             .into_iter()
             .filter(|r| Some(r.version) == version)
-            .filter(|r| judges.iter().any(|j| !r.judged_by(j.as_str())))
+            .filter(|r| all || !r.graded_by(&key))
             .collect();
         if waiting.is_empty() {
             return Ok(format!(
-                "Every run of {id}'s latest version is judged by {}.",
-                names_of(&judges)
+                "Every run of {id}'s latest version is graded by {key}; grade them all again with `all` if the grader changed behind its name."
             ));
         }
         let action = format!(
-            "have {} judge {} run{} of {id}",
-            names_of(&judges),
+            "have {grader} grade {} run{} of {id}",
             waiting.len(),
             if waiting.len() == 1 { "" } else { "s" }
         );
-        let reason = format!("it spends {}", self.judging_said(waiting.len()));
+        let reason = format!("it spends {}", self.grading_said(waiting.len()));
         if !crew.confirm(agent, action, reason).await {
-            return Ok("The person did not agree: nothing was judged.".into());
+            return Ok("The person did not agree: nothing was graded.".into());
         }
         let assay = self.clone();
         let crew = crew.clone();
@@ -1228,11 +1477,11 @@ where
             }
             let mut notes = Vec::new();
             for mut batch in by_batch {
-                notes.extend(assay.grade_by(&exercise, &mut batch, &judges).await);
+                notes.extend(assay.grade(&exercise, &mut batch).await);
             }
             assay.tell(Told::Store);
-            let table = report::table(&exercise, &assay.inner.store.records(&exercise.id));
-            let mut out = format!("The judging of {} is done.\n", exercise.id);
+            let table = report::table(&exercise, &assay.graded_records(&exercise.id));
+            let mut out = format!("The grading of {} is done.\n", exercise.id);
             for note in notes {
                 out.push_str(&format!("- {note}\n"));
             }
@@ -1240,8 +1489,7 @@ where
             let _ = crew.deliver(WRITER, &agent, out);
         });
         Ok(format!(
-            "Judging {}: the results come to you as a message.",
-            id
+            "Grading {id}: the results come to you as a message."
         ))
     }
 
@@ -1436,25 +1684,16 @@ where
             return None;
         }
         let settings = &self.inner.settings;
-        let mirrors = if self.takes_servers() {
-            settings.mirrors.clone()
-        } else {
-            Vec::new()
-        };
         Some(crate::prompt::instructions(
             settings.reference.as_str(),
             &settings.allowed.said(),
-            &settings
-                .judges
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            &mirrors,
+            settings.grader.as_str(),
+            &settings.mirrors,
         ))
     }
 
     fn servers(&self, agent: &str) -> Vec<iq_core::McpServer> {
-        if self.serves(agent) && self.takes_servers() {
+        if self.serves(agent) {
             self.inner.settings.servers.clone()
         } else {
             Vec::new()
@@ -1472,14 +1711,6 @@ fn text<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
         .as_str()
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| format!("`{name}` is missing or not text"))
-}
-
-fn names_of(models: &[ModelId]) -> String {
-    models
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// The cheapest fit in words, against the reference when it ran.
@@ -1508,7 +1739,7 @@ fn tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "assay_roster".into(),
-            description: "Who may be tested: the provider's models that call tools, cheapest first, with their prices, the agents with tools of their own installed, the judges, the reference, and what the person's settings allow.".into(),
+            description: "Who may be tested: the provider's models that call tools, cheapest first, with their prices, the agents with tools of their own installed, the grader, the reference, and what the person's settings allow.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1524,7 +1755,7 @@ fn tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "assay_results".into(),
-            description: "The results summed by iq: an exercise's, a kind of task's across its exercises, or all; each candidate's runs, passes, judges' score and cost, and the cheapest that does as well as the reference.".into(),
+            description: "The results summed by iq: an exercise's, a kind of task's across its exercises, or all; each candidate's runs, passes, the grader's score and cost, and the cheapest that does as well as the reference. Only the grader's grades are summed: those by another model are said apart.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1546,7 +1777,7 @@ fn tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "assay_freeze".into(),
-            description: "Freezes an exercise as it is, once the person agrees, which it asks them: from then on every candidate gets exactly the same. Changed later, it is frozen again as a new version.".into(),
+            description: "Freezes an exercise as it is, once the person agrees, which it asks them: from then on every candidate gets exactly the same. Before asking, iq runs its check in the sandbox: it must fail on start/ and pass on reference/ (the start with a solution laid over it), else the exercise is refused, saying why. Changed later, it is frozen again as a new version.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {"exercise": {"type": "string"}},
@@ -1555,7 +1786,7 @@ fn tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "assay_run".into(),
-            description: "Runs a frozen exercise on candidates, once the person agrees to what it should cost, which it asks them; each in a folder of its own, checked, then judged blind. Returns at once; the results come to you as a message. A candidate is a model (`z-ai/glm-5`), an agent (`claude-code/sonnet`), or a team (`pair: writer + reviewer`, `lead: lead + cheaper`, `debate: a + b`).".into(),
+            description: "Runs a frozen exercise on candidates, once the person agrees to what it should cost, which it asks them; each in a folder of its own, checked, then graded blind by the grader. Returns at once; the results come to you as a message. A candidate is a model (`z-ai/glm-5`), an agent (`claude-code/sonnet`), or a team (`pair: writer + reviewer`, `lead: lead + cheaper`, `debate: a + b`).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1568,19 +1799,19 @@ fn tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "assay_grade".into(),
-            description: "Has judges grade the runs of an exercise's latest version they did not grade yet, once the person agrees, which it asks them: the settings' judges, or those named.".into(),
+            description: "Has the grader grade the runs of an exercise's latest version it did not grade yet, once the person agrees, which it asks them; all of them again with `all`, when the grader changed, so that every grade compared is its own.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "exercise": {"type": "string"},
-                    "judges": {"type": "array", "items": {"type": "string"}},
+                    "all": {"type": "boolean"},
                 },
                 "required": ["exercise"],
             }),
         },
         ToolSpec {
             name: "assay_from_commit".into(),
-            description: "Makes a draft exercise from a commit of a repository on this machine, which the person allows: start/ as the folder was before it, reference.diff (what it changed), after/ (those files after it), source.md. You then write task.md, rubric.md and the checks, from the tests the commit added.".into(),
+            description: "Makes a draft exercise from a commit of a repository on this machine, which the person allows: start/ as the folder was before it, reference.diff (what it changed), after/ (those files after it), source.md. You then write task.md, rubric.md and the checks, from the tests the commit added, and reference/ from after/.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

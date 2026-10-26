@@ -1,7 +1,7 @@
 //! The assay as the terminal holds it: what the program read of its store,
 //! and the runs at work, as they go.
 
-pub use iq_assay::{JUDGE, Kind, Overview, Phase, Progress, Row, State, Summary, Table};
+pub use iq_assay::{CHAT, Kind, Overview, Phase, Progress, Row, State, Summary, Table};
 
 /// The assay, as last told.
 #[derive(Debug, Clone, Default)]
@@ -31,10 +31,10 @@ impl AssayView {
         self.told
     }
 
-    /// The judge the person talks with, as the settings name it.
+    /// Who grades the runs, as the settings name it.
     #[must_use]
-    pub fn judge(&self) -> Option<&str> {
-        self.overview.judges.first().map(String::as_str)
+    pub fn grader(&self) -> &str {
+        &self.overview.grader
     }
 
     pub(crate) fn set(&mut self, overview: Overview) {

@@ -4,7 +4,7 @@
 //! candidates apart.
 
 use iq_core::TokenCount;
-use iq_ui::assay::{JUDGE, Kind, Phase, Row, State};
+use iq_ui::assay::{CHAT, Kind, Phase, Row, State};
 use ratatui::text::{Line, Span};
 
 use super::Seen;
@@ -19,7 +19,7 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
     seen.said(
         &mut lines,
-        "The same frozen exercises for every candidate, checked by hidden tests, then judged blind: for each kind of task, the cheapest agent that does it as well as your lead.",
+        "The same frozen exercises for every candidate, checked by hidden tests, then graded blind by one grader, always the same: for each kind of task, the cheapest agent that does it as well as your lead.",
         p.dim,
     );
     if !view.told() {
@@ -33,8 +33,12 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         seen.said(&mut lines, notice, p.warn);
     }
     lines.push(Line::default());
+    let grader = match &overview.graded_by {
+        Some(model) => format!("{} (lately {model})", overview.grader),
+        None => overview.grader.clone(),
+    };
     for (name, value) in [
-        ("Judges", overview.judges.join(", ")),
+        ("Grader", grader),
         ("Reference", overview.reference.clone()),
         ("Tested", overview.allowed.clone()),
         ("Folder", overview.folder.display().to_string()),
@@ -45,15 +49,15 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         ]));
     }
     lines.push(Line::default());
-    let talking = board.crew().agent(JUDGE).is_some();
+    let chatting = board.crew().agent(CHAT).is_some();
     lines.push(Line::from(vec![
         Span::styled("  t ", p.bold(p.accent)),
         Span::styled(
-            if talking { "write to the judge" } else { "talk with the judge" },
+            if chatting { "write in the assay's chat" } else { "a chat in the assay" },
             p.fg(p.accent),
         ),
         Span::styled(
-            ": it proposes kinds of task and exercises with you, and asks before anything that costs",
+            ": ask it to test a model, write or adjust an exercise, read the results; what costs is asked first",
             p.fg(p.faint),
         ),
     ]));
@@ -107,7 +111,7 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
     if overview.exercises.is_empty() {
         seen.said(
             &mut lines,
-            "None yet. Talk with the judge to write the first ones, best from commits of your own work.",
+            "None yet. Ask the assay's chat (t) to write the first ones, best from commits of your own work.",
             p.dim,
         );
     }
@@ -143,6 +147,14 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
                 format!("   {problem}")
             };
             seen.said(&mut lines, &text, p.warn);
+        }
+        if let Some(grade) = summary.reference_grade {
+            let tint = if grade < 8.0 { p.warn } else { p.faint };
+            seen.said(
+                &mut lines,
+                &format!("   the grader gave its reference {grade:.1}"),
+                tint,
+            );
         }
     }
     for table in &overview.tables {
