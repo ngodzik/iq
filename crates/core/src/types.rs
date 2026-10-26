@@ -615,6 +615,9 @@ pub enum DelegateEvent {
         billed: bool,
         /// What it read from the prompt cache and wrote to it, when known.
         cache: Option<CacheUse>,
+        /// The model that answered, as the agent names it, such as
+        /// `claude-opus-5-5`; empty when it did not say.
+        model: String,
     },
     /// A tool call finished.
     Tool {

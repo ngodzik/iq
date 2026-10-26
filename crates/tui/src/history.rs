@@ -420,7 +420,7 @@ impl History {
         let model = board
             .crew()
             .agent(agent)
-            .map(|a| a.model.clone())
+            .map(|a| a.serving().to_owned())
             .unwrap_or_default();
         self.paras.push(Para::blank());
         self.paras.push(Para::indented(
@@ -460,6 +460,19 @@ impl History {
     /// How long `agent`'s turn has lasted, while it works.
     pub(crate) fn working_for(&self, agent: &str) -> Option<std::time::Duration> {
         self.turns.get(agent).map(|turn| turn.since.elapsed())
+    }
+
+    /// What `agent`'s turn spent so far, as a status says it: dollars
+    /// billed, else tokens under a subscription.
+    pub(crate) fn turn_spent(&self, agent: &str) -> Option<String> {
+        let turn = self.turns.get(agent)?;
+        if turn.billed.0 > 0.0 {
+            Some(turn.billed.to_string())
+        } else if turn.tokens > 0 {
+            Some(format!("{} tokens", TokenCount(turn.tokens)))
+        } else {
+            None
+        }
     }
 
     /// The line `agent` is writing, not whole yet.

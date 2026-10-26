@@ -129,8 +129,11 @@ pub enum Entry {
 pub struct AgentView {
     /// Its name.
     pub name: String,
-    /// Its model.
+    /// Its model, as it was started on: `claude-code/opus`.
     pub model: String,
+    /// The model that answered its last call, as its agent named it:
+    /// `claude-code/claude-opus-5-5`; empty before its first.
+    pub answered: String,
     /// Who started it.
     pub by: String,
     /// Whether it works.
@@ -170,6 +173,19 @@ pub struct CrewView {
     /// The lead's model and the reviewer's, as the program starts them.
     lead: String,
     reviewer: String,
+}
+
+impl AgentView {
+    /// Its model, as precisely as known: the one that answered last, else
+    /// the one it was started on.
+    #[must_use]
+    pub fn serving(&self) -> &str {
+        if self.answered.is_empty() {
+            &self.model
+        } else {
+            &self.answered
+        }
+    }
 }
 
 impl CrewView {
@@ -261,6 +277,7 @@ impl CrewView {
                 self.agents.push(AgentView {
                     name: agent,
                     model,
+                    answered: String::new(),
                     by,
                     working: false,
                     thread: Vec::new(),
@@ -289,12 +306,15 @@ impl CrewView {
             }
             Event::Spent {
                 agent,
+                model,
                 cost,
                 billed,
                 usage,
-                ..
             } => {
                 if let Some(view) = self.agent_mut(&agent) {
+                    if !model.is_empty() {
+                        view.answered = model;
+                    }
                     if billed {
                         if let Some(cost) = cost {
                             view.billed += cost;

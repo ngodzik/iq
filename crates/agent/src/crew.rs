@@ -1042,8 +1042,19 @@ where
                 usage,
                 cost,
                 billed,
+                model: answered,
                 ..
-            } => self.spent(&agent, model, usage, cost, billed),
+            } => {
+                // The model that answered, under the agent's name, when it
+                // said which: `claude-code/claude-opus-5-5` rather than the
+                // `claude-code/opus` it was asked for.
+                let model = match (answered.is_empty(), model.split_once('/')) {
+                    (false, Some((agent, _))) => format!("{agent}/{answered}"),
+                    (false, None) => format!("{model}/{answered}"),
+                    (true, _) => model.to_owned(),
+                };
+                self.spent(&agent, &model, usage, cost, billed);
+            }
             DelegateEvent::Tool {
                 name,
                 input,

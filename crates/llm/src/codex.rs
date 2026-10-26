@@ -273,6 +273,7 @@ impl Codex {
                     written: None,
                     rewrite_extra: None,
                 }),
+                model: model.clone(),
             });
         }
         // Under a subscription, how much of it is left.

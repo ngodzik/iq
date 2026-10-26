@@ -145,6 +145,7 @@ impl Delegate for Agents {
             cost: Some(Usd(0.5)),
             billed: false,
             cache: None,
+            model: String::new(),
         });
         let text = if request.read_only {
             "APPROVE: it is what the task asks.".to_owned()

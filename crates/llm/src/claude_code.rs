@@ -484,6 +484,7 @@ impl StreamParser {
                             written: Some(TokenCount(tokens.cache_write)),
                             rewrite_extra,
                         }),
+                        model: self.model.clone(),
                     });
                 }
             }
@@ -691,11 +692,13 @@ mod tests {
                 cost,
                 billed,
                 cache,
+                model,
             },
         ] = events.as_slice()
         else {
             panic!("one message, one usage: {events:?}");
         };
+        assert_eq!(model, "claude-opus-5-5");
         assert_eq!(usage.input, TokenCount(103_000));
         assert_eq!(usage.output, TokenCount(500));
         assert!((cost.unwrap().0 - 0.044).abs() < 1e-12);
