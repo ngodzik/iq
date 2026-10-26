@@ -507,7 +507,8 @@ mod tests {
         let refused = memory
             .remember("deploy", "how", &format!("use the token {token}"))
             .unwrap_err();
-        assert!(refused.contains("secret"), "{refused}");
+        // Its text is not printed: a scanner takes it for the token.
+        assert!(refused.contains("secret"));
         let key = format!("{} OPENSSH {} KEY-----", "-----BEGIN", "PRIVATE");
         assert!(memory.remember("key", "k", &key).is_err());
         // Words that only start the same are no secret.
