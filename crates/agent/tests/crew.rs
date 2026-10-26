@@ -44,6 +44,17 @@ impl Scripted {
             .collect()
     }
 
+    /// The efforts `agent`'s calls asked for.
+    fn efforts_of(&self, agent: &str) -> Vec<Option<iq_core::Effort>> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == agent)
+            .map(|(_, request)| request.effort)
+            .collect()
+    }
+
     /// Everything `agent` was sent, as one text.
     fn seen_by(&self, agent: &str) -> String {
         self.requests
@@ -482,6 +493,7 @@ async fn a_writer_and_its_reviewer_go_round_until_it_approves() {
         &[model("cheap/model"), model("cheap/other")],
         "make it work".into(),
         None,
+        None,
     );
     for _ in 0..4 {
         f.settled().await;
@@ -527,6 +539,7 @@ async fn debaters_answer_alone_then_read_each_other_and_the_first_sums_up() {
         "think",
         &[model("cheap/model"), model("cheap/other")],
         "how to store it".into(),
+        None,
         None,
     );
     assert_eq!(first, "think");
@@ -731,6 +744,48 @@ async fn the_lead_starts_its_agents_on_the_models_it_chooses() {
     f.settled().await;
     // iq holds it to nothing: what it starts is its choice.
     assert_eq!(f.model.models_of("helper"), ["cheap/other"]);
+}
+
+#[tokio::test]
+async fn the_lead_chooses_how_hard_its_agents_think_and_the_person_its_own() {
+    use iq_core::Effort;
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "start_agent",
+                    serde_json::json!({"name": "helper", "model": "cheap/other", "task": "rename it", "effort": "low"}),
+                ),
+                say("Started."),
+                say("Again."),
+            ],
+        )],
+        Settings {
+            effort: Some(Effort::High),
+            ..Settings::default()
+        },
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "go".into(), PERSON);
+    f.settled().await;
+    assert_eq!(f.model.efforts_of("helper"), [Some(Effort::Low)]);
+    // The lead, as the settings say, its turns woken by the helper too.
+    assert!(
+        f.model
+            .efforts_of("lead")
+            .iter()
+            .all(|e| *e == Some(Effort::High))
+    );
+    f.crew.set_effort("lead", Effort::Max).unwrap();
+    assert!(f.events().contains(&Event::Effort {
+        agent: "lead".into(),
+        effort: Some(Effort::Max)
+    }));
+    f.crew.tell("lead", "once more".into()).unwrap();
+    f.settled().await;
+    assert_eq!(f.model.efforts_of("lead").last(), Some(&Some(Effort::Max)));
+    assert!(f.crew.set_effort("nobody", Effort::Low).is_err());
 }
 
 #[tokio::test]

@@ -91,7 +91,8 @@ pub fn board() -> Vec<ToolSpec> {
         ToolSpec {
             name: "start_agent".into(),
             description: "Starts another agent on a task, beside you. `model` is a model of the \
-                          provider, such as `openai/gpt-5-mini`. It returns at once; the agent's \
+                          provider, such as `openai/gpt-5-mini`; `effort`, how hard it thinks, \
+                          lower for plain work, as it costs less. It returns at once; the agent's \
                           answer comes to you as a message."
                 .into(),
             parameters: json!({
@@ -101,6 +102,7 @@ pub fn board() -> Vec<ToolSpec> {
                     "model": {"type": "string"},
                     "task": {"type": "string", "description": "All it needs to know: it sees nothing of your conversation."},
                     "role": {"type": "string", "description": "Its part in the crew, which it keeps to: tests, review, the front end."},
+                    "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "How hard it thinks; left out, as the crew's settings say."},
                 },
                 "required": ["name", "model", "task"],
             }),

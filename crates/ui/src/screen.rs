@@ -24,6 +24,9 @@ pub struct NewChat {
     /// Whether it is the chat in the assay's folder, with the assay's
     /// tools, rather than one in the project.
     pub assay: bool,
+    /// How hard its agent thinks, when the person chose; else as the
+    /// settings say.
+    pub effort: Option<iq_core::Effort>,
 }
 
 /// Where what the person writes goes.

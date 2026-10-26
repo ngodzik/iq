@@ -18,7 +18,7 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 14] = [
+pub const COMMANDS: [Spec; 15] = [
     Spec {
         name: "new",
         args: "[model]",
@@ -75,6 +75,11 @@ pub const COMMANDS: [Spec; 14] = [
         what: "the internet open to every command, or only to what fetches packages",
     },
     Spec {
+        name: "effort",
+        args: "[low|medium|high|xhigh|max]",
+        what: "how hard the agent you write to thinks, or the new chat's",
+    },
+    Spec {
         name: "theme",
         args: "[graphite|ink|porcelain]",
         what: "the next theme, or this one",
@@ -118,6 +123,9 @@ pub enum Command {
     Autopilot,
     /// The internet open to every command, or not.
     Internet,
+    /// How hard the agent written to thinks, or the new chat's; none to
+    /// be told.
+    Effort(Option<iq_core::Effort>),
     /// The next theme, or this one.
     Theme(Option<Theme>),
     /// Stop the agent written to, this one, or `all`.
@@ -190,6 +198,12 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "keys" | "help" => bare(Command::Keys),
         "autopilot" => bare(Command::Autopilot),
         "internet" => bare(Command::Internet),
+        "effort" => match one("effort")? {
+            None => Ok(Command::Effort(None)),
+            Some(level) => level
+                .parse::<iq_core::Effort>()
+                .map(|effort| Command::Effort(Some(effort))),
+        },
         "theme" => match one("theme")? {
             None => Ok(Command::Theme(None)),
             Some(name) => name
@@ -267,6 +281,10 @@ pub fn complete(line: &str, agents: &[&str], models: &[&str]) -> Vec<Completion>
         "new" => models
             .iter()
             .map(|m| ((*m).to_owned(), "a model".to_owned()))
+            .collect(),
+        "effort" => iq_core::Effort::ALL
+            .iter()
+            .map(|e| (e.as_str().to_owned(), "an effort".to_owned()))
             .collect(),
         "theme" => Theme::ALL
             .iter()

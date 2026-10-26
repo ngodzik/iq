@@ -239,6 +239,7 @@ where
             &candidate.models,
             task,
             None,
+            None,
         );
         let limit = Duration::from_secs(exercise.minutes * 60);
         let in_time = tokio::time::timeout(limit, crew.settled()).await.is_ok();
@@ -485,7 +486,10 @@ fn transcript(events: &[Event]) -> String {
                 Err(why) => out.push_str(&format!("### {agent} stops: {why}\n\n")),
             },
             Event::Notice { agent, text } => out.push_str(&format!("- {agent}: {text}\n")),
-            Event::Spent { .. } | Event::Answered { .. } | Event::Reviewed { .. } => {}
+            Event::Spent { .. }
+            | Event::Answered { .. }
+            | Event::Reviewed { .. }
+            | Event::Effort { .. } => {}
         }
     }
     out

@@ -3,7 +3,7 @@
 //! what the person writes.
 
 use iq_agent::{Event, PERSON, Pattern};
-use iq_core::{TokenCount, Usd};
+use iq_core::{Effort, TokenCount, Usd};
 
 /// What the person asks of the crew, for the program to carry out.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +28,16 @@ pub enum Request {
         /// The models the person named in the task: the first is the one
         /// it starts on.
         named: Vec<String>,
+        /// How hard it thinks, when the person chose; else as the
+        /// settings say.
+        effort: Option<Effort>,
+    },
+    /// Have an agent think with this effort from its next call.
+    Effort {
+        /// The agent.
+        agent: String,
+        /// Its effort.
+        effort: Effort,
     },
     /// Write to an agent.
     Tell {
@@ -140,6 +150,8 @@ pub struct AgentView {
     /// What each of its calls read, oldest first: the last is how much of
     /// its model's context its conversation fills.
     pub reads: Vec<TokenCount>,
+    /// How hard it thinks; `None` leaves it to its model.
+    pub effort: Option<Effort>,
 }
 
 impl AgentView {
@@ -286,6 +298,7 @@ impl CrewView {
                     thread: Vec::new(),
                     billed: Usd(0.0),
                     reads: Vec::new(),
+                    effort: None,
                 });
             }
             Event::Working { agent, prompt } => {
@@ -420,6 +433,11 @@ impl CrewView {
             Event::Notice { agent, text } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.thread.push(Entry::Notice(text));
+                }
+            }
+            Event::Effort { agent, effort } => {
+                if let Some(view) = self.agent_mut(&agent) {
+                    view.effort = effort;
                 }
             }
         }

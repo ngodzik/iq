@@ -1,7 +1,7 @@
 //! What the crew reports as it works, for the window or the terminal to
 //! show.
 
-use iq_core::{Usage, Usd};
+use iq_core::{Effort, Usage, Usd};
 
 /// Who the person is on the board: they write to agents and agents to
 /// them under this name.
@@ -18,6 +18,13 @@ pub enum Event {
         model: String,
         /// Who started it: the person or another agent.
         by: String,
+    },
+    /// How hard an agent thinks, as it joined or as it was changed.
+    Effort {
+        /// The agent.
+        agent: String,
+        /// Its effort; `None` leaves it to its model.
+        effort: Option<Effort>,
     },
     /// An agent was given work: its task, a message that woke it.
     Working {

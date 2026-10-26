@@ -437,7 +437,7 @@ async fn work(
     if let Some(partner) = partner {
         models.push(ModelId::new(partner)?);
     }
-    crew.launch(pattern, LEAD, &models, task.to_owned(), None);
+    crew.launch(pattern, LEAD, &models, task.to_owned(), None, None);
     let mut tally = terminal::Tally::default();
     let handle = |event: Event, tally: &mut terminal::Tally| {
         if let Some((id, question)) = terminal::show(&event, tally) {
@@ -708,7 +708,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     partner,
                     assay,
                     named,
-                    ..
+                    effort,
                 } => match ModelId::new(&model) {
                     Ok(model) => {
                         let mut models = vec![model];
@@ -717,7 +717,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                         // a crew of its own, with the assay's tools.
                         let crew = if assay { &judging } else { &working };
                         let task = with_named(task, &named[named.len().min(1)..], assay);
-                        crew.launch(pattern, &name, &models, task, role);
+                        crew.launch(pattern, &name, &models, task, role, effort);
                     }
                     Err(error) => tracing::warn!("no chat on `{model}`: {error}"),
                 },
@@ -739,6 +739,13 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                 Request::Internet(open) => {
                     working.set_internet(open);
                     judging.set_internet(open);
+                }
+                Request::Effort { agent, effort } => {
+                    let _ = if judge_has(&agent) {
+                        judging.set_effort(&agent, effort)
+                    } else {
+                        working.set_effort(&agent, effort)
+                    };
                 }
                 Request::Stop { agent } => {
                     if judge_has(&agent) {

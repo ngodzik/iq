@@ -605,6 +605,7 @@ impl Board {
                     partner,
                     assay: chat.assay,
                     named,
+                    effort: chat.effort,
                 }
             }
         };
@@ -652,6 +653,7 @@ impl Board {
             Command::Internet => return self.act(Action::Internet).into_iter().collect(),
             Command::Theme(None) => self.look.next_theme(),
             Command::Theme(Some(theme)) => self.look.set_theme(theme),
+            Command::Effort(effort) => return self.effort(effort, now),
             Command::Stop(None) => return self.act(Action::Stop).into_iter().collect(),
             Command::Stop(Some(all)) if all == "all" => {
                 return self
@@ -668,6 +670,41 @@ impl Board {
                 return self.crew.stop(&agent).into_iter().collect();
             }
             Command::Quit => self.quitting = true,
+        }
+        Vec::new()
+    }
+
+    /// Sets how hard the agent written to thinks, or the new chat's; says
+    /// it when `effort` is none.
+    fn effort(&mut self, effort: Option<iq_core::Effort>, now: u64) -> Vec<Request> {
+        let shown =
+            |effort: Option<iq_core::Effort>| effort.map_or("as its model chooses", |e| e.as_str());
+        match (self.screen.talk().clone(), effort) {
+            (Talk::To(agent), Some(effort)) => {
+                if self.crew.agent(&agent).is_none() {
+                    self.screen.notice(self.no_agent(&agent), now);
+                    return Vec::new();
+                }
+                self.screen.notice(
+                    format!("{agent} thinks: {}, from its next call", effort.as_str()),
+                    now,
+                );
+                return vec![Request::Effort { agent, effort }];
+            }
+            (Talk::To(agent), None) => {
+                let current = self.crew.agent(&agent).and_then(|a| a.effort);
+                self.screen
+                    .notice(format!("{agent} thinks: {}", shown(current)), now);
+            }
+            (Talk::New(_), Some(effort)) => {
+                if let Some(chat) = self.screen.new_chat_mut() {
+                    chat.effort = Some(effort);
+                }
+            }
+            (Talk::New(chat), None) => {
+                self.screen
+                    .notice(format!("The new chat thinks: {}", shown(chat.effort)), now);
+            }
         }
         Vec::new()
     }
@@ -919,6 +956,7 @@ mod tests {
                 partner: None,
                 assay: false,
                 named: Vec::new(),
+                effort: None,
             }]
         );
         assert_eq!(board.screen().talking_to(), Some("claude-opus-5-5"));
@@ -1189,6 +1227,36 @@ mod tests {
         key(&mut board, "enter");
         assert_eq!(board.screen().page(), None);
         assert_eq!(board.screen().talking_to(), Some("helper"));
+    }
+
+    #[test]
+    fn the_effort_is_set_for_the_agent_written_to_or_the_new_chat() {
+        let mut board = Board::default();
+        started(&mut board, "anthropic/claude-opus-5-5");
+        board.run(Command::Effort(Some(iq_core::Effort::Low)), 100);
+        write(&mut board, "rename it");
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Start {
+                effort: Some(iq_core::Effort::Low),
+                ..
+            }]
+        ));
+        joined(&mut board, "lead", PERSON);
+        board.screen_mut().talk_to("lead");
+        assert_eq!(
+            board.run(Command::Effort(Some(iq_core::Effort::Max)), 100),
+            vec![Request::Effort {
+                agent: "lead".into(),
+                effort: iq_core::Effort::Max
+            }]
+        );
+        board.update(Update::Crew(Event::Effort {
+            agent: "lead".into(),
+            effort: Some(iq_core::Effort::Max),
+        }));
+        board.run(Command::Effort(None), 100);
+        assert_eq!(board.screen().noticed(100), Some("lead thinks: max"));
     }
 
     #[test]

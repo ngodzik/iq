@@ -150,7 +150,8 @@ impl History {
                     ],
                 ));
             }
-            Event::Joined { .. } => {}
+            // The box where the person writes says how hard its agent thinks.
+            Event::Joined { .. } | Event::Effort { .. } => {}
             Event::Working { agent, prompt } => {
                 self.turns.insert(
                     agent.clone(),

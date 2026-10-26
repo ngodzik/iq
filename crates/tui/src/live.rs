@@ -362,7 +362,10 @@ impl Live<'_> {
             Talk::To(agent) => {
                 let view = self.board.crew().agent(agent);
                 let tint = agent_tint(self.board, agent, p);
-                let model = view.map(|v| v.model.clone()).unwrap_or_default();
+                let mut model = view.map(|v| v.model.clone()).unwrap_or_default();
+                if let Some(effort) = view.and_then(|v| v.effort) {
+                    model.push_str(&format!(" · {}", effort.as_str()));
+                }
                 let spent = view.map_or(String::new(), |v| match v.context().0 {
                     0 => String::new(),
                     _ => format!(" {} · context {} ", v.billed, v.context()),
@@ -379,6 +382,9 @@ impl Live<'_> {
             }
             Talk::New(chat) => {
                 let mut said = format!(" · {} ", chat.model);
+                if let Some(effort) = chat.effort {
+                    said.push_str(&format!("· {} ", effort.as_str()));
+                }
                 if chat.pattern != iq_agent::Pattern::Solo {
                     said.push_str(&format!("· {} ", chat.pattern.name()));
                     if !chat.partner.trim().is_empty() {

@@ -154,6 +154,9 @@ struct Member {
     turn: Option<JoinHandle<()>>,
     /// Its conversation, kept between turns.
     messages: Vec<Message>,
+    /// How hard it thinks: as it was started or changed, else as the
+    /// settings say.
+    effort: Option<Effort>,
 }
 
 /// An agent of the crew, as listed.
@@ -295,8 +298,9 @@ where
     /// Starts a team on the person's `task`, as `pattern` works: one agent
     /// on the first of `models`, a lead that may give its agents the
     /// others, a writer with a reviewer on the second, or as many debaters
-    /// as models, two at the least. Returns the first agent's name: `name`,
-    /// made unique.
+    /// as models, two at the least; the first thinking with `effort`, as
+    /// the settings say when `None`. Returns the first agent's name:
+    /// `name`, made unique.
     pub fn launch(
         &self,
         pattern: Pattern,
@@ -304,6 +308,7 @@ where
         models: &[ModelId],
         task: String,
         role: Option<String>,
+        effort: Option<Effort>,
     ) -> String {
         let Some(first) = models.first() else {
             return String::new();
@@ -312,18 +317,20 @@ where
         // its team.
         let mut teams = lock(&self.inner.teams);
         match pattern {
-            Pattern::Solo => self.start_as(name, first, task, PERSON, role),
+            Pattern::Solo => self.start_with(name, first, task, PERSON, role, effort),
             Pattern::Lead => {
                 let cheaper: Vec<String> = models[1..].iter().map(ToString::to_string).collect();
-                self.start_as(name, first, task, PERSON, Some(team::lead_role(&cheaper)))
+                let role = Some(team::lead_role(&cheaper));
+                self.start_with(name, first, task, PERSON, role, effort)
             }
             Pattern::Pair => {
-                let writer = self.start_as(
+                let writer = self.start_with(
                     name,
                     first,
                     task.clone(),
                     PERSON,
                     Some(team::WRITER_ROLE.to_owned()),
+                    effort,
                 );
                 teams.push(Team::Pair {
                     writer: writer.clone(),
@@ -480,6 +487,20 @@ where
         by: &str,
         role: Option<String>,
     ) -> String {
+        self.start_with(name, model, task, by, role, None)
+    }
+
+    /// Starts an agent as [`Self::start_as`] does, thinking with `effort`,
+    /// as the settings say when `None`.
+    fn start_with(
+        &self,
+        name: &str,
+        model: &ModelId,
+        task: String,
+        by: &str,
+        role: Option<String>,
+        effort: Option<Effort>,
+    ) -> String {
         let mut board = lock(&self.inner.board);
         let base: String = name
             .trim()
@@ -519,6 +540,7 @@ where
                 read,
                 turn: None,
                 messages,
+                effort,
             },
         );
         drop(board);
@@ -527,8 +549,32 @@ where
             model: model.to_string(),
             by: by.to_owned(),
         });
+        self.report(Event::Effort {
+            agent: name.clone(),
+            effort: effort.or(self.inner.settings.effort),
+        });
         self.wake(&name, task);
         name
+    }
+
+    /// Has `agent` think with `effort` from its next call to its model.
+    ///
+    /// # Errors
+    ///
+    /// No agent of that name.
+    pub fn set_effort(&self, agent: &str, effort: Effort) -> Result<(), String> {
+        let mut board = lock(&self.inner.board);
+        let member = board
+            .members
+            .get_mut(agent)
+            .ok_or_else(|| format!("no agent is named {agent:?}"))?;
+        member.effort = Some(effort);
+        drop(board);
+        self.report(Event::Effort {
+            agent: agent.to_owned(),
+            effort: Some(effort),
+        });
+        Ok(())
     }
 
     /// The person writes to `to`: an agent, woken if it rests, or all.
@@ -796,11 +842,17 @@ where
             if let Err(error) = self.within_budget() {
                 return (messages, Err(error));
             }
+            // Read at each call, so that a change reaches a turn under way.
+            let effort = lock(&self.inner.board)
+                .members
+                .get(name)
+                .and_then(|member| member.effort)
+                .or(self.inner.settings.effort);
             let request = ChatRequest {
                 model: model.clone(),
                 messages: messages.clone(),
                 tools: tools.clone(),
-                effort: self.inner.settings.effort,
+                effort,
             };
             let response = match self.inner.provider.complete(&request).await {
                 Ok(response) => response,
@@ -961,12 +1013,17 @@ where
                     .map(str::trim)
                     .filter(|r| !r.is_empty())
                     .map(str::to_owned);
-                let started = self.start_as(
+                let effort = match args.text("effort").map(str::trim) {
+                    Ok(level) if !level.is_empty() => Some(level.parse::<Effort>()?),
+                    _ => None,
+                };
+                let started = self.start_with(
                     args.text("name")?,
                     &model,
                     args.text("task")?.to_owned(),
                     agent,
                     role,
+                    effort,
                 );
                 Ok(format!(
                     "{started} started on {model}. Its answer will come to you as a message."
