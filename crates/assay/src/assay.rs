@@ -858,7 +858,7 @@ where
         }
         let file = exercise.folder.join(REFERENCE_FILE);
         if let Ok(text) = serde_json::to_string_pretty(&second) {
-            let _ = std::fs::write(&file, text + "\n");
+            let _ = crate::store::write_whole(&file, &(text + "\n"));
         }
         let tally = second
             .tally
@@ -1391,7 +1391,7 @@ where
                     kept.verdicts.retain(|v| v.key() != given.key());
                     kept.verdicts.push(given);
                     if let Ok(text) = serde_json::to_string_pretty(&kept) {
-                        let _ = std::fs::write(&file, text + "\n");
+                        let _ = crate::store::write_whole(&file, &(text + "\n"));
                     }
                     if grade.score < REFERENCE_LEAST {
                         notes.push(format!(

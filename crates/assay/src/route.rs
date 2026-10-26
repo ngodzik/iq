@@ -184,7 +184,7 @@ impl Routing {
         if std::fs::read_to_string(&file).ok().as_deref() == Some(text.as_str()) {
             return Ok(());
         }
-        std::fs::write(file, text)
+        crate::store::write_whole(&file, &text)
     }
 
     /// The route of `category`, as the person's `choices` leave it: their

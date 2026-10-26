@@ -27,6 +27,16 @@ The same exercises given to agents, checked by hidden tests, then judged blind, 
 - `runs/<id>/<batch>/<label>/`: `run.json` (the record), `transcript.md`, `changes.diff`, `work/` (the folder the candidate worked in).
 ";
 
+/// Writes `text` to `file` whole or not at all: beside it first, then put
+/// in its place, so that a reader at the same time reads the one before.
+pub(crate) fn write_whole(file: &Path, text: &str) -> std::io::Result<()> {
+    let mut beside = file.as_os_str().to_owned();
+    beside.push(".new");
+    let beside = PathBuf::from(beside);
+    std::fs::write(&beside, text)?;
+    std::fs::rename(&beside, file)
+}
+
 /// The assay's folder.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -139,7 +149,9 @@ impl Store {
             .join(label)
     }
 
-    /// Keeps `record` in its run's folder.
+    /// Keeps `record` in its run's folder, whole or not at all: it is
+    /// written beside, then put in place, so that whoever reads it while it
+    /// is graded again reads the one before.
     ///
     /// # Errors
     ///
@@ -152,7 +164,7 @@ impl Store {
             path: file.clone(),
             source,
         })?;
-        std::fs::write(&file, text + "\n").map_err(AssayError::io(file))
+        write_whole(&file, &(text + "\n")).map_err(AssayError::io(file))
     }
 
     /// The runs of exercise `id`, oldest first. A record that cannot be

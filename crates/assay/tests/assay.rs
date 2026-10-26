@@ -468,7 +468,10 @@ async fn a_team_runs_as_its_pattern_says_and_is_graded_again_with_its_reference(
     .unwrap();
     assert!(regraded.contains("Grading add-mul"), "{regraded}");
     until("the grade given again", || {
-        store.records("add-mul")[0].score() == Some(9.0)
+        store
+            .records("add-mul")
+            .first()
+            .is_some_and(|r| r.score() == Some(9.0))
     })
     .await;
     // The same grader's grade replaces its own.
