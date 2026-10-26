@@ -30,13 +30,13 @@ use crate::journal::Journal;
 use crate::ledger::Ledger;
 use crate::settings::Settings;
 
-/// How often the window reads the agents' files again.
+/// How often the agents' files are read again.
 const READ_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The lead's name on the board.
 const LEAD: &str = "lead";
 
-/// Without a command, iq opens its window: the agents at work, the costs
+/// Without a command, iq runs in the terminal: the agents at work, the costs
 /// of every call to a model, and what is left of the subscriptions.
 #[derive(Parser)]
 #[command(version, about = "An experimental coding agent")]
@@ -100,7 +100,7 @@ enum Command {
     Assay,
     /// Syncs iq's folder of data now with the repository the settings'
     /// [sync] names: what changed here sent, what changed elsewhere taken;
-    /// a new machine takes everything first. The window does it on its own.
+    /// a new machine takes everything first. iq does it on its own as it runs.
     Sync,
     /// Runs a command line in the sandbox, as a model's would be: judged by
     /// the gate, asked when it must be, written to the audit log.
@@ -135,11 +135,29 @@ fn main() -> Result<()> {
         Some(flag) if flag == EXEC_FLAG => std::process::exit(iq_agent::exec_main(args.next())),
         _ => {}
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
     let cli = Cli::parse();
+    // In the terminal, what is logged would write over what iq draws: it
+    // goes to iq's folder instead.
+    let log = cli
+        .command
+        .is_none()
+        .then(|| home_folder().ok())
+        .flatten()
+        .and_then(|folder| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(folder.join("iq.log"))
+                .ok()
+        });
+    let logging = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
+    match log {
+        Some(file) => logging
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => logging.with_writer(std::io::stderr).init(),
+    }
     let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
     match &cli.command {
         Some(Command::Do {
@@ -148,7 +166,7 @@ fn main() -> Result<()> {
             partner,
         }) => runtime.block_on(work(&cli, task, *pattern, partner.as_deref())),
         Some(command) => runtime.block_on(run(command, &cli)),
-        None => window(&runtime, &cli),
+        None => session(&runtime, &cli),
     }
 }
 
@@ -213,7 +231,7 @@ async fn sync_now(sync: &iq_sync::Sync) -> Result<iq_sync::Outcome, iq_sync::Syn
     Ok(outcome)
 }
 
-/// How a sync went, as the window shows it.
+/// How a sync went, as the status line says it.
 fn synced(result: &Result<iq_sync::Outcome, iq_sync::SyncError>) -> iq_ui::Synced {
     iq_ui::Synced {
         at: iq_ui::now(),
@@ -480,10 +498,10 @@ async fn work(
     Ok(())
 }
 
-/// Opens the window: the crew works on the runtime, the agents' files are
-/// read on a thread of their own, and the window runs on the main thread,
-/// as the system wants it.
-fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
+/// Runs iq in the terminal: the crew works on the runtime, the agents'
+/// files are read on a thread of their own, and the terminal is drawn on
+/// the main thread.
+fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let folder = home_folder()?;
     // What other machines sent comes first, the settings among it: a new
     // machine takes everything before it sends anything.
@@ -515,7 +533,6 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let (send, feed) = std::sync::mpsc::channel();
     let quit = send.clone();
     let (ask, requests) = std::sync::mpsc::channel::<Request>();
-    let waker = iq_gui::Waker::default();
     let since = iq_ui::now().saturating_sub(iq_ui::subscriptions::KEEP_SECS);
     // The provider's calls of the whole month too, for the steward.
     let billed_since =
@@ -537,7 +554,6 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     // other machines sent is taken now and then.
     if let Some(sync) = sync.clone() {
         let send = send.clone();
-        let waker = waker.clone();
         runtime.spawn(async move {
             let mut last = std::time::Instant::now();
             loop {
@@ -550,7 +566,6 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                 if send.send(Update::Synced(synced(&result))).is_err() {
                     return;
                 }
-                waker.wake();
             }
         });
     }
@@ -560,7 +575,6 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let observer = {
         let costs: Report = {
             let send = send.clone();
-            let waker = waker.clone();
             let ledger = Arc::clone(&ledger);
             Arc::new(move |event: Event| {
                 if let Event::Spent {
@@ -574,7 +588,6 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     ledger.bill(agent, model, *cost);
                 }
                 let _ = send.send(Update::Crew(event));
-                waker.wake();
             })
         };
         iq_observe::Observer::new(
@@ -595,7 +608,6 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     }
     let report: Report = {
         let send = send.clone();
-        let waker = waker.clone();
         let ledger = Arc::clone(&ledger);
         let journal = Arc::clone(&journal);
         let observer = observer.clone();
@@ -604,7 +616,6 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                 observer.done(task);
             }
             let _ = send.send(Update::Crew(event));
-            waker.wake();
         })
     };
     let crew = {
@@ -627,14 +638,12 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         )?
     };
     // What the assay's folder holds is read on a thread of its own, never
-    // in the window, at once and whenever it changes.
+    // where the terminal is drawn, at once and whenever it changes.
     {
         let send = send.clone();
-        let waker = waker.clone();
         let assay = assay.clone();
         std::thread::spawn(move || {
             let _ = send.send(Update::Assay(Box::new(assay.overview())));
-            waker.wake();
             for news in heard {
                 let update = match news {
                     Told::Store => Update::Assay(Box::new(assay.overview())),
@@ -643,7 +652,6 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                 if send.send(update).is_err() {
                     return;
                 }
-                waker.wake();
             }
         });
     }
@@ -657,7 +665,6 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     }
 
     let files = {
-        let waker = waker.clone();
         let journal = journal.file().to_path_buf();
         let categories = settings.categories();
         let labels = iq_observe::Labels::at(folder.join(LABELS));
@@ -689,21 +696,18 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                 {
                     return;
                 }
-                waker.wake();
                 std::thread::sleep(READ_EVERY);
             }
         }
     };
     std::thread::spawn(files);
 
-    // Asked to stop from outside, the window closes as if the person had
-    // closed it, so that the agents are stopped with it.
+    // Asked to stop from outside, iq ends as if the person had quit, so
+    // that the agents are stopped with it.
     {
-        let waker = waker.clone();
         runtime.spawn(async move {
             stop_asked().await;
             let _ = quit.send(Update::Quit);
-            waker.wake();
         });
     }
     let handle = runtime.handle().clone();
@@ -789,7 +793,7 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
 
     let board = iq_ui::Board::new(settings.keymap()?, settings.look()?)
         .with_limits(settings.limits(), settings.steward);
-    iq_gui::run(feed, ask, waker, board);
+    let ran = iq_tui::run(feed, ask, board).context("running in the terminal");
     runtime.block_on(async {
         // The runs stop, and end their crews, before iq does.
         assay.stop();
@@ -812,7 +816,7 @@ fn window(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
             }
         }
     });
-    Ok(())
+    ran
 }
 
 /// Resolves once the person or the system asks iq to stop: Ctrl-C in its
@@ -1023,7 +1027,7 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
             println!("The assay's folder: {}", store.root().display());
             let exercises = store.exercises()?;
             if exercises.is_empty() {
-                println!("No exercise yet: talk to the judge in the window's assay (Ctrl-L).");
+                println!("No exercise yet: talk to the judge, /judge in iq, or Ctrl-L then t.");
             }
             for exercise in &exercises {
                 let state = match &exercise.state {

@@ -1,12 +1,12 @@
-//! What the person's settings for the window can get wrong.
+//! What the person's settings for the terminal can get wrong.
 
-/// A shortcut or a look the settings name that the window cannot take.
+/// A shortcut or a look the settings name that iq cannot take.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UiError {
-    /// `[keys]` names an action the window does not have.
+    /// `[keys]` names an action iq does not have.
     #[error("there is no action `{0}` to bind a key to; the actions are {1}")]
     UnknownAction(String, String),
-    /// A key the window cannot read.
+    /// A key iq cannot read.
     #[error("`{chord}` for `{action}` is not a key: {why}")]
     BadChord {
         /// The action it was meant for.
@@ -26,7 +26,7 @@ pub enum UiError {
         /// The other.
         second: String,
     },
-    /// A look the window does not have.
+    /// A look iq does not have.
     #[error("there is no theme `{0}`; the themes are {1}")]
     UnknownTheme(String, String),
 }

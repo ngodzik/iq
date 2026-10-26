@@ -29,7 +29,7 @@ impl Span {
     /// Every span, the shortest first.
     pub const ALL: [Span; 5] = [Span::Day, Span::Week, Span::Month, Span::Year, Span::All];
 
-    /// Its name, as the window shows it.
+    /// Its name, as iq shows it.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -60,7 +60,7 @@ impl By {
     /// Every way, in the order offered.
     pub const ALL: [By; 4] = [By::Category, By::Model, By::Project, By::Agent];
 
-    /// Its name, as the window shows it.
+    /// Its name, as iq shows it.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {

@@ -1,9 +1,12 @@
 //! The shortcuts: which key does what, as the person may set it in the
-//! `[keys]` of their settings. The window reads a key in its own terms and
-//! asks here what it does, so that the bindings are tested without one.
+//! `[keys]` of their settings. The terminal reads a key in its own terms
+//! and asks here what it does, so that the bindings are tested without one.
 //!
 //! The defaults are letters held with Ctrl, which sit where they are named
-//! on QWERTY and AZERTY alike: digits and signs move between the two.
+//! on QWERTY and AZERTY alike: digits and signs move between the two. None
+//! takes a key a terminal keeps for itself (Ctrl-I is Tab there, Ctrl-M
+//! Enter) or one its line editors use (Ctrl-A, Ctrl-E, Ctrl-K, Ctrl-U,
+//! Ctrl-W and their like edit what the person writes).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -13,68 +16,53 @@ use crate::error::UiError;
 /// What a shortcut does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Action {
-    /// One pane, two side by side, four: the next of these.
-    Split,
-    /// The focus to the next pane shown.
-    NextPane,
-    /// The pane with the focus over the whole window, or back in its place.
-    Zoom,
-    /// A new chat in the pane with the focus.
-    NewChat,
-    /// The costs on the right, or not.
+    /// Writes to the next agent, or to a new chat after the last.
+    NextAgent,
+    /// The crew's page: each agent, what it does and spends.
+    Team,
+    /// The costs' page.
     Costs,
-    /// How far back the costs are summed: the next period.
-    Period,
+    /// The assay's page.
+    Assay,
+    /// What the work went to, over time.
+    Observations,
+    /// The shortcuts and the commands.
+    Keys,
     /// The next theme.
     Theme,
-    /// How much of the desktop shows through: the next step.
-    Opacity,
-    /// The menu at the top, or not.
-    Menu,
-    /// The list of shortcuts, or not.
-    Keys,
     /// The reviewer answering for the person, or not.
     Autopilot,
     /// The internet open to every command, or only to what fetches packages.
     Internet,
-    /// Allows what the agent in the pane with the focus asks.
+    /// Allows what an agent asks, the oldest question first.
     Allow,
     /// Refuses it.
     Refuse,
-    /// Stops the agent in the pane with the focus.
+    /// Stops the agent the person writes to.
     Stop,
     /// The steward writing to the agents that spend too fast, or only
     /// watching.
     Steward,
-    /// The assay in the pane with the focus.
-    Assay,
-    /// What the work went to, in the pane with the focus.
-    Observations,
     /// Quits.
     Quit,
 }
 
 impl Action {
     /// Every action, in the order the list of shortcuts gives them.
-    pub const ALL: [Action; 19] = [
-        Action::Split,
-        Action::NextPane,
-        Action::Zoom,
-        Action::NewChat,
+    pub const ALL: [Action; 14] = [
+        Action::NextAgent,
+        Action::Team,
         Action::Costs,
-        Action::Period,
-        Action::Theme,
-        Action::Opacity,
-        Action::Menu,
+        Action::Assay,
+        Action::Observations,
         Action::Keys,
+        Action::Theme,
         Action::Autopilot,
         Action::Internet,
         Action::Allow,
         Action::Refuse,
         Action::Stop,
         Action::Steward,
-        Action::Assay,
-        Action::Observations,
         Action::Quit,
     ];
 
@@ -82,24 +70,19 @@ impl Action {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Action::Split => "split",
-            Action::NextPane => "next_pane",
-            Action::Zoom => "zoom",
-            Action::NewChat => "new_chat",
+            Action::NextAgent => "next_agent",
+            Action::Team => "team",
             Action::Costs => "costs",
-            Action::Period => "period",
-            Action::Theme => "theme",
-            Action::Opacity => "opacity",
-            Action::Menu => "menu",
+            Action::Assay => "assay",
+            Action::Observations => "observations",
             Action::Keys => "keys",
+            Action::Theme => "theme",
             Action::Autopilot => "autopilot",
             Action::Internet => "internet",
             Action::Allow => "allow",
             Action::Refuse => "refuse",
             Action::Stop => "stop",
             Action::Steward => "steward",
-            Action::Assay => "assay",
-            Action::Observations => "observations",
             Action::Quit => "quit",
         }
     }
@@ -108,51 +91,40 @@ impl Action {
     #[must_use]
     pub fn what(self) -> &'static str {
         match self {
-            Action::Split => "one pane, two, four",
-            Action::NextPane => "the next pane",
-            Action::Zoom => "the pane over the whole window, or back",
-            Action::NewChat => "a new chat in this pane",
-            Action::Costs => "the costs on the right",
-            Action::Period => "the costs' period: 1h, 6h, 24h, 7d",
-            Action::Theme => "the next theme",
-            Action::Opacity => "how much of the desktop shows through",
-            Action::Menu => "the menu",
-            Action::Keys => "this list",
-            Action::Autopilot => "the autopilot",
-            Action::Internet => "the internet open to every command",
-            Action::Allow => "allow what this pane's agent asks",
-            Action::Refuse => "refuse it",
-            Action::Stop => "stop this pane's agent",
-            Action::Steward => "the steward writing to who spends too fast",
+            Action::NextAgent => "write to the next agent, or start a new chat",
+            Action::Team => "the crew: each agent, what it does and spends",
+            Action::Costs => "the costs, the limits and the subscriptions",
             Action::Assay => "the assay: agents tried on the same exercises",
             Action::Observations => "what the work went to, over time",
+            Action::Keys => "this list",
+            Action::Theme => "the next theme",
+            Action::Autopilot => "the autopilot",
+            Action::Internet => "the internet open to every command",
+            Action::Allow => "allow what an agent asks",
+            Action::Refuse => "refuse it",
+            Action::Stop => "stop the agent you write to",
+            Action::Steward => "the steward writing to who spends too fast",
             Action::Quit => "quit",
         }
     }
 
-    /// Its key unless the settings say otherwise.
+    /// Its key unless the settings say otherwise; empty for none.
     fn default_chord(self) -> &'static str {
         match self {
-            Action::Split => "ctrl+d",
-            Action::NextPane => "ctrl+tab",
-            Action::Zoom => "ctrl+e",
-            Action::NewChat => "ctrl+n",
+            Action::NextAgent => "ctrl+n",
+            Action::Team => "ctrl+t",
             Action::Costs => "ctrl+o",
-            Action::Period => "ctrl+p",
-            Action::Theme => "ctrl+t",
-            Action::Opacity => "ctrl+m",
-            Action::Menu => "ctrl+b",
+            Action::Assay => "ctrl+l",
+            Action::Observations => "ctrl+j",
             Action::Keys => "ctrl+s",
+            // Seldom wanted: the commands do them, `/theme`, `/internet`.
+            Action::Theme | Action::Internet => "",
             Action::Autopilot => "shift+tab",
-            Action::Internet => "ctrl+i",
             Action::Allow => "ctrl+y",
             Action::Refuse => "ctrl+r",
             Action::Stop => "escape",
             Action::Steward => "ctrl+g",
-            Action::Assay => "ctrl+l",
-            Action::Observations => "ctrl+j",
-            // Where each system quits.
-            Action::Quit if cfg!(target_os = "macos") => "cmd+q",
+            // A terminal never hands Cmd-Q to the program in it.
             Action::Quit => "ctrl+q",
         }
     }
@@ -173,7 +145,7 @@ pub struct Chord {
     pub shift: bool,
     /// Command, on macOS.
     pub cmd: bool,
-    /// The key, as the window names it: `O`, `Tab`, `Escape`, `F2`.
+    /// The key: a letter in capitals, `Tab`, `Escape`, `F2`.
     pub key: String,
 }
 
@@ -241,8 +213,8 @@ impl fmt::Display for Chord {
     }
 }
 
-/// A key's name as the window gives it, whatever case or alias the
-/// settings use: letters in capitals, `Escape` for `esc`.
+/// A key's name as chords hold it, whatever case or alias the settings
+/// use: letters in capitals, `Escape` for `esc`.
 fn key_name(key: &str) -> String {
     let lower = key.to_ascii_lowercase();
     let known = match lower.as_str() {
@@ -300,7 +272,7 @@ impl Keymap {
     ///
     /// # Errors
     ///
-    /// An action the window does not have, a key it cannot read, or two
+    /// An action iq does not have, a key it cannot read, or two
     /// actions on one key.
     pub fn with(changes: &BTreeMap<String, String>) -> Result<Self, UiError> {
         let mut chords = Self::default().chords;
@@ -362,7 +334,8 @@ mod tests {
     #[test]
     fn every_default_is_read_and_none_shares_a_key() {
         let keys = Keymap::default();
-        assert_eq!(keys.list().len(), Action::ALL.len());
+        // All but the two the commands do.
+        assert_eq!(keys.list().len(), Action::ALL.len() - 2);
         let costs = Chord::parse("ctrl+o").unwrap();
         assert_eq!(keys.action(&costs), Some(Action::Costs));
         assert_eq!(
@@ -399,7 +372,7 @@ mod tests {
             Err(UiError::BadChord { .. })
         ));
         assert!(matches!(
-            Keymap::with(&changes(&[("costs", "ctrl+d")])),
+            Keymap::with(&changes(&[("costs", "ctrl+l")])),
             Err(UiError::Taken { .. })
         ));
     }

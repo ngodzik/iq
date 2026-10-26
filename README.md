@@ -12,14 +12,12 @@ Deterministic tools before models, security as the foundation, and every cost in
 
 ```bash
 export REQUESTY_API_KEY=...   # without one, only Claude Code and Codex answer
-iq                            # opens the window
+iq                            # runs in the terminal
 iq do "..."                   # hands a task to the agents in the terminal
 iq --help
 ```
 
 ## Building
-
-On Linux the window needs Wayland's client library: `sudo apt install libwayland-dev` on Debian and Ubuntu.
 
 ```bash
 cargo install --path .              # builds the iq binary into ~/.cargo/bin

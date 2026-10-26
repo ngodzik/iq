@@ -9,12 +9,11 @@
 //! autopilot = false
 //! autopilot_internet = true              # the reviewer also answers what only reaches the internet
 //! internet = false                       # true: every command reaches the internet
-//! theme = "graphite"                     # or "ink", "porcelain"; Ctrl-T goes through them
-//! opacity = 0.86                         # how much of the desktop shows through, 0.3 to 1
+//! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //!
 //! steward = true                         # the steward writes to who spends too fast; Ctrl-G
 //!
-//! [keys]                                 # any shortcut moved, "" for none
+//! [keys]                                 # any shortcut moved, "" for none; Ctrl-S lists them
 //! costs = "ctrl+o"
 //!
 //! [limits]                               # what iq may use; what you spend outside iq counts too
@@ -88,10 +87,8 @@ pub(crate) struct Settings {
     /// it to and what the person allows.
     #[serde(default)]
     pub(crate) internet: bool,
-    /// The window's theme.
+    /// The theme.
     theme: Option<String>,
-    /// How opaque the window is.
-    opacity: Option<f32>,
     /// The shortcuts moved: an action's name and its key.
     #[serde(default)]
     keys: BTreeMap<String, String>,
@@ -223,14 +220,13 @@ impl Settings {
         Ok(ModelId::new(self.model.as_deref().unwrap_or(default))?)
     }
 
-    /// The window's look: its theme and opacity, as set.
+    /// The look: its theme, as set.
     pub(crate) fn look(&self) -> Result<iq_ui::look::Look> {
         let theme = match &self.theme {
             Some(name) => name.parse()?,
             None => iq_ui::look::Theme::default(),
         };
-        let opacity = self.opacity.unwrap_or(iq_ui::look::OPACITIES[0]);
-        Ok(iq_ui::look::Look::new(theme, opacity))
+        Ok(iq_ui::look::Look::new(theme))
     }
 
     /// Whether the autopilot's reviewer answers what only reaches the
@@ -264,7 +260,7 @@ impl Settings {
         limits
     }
 
-    /// The window's shortcuts, the defaults moved as set.
+    /// The shortcuts, the defaults moved as set.
     pub(crate) fn keymap(&self) -> Result<iq_ui::keys::Keymap> {
         Ok(iq_ui::keys::Keymap::with(&self.keys)?)
     }
@@ -461,9 +457,8 @@ mod tests {
         assert!(set.autopilot && set.internet);
         assert!(toml::from_str::<Settings>("modle = \"x\"").is_err());
         let looks: Settings =
-            toml::from_str("theme = \"Ink\"\nopacity = 0.6\n[keys]\ncosts = \"ctrl+u\"").unwrap();
-        let look = looks.look().unwrap();
-        assert_eq!((look.theme().name(), look.opacity()), ("ink", 0.6));
+            toml::from_str("theme = \"Ink\"\n[keys]\ncosts = \"ctrl+u\"").unwrap();
+        assert_eq!(looks.look().unwrap().theme().name(), "ink");
         assert!(
             looks
                 .keymap()

@@ -16,7 +16,7 @@ pub enum Payer {
 }
 
 impl Payer {
-    /// Its name, as the window shows it.
+    /// Its name, as iq shows it.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {

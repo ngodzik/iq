@@ -1,4 +1,4 @@
-//! What iq keeps of its sessions in its folder, for the window to show
+//! What iq keeps of its sessions in its folder, for the terminal to show
 //! after them: each call billed to the provider, one line of JSON each, and
 //! the quotas Claude Code and Codex reported, which Claude Code says
 //! nowhere else.
@@ -77,7 +77,7 @@ impl Ledger {
     }
 
     /// Keeps a call billed to the provider. A call that cannot be kept is
-    /// still shown: the window counts it as it comes.
+    /// still shown: the terminal counts it as it comes.
     pub(crate) fn bill(&self, agent: &str, model: &str, cost: Option<Usd>) {
         let line = Line {
             at: iq_ui::now(),

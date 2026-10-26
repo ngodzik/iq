@@ -1,4 +1,4 @@
-//! The subscriptions of Claude Code and Codex as the window shows them:
+//! The subscriptions of Claude Code and Codex as iq shows them:
 //! each window's share used and when it starts again, the context each
 //! call read, and what each request took.
 //!

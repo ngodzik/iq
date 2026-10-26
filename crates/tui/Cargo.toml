@@ -1,0 +1,19 @@
+[package]
+name    = "iq-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Draws iq's state in the terminal: the conversation in the terminal's own scrollback, the live part below it, the pages over it."
+
+[dependencies]
+iq-core.workspace  = true
+iq-agent.workspace = true
+iq-ui.workspace    = true
+jiff.workspace     = true
+ratatui.workspace  = true
+tachyonfx.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+vt100.workspace = true

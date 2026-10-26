@@ -1,18 +1,20 @@
-//! The window's state: what it shows and what the person did with it.
-//! Draws nothing, so that it is tested without a window.
+//! iq's state in the terminal: what it shows and what the person did with
+//! it. Draws nothing, so that it is tested without a terminal.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod assay;
 pub mod board;
+pub mod command;
 pub mod costs;
 pub mod crew;
 pub mod error;
+pub mod input;
 pub mod keys;
-pub mod layout;
 pub mod look;
 pub mod observations;
+pub mod screen;
 pub mod steward;
 pub mod subscriptions;
 

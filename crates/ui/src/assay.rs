@@ -1,4 +1,4 @@
-//! The assay as the window holds it: what the program read of its store,
+//! The assay as the terminal holds it: what the program read of its store,
 //! and the runs at work, as they go.
 
 pub use iq_assay::{JUDGE, Kind, Overview, Phase, Progress, Row, State, Summary, Table};
