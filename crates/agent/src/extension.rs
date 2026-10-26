@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use iq_core::{McpServer, ToolSpec};
+use iq_core::ToolSpec;
 use serde_json::Value;
 
 use crate::crew::Crew;
@@ -17,7 +17,7 @@ pub type Called = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
 
 /// Tools offered to some agents of a crew. Most agents get none of them:
 /// an extension knows the agents it serves by their names.
-pub trait Extension<M, D>: Send + Sync {
+pub trait Extension<M>: Send + Sync {
     /// The tools `agent` gets, none for most.
     fn tools(&self, agent: &str) -> Vec<ToolSpec>;
 
@@ -27,16 +27,9 @@ pub trait Extension<M, D>: Send + Sync {
         None
     }
 
-    /// The MCP servers `agent` is given beside iq's, when it is an agent
-    /// with tools of its own that takes them.
-    fn servers(&self, agent: &str) -> Vec<McpServer> {
-        let _ = agent;
-        Vec::new()
-    }
-
     /// Runs the tool `name` for `agent` with `args`, a JSON object. The
     /// crew is the one the agent works in: what the call does on the
     /// machine, it asks of the crew's gate, and what it must ask the
     /// person, it asks through the crew.
-    fn call(&self, crew: Crew<M, D>, agent: String, name: String, args: Value) -> Called;
+    fn call(&self, crew: Crew<M>, agent: String, name: String, args: Value) -> Called;
 }

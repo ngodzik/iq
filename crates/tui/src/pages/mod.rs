@@ -72,10 +72,7 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, &'static str) {
             "↑↓ choose · Enter write to it · v its thread · n a new chat",
         ),
         Page::Thread(agent) => (team::thread(seen, agent), "↑↓ scroll · ← the team"),
-        Page::Costs => (
-            costs::lines(seen),
-            "← → the period · e your own sessions too · ↑↓ scroll",
-        ),
+        Page::Costs => (costs::lines(seen), "← → the period · ↑↓ scroll"),
         Page::Assay => (
             assay::lines(seen),
             "t the assay's chat · s stop the runs · ↑↓ scroll",

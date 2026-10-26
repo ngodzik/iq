@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iq_agent::{Called, Crew, Extension, Report};
-use iq_core::{ChatModel, Delegate, ModelId, ToolSpec};
+use iq_core::{ChatModel, ModelId, ToolSpec};
 use iq_gate::Action;
 use serde_json::{Value, json};
 
@@ -59,12 +59,6 @@ pub struct Settings {
     pub reference: ModelId,
     /// How many runs go at once.
     pub parallel: usize,
-    /// Where a copy of the store is kept, as the chat is told: a server
-    /// and where in it.
-    pub mirrors: Vec<String>,
-    /// The MCP servers the copies are made through, handed to the chat
-    /// when it is Claude Code, which takes them.
-    pub servers: Vec<iq_core::McpServer>,
     /// The journal of iq's tasks, for what each category of work spent.
     pub journal: Option<PathBuf>,
     /// Where the categories models gave tasks are kept.
@@ -72,7 +66,7 @@ pub struct Settings {
     /// The person's categories of work.
     pub categories: iq_observe::Categories,
     /// What is wrong in the settings the assay was made from, for the
-    /// person to see: a server that cannot be handed.
+    /// person to see.
     pub notices: Vec<String>,
 }
 
@@ -170,11 +164,11 @@ impl RunPlan {
 }
 
 /// The assay. Cheap to clone: every clone is the same.
-pub struct Assay<M, D> {
-    inner: Arc<Inner<M, D>>,
+pub struct Assay<M> {
+    inner: Arc<Inner<M>>,
 }
 
-impl<M, D> Clone for Assay<M, D> {
+impl<M> Clone for Assay<M> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -182,18 +176,17 @@ impl<M, D> Clone for Assay<M, D> {
     }
 }
 
-struct Inner<M, D> {
+struct Inner<M> {
     store: Store,
-    runner: Runner<M, D>,
+    runner: Runner<M>,
     settings: Settings,
     roster: Mutex<Roster>,
     /// The agents it gives its tools to.
     served: Mutex<Vec<String>>,
     running: Mutex<Vec<Progress>>,
-    active: Mutex<Vec<(String, Crew<M, D>)>>,
+    active: Mutex<Vec<(String, Crew<M>)>>,
     stopping: AtomicBool,
     batches: AtomicUsize,
-    closed: Mutex<Vec<String>>,
     costs: Report,
     told: Arc<dyn Fn(Told) + Send + Sync>,
 }
@@ -245,16 +238,15 @@ pub struct Overview {
     pub notices: Vec<String>,
 }
 
-impl<M, D> Assay<M, D>
+impl<M> Assay<M>
 where
     M: ChatModel + Clone + 'static,
-    D: Delegate + Clone + 'static,
 {
     /// The assay of `store`, its runs made by `runner`, their costs told
     /// to `costs` as a crew's report, what changes told to `told`.
     pub fn new(
         store: Store,
-        runner: Runner<M, D>,
+        runner: Runner<M>,
         settings: Settings,
         costs: Report,
         told: Arc<dyn Fn(Told) + Send + Sync>,
@@ -270,7 +262,6 @@ where
                 active: Mutex::new(Vec::new()),
                 stopping: AtomicBool::new(false),
                 batches: AtomicUsize::new(0),
-                closed: Mutex::new(Vec::new()),
                 costs,
                 told,
             }),
@@ -310,15 +301,6 @@ where
 
     fn serves(&self, agent: &str) -> bool {
         lock(&self.inner.served).iter().any(|a| a == agent)
-    }
-
-    /// Closes the payers named, as the person's limits say: no run starts
-    /// on them.
-    pub fn close_payers(&self, payers: Vec<String>) {
-        for (_, crew) in lock(&self.inner.active).iter() {
-            crew.close_payers(payers.clone());
-        }
-        *lock(&self.inner.closed) = payers;
     }
 
     /// Stops the runs at work and those waiting.
@@ -515,14 +497,6 @@ where
             settings.grader,
             settings.allowed.said()
         );
-        out.push_str(&format!(
-            "\nAgents with tools of their own, installed (paid by their subscriptions): {}\n",
-            if roster.harnesses.is_empty() {
-                "none".to_owned()
-            } else {
-                roster.harnesses.join(", ")
-            }
-        ));
         let provider = roster
             .provider
             .clone()
@@ -725,7 +699,7 @@ where
         Ok(out)
     }
 
-    async fn freeze(&self, crew: &Crew<M, D>, agent: &str, args: &Value) -> Result<String, String> {
+    async fn freeze(&self, crew: &Crew<M>, agent: &str, args: &Value) -> Result<String, String> {
         let id = text(args, "exercise")?;
         let plan = match self.plan_freeze(id).await? {
             Planned::Ready(plan) => plan,
@@ -935,32 +909,17 @@ where
         let roster = lock(&self.inner.roster).clone();
         let read = READ_PER_RUN * runs as u64;
         let grader = &self.inner.settings.grader;
-        let prices = if grader.delegate().is_some() {
-            None
-        } else {
-            roster
-                .offer(grader.as_str())
-                .and_then(|o| Some((o.input?, o.output?)))
-        };
-        let (billed, tokens) = estimate::judging(read, runs, prices);
-        let dollars = billed.map_or(0.0, |b| b.0);
-        let mut parts = Vec::new();
-        if dollars > 0.0 {
-            parts.push(format!("about {} billed", iq_core::Usd(dollars)));
+        let prices = roster
+            .offer(grader.as_str())
+            .and_then(|o| Some((o.input?, o.output?)));
+        match estimate::judging(read, runs, prices) {
+            Some(billed) if billed.0 > 0.0 => format!("about {billed} billed"),
+            Some(_) => "little".into(),
+            None => "an amount unknown, its prices not listed".into(),
         }
-        if tokens > 0 {
-            parts.push(format!(
-                "about {} tokens of subscriptions",
-                iq_core::TokenCount(tokens)
-            ));
-        }
-        if parts.is_empty() {
-            parts.push("little".into());
-        }
-        parts.join(" and ")
     }
 
-    async fn run(&self, crew: &Crew<M, D>, agent: &str, args: &Value) -> Result<String, String> {
+    async fn run(&self, crew: &Crew<M>, agent: &str, args: &Value) -> Result<String, String> {
         let id = text(args, "exercise")?;
         let named: Vec<&str> = args["candidates"]
             .as_array()
@@ -996,8 +955,8 @@ where
     ///
     /// # Errors
     ///
-    /// The exercise is not frozen as it is, a candidate cannot be tested,
-    /// or the provider's limit is reached.
+    /// The exercise is not frozen as it is, or a candidate cannot be
+    /// tested.
     pub fn plan_run(&self, id: &str, named: &[&str], times: u64) -> Result<RunPlan, String> {
         let exercise = self.inner.store.exercise(id).map_err(|e| error_text(&e))?;
         let version = match &exercise.state {
@@ -1012,15 +971,6 @@ where
         };
         let candidates = self.candidates(named)?;
         let times = times.clamp(1, MOST_TIMES) as usize;
-        if lock(&self.inner.closed)
-            .iter()
-            .any(|p| p == iq_agent::PROVIDER)
-            && candidates
-                .iter()
-                .any(|c| c.models.iter().any(|m| m.delegate().is_none()))
-        {
-            return Err("the provider's limit, as the person set it, is reached: no run of its models starts".into());
-        }
         let records = self.inner.store.records(id);
         let roster = lock(&self.inner.roster).clone();
         let guesses: Vec<estimate::Guess> = candidates
@@ -1238,7 +1188,6 @@ where
             }
             assay.show_running();
         });
-        let closed = lock(&self.inner.closed).clone();
         self.inner
             .runner
             .run(
@@ -1255,7 +1204,6 @@ where
                     progress,
                     active: &self.inner.active,
                     stopping: &self.inner.stopping,
-                    closed,
                     now: crate::now(),
                 },
             )
@@ -1277,15 +1225,6 @@ where
     /// grades. Returns what went wrong.
     async fn grade(&self, exercise: &Exercise, records: &mut [Record]) -> Vec<String> {
         let grader = self.inner.settings.grader.clone();
-        if grader.delegate().is_none()
-            && lock(&self.inner.closed)
-                .iter()
-                .any(|p| p == iq_agent::PROVIDER)
-        {
-            return vec![format!(
-                "{grader} did not grade: the provider's limit is reached"
-            )];
-        }
         let task = match exercise.task() {
             Ok(task) => task,
             Err(error) => {
@@ -1358,7 +1297,7 @@ where
             judge::prompt(exercise, &task, &works)
         };
         let mut notes = Vec::new();
-        match self.ask_grader(&grader, &prompt, &labels, &blind).await {
+        match self.ask_grader(&grader, &prompt, &labels).await {
             Ok((grades, model)) => {
                 let verdict = |grade: &judge::Grade| Verdict {
                     judge: grader.to_string(),
@@ -1419,15 +1358,12 @@ where
         grader: &ModelId,
         prompt: &str,
         labels: &[String],
-        folder: &Path,
     ) -> Result<(Vec<judge::Grade>, String), String> {
         let runner = &self.inner.runner;
         let answer = judge::ask(
             &runner.provider,
-            &runner.agents,
             grader,
             prompt.to_owned(),
-            folder,
             &self.inner.costs,
         )
         .await?;
@@ -1437,15 +1373,7 @@ where
                 let again = format!(
                     "{prompt}\n\nAn answer of yours to this could not be read: {why}. Answer with the JSON object only."
                 );
-                let answer = judge::ask(
-                    &runner.provider,
-                    &runner.agents,
-                    grader,
-                    again,
-                    folder,
-                    &self.inner.costs,
-                )
-                .await?;
+                let answer = judge::ask(&runner.provider, grader, again, &self.inner.costs).await?;
                 judge::read(&answer.text, labels).map(|grades| (grades, answer.model))
             }
         }
@@ -1454,12 +1382,7 @@ where
     /// Has the grader grade the runs of an exercise's latest version it did
     /// not grade yet, or all of them when asked: after it changed, so that
     /// every grade compared is its own.
-    async fn regrade(
-        &self,
-        crew: &Crew<M, D>,
-        agent: &str,
-        args: &Value,
-    ) -> Result<String, String> {
+    async fn regrade(&self, crew: &Crew<M>, agent: &str, args: &Value) -> Result<String, String> {
         let id = text(args, "exercise")?;
         let exercise = self.inner.store.exercise(id).map_err(|e| error_text(&e))?;
         let all = args["all"].as_bool().unwrap_or(false);
@@ -1515,12 +1438,7 @@ where
         ))
     }
 
-    async fn of_commit(
-        &self,
-        crew: &Crew<M, D>,
-        agent: &str,
-        args: &Value,
-    ) -> Result<String, String> {
+    async fn of_commit(&self, crew: &Crew<M>, agent: &str, args: &Value) -> Result<String, String> {
         let repository = PathBuf::from(text(args, "repository")?);
         let commit = text(args, "commit")?.trim().to_owned();
         let id = text(args, "exercise")?;
@@ -1588,7 +1506,7 @@ where
                  a description, and rules if they wish).\n",
             );
         }
-        let mut sums: Vec<(Option<String>, usize, f64, f64, u64)> = Vec::new();
+        let mut sums: Vec<(Option<String>, usize, f64, u64)> = Vec::new();
         let mut unplaced = Vec::new();
         for task in &tasks {
             let category = iq_observe::category_of(task, categories, &labels);
@@ -1599,23 +1517,17 @@ where
                 Some(sum) => {
                     sum.1 += 1;
                     sum.2 += task.billed;
-                    sum.3 += task.listed;
-                    sum.4 += task.tokens;
+                    sum.3 += task.tokens;
                 }
-                None => sums.push((category, 1, task.billed, task.listed, task.tokens)),
+                None => sums.push((category, 1, task.billed, task.tokens)),
             }
         }
-        sums.sort_by(|a, b| {
-            a.0.is_none()
-                .cmp(&b.0.is_none())
-                .then((b.2 + b.3).total_cmp(&(a.2 + a.3)))
-        });
-        for (category, count, billed, listed, tokens) in &sums {
+        sums.sort_by(|a, b| a.0.is_none().cmp(&b.0.is_none()).then(b.2.total_cmp(&a.2)));
+        for (category, count, billed, tokens) in &sums {
             out.push_str(&format!(
-                "- {}: {count} tasks, {} billed, {} at list prices under subscriptions, {} tokens\n",
+                "- {}: {count} tasks, {} billed, {} tokens\n",
                 category.as_deref().unwrap_or("(not placed yet)"),
                 iq_core::Usd(*billed),
-                iq_core::Usd(*listed),
                 iq_core::TokenCount(*tokens)
             ));
         }
@@ -1645,11 +1557,10 @@ where
                 commands.dedup();
                 let prompt: String = task.prompt.chars().take(100).collect();
                 out.push_str(&format!(
-                    "- {} on {}, {} billed, {} listed: files {}; commands {}; given: {}\n",
+                    "- {} on {}, {} billed: files {}; commands {}; given: {}\n",
                     task.agent,
                     task.model,
                     iq_core::Usd(task.billed),
-                    iq_core::Usd(task.listed),
                     if files.is_empty() {
                         "none".into()
                     } else {
@@ -1669,7 +1580,7 @@ where
 
     async fn call_tool(
         &self,
-        crew: Crew<M, D>,
+        crew: Crew<M>,
         agent: String,
         name: String,
         args: Value,
@@ -1688,10 +1599,9 @@ where
     }
 }
 
-impl<M, D> Extension<M, D> for Assay<M, D>
+impl<M> Extension<M> for Assay<M>
 where
     M: ChatModel + Clone + 'static,
-    D: Delegate + Clone + 'static,
 {
     fn tools(&self, agent: &str) -> Vec<ToolSpec> {
         if self.serves(agent) {
@@ -1710,19 +1620,10 @@ where
             settings.reference.as_str(),
             &settings.allowed.said(),
             settings.grader.as_str(),
-            &settings.mirrors,
         ))
     }
 
-    fn servers(&self, agent: &str) -> Vec<iq_core::McpServer> {
-        if self.serves(agent) {
-            self.inner.settings.servers.clone()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn call(&self, crew: Crew<M, D>, agent: String, name: String, args: Value) -> Called {
+    fn call(&self, crew: Crew<M>, agent: String, name: String, args: Value) -> Called {
         let assay = self.clone();
         Box::pin(async move { assay.call_tool(crew, agent, name, args).await })
     }
@@ -1761,7 +1662,7 @@ fn tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "assay_roster".into(),
-            description: "Who may be tested: the provider's models that call tools, cheapest first, with their prices, the agents with tools of their own installed, the grader, the reference, and what the person's settings allow.".into(),
+            description: "Who may be tested: the provider's models that call tools, cheapest first, with their prices, the grader, the reference, and what the person's settings allow.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1808,7 +1709,7 @@ fn tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "assay_run".into(),
-            description: "Runs a frozen exercise on candidates, once the person agrees to what it should cost, which it asks them; each in a folder of its own, checked, then graded blind by the grader. Returns at once; the results come to you as a message. A candidate is a model (`z-ai/glm-5`), an agent (`claude-code/sonnet`), or a team (`pair: writer + reviewer`, `lead: lead + cheaper`, `debate: a + b`).".into(),
+            description: "Runs a frozen exercise on candidates, once the person agrees to what it should cost, which it asks them; each in a folder of its own, checked, then graded blind by the grader. Returns at once; the results come to you as a message. A candidate is a model (`z-ai/glm-5`), or a team (`pair: writer + reviewer`, `lead: lead + cheaper`, `debate: a + b`).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

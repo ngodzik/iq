@@ -3,22 +3,16 @@
 //! the gate.
 //!
 //! An agent is a model of the provider, which iq runs in a loop with its
-//! tools, or an agent with tools of its own (Claude Code, Codex), which
-//! reaches iq back through its program: Claude Code's tool calls are judged
-//! by the gate, and both find the board among their tools. What the gate
-//! asks goes to the person, or, the autopilot being on, to the reviewer,
-//! which may answer only what stays within the sandbox.
+//! tools, the board's among them. What the gate asks goes to the person,
+//! or, the autopilot being on, to the reviewer, which may answer only what
+//! stays within the sandbox.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use iq_core::{
-    Agent, ChatModel, ChatRequest, Delegate, DelegateEvent, DelegateRequest, Effort, Message,
-    ModelId, Reach, ToolCall, ToolSpec, Usd,
-};
+use iq_core::{ChatModel, ChatRequest, Effort, Message, ModelId, ToolCall, ToolSpec, Usd};
 use iq_gate::{Action, Approver, Gate, Helper, Judged, Pending, Permit, Sandbox, Scope};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
@@ -34,10 +28,6 @@ pub type Report = Arc<dyn Fn(Event) + Send + Sync>;
 
 /// Everyone on the board: a message to `all` reaches every agent.
 pub const ALL: &str = "all";
-
-/// The steward on the board: it writes to agents that spend too fast, and
-/// they answer it.
-pub const STEWARD: &str = "steward";
 
 /// How often two agents may wake each other in [`PEER_SPAN`], whichever
 /// writes: more, and they talk on without the work moving, on the
@@ -62,25 +52,18 @@ const RULES_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 /// The most of a project's rules an agent is given, in bytes.
 const RULES_MOST: usize = 40_000;
 
-/// What a payer is called when it is closed: Claude Code's and Codex's
-/// subscriptions by their agents' names, the provider by this.
-pub const PROVIDER: &str = "provider";
-
-/// What decides whether an agent may start another on a model for a
-/// task: the task, and the model. The person's named models are allowed
-/// before it is asked.
-pub type StartGuard = Arc<dyn Fn(&str, &ModelId) -> Result<(), String> + Send + Sync>;
-
 /// What the crew starts with.
 #[derive(Debug, Clone)]
 pub struct Settings {
-    /// The model that answers for the person when the autopilot is on: a
-    /// model of the provider, or an agent such as `claude-code/haiku`.
-    pub reviewer: ModelId,
+    /// The model of the provider that answers for the person when the
+    /// autopilot is on: none, and the person is asked.
+    pub reviewer: Option<ModelId>,
     /// How hard models think; `None` leaves it to them.
     pub effort: Option<Effort>,
     /// The most the provider's key may be billed for the crew's calls,
-    /// from its start; `None` for no limit.
+    /// from its start, as an assay's exercise allows each run; `None`, as
+    /// in the person's sessions, for no limit: the lead spends as it
+    /// judges, and the person follows what it costs.
     pub budget: Option<Usd>,
     /// How long a question waits for the person before it is refused.
     pub patience: Duration,
@@ -94,7 +77,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            reviewer: ModelId::agent(Agent::ClaudeCode),
+            reviewer: None,
             effort: None,
             budget: None,
             patience: Duration::from_secs(50 * 60),
@@ -104,41 +87,13 @@ impl Default for Settings {
     }
 }
 
-/// How the agents with tools of their own reach the crew: through iq's
-/// program, speaking to the bridge.
-#[derive(Debug, Clone)]
-pub struct Bridge {
-    /// iq's program.
-    pub program: PathBuf,
-    /// The socket the crew listens on.
-    pub socket: PathBuf,
-    /// A folder of iq's own, out of the commands' reach, for the agents'
-    /// settings.
-    pub folder: PathBuf,
-}
-
-/// The variable that names the bridge's socket for iq's program.
-pub const BRIDGE_VAR: &str = "IQ_BRIDGE";
-
-/// The variable that names the agent iq's program speaks for.
-pub const AGENT_VAR: &str = "IQ_AGENT";
-
-/// The flag that makes iq's program judge one of Claude Code's tool calls.
-pub const HOOK_FLAG: &str = "--iq-hook";
-
-/// The flag that makes iq's program serve the board's tools over MCP.
-pub const MCP_FLAG: &str = "--iq-mcp";
-
-/// The flag that makes iq's program run a command the gate judged.
-pub const EXEC_FLAG: &str = "--iq-exec";
-
 /// The agents in one workspace. Cheap to clone: every clone is the same
 /// crew.
-pub struct Crew<M, D> {
-    inner: Arc<Inner<M, D>>,
+pub struct Crew<M> {
+    inner: Arc<Inner<M>>,
 }
 
-impl<M, D> Clone for Crew<M, D> {
+impl<M> Clone for Crew<M> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -146,9 +101,8 @@ impl<M, D> Clone for Crew<M, D> {
     }
 }
 
-struct Inner<M, D> {
+struct Inner<M> {
     provider: M,
-    agents: D,
     gate: Gate,
     sandbox: Sandbox,
     settings: Settings,
@@ -163,23 +117,12 @@ struct Inner<M, D> {
     posted: watch::Sender<usize>,
     /// What the provider's key was billed so far.
     billed: Mutex<Usd>,
-    /// The models the person named in what they wrote.
-    named: Mutex<Vec<ModelId>>,
-    /// What decides the models agents start others on, when something
-    /// does: the routing.
-    guard: Mutex<Option<StartGuard>>,
-    bridge: Mutex<Option<Bridge>>,
-    /// Commands Claude Code was allowed, by the number its call runs.
-    permits: Mutex<HashMap<String, Permit>>,
-    /// The payers whose limits the person set are reached: no agent starts
-    /// on them, and the provider bills no more.
-    closed: Mutex<Vec<String>>,
     /// When agents woke each other lately, and which two.
     peer_wakes: Mutex<Vec<(Instant, (String, String))>>,
     /// The teams at work, and where each stands.
     teams: Mutex<Vec<Team>>,
     /// The tools other parts of iq offer some agents.
-    extensions: Mutex<Vec<Arc<dyn Extension<M, D>>>>,
+    extensions: Mutex<Vec<Arc<dyn Extension<M>>>>,
 }
 
 #[derive(Default)]
@@ -209,19 +152,8 @@ struct Member {
     read: usize,
     /// Its turn under way, when it works.
     turn: Option<JoinHandle<()>>,
-    kind: Kind,
-}
-
-#[derive(Clone)]
-enum Kind {
-    /// One of iq's: its conversation, kept between turns.
-    Own { messages: Vec<Message> },
-    /// An agent with tools of its own, and its session to go on with.
-    Other {
-        agent: Agent,
-        model: String,
-        session: Option<String>,
-    },
+    /// Its conversation, kept between turns.
+    messages: Vec<Message>,
 }
 
 /// An agent of the crew, as listed.
@@ -239,17 +171,15 @@ pub struct Listed {
     pub role: Option<String>,
 }
 
-impl<M, D> Crew<M, D>
+impl<M> Crew<M>
 where
     M: ChatModel + 'static,
-    D: Delegate + 'static,
 {
-    /// A crew with no agent yet, its models answered by `provider`, its
-    /// other agents run by `agents`, acting through `gate`, its commands
-    /// run in the gate's sandbox through `helper`.
+    /// A crew with no agent yet, its models answered by `provider`, acting
+    /// through `gate`, its commands run in the gate's sandbox through
+    /// `helper`.
     pub fn new(
         provider: M,
-        agents: D,
         gate: Gate,
         helper: Helper,
         settings: Settings,
@@ -259,7 +189,6 @@ where
         Self {
             inner: Arc::new(Inner {
                 provider,
-                agents,
                 gate,
                 sandbox,
                 settings,
@@ -271,11 +200,6 @@ where
                 board: Mutex::new(Board::default()),
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
-                named: Mutex::new(Vec::new()),
-                guard: Mutex::new(None),
-                bridge: Mutex::new(None),
-                permits: Mutex::new(HashMap::new()),
-                closed: Mutex::new(Vec::new()),
                 peer_wakes: Mutex::new(Vec::new()),
                 teams: Mutex::new(Vec::new()),
                 extensions: Mutex::new(Vec::new()),
@@ -285,12 +209,12 @@ where
 
     /// Offers `extension`'s tools to the agents it serves, from their
     /// next turn.
-    pub fn extend(&self, extension: Arc<dyn Extension<M, D>>) {
+    pub fn extend(&self, extension: Arc<dyn Extension<M>>) {
         lock(&self.inner.extensions).push(extension);
     }
 
     /// The extensions, taken out of their lock to be called.
-    fn extensions(&self) -> Vec<Arc<dyn Extension<M, D>>> {
+    fn extensions(&self) -> Vec<Arc<dyn Extension<M>>> {
         lock(&self.inner.extensions).clone()
     }
 
@@ -319,11 +243,6 @@ where
         &self.inner.gate
     }
 
-    /// The sandbox its commands run in.
-    pub(crate) fn sandbox(&self) -> &Sandbox {
-        &self.inner.sandbox
-    }
-
     /// Whether the reviewer answers for the person.
     pub fn autopilot(&self) -> bool {
         self.inner.autopilot.load(Ordering::Relaxed)
@@ -340,22 +259,10 @@ where
         self.inner.gate.internet()
     }
 
-    /// Gives every command the internet, Codex's included from its next
-    /// turn, or only what a rule gives it to and what the person allows.
+    /// Gives every command the internet, or only what a rule gives it to
+    /// and what the person allows.
     pub fn set_internet(&self, open: bool) {
         self.inner.gate.set_internet(open);
-    }
-
-    /// Has the agents with tools of their own reach the crew through
-    /// `bridge`, once it listens.
-    pub fn reach_through(&self, bridge: Bridge) {
-        *lock(&self.inner.bridge) = Some(bridge);
-    }
-
-    /// The bridge, taken away: the agents with tools of their own no
-    /// longer reach the crew.
-    pub(crate) fn take_bridge(&self) -> Option<Bridge> {
-        lock(&self.inner.bridge).take()
     }
 
     /// What the provider's key was billed so far.
@@ -421,10 +328,7 @@ where
                 teams.push(Team::Pair {
                     writer: writer.clone(),
                     reviewer: None,
-                    reviewer_model: models
-                        .get(1)
-                        .cloned()
-                        .unwrap_or_else(|| self.inner.settings.reviewer.clone()),
+                    reviewer_model: models.get(1).unwrap_or(first).clone(),
                     task,
                     rounds: 0,
                     over: false,
@@ -599,20 +503,11 @@ where
             name = format!("{base}-{n}");
             n += 1;
         }
-        let kind = match model.delegate() {
-            Some((agent, model)) => Kind::Other {
-                agent,
-                model: model.to_owned(),
-                session: None,
-            },
-            None => Kind::Own {
-                messages: vec![Message::system(self.instructions(
-                    &name,
-                    by,
-                    role.as_deref(),
-                ))],
-            },
-        };
+        let messages = vec![Message::system(self.instructions(
+            &name,
+            by,
+            role.as_deref(),
+        ))];
         let read = board.messages.len();
         board.members.insert(
             name.clone(),
@@ -623,7 +518,7 @@ where
                 task: task.clone(),
                 read,
                 turn: None,
-                kind,
+                messages,
             },
         );
         drop(board);
@@ -664,6 +559,13 @@ where
         }
     }
 
+    /// Ends the crew: every agent stopped, and what their commands left
+    /// running stopped with the sandbox.
+    pub async fn end(&self) {
+        self.stop_all();
+        self.inner.sandbox.end().await;
+    }
+
     /// Waits until no agent works, nor any answer is on its way to wake
     /// one.
     pub async fn settled(&self) {
@@ -700,7 +602,7 @@ where
     pub(crate) fn post(&self, from: &str, to: &str, text: String) -> Result<(), String> {
         let wakes = {
             let mut board = lock(&self.inner.board);
-            if to != ALL && to != PERSON && to != STEWARD && !board.members.contains_key(to) {
+            if to != ALL && to != PERSON && !board.members.contains_key(to) {
                 let names: Vec<&str> = board.members.keys().map(String::as_str).collect();
                 return Err(format!(
                     "no agent is named {to:?}: the agents are {}",
@@ -820,40 +722,21 @@ where
     async fn turn(self, name: String, prompt: String) {
         let (taken, posted_before) = {
             let board = lock(&self.inner.board);
-            let taken = board
-                .members
-                .get(&name)
-                .map(|member| (member.kind.clone(), member.model.clone(), member.by.clone()));
+            let taken = board.members.get(&name).map(|member| {
+                (
+                    member.messages.clone(),
+                    member.model.clone(),
+                    member.by.clone(),
+                )
+            });
             (taken, board.messages.len())
         };
-        let Some((kind, model, by)) = taken else {
+        let Some((messages, model, by)) = taken else {
             return;
         };
-        let (kind, outcome) = match kind {
-            Kind::Own { messages } => {
-                let (messages, outcome) = self.own_turn(&name, &model, messages, prompt).await;
-                (Kind::Own { messages }, outcome)
-            }
-            Kind::Other {
-                agent,
-                model: agent_model,
-                session,
-            } => {
-                let (session, outcome) = self
-                    .other_turn(&name, agent, &agent_model, session, prompt)
-                    .await;
-                (
-                    Kind::Other {
-                        agent,
-                        model: agent_model,
-                        session,
-                    },
-                    outcome,
-                )
-            }
-        };
+        let (messages, outcome) = self.own_turn(&name, &model, messages, prompt).await;
         if let Some(member) = lock(&self.inner.board).members.get_mut(&name) {
-            member.kind = kind;
+            member.messages = messages;
             // It rests from now: what is posted to it wakes it.
             member.turn = None;
         }
@@ -932,7 +815,7 @@ where
                     .await
                     .map(|pricing| pricing.cost(&response.usage)),
             };
-            self.spent(name, model.as_str(), response.usage, cost, true);
+            self.spent(name, model.as_str(), response.usage, cost);
             let said = response
                 .content
                 .as_ref()
@@ -984,124 +867,6 @@ where
             messages,
             Err(format!("stopped after {steps} calls to its model")),
         )
-    }
-
-    /// A turn of an agent with tools of its own.
-    async fn other_turn(
-        &self,
-        name: &str,
-        agent: Agent,
-        model: &str,
-        session: Option<String>,
-        prompt: String,
-    ) -> (Option<String>, Result<String, String>) {
-        let servers: Vec<iq_core::McpServer> = self
-            .extensions()
-            .iter()
-            .flat_map(|extension| extension.servers(name))
-            .collect();
-        let reach = lock(&self.inner.bridge).as_ref().map(|bridge| Reach {
-            program: bridge.program.clone(),
-            hook_args: vec![HOOK_FLAG.to_owned()],
-            mcp_args: vec![MCP_FLAG.to_owned()],
-            env: vec![
-                (BRIDGE_VAR.to_owned(), bridge.socket.display().to_string()),
-                (AGENT_VAR.to_owned(), name.to_owned()),
-            ],
-            folder: bridge.folder.clone(),
-            servers,
-        });
-        let (by, role) = lock(&self.inner.board)
-            .members
-            .get(name)
-            .map(|member| (member.by.clone(), member.role.clone()))
-            .unwrap_or_default();
-        let request = DelegateRequest {
-            agent,
-            read_only: false,
-            effort: self.inner.settings.effort,
-            model: model.to_owned(),
-            prompt,
-            instructions: self.instructions_for_other(name, &by, role.as_deref(), reach.is_some()),
-            resume: session.clone(),
-            fork: false,
-            ephemeral: false,
-            directory: self.inner.gate.workspace().to_path_buf(),
-            reach,
-            network: self.inner.gate.internet(),
-        };
-        let crew = self.clone();
-        let who = name.to_owned();
-        let shown = if model.is_empty() {
-            agent.prefix().to_owned()
-        } else {
-            format!("{}/{model}", agent.prefix())
-        };
-        let mut on_event = move |event: DelegateEvent| crew.relay(&who, &shown, event);
-        match self.inner.agents.run(&request, &mut on_event).await {
-            Ok(reply) => (Some(reply.session), Ok(reply.text)),
-            Err(error) => (session, Err(chain(&error))),
-        }
-    }
-
-    /// Reports what an agent with tools of its own did.
-    fn relay(&self, agent: &str, model: &str, event: DelegateEvent) {
-        let agent = agent.to_owned();
-        match event {
-            DelegateEvent::TextStart => self.report(Event::TextStart { agent }),
-            DelegateEvent::Text(text) => self.report(Event::Text { agent, text }),
-            DelegateEvent::Usage {
-                usage,
-                cost,
-                billed,
-                model: answered,
-                ..
-            } => {
-                // The model that answered, under the agent's name, when it
-                // said which: `claude-code/claude-opus-5-5` rather than the
-                // `claude-code/opus` it was asked for.
-                let model = match (answered.is_empty(), model.split_once('/')) {
-                    (false, Some((agent, _))) => format!("{agent}/{answered}"),
-                    (false, None) => format!("{model}/{answered}"),
-                    (true, _) => model.to_owned(),
-                };
-                self.spent(&agent, &model, usage, cost, billed);
-            }
-            DelegateEvent::Tool {
-                name,
-                input,
-                output,
-            } => {
-                let (output, ok) = match output {
-                    Ok(output) => (output, true),
-                    Err(error) => (error, false),
-                };
-                self.report(Event::Tool {
-                    agent,
-                    name,
-                    input: tools::summary(&input),
-                    output,
-                    ok,
-                });
-            }
-            DelegateEvent::Notice(text) => self.report(Event::Notice { agent, text }),
-            DelegateEvent::Quota(quota) => self.report(Event::Quota(quota)),
-            DelegateEvent::Denied {
-                name,
-                input,
-                reason,
-            } => {
-                let reason = if reason.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {reason}")
-                };
-                self.report(Event::Notice {
-                    agent,
-                    text: format!("{name} {} was refused{reason}", tools::summary(&input)),
-                });
-            }
-        }
     }
 
     /// Runs one of the tools of iq's agents, and gives what it returned or
@@ -1179,8 +944,7 @@ where
         }
     }
 
-    /// Runs one of the board's tools, for iq's agents or, through the
-    /// bridge, for the others.
+    /// Runs one of the board's tools.
     pub(crate) async fn board_tool(
         &self,
         agent: &str,
@@ -1190,14 +954,7 @@ where
         match name {
             "start_agent" => {
                 let model = ModelId::new(args.text("model")?).map_err(|e| e.to_string())?;
-                self.open_for(&model)?;
                 self.held_to(&model)?;
-                let guard = lock(&self.inner.guard).clone();
-                if let Some(guard) = guard
-                    && !lock(&self.inner.named).contains(&model)
-                {
-                    guard(args.text("task")?, &model)?;
-                }
                 let role = args
                     .text("role")
                     .ok()
@@ -1390,114 +1147,37 @@ where
             .map(|member| member.task.clone())
             .unwrap_or_default();
         let prompt = review::prompt(&task, action, reason);
-        let model = &self.inner.settings.reviewer;
-        let answer = match model.delegate() {
-            Some((other, its_model)) => {
-                let request = DelegateRequest {
-                    agent: other,
-                    read_only: true,
-                    effort: Some(Effort::Low),
-                    model: its_model.to_owned(),
-                    prompt,
-                    instructions: review::INSTRUCTIONS.to_owned(),
-                    resume: None,
-                    fork: false,
-                    ephemeral: true,
-                    directory: self.inner.gate.workspace().to_path_buf(),
-                    reach: None,
-                    network: false,
-                };
-                let crew = self.clone();
-                let shown = model.to_string();
-                let mut on_event = move |event: DelegateEvent| {
-                    if let DelegateEvent::Usage {
-                        usage,
-                        cost,
-                        billed,
-                        ..
-                    } = event
-                    {
-                        crew.spent("reviewer", &shown, usage, cost, billed);
-                    }
-                };
-                self.inner
-                    .agents
-                    .run(&request, &mut on_event)
-                    .await
-                    .map(|reply| reply.text)
-                    .map_err(|e| chain(&e))?
-            }
-            None => {
-                self.within_budget()?;
-                let request = ChatRequest {
-                    model: model.clone(),
-                    messages: vec![Message::system(review::INSTRUCTIONS), Message::user(prompt)],
-                    tools: Vec::new(),
-                    effort: Some(Effort::Low),
-                };
-                let response = self
-                    .inner
-                    .provider
-                    .complete(&request)
-                    .await
-                    .map_err(|e| chain(&e))?;
-                let cost = match response.cost {
-                    Some(cost) => Some(cost),
-                    None => self
-                        .inner
-                        .provider
-                        .pricing(model)
-                        .await
-                        .map(|pricing| pricing.cost(&response.usage)),
-                };
-                self.spent("reviewer", model.as_str(), response.usage, cost, true);
-                response.content.unwrap_or_default()
-            }
+        let model = self
+            .inner
+            .settings
+            .reviewer
+            .as_ref()
+            .ok_or("no reviewer is set")?;
+        self.within_budget()?;
+        let request = ChatRequest {
+            model: model.clone(),
+            messages: vec![Message::system(review::INSTRUCTIONS), Message::user(prompt)],
+            tools: Vec::new(),
+            effort: Some(Effort::Low),
         };
+        let response = self
+            .inner
+            .provider
+            .complete(&request)
+            .await
+            .map_err(|e| chain(&e))?;
+        let cost = match response.cost {
+            Some(cost) => Some(cost),
+            None => self
+                .inner
+                .provider
+                .pricing(model)
+                .await
+                .map(|pricing| pricing.cost(&response.usage)),
+        };
+        self.spent("reviewer", model.as_str(), response.usage, cost);
+        let answer = response.content.unwrap_or_default();
         Ok(review::verdict(&answer))
-    }
-
-    /// Answers one of Claude Code's tool calls, as its hook gives it: the
-    /// hook's output, empty to leave the call to Claude Code's own mode.
-    pub(crate) async fn hook(&self, agent: &str, input: &serde_json::Value) -> String {
-        let workspace = self.inner.gate.workspace().to_path_buf();
-        let call = crate::hook::read(input, &workspace);
-        // What others wrote to it since it last looked rides on the answer:
-        // between two of its calls is when Claude Code can read it.
-        let news = self.unread(agent);
-        let news = news.as_deref();
-        match call {
-            crate::hook::Call::Defer => crate::hook::defer(news),
-            crate::hook::Call::Refuse(reason) => crate::hook::deny(&reason, news),
-            crate::hook::Call::Judge { action, command } => match self.act(agent, action).await {
-                Ok(permit) => match command {
-                    Some(input) => {
-                        let program = lock(&self.inner.bridge)
-                            .as_ref()
-                            .map(|bridge| bridge.program.clone());
-                        let Some(program) = program else {
-                            return crate::hook::deny("iq's bridge is closed", news);
-                        };
-                        let id = crate::bridge::token();
-                        lock(&self.inner.permits).insert(id.clone(), permit);
-                        crate::hook::allow(
-                            Some(crate::hook::through(input, &program, &[EXEC_FLAG, &id])),
-                            news,
-                        )
-                    }
-                    None => crate::hook::allow(None, news),
-                },
-                Err(reason) => crate::hook::deny(&reason, news),
-            },
-        }
-    }
-
-    /// Runs the command the gate allowed one of Claude Code's calls, once.
-    pub(crate) async fn exec(&self, id: &str) -> Result<(String, bool), String> {
-        let permit = lock(&self.inner.permits)
-            .remove(id)
-            .ok_or("no command waits under that number")?;
-        self.run(permit, CLAUDE_ASK).await
     }
 
     /// Lets the reviewer give a command the internet, the autopilot on, or
@@ -1505,21 +1185,6 @@ where
     /// are always the person's.
     pub fn set_autopilot_internet(&self, may: bool) {
         self.inner.gate.set_reviewer_internet(may);
-    }
-
-    /// Closes the payers named, whose limits are reached, and opens the
-    /// others: `claude-code`, `codex`, or the provider.
-    pub fn close_payers(&self, payers: Vec<String>) {
-        *lock(&self.inner.closed) = payers;
-    }
-
-    /// Writes to `to` as the steward.
-    ///
-    /// # Errors
-    ///
-    /// No agent of that name.
-    pub fn advise(&self, to: &str, text: String) -> Result<(), String> {
-        self.post(STEWARD, to, text)
     }
 
     /// Asks the person whether `agent` may do `action`, which the gate
@@ -1583,52 +1248,6 @@ where
         self.run(permit, OWN_ASK).await
     }
 
-    /// Refuses a model whose payer is closed, saying which are open.
-    fn open_for(&self, model: &ModelId) -> Result<(), String> {
-        let closed = lock(&self.inner.closed).clone();
-        let payer = model
-            .delegate()
-            .map_or(PROVIDER, |(agent, _)| agent.prefix());
-        if !closed.iter().any(|c| c == payer) {
-            return Ok(());
-        }
-        let open: Vec<&str> = [Agent::ClaudeCode.prefix(), Agent::Codex.prefix(), PROVIDER]
-            .into_iter()
-            .filter(|p| !closed.iter().any(|c| c == p))
-            .collect();
-        Err(format!(
-            "{payer} has reached the limit the person set; start the agent on another: {}",
-            if open.is_empty() {
-                "none is open".to_owned()
-            } else {
-                open.join(", ")
-            }
-        ))
-    }
-
-    /// The models the person named in what they wrote: agents may start
-    /// others on them, whatever else would choose for them.
-    pub fn name_models(&self, models: &[ModelId]) {
-        let mut named = lock(&self.inner.named);
-        for model in models {
-            if !named.contains(model) {
-                named.push(model.clone());
-            }
-        }
-    }
-
-    /// Has `guard` decide the models agents start others on: the person's
-    /// named models aside, what it refuses is refused, with its reason.
-    pub fn guard_starts(&self, guard: StartGuard) {
-        *lock(&self.inner.guard) = Some(guard);
-    }
-
-    /// The models the person named so far.
-    #[must_use]
-    pub fn named_models(&self) -> Vec<ModelId> {
-        lock(&self.inner.named).clone()
-    }
-
     /// Fails when the crew is held to other models than `model`.
     fn held_to(&self, model: &ModelId) -> Result<(), String> {
         match &self.inner.settings.models {
@@ -1644,14 +1263,9 @@ where
         }
     }
 
-    /// Fails once the provider's key was billed the budget, or the
-    /// provider's limit for the month is reached.
+    /// Fails once the provider's key was billed the budget, when the crew
+    /// has one.
     fn within_budget(&self) -> Result<(), String> {
-        if lock(&self.inner.closed).iter().any(|c| c == PROVIDER) {
-            return Err(
-                "the provider's limit for the month, as the person set it, is reached".to_owned(),
-            );
-        }
         match self.inner.settings.budget {
             Some(budget) if self.billed() >= budget => Err(format!(
                 "the budget of {budget} for the provider is spent; raise it to go on"
@@ -1660,23 +1274,8 @@ where
         }
     }
 
-    fn spent(
-        &self,
-        agent: &str,
-        model: &str,
-        usage: iq_core::Usage,
-        cost: Option<Usd>,
-        billed: bool,
-    ) {
-        // The session's budget is the provider's: a call an agent bills to
-        // a key of its own is owed elsewhere.
-        let own_key = ModelId::new(model)
-            .ok()
-            .is_some_and(|model| model.delegate().is_some());
-        if billed
-            && !own_key
-            && let Some(cost) = cost
-        {
+    fn spent(&self, agent: &str, model: &str, usage: iq_core::Usage, cost: Option<Usd>) {
+        if let Some(cost) = cost {
             *lock(&self.inner.billed) += cost;
         }
         self.report(Event::Spent {
@@ -1684,7 +1283,6 @@ where
             model: model.to_owned(),
             usage,
             cost,
-            billed,
         });
     }
 
@@ -1713,9 +1311,7 @@ where
              or say what you need.\n\n\
              Other agents may work beside you. start_agent hands a task to a new one, \
              send_message writes to one, to all, or to the person, and wait_for_messages waits \
-             for an answer. Messages to you also arrive between your calls. The steward watches \
-             what the crew spends against the person's limits: when it writes to you, answer it \
-             in a line, with send_message to steward, and do as it asks.\n\n\
+             for an answer. Messages to you also arrive between your calls.\n\n\
              Read before you change, check your work with the project's own tools (its build, \
              tests, linters), and be brief. When the task is done, answer with what you did and \
              call no tool.{}{}",
@@ -1732,7 +1328,7 @@ where
     /// `AGENTS.md`, else its `CLAUDE.md`, whose `@file` lines are the
     /// files they import. Read through the gate, as an agent's reads are,
     /// and never asked of the person: what the gate does not allow at once
-    /// is left out. Claude Code and Codex read them on their own.
+    /// is left out.
     fn project_rules(&self) -> Option<(&'static str, String)> {
         let workspace = self.inner.gate.workspace().to_path_buf();
         let read = |path: std::path::PathBuf| -> Option<String> {
@@ -1774,34 +1370,6 @@ where
             Some((file, format!("{}{more}", &text[..cut])))
         })
     }
-
-    /// What an agent with tools of its own is told of the crew.
-    fn instructions_for_other(
-        &self,
-        name: &str,
-        by: &str,
-        role: Option<&str>,
-        reaches: bool,
-    ) -> String {
-        let part = role_line(role);
-        let extended = self.extended(name);
-        if !reaches {
-            return format!("You are {name}, an agent of iq's, started by {by}.{part}{extended}");
-        }
-        format!(
-            "You are {name}, an agent of iq's, started by {by}.{part} Your commands run in iq's \
-             sandbox, which writes only this folder. They reach localhost; the internet is \
-             given to what fetches packages and sources (npm install, cargo fetch, pip install, \
-             git fetch), and to ask the person for it for another command, start its line with \
-             IQ_NETWORK=1. What iq's gate holds waits for the person. iq's tools (send_message, wait_for_messages, \
-             start_agent, list_agents) let you write to the other agents and to the person, and \
-             hand tasks to new agents. Messages written to you while you work arrive beside \
-             your tools' results; wait for one with wait_for_messages when your work depends on \
-             others. The steward watches what the crew spends against the person's limits: when \
-             it writes to you, answer it in a line, with send_message to steward, and do as it \
-             asks.{extended}"
-        )
-    }
 }
 
 /// The line of an agent's instructions that gives it its part, if any.
@@ -1837,15 +1405,11 @@ const OFFLINE: &[&str] = &[
 const OWN_ASK: &str = "to have it, run it again with \"network\": true, which the person approves, \
                        unless a rule gives it";
 
-/// How Claude Code does.
-const CLAUDE_ASK: &str = "to have it, run the same line again starting with IQ_NETWORK=1, \
-                          which the person approves, unless a rule gives it";
-
 /// A turn under way: counted until it ends, or is stopped, as its task
 /// drops it either way.
-struct Busy<M, D>(Crew<M, D>);
+struct Busy<M>(Crew<M>);
 
-impl<M, D> Drop for Busy<M, D> {
+impl<M> Drop for Busy<M> {
     fn drop(&mut self) {
         self.0.inner.busy.fetch_sub(1, Ordering::SeqCst);
     }

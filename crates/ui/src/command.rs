@@ -18,7 +18,7 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 15] = [
+pub const COMMANDS: [Spec; 14] = [
     Spec {
         name: "new",
         args: "[model]",
@@ -47,7 +47,7 @@ pub const COMMANDS: [Spec; 15] = [
     Spec {
         name: "costs",
         args: "",
-        what: "the costs, the limits and the subscriptions",
+        what: "the costs: by model, by kind of task, over time",
     },
     Spec {
         name: "assay",
@@ -73,11 +73,6 @@ pub const COMMANDS: [Spec; 15] = [
         name: "internet",
         args: "",
         what: "the internet open to every command, or only to what fetches packages",
-    },
-    Spec {
-        name: "steward",
-        args: "",
-        what: "the steward writing to who spends too fast, or only watching",
     },
     Spec {
         name: "theme",
@@ -123,8 +118,6 @@ pub enum Command {
     Autopilot,
     /// The internet open to every command, or not.
     Internet,
-    /// The steward writing, or only watching.
-    Steward,
     /// The next theme, or this one.
     Theme(Option<Theme>),
     /// Stop the agent written to, this one, or `all`.
@@ -197,7 +190,6 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "keys" | "help" => bare(Command::Keys),
         "autopilot" => bare(Command::Autopilot),
         "internet" => bare(Command::Internet),
-        "steward" => bare(Command::Steward),
         "theme" => match one("theme")? {
             None => Ok(Command::Theme(None)),
             Some(name) => name
@@ -309,12 +301,12 @@ mod tests {
     fn lines_are_read_or_refused_with_a_reason() {
         assert_eq!(parse("/new").unwrap(), Command::New(None));
         assert_eq!(
-            parse("/new codex").unwrap(),
-            Command::New(Some("codex".into()))
+            parse("/new openai/gpt-6").unwrap(),
+            Command::New(Some("openai/gpt-6".into()))
         );
         assert_eq!(
-            parse("/pattern pair claude-code/haiku").unwrap(),
-            Command::Pattern(Pattern::Pair, Some("claude-code/haiku".into()))
+            parse("/pattern pair z-ai/glm-5").unwrap(),
+            Command::Pattern(Pattern::Pair, Some("z-ai/glm-5".into()))
         );
         assert_eq!(parse("/to @helper").unwrap(), Command::To("helper".into()));
         assert_eq!(
@@ -343,7 +335,10 @@ mod tests {
             names(complete("/stop h", &["helper", "lead"], &[])),
             ["/stop helper"]
         );
-        assert_eq!(names(complete("/new ", &[], &["codex"])), ["/new codex"]);
+        assert_eq!(
+            names(complete("/new ", &[], &["z-ai/glm-5"])),
+            ["/new z-ai/glm-5"]
+        );
         // Once complete, or when a message is written, nothing is offered.
         assert!(complete("/theme ink", &[], &[]).is_empty());
         assert!(complete("fix it", &[], &[]).is_empty());

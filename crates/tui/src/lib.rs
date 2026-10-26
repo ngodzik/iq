@@ -31,7 +31,7 @@ use std::io::{self, Write};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use iq_core::{TokenCount, Usd};
+use iq_core::Usd;
 use iq_ui::crew::Request;
 use iq_ui::{Board, Update};
 use ratatui::backend::CrosstermBackend;
@@ -171,9 +171,6 @@ impl Iq {
             for post in self.board.take_posts() {
                 self.motion.posted(&post);
             }
-            for request in self.board.watch(now) {
-                self.ask(request);
-            }
             if self.board.quitting() {
                 return Ok(());
             }
@@ -224,15 +221,6 @@ impl Iq {
         // What the person named is said under what they wrote, as it
         // decides who works.
         match &request {
-            Request::Start {
-                name,
-                model,
-                routed: Some(why),
-                ..
-            } => {
-                self.history
-                    .after_message(name, format!("→ on {model}, {why}"));
-            }
             Request::Start {
                 name, model, named, ..
             } if !named.is_empty() => {
@@ -417,22 +405,13 @@ impl Iq {
         }
         self.history.finish_all(&self.board, &self.p);
         let mut billed = Usd(0.0);
-        let mut tokens = 0;
         for agent in self.board.crew().agents() {
             billed += agent.billed;
-            tokens += agent.subscription.0;
         }
-        let mut spent = Vec::new();
-        if billed.0 > 0.0 {
-            spent.push(format!("{billed} billed to the provider"));
-        }
-        if tokens > 0 {
-            spent.push(format!("{} tokens under subscriptions", TokenCount(tokens)));
-        }
-        let said = if spent.is_empty() {
-            "iq ends.".to_owned()
+        let said = if billed.0 > 0.0 {
+            format!("iq ends: {billed} billed to the provider.")
         } else {
-            format!("iq ends: {}.", spent.join(", "))
+            "iq ends.".to_owned()
         };
         self.history.say(&said, &self.p);
         let screen = &mut self.screen;

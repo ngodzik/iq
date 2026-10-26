@@ -33,25 +33,8 @@ pub enum LlmError {
         reason: String,
     },
 
-    /// An agent program could not be started at all.
-    #[error("could not run {program}")]
-    Spawn {
-        /// The program.
-        program: String,
-        /// The underlying failure.
-        #[source]
-        source: std::io::Error,
-    },
-
-    /// An agent the task was handed to failed, with its own explanation.
-    #[error("{0}")]
-    Delegate(String),
-
     /// No key was given for the provider, so its models cannot be called.
-    /// Claude Code and Codex, which bring their own credentials, still can.
-    #[error(
-        "no API key for {url}: set REQUESTY_API_KEY, or use Claude Code or Codex, which bring their own"
-    )]
+    #[error("no API key for {url}: set REQUESTY_API_KEY")]
     NoKey {
         /// The endpoint that would have been called.
         url: String,

@@ -1,8 +1,8 @@
-//! The agents the assay may give an exercise to: the provider's models as
-//! it lists them, with what they charge, and the agents with tools of their
-//! own. The program reads them; the assay only chooses among them.
+//! The models the assay may give an exercise to: the provider's, as it
+//! lists them, with what they charge. The program reads them; the assay
+//! only chooses among them.
 
-use iq_core::{Agent, ModelId};
+use iq_core::ModelId;
 
 use crate::candidate::Kind;
 
@@ -32,36 +32,12 @@ pub struct Roster {
     pub provider: Option<String>,
     /// The provider's models.
     pub models: Vec<Offer>,
-    /// The agents with tools of their own installed, as candidates name
-    /// them, with their models: `claude-code/opus`, `codex`.
-    pub harnesses: Vec<String>,
     /// Why the provider's models are not there, when they are not: no
     /// key, the list could not be fetched.
     pub missing: Option<String>,
 }
 
-/// The models Claude Code is offered with, besides its default.
-const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
-
 impl Roster {
-    /// The agents with tools of their own, as candidates name them, for
-    /// those of `installed`.
-    #[must_use]
-    pub fn harnesses_of(installed: &[Agent]) -> Vec<String> {
-        let mut named = Vec::new();
-        for agent in installed {
-            match agent {
-                Agent::ClaudeCode => named.extend(
-                    CLAUDE_MODELS
-                        .iter()
-                        .map(|model| format!("{}/{model}", agent.prefix())),
-                ),
-                Agent::Codex => named.push(agent.prefix().to_owned()),
-            }
-        }
-        named
-    }
-
     /// The provider's model `id`, when it lists it.
     #[must_use]
     pub fn offer(&self, id: &str) -> Option<&Offer> {
@@ -74,9 +50,6 @@ impl Roster {
     /// `z-ai/glm-5.3` and `glm-5-3` are one model.
     #[must_use]
     pub fn key(&self, model: &ModelId) -> String {
-        if model.delegate().is_some() {
-            return model.to_string();
-        }
         let named = self
             .offer(model.as_str())
             .and_then(|offer| offer.canonical.clone())
@@ -87,26 +60,14 @@ impl Roster {
         plain(&named)
     }
 
-    /// Whether `model` may be tested: a harness installed, or a model the
-    /// provider lists that calls tools. A model the list does not hold is
+    /// Whether `model` may be tested: a model the provider lists that
+    /// calls tools. A model the list does not hold is
     /// let through when there is no list, for the provider to answer.
     ///
     /// # Errors
     ///
     /// Why it may not.
     pub fn check(&self, model: &ModelId) -> Result<(), String> {
-        if model.delegate().is_some() {
-            let shown = model.to_string();
-            let installed = self
-                .harnesses
-                .iter()
-                .any(|h| h == &shown || shown.split('/').next() == h.split('/').next());
-            return if installed {
-                Ok(())
-            } else {
-                Err(format!("{shown} is not installed on this machine"))
-            };
-        }
         if self.models.is_empty() {
             return Ok(());
         }
@@ -148,7 +109,7 @@ impl Default for Allowed {
 }
 
 impl Allowed {
-    /// As the settings write it: `models`, `harnesses`, `teams`, or
+    /// As the settings write it: `models`, `teams`, or
     /// candidates' names; every kind when empty.
     #[must_use]
     pub fn from_words(words: &[String]) -> Self {
@@ -210,28 +171,24 @@ mod tests {
                 offer("z-ai/glm-5.3", Some("glm-5.3"), true),
                 offer("old/plain", None, false),
             ],
-            harnesses: Roster::harnesses_of(&[Agent::ClaudeCode]),
             missing: None,
         };
         let key = |id: &str| roster.key(&ModelId::new(id).unwrap());
         assert_eq!(key("z-ai/glm-5.3"), "glm53");
         assert_eq!(key("elsewhere/GLM-5-3"), "glm53");
-        assert_eq!(key("claude-code/opus"), "claude-code/opus");
         let check = |id: &str| roster.check(&ModelId::new(id).unwrap());
         assert!(check("z-ai/glm-5.3").is_ok());
         assert!(check("old/plain").unwrap_err().contains("no tools"));
         assert!(check("made/up").unwrap_err().contains("assay_roster"));
-        assert!(check("claude-code/haiku").is_ok());
-        assert!(check("codex").unwrap_err().contains("not installed"));
     }
 
     #[test]
     fn the_settings_allow_by_kind_or_name() {
-        let allowed = Allowed::from_words(&["models".into(), "claude-code/opus".into()]);
+        let allowed = Allowed::from_words(&["models".into(), "pair: a/b + c/d".into()]);
         assert!(allowed.allows(Kind::Model, "x/y"));
-        assert!(!allowed.allows(Kind::Harness, "codex"));
-        assert!(allowed.allows(Kind::Harness, "claude-code/opus"));
+        assert!(!allowed.allows(Kind::Team, "debate: a/b + c/d"));
+        assert!(allowed.allows(Kind::Team, "pair: a/b + c/d"));
         assert!(Allowed::from_words(&[]).allows(Kind::Team, "pair: a + b"));
-        assert_eq!(allowed.said(), "models, claude-code/opus");
+        assert_eq!(allowed.said(), "models, pair: a/b + c/d");
     }
 }

@@ -1,25 +1,8 @@
 //! What the chat in the assay's folder is told: what the assay is for,
-//! the store it works in, its tools, and how to spend the person's money
-//! and subscriptions.
+//! the store it works in, its tools, and how to spend the person's money.
 
 /// What the chat is told of the assay, the store's folder its workspace.
-pub(crate) fn instructions(
-    reference: &str,
-    allowed: &str,
-    grader: &str,
-    mirrors: &[String],
-) -> String {
-    let mirror = if mirrors.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nA copy of the store is kept elsewhere, which you keep up to date with the tools of \
-             these MCP servers, once what changed is settled (an exercise frozen, a batch graded, \
-             the kinds of task written): {}. The store's files are the reference: the copy only \
-             receives them, and you never read results back from it.",
-            mirrors.join("; ")
-        )
-    };
+pub(crate) fn instructions(reference: &str, allowed: &str, grader: &str) -> String {
     format!(
         "You work with the person in iq's assay, whose folder is your workspace: read its \
          README.md first. It is for this: for each kind of task they give agents, find the \
@@ -46,14 +29,14 @@ pub(crate) fn instructions(
          grade the work blind, the reference among it. You never grade: the grader's grades are \
          the ones compared, always by the same model, and those by another model are kept apart. \
          When the grader changed, assay_grade grades the runs again. A candidate is a model of \
-         the provider, an agent (claude-code/sonnet, codex), or a team (`pair: writer + \
-         reviewer`, `lead: lead + cheaper`, `debate: a + b`); assay_roster lists who may be \
+         the provider, or a team (`pair: writer + reviewer`, `lead: lead + cheaper`, `debate: a \
+         + b`); assay_roster lists who may be \
          tested, with their prices; the person's settings allow {allowed}.\n\
          - Results, with assay_results, summed by iq: give the numbers as it gives them, they \
          are iq's, not yours. Their message comes to you once runs are graded: say what it shows, \
          and what the person might do next. One run says little; run again only those close \
          to each other.\n\n\
          Spend little: the person pays for every call, yours included. Never run, freeze or \
-         grade without the person's go: those tools ask them. Be brief.{mirror}"
+         grade without the person's go: those tools ask them. Be brief."
     )
 }

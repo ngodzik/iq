@@ -1004,12 +1004,9 @@ version = "0.1.0"
 dependencies = [
  "iq-core",
  "iq-gate",
- "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1063,7 +1060,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -1110,7 +1106,6 @@ dependencies = [
  "iq-agent",
  "iq-core",
  "iq-ui",
- "jiff",
  "nix",
  "ratatui",
  "unicode-width",
@@ -1125,7 +1120,6 @@ dependencies = [
  "iq-assay",
  "iq-core",
  "jiff",
- "serde",
  "thiserror",
 ]
 

@@ -28,9 +28,6 @@ pub struct Task {
     /// What the provider billed it, in dollars.
     #[serde(default)]
     pub billed: f64,
-    /// What its calls under a subscription would cost at list prices.
-    #[serde(default)]
-    pub listed: f64,
     /// The tokens it read and wrote.
     #[serde(default)]
     pub tokens: u64,
@@ -57,7 +54,6 @@ impl Default for Task {
             files: Vec::new(),
             commands: Vec::new(),
             billed: 0.0,
-            listed: 0.0,
             tokens: 0,
             seconds: 0,
             ok: true,

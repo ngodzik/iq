@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iq_agent::Report;
-use iq_core::{ChatModel, Delegate, Effort, ModelId};
+use iq_core::{ChatModel, Effort, ModelId};
 
 use crate::categories::Categories;
 use crate::labels::{Labels, category_of};
@@ -40,11 +40,11 @@ pub struct Settings {
 }
 
 /// The observer. Cheap to clone: every clone is the same.
-pub struct Observer<M, D> {
-    inner: Arc<Inner<M, D>>,
+pub struct Observer<M> {
+    inner: Arc<Inner<M>>,
 }
 
-impl<M, D> Clone for Observer<M, D> {
+impl<M> Clone for Observer<M> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -52,46 +52,38 @@ impl<M, D> Clone for Observer<M, D> {
     }
 }
 
-struct Inner<M, D> {
+struct Inner<M> {
     provider: M,
-    agents: D,
     settings: Settings,
     journal: PathBuf,
     labels: Labels,
     costs: Report,
-    /// Where an agent with tools of its own asked to place runs, reading.
-    directory: PathBuf,
     waiting: Mutex<Vec<Task>>,
     placing: AtomicBool,
     /// The day, in days since 1970, and the tasks placed that day.
     today: Mutex<(u64, usize)>,
 }
 
-impl<M, D> Observer<M, D>
+impl<M> Observer<M>
 where
     M: ChatModel + 'static,
-    D: Delegate + 'static,
 {
     /// An observer placing the tasks of the journal at `journal`, keeping
     /// what models give in `labels`, its costs told to `costs`.
     pub fn new(
         provider: M,
-        agents: D,
         settings: Settings,
         journal: PathBuf,
         labels: Labels,
         costs: Report,
-        directory: PathBuf,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 provider,
-                agents,
                 settings,
                 journal,
                 labels,
                 costs,
-                directory,
                 waiting: Mutex::new(Vec::new()),
                 placing: AtomicBool::new(false),
                 today: Mutex::new((0, 0)),
@@ -203,13 +195,11 @@ where
         let prompt = place::prompt(categories, &before, tasks);
         let answer = iq_agent::ask_once(
             &inner.provider,
-            &inner.agents,
             &inner.settings.model,
             place::INSTRUCTIONS,
             prompt,
             iq_agent::Asked {
                 agent: "observer",
-                directory: &inner.directory,
                 effort: Effort::Low,
                 costs: &inner.costs,
             },

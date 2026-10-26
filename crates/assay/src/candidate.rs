@@ -1,6 +1,5 @@
-//! Who does an exercise: one model in iq's loop, an agent with a loop of
-//! its own (Claude Code, Codex), or a team of them working in one of the
-//! crew's patterns.
+//! Who does an exercise: one model in iq's loop, or a team of them working
+//! in one of the crew's patterns.
 
 use std::fmt;
 use std::str::FromStr;
@@ -10,29 +9,26 @@ use iq_core::ModelId;
 use serde::{Deserialize, Serialize};
 
 /// The kinds of candidates, kept apart in the results: a model is tested
-/// in iq's loop, a harness in its own, and a team is several agents. Set
-/// side by side, two kinds would compare two things at once.
+/// alone in iq's loop, and a team is several agents. Set side by side, two
+/// kinds would compare two things at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     /// A model of a provider, in iq's own loop with its tools.
     Model,
-    /// An agent with a loop and tools of its own, such as Claude Code.
-    Harness,
     /// Agents working in one of the crew's patterns.
     Team,
 }
 
 impl Kind {
     /// Every kind, in the order the results give them.
-    pub const ALL: [Kind; 3] = [Kind::Model, Kind::Harness, Kind::Team];
+    pub const ALL: [Kind; 2] = [Kind::Model, Kind::Team];
 
     /// Its name in the settings, plural as a list of them reads.
     #[must_use]
     pub fn plural(self) -> &'static str {
         match self {
             Kind::Model => "models",
-            Kind::Harness => "harnesses",
             Kind::Team => "teams",
         }
     }
@@ -42,7 +38,6 @@ impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Kind::Model => "model",
-            Kind::Harness => "harness",
             Kind::Team => "team",
         })
     }
@@ -109,7 +104,6 @@ impl Candidate {
     #[must_use]
     pub fn kind(&self) -> Kind {
         match (self.pattern, self.models.as_slice()) {
-            (Pattern::Solo, [model]) if model.delegate().is_some() => Kind::Harness,
             (Pattern::Solo, [_]) => Kind::Model,
             _ => Kind::Team,
         }
@@ -188,7 +182,7 @@ mod tests {
     fn candidates_read_back_as_they_are_written() {
         for text in [
             "openai/gpt-5-mini",
-            "claude-code/haiku",
+            "anthropic/claude-haiku-5-5",
             "pair: z-ai/glm-5 + openai/gpt-5-mini",
             "debate: a/b + c/d + e/f",
             "qwen/qwen3:free",
@@ -207,8 +201,8 @@ mod tests {
     fn each_kind_is_told_apart() {
         let kind = |text: &str| text.parse::<Candidate>().unwrap().kind();
         assert_eq!(kind("deepseek/deepseek-chat"), Kind::Model);
-        assert_eq!(kind("codex"), Kind::Harness);
-        assert_eq!(kind("lead: claude-code + a/b"), Kind::Team);
+        assert_eq!(kind("anthropic/claude-opus-5-5"), Kind::Model);
+        assert_eq!(kind("lead: anthropic/claude-opus-5-5 + a/b"), Kind::Team);
         assert_eq!("debate: a/b".parse::<Candidate>().unwrap().agents(), 2);
     }
 }

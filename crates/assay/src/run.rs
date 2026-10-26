@@ -5,16 +5,16 @@
 //! for the person during a run: what the gate asks is refused, the same
 //! for every candidate.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iq_agent::{Crew, Event, PERSON, Report};
-use iq_core::{Agent, ChatModel, Delegate, Effort, ModelId, Usd};
+use iq_core::{ChatModel, Effort, Usd};
 use iq_gate::{Action, Approver, Gate, Helper, Judged, Scope};
 
-use crate::candidate::{Candidate, Kind};
+use crate::candidate::Candidate;
 use crate::error::AssayError;
 use crate::exercise::Exercise;
 use crate::record::{Checked, Ending, Record, Spent};
@@ -32,16 +32,6 @@ const TRANSCRIPT_LINES: usize = 12;
 
 /// Makes the gate of a run's folder, with the person's rules.
 pub type GateFor = Arc<dyn Fn(&Path) -> Result<Gate, String> + Send + Sync>;
-
-/// How the agents with tools of their own reach a run's crew: iq's
-/// program, and the folder of iq's own where their sockets are.
-#[derive(Debug, Clone)]
-pub struct Reach {
-    /// iq's program.
-    pub program: PathBuf,
-    /// The folder of iq's own for the bridge's sockets.
-    pub folder: PathBuf,
-}
 
 /// What a run is at, for the window to show it as it goes.
 #[derive(Debug, Clone, PartialEq)]
@@ -82,20 +72,15 @@ pub enum Phase {
 }
 
 /// Runs candidates, each with a crew of its own.
-pub struct Runner<M, D> {
+pub struct Runner<M> {
     /// The models of the provider.
     pub provider: M,
     /// Who serves them, as it names itself: `Requesty`, a host.
     pub provider_name: Option<String>,
-    /// The agents with tools of their own.
-    pub agents: D,
     /// The sandbox's helper.
     pub helper: Helper,
     /// The gate of a run's folder.
     pub gate: GateFor,
-    /// How the agents with tools of their own reach a run's crew, when
-    /// they may.
-    pub reach: Option<Reach>,
     /// How hard the models think.
     pub effort: Option<Effort>,
 }
@@ -115,18 +100,16 @@ pub struct Order<'a> {
 }
 
 /// What a run is told of the world around it while it goes.
-pub struct Around<'a, M, D> {
+pub struct Around<'a, M> {
     /// Where its costs go, as the crew's report: they are counted with
     /// iq's others.
     pub costs: Report,
     /// Told what the run is at.
     pub progress: Arc<dyn Fn(Progress) + Send + Sync>,
     /// The crews at work, for them to be stopped.
-    pub active: &'a Mutex<Vec<(String, Crew<M, D>)>>,
+    pub active: &'a Mutex<Vec<(String, Crew<M>)>>,
     /// Whether the person asked for the runs to stop.
     pub stopping: &'a AtomicBool,
-    /// The payers the person's limits closed.
-    pub closed: Vec<String>,
     /// The time now, in seconds since 1970, as the run starts.
     pub now: u64,
 }
@@ -141,10 +124,9 @@ struct Gathered {
     spent: Spent,
 }
 
-impl<M, D> Runner<M, D>
+impl<M> Runner<M>
 where
     M: ChatModel + Clone + 'static,
-    D: Delegate + Clone + 'static,
 {
     /// Runs `order` and keeps its record in `store`.
     ///
@@ -156,7 +138,7 @@ where
         &self,
         store: &Store,
         order: Order<'_>,
-        around: Around<'_, M, D>,
+        around: Around<'_, M>,
     ) -> Result<Record, AssayError> {
         let exercise = order.exercise;
         let version = exercise.version().ok_or_else(|| {
@@ -203,21 +185,11 @@ where
                     }
                     Event::Asked { .. } => kept.refused += 1,
                     Event::Spent {
-                        model,
-                        usage,
-                        cost,
-                        billed,
-                        ..
+                        model, usage, cost, ..
                     } => {
-                        let tokens = usage.input.0 + usage.output.0;
                         kept.spent.calls += 1;
-                        kept.spent.tokens += tokens;
-                        if *billed {
-                            kept.spent.billed += cost.unwrap_or_default();
-                        } else {
-                            kept.spent.listed += cost.unwrap_or_default();
-                            kept.spent.subscription_tokens += tokens;
-                        }
+                        kept.spent.tokens += usage.input.0 + usage.output.0;
+                        kept.spent.billed += cost.unwrap_or_default();
                         // Every cost is counted with iq's others, under the
                         // run's name.
                         costs(Event::Spent {
@@ -225,10 +197,8 @@ where
                             model: model.clone(),
                             usage: *usage,
                             cost: *cost,
-                            billed: *billed,
                         });
                     }
-                    Event::Quota(quota) => costs(Event::Quota(quota.clone())),
                     _ => {}
                 }
                 let moved = matches!(event, Event::Tool { .. } | Event::Spent { .. });
@@ -244,7 +214,6 @@ where
             })
         };
         let settings = iq_agent::Settings {
-            reviewer: ModelId::agent(Agent::ClaudeCode),
             effort: self.effort,
             budget: exercise.dollars.map(Usd),
             // Nobody answers for the person during a run.
@@ -256,17 +225,11 @@ where
         };
         let crew = Crew::new(
             self.provider.clone(),
-            self.agents.clone(),
             gate.clone(),
             self.helper.clone(),
             settings,
             report,
         );
-        crew.close_payers(around.closed.clone());
-        if let Some(reach) = &self.reach {
-            crew.serve(reach.program.clone(), reach.folder.clone())
-                .map_err(AssayError::io(&reach.folder))?;
-        }
         let key = format!("{}/{}/{}", exercise.id, order.batch, order.label);
         lock(around.active).push((key.clone(), crew.clone()));
         let candidate = order.candidate;
@@ -326,14 +289,7 @@ where
             candidate: candidate.clone(),
             kind,
             model: order.model,
-            provider: match kind {
-                Kind::Harness => None,
-                Kind::Model | Kind::Team => self.provider_name.clone(),
-            },
-            harness: match candidate.lead().delegate() {
-                Some((agent, _)) if kind == Kind::Harness => agent.prefix().to_owned(),
-                _ => "iq".to_owned(),
-            },
+            provider: self.provider_name.clone(),
             started: around.now,
             seconds,
             ending,
@@ -529,10 +485,7 @@ fn transcript(events: &[Event]) -> String {
                 Err(why) => out.push_str(&format!("### {agent} stops: {why}\n\n")),
             },
             Event::Notice { agent, text } => out.push_str(&format!("- {agent}: {text}\n")),
-            Event::Spent { .. }
-            | Event::Answered { .. }
-            | Event::Reviewed { .. }
-            | Event::Quota(_) => {}
+            Event::Spent { .. } | Event::Answered { .. } | Event::Reviewed { .. } => {}
         }
     }
     out

@@ -11,28 +11,12 @@ use iq_core::Usd;
 pub(crate) struct Tally {
     billed: Usd,
     unpriced: usize,
-    /// Calls under a subscription, and their tokens: paid for by the
-    /// month, they are counted, not priced.
-    subscribed: usize,
-    tokens: u64,
 }
 
 impl Tally {
     /// What the session cost, as its last line says it.
     pub(crate) fn summary(&self) -> String {
         let mut text = format!("Billed to the provider: {}", self.billed);
-        if self.subscribed > 0 {
-            let calls = if self.subscribed == 1 {
-                "call"
-            } else {
-                "calls"
-            };
-            text.push_str(&format!(
-                ", and {} {calls} under subscriptions, {} tokens",
-                self.subscribed,
-                iq_core::TokenCount(self.tokens)
-            ));
-        }
         if self.unpriced > 0 {
             text.push_str(&format!(", {} calls of unknown price", self.unpriced));
         }
@@ -64,19 +48,10 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
         Event::Working { agent, prompt } => writeln!(out, "→ {agent}: {}", first(prompt, 100)),
         Event::TextStart { agent } => write!(out, "\n{agent}: "),
         Event::Text { text, .. } => write!(out, "{text}"),
-        Event::Spent {
-            cost,
-            billed,
-            usage,
-            ..
-        } => {
-            match (cost, billed) {
-                (Some(cost), true) => tally.billed += *cost,
-                (None, true) => tally.unpriced += 1,
-                (_, false) => {
-                    tally.subscribed += 1;
-                    tally.tokens += usage.input.0 + usage.output.0;
-                }
+        Event::Spent { cost, .. } => {
+            match cost {
+                Some(cost) => tally.billed += *cost,
+                None => tally.unpriced += 1,
             }
             Ok(())
         }
@@ -135,7 +110,6 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
             Err(error) => writeln!(out, "\n✘ {agent} stopped: {error}"),
         },
         Event::Notice { agent, text } => writeln!(out, "\n! {agent}: {text}"),
-        Event::Quota(_) => Ok(()),
     };
     let _ = out.flush();
     None

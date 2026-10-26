@@ -12,7 +12,7 @@ pub enum Request {
     Start {
         /// The name asked for it.
         name: String,
-        /// Its model: one of the provider's, or `claude-code`, `codex`.
+        /// Its model, one of the provider's.
         model: String,
         /// The task.
         task: String,
@@ -28,9 +28,6 @@ pub enum Request {
         /// The models the person named in the task: the first is the one
         /// it starts on.
         named: Vec<String>,
-        /// Why it starts on its model when the routing chose it: its kind
-        /// of task and the evidence.
-        routed: Option<String>,
     },
     /// Write to an agent.
     Tell {
@@ -59,16 +56,6 @@ pub enum Request {
         /// The agent.
         agent: String,
     },
-    /// Write to an agent as the steward.
-    Advise {
-        /// The agent.
-        to: String,
-        /// What the steward says.
-        text: String,
-    },
-    /// Close the payers named, whose limits are reached, and open the
-    /// others: `claude-code`, `codex`, `provider`.
-    Closed(Vec<String>),
     /// Something of the assay.
     Assay(AssayAsk),
 }
@@ -138,10 +125,9 @@ pub enum Entry {
 pub struct AgentView {
     /// Its name.
     pub name: String,
-    /// Its model, as it was started on: `claude-code/opus`.
+    /// Its model, as it was started on: `anthropic/claude-opus-5-5`.
     pub model: String,
-    /// The model that answered its last call, as its agent named it:
-    /// `claude-code/claude-opus-5-5`; empty before its first.
+    /// The model that answered its last call; empty before its first.
     pub answered: String,
     /// Who started it.
     pub by: String,
@@ -151,10 +137,18 @@ pub struct AgentView {
     pub thread: Vec<Entry>,
     /// What its calls were billed.
     pub billed: Usd,
-    /// The tokens its calls under a subscription read and wrote: a
-    /// subscription is paid for by the month, so what counts is how much
-    /// of it they use, not dollars.
-    pub subscription: TokenCount,
+    /// What each of its calls read, oldest first: the last is how much of
+    /// its model's context its conversation fills.
+    pub reads: Vec<TokenCount>,
+}
+
+impl AgentView {
+    /// What its last call read: how much of its model's context its
+    /// conversation fills.
+    #[must_use]
+    pub fn context(&self) -> TokenCount {
+        self.reads.last().copied().unwrap_or(TokenCount(0))
+    }
 }
 
 /// A question waiting for the person.
@@ -291,7 +285,7 @@ impl CrewView {
                     working: false,
                     thread: Vec::new(),
                     billed: Usd(0.0),
-                    subscription: TokenCount(0),
+                    reads: Vec::new(),
                 });
             }
             Event::Working { agent, prompt } => {
@@ -317,21 +311,16 @@ impl CrewView {
                 agent,
                 model,
                 cost,
-                billed,
                 usage,
             } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     if !model.is_empty() {
                         view.answered = model;
                     }
-                    if billed {
-                        if let Some(cost) = cost {
-                            view.billed += cost;
-                        }
-                    } else {
-                        view.subscription =
-                            TokenCount(view.subscription.0 + usage.input.0 + usage.output.0);
+                    if let Some(cost) = cost {
+                        view.billed += cost;
                     }
+                    view.reads.push(usage.input);
                 }
             }
             Event::Tool {
@@ -433,7 +422,6 @@ impl CrewView {
                     view.thread.push(Entry::Notice(text));
                 }
             }
-            Event::Quota(_) => {}
         }
     }
 
@@ -489,16 +477,15 @@ mod tests {
             id: 7,
             approved: true,
         });
-        for (cost, billed) in [(0.25, true), (1.0, false)] {
+        for (cost, read) in [(0.25, 1200), (1.0, 1800)] {
             crew.event(Event::Spent {
                 agent: "lead".into(),
                 model: "m".into(),
                 usage: iq_core::Usage {
-                    input: TokenCount(1200),
+                    input: TokenCount(read),
                     output: TokenCount(300),
                 },
                 cost: Some(Usd(cost)),
-                billed,
             });
         }
         let lead = crew.agent("lead").unwrap();
@@ -511,11 +498,8 @@ mod tests {
                 ..
             }
         ));
-        // Billed calls count in dollars, a subscription's in tokens.
-        assert_eq!(
-            (lead.billed, lead.subscription),
-            (Usd(0.25), TokenCount(1500))
-        );
+        // Its calls add up; its context is what its last call read.
+        assert_eq!((lead.billed, lead.context()), (Usd(1.25), TokenCount(1800)));
         assert_eq!(crew.toggle_autopilot(), Request::Autopilot(true));
         assert_eq!(crew.toggle_internet(), Request::Internet(true));
         assert!(crew.internet());

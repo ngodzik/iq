@@ -31,7 +31,7 @@ const FLIGHT: Duration = Duration::from_millis(900);
 /// How long a mark glows once a spark lands.
 const GLOW: Duration = Duration::from_millis(700);
 
-/// Where a spark runs from or to: the person, the steward, or an agent.
+/// Where a spark runs from or to: the person, or an agent.
 pub(crate) const YOU: &str = "you";
 
 /// A message's spark on its way.

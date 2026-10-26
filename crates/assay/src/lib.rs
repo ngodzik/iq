@@ -12,8 +12,8 @@
 //! must fail on the start and pass on the reference. The store's files are
 //! the reference: plain files, which a copy elsewhere is made from.
 //!
-//! The assay knows no provider: it is generic over [`iq_core::ChatModel`]
-//! and [`iq_core::Delegate`], and its candidates are any of them.
+//! The assay knows no provider: it is generic over [`iq_core::ChatModel`],
+//! and its candidates are the provider's models, alone or in teams.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -45,7 +45,7 @@ pub use record::{Checked, Ending, Record, Spent, Verdict};
 pub use report::{Row, Table, cheapest_fit, rows, table};
 pub use roster::{Allowed, Offer, Roster, plain};
 pub use route::{Card, Choice, Choices, Route, Routing};
-pub use run::{GateFor, Order, Phase, Progress, Reach, Runner};
+pub use run::{GateFor, Order, Phase, Progress, Runner};
 pub use store::{Store, batch_name};
 pub use tally::tally;
 pub use tree::Changed;

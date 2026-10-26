@@ -12,7 +12,7 @@ use crate::input::Editor;
 /// and its part in the crew.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct NewChat {
-    /// The model: one of the provider's, or `claude-code`, `codex`.
+    /// The model, one of the provider's.
     pub model: String,
     /// Its part in the crew, as the person wrote it: empty for none.
     pub role: String,
@@ -24,9 +24,6 @@ pub struct NewChat {
     /// Whether it is the chat in the assay's folder, with the assay's
     /// tools, rather than one in the project.
     pub assay: bool,
-    /// Whether the person chose its model, with `/new <model>`: the
-    /// routing then leaves it alone.
-    pub chosen: bool,
 }
 
 /// Where what the person writes goes.
@@ -45,7 +42,7 @@ pub enum Page {
     Team,
     /// One agent's whole thread.
     Thread(String),
-    /// The costs, the limits and the subscriptions.
+    /// The costs: by model, by kind of task, over time.
     Costs,
     /// The assay.
     Assay,

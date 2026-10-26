@@ -85,16 +85,14 @@ pub(crate) fn work() -> Vec<ToolSpec> {
     ]
 }
 
-/// The tools of the board, offered to iq's models and, through MCP, to
-/// the other agents.
+/// The tools of the board, offered to iq's models.
 pub fn board() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "start_agent".into(),
             description: "Starts another agent on a task, beside you. `model` is a model of the \
-                          provider, such as `openai/gpt-5-mini`, or `claude-code` or `codex`, \
-                          agents with tools of their own (`claude-code/haiku` picks its model). \
-                          It returns at once; the agent's answer comes to you as a message."
+                          provider, such as `openai/gpt-5-mini`. It returns at once; the agent's \
+                          answer comes to you as a message."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -140,22 +138,6 @@ pub fn board() -> Vec<ToolSpec> {
     ]
 }
 
-/// `tools` as MCP lists them.
-pub(crate) fn specs_json(tools: &[ToolSpec]) -> Value {
-    Value::Array(
-        tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": tool.parameters,
-                })
-            })
-            .collect(),
-    )
-}
-
 /// A call's arguments, read from the JSON text the model wrote.
 #[derive(Debug)]
 pub(crate) struct Args(Value);
@@ -168,15 +150,6 @@ impl Args {
             Ok(value) if value.is_object() => Ok(Self(value)),
             Ok(_) => Err("the arguments are not a JSON object".into()),
             Err(error) => Err(format!("the arguments are not valid JSON: {error}")),
-        }
-    }
-
-    /// Arguments given as JSON already, as MCP gives them.
-    pub(crate) fn from_value(value: Value) -> Result<Self, String> {
-        match value {
-            Value::Null => Ok(Self(Value::Object(serde_json::Map::new()))),
-            Value::Object(_) => Ok(Self(value)),
-            _ => Err("the arguments are not a JSON object".into()),
         }
     }
 

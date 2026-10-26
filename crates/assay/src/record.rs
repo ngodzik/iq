@@ -52,11 +52,10 @@ pub struct Checked {
 /// What the grader gave a run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Verdict {
-    /// The grader, as the settings named it: `claude-code/opus`.
+    /// The grader, as the settings named it: `anthropic/claude-opus-5-5`.
     pub judge: String,
-    /// The model that answered, as precisely as its agent said:
-    /// `claude-code/claude-opus-5-5`. Grades compare only when it is the
-    /// same; empty in grades kept before it was told.
+    /// The model that answered. Grades compare only when it is the same;
+    /// empty in grades kept before it was told.
     #[serde(default)]
     pub model: String,
     /// From 0 to 10.
@@ -85,11 +84,6 @@ impl Verdict {
 pub struct Spent {
     /// What the provider billed, in dollars.
     pub billed: Usd,
-    /// What its calls under a subscription would cost at list prices,
-    /// when they are known: not owed, a measure to compare with.
-    pub listed: Usd,
-    /// Tokens read and written under a subscription.
-    pub subscription_tokens: u64,
     /// Tokens read and written in all.
     pub tokens: u64,
     /// Calls to models.
@@ -119,8 +113,6 @@ pub struct Record {
     pub model: String,
     /// Who served the models of iq's loop, as the provider names itself.
     pub provider: Option<String>,
-    /// The loop it worked in: `iq`, or the agent's own.
-    pub harness: String,
     /// When it started, in seconds since 1970.
     pub started: u64,
     /// How long it worked.

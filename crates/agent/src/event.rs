@@ -1,7 +1,7 @@
 //! What the crew reports as it works, for the window or the terminal to
 //! show.
 
-use iq_core::{Quota, Usage, Usd};
+use iq_core::{Usage, Usd};
 
 /// Who the person is on the board: they write to agents and agents to
 /// them under this name.
@@ -14,8 +14,7 @@ pub enum Event {
     Joined {
         /// Its name on the board.
         agent: String,
-        /// The model it runs on: a model of the provider, or an agent such
-        /// as `claude-code`.
+        /// The model of the provider it runs on.
         model: String,
         /// Who started it: the person or another agent.
         by: String,
@@ -47,12 +46,8 @@ pub enum Event {
         model: String,
         /// Its tokens.
         usage: Usage,
-        /// What it cost, or would cost at list prices under a
-        /// subscription; `None` when the price is unknown.
+        /// What it cost; `None` when the price is unknown.
         cost: Option<Usd>,
-        /// Whether it is billed, to the provider's key: else a
-        /// subscription paid for it, and the cost is an estimate.
-        billed: bool,
     },
     /// A tool call ended.
     Tool {
@@ -124,6 +119,4 @@ pub enum Event {
         /// What.
         text: String,
     },
-    /// A subscription's quota, as its agent reported it.
-    Quota(Quota),
 }

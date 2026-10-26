@@ -62,7 +62,7 @@ libc        = "0.2.180"
 # a user and a network namespace, and the loopback device brought up over
 # netlink, through safe interfaces.
 nix         = { version = "0.31.3", default-features = false, features = ["sched", "user", "socket"] }
-# Local time for when a subscription's window starts again, the system's
+# Local time for the observations' days, weeks and months, the system's
 # time zone read as the platform keeps it.
 jiff       = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 # The terminal: ratatui draws in it, through the crossterm it ships, which

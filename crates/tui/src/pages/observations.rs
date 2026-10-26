@@ -49,11 +49,10 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
     lines.push(Line::default());
     let total = &period.total;
     let mut said = format!(
-        "{} task{} · {} billed · {} at list prices · {}",
+        "{} task{} · {} billed · {}",
         total.tasks,
         if total.tasks == 1 { "" } else { "s" },
         Usd(total.billed),
-        Usd(total.listed),
         seconds(total.seconds)
     );
     if total.failed > 0 {
@@ -129,8 +128,8 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         + 2;
     lines.push(Line::from(Span::styled(
         format!(
-            "   {:<name_width$}{:>6}{:>8}{:>11}{:>13}{:>11}{:>9}{:>9}",
-            "", "tasks", "failed", "billed", "list prices", "a success", "tokens", "time"
+            "   {:<name_width$}{:>6}{:>8}{:>11}{:>11}{:>9}{:>9}",
+            "", "tasks", "failed", "billed", "a success", "tokens", "time"
         ),
         p.fg(p.faint),
     )));
@@ -156,10 +155,6 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
                 p.fg(p.text),
             ),
             Span::styled(
-                format!("{:>13}", Usd(group.listed).to_string()),
-                p.fg(p.dim),
-            ),
-            Span::styled(
                 format!("{:>9}", TokenCount(group.tokens).to_string()),
                 p.fg(p.dim),
             ),
@@ -172,10 +167,7 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
     seen.heading(&mut lines, "The dearest tasks", "");
     for task in &period.top {
         let mut spans = vec![
-            Span::styled(
-                format!("  {:<10}", (task.billed + task.listed).to_string()),
-                p.fg(p.accent),
-            ),
+            Span::styled(format!("  {:<10}", task.billed.to_string()), p.fg(p.accent)),
             Span::styled(
                 format!("{:<18}", task.kind.as_deref().unwrap_or(UNPLACED)),
                 p.fg(p.info),

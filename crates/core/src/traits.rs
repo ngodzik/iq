@@ -1,8 +1,6 @@
 use std::future::Future;
 
-use crate::types::{
-    ChatRequest, ChatResponse, DelegateEvent, DelegateReply, DelegateRequest, ModelId, Pricing,
-};
+use crate::types::{ChatRequest, ChatResponse, ModelId, Pricing};
 
 /// Something that can answer a chat request.
 ///
@@ -31,31 +29,5 @@ pub trait ChatModel: Send + Sync {
     fn pricing(&self, model: &ModelId) -> impl Future<Output = Option<Pricing>> + Send {
         let _ = model;
         std::future::ready(None)
-    }
-}
-
-/// An external agent a whole task can be handed to, such as Claude Code.
-///
-/// Unlike a [`ChatModel`], it reads and edits files itself and runs its own
-/// loop. It reports what it does through `on_event` as it happens, so that
-/// the person sees it live, and the files it changed can still be checked.
-pub trait Delegate: Send + Sync {
-    /// The error this agent reports.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Runs one task, or one follow-up when the request names a session.
-    fn run(
-        &self,
-        request: &DelegateRequest,
-        on_event: &mut (dyn FnMut(DelegateEvent) + Send),
-    ) -> impl Future<Output = Result<DelegateReply, Self::Error>> + Send;
-
-    /// The calls the agents made under a subscription since `since`, in
-    /// seconds since 1970, oldest first, as their own files keep them:
-    /// those the person started outside iq too. Reads files, and may
-    /// take a moment; none by default.
-    fn subscription_calls(&self, since: u64) -> Vec<crate::subscription::SubscriptionCall> {
-        let _ = since;
-        Vec::new()
     }
 }

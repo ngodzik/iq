@@ -388,10 +388,9 @@ fn tools() -> Vec<ToolSpec> {
     ]
 }
 
-impl<M, D> Extension<M, D> for Memory
+impl<M> Extension<M> for Memory
 where
     M: Send + Sync + 'static,
-    D: Send + Sync + 'static,
 {
     fn tools(&self, _agent: &str) -> Vec<ToolSpec> {
         tools()
@@ -401,7 +400,7 @@ where
         Some(self.told())
     }
 
-    fn call(&self, _crew: Crew<M, D>, _agent: String, name: String, args: Value) -> Called {
+    fn call(&self, _crew: Crew<M>, _agent: String, name: String, args: Value) -> Called {
         let text = |key: &str| args[key].as_str().unwrap_or_default().to_owned();
         let result = match name.as_str() {
             "remember" => self.remember(&text("name"), &text("description"), &text("text")),

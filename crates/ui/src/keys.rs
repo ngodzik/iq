@@ -40,16 +40,13 @@ pub enum Action {
     Refuse,
     /// Stops the agent the person writes to.
     Stop,
-    /// The steward writing to the agents that spend too fast, or only
-    /// watching.
-    Steward,
     /// Quits.
     Quit,
 }
 
 impl Action {
     /// Every action, in the order the list of shortcuts gives them.
-    pub const ALL: [Action; 14] = [
+    pub const ALL: [Action; 13] = [
         Action::NextAgent,
         Action::Team,
         Action::Costs,
@@ -62,7 +59,6 @@ impl Action {
         Action::Allow,
         Action::Refuse,
         Action::Stop,
-        Action::Steward,
         Action::Quit,
     ];
 
@@ -82,7 +78,6 @@ impl Action {
             Action::Allow => "allow",
             Action::Refuse => "refuse",
             Action::Stop => "stop",
-            Action::Steward => "steward",
             Action::Quit => "quit",
         }
     }
@@ -93,7 +88,7 @@ impl Action {
         match self {
             Action::NextAgent => "write to the next agent, or start a new chat",
             Action::Team => "the crew: each agent, what it does and spends",
-            Action::Costs => "the costs, the limits and the subscriptions",
+            Action::Costs => "the costs: by model, by kind of task, over time",
             Action::Assay => "the assay: agents tried on the same exercises",
             Action::Observations => "what the work went to, over time",
             Action::Keys => "this list",
@@ -103,7 +98,6 @@ impl Action {
             Action::Allow => "allow what an agent asks",
             Action::Refuse => "refuse it",
             Action::Stop => "stop the agent you write to",
-            Action::Steward => "the steward writing to who spends too fast",
             Action::Quit => "quit",
         }
     }
@@ -123,7 +117,6 @@ impl Action {
             Action::Allow => "ctrl+y",
             Action::Refuse => "ctrl+r",
             Action::Stop => "escape",
-            Action::Steward => "ctrl+g",
             // A terminal never hands Cmd-Q to the program in it.
             Action::Quit => "ctrl+q",
         }

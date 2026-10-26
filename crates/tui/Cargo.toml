@@ -10,7 +10,6 @@ description = "Draws iq's state in the terminal: the conversation in the termina
 iq-core.workspace  = true
 iq-agent.workspace = true
 iq-ui.workspace    = true
-jiff.workspace     = true
 ratatui.workspace  = true
 unicode-width.workspace = true
 # Watching the terminal for keys, which tells when its window is closed.

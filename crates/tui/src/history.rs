@@ -150,7 +150,7 @@ impl History {
                     ],
                 ));
             }
-            Event::Joined { .. } | Event::Quota(_) => {}
+            Event::Joined { .. } => {}
             Event::Working { agent, prompt } => {
                 self.turns.insert(
                     agent.clone(),
@@ -188,18 +188,13 @@ impl History {
                 }
             }
             Event::Spent {
-                agent,
-                usage,
-                cost,
-                billed,
-                ..
+                agent, usage, cost, ..
             } => {
                 if let Some(turn) = self.turns.get_mut(agent) {
-                    match (billed, cost) {
-                        (true, Some(cost)) => turn.billed += *cost,
-                        (true, None) => {}
-                        (false, _) => turn.tokens += usage.input.0 + usage.output.0,
+                    if let Some(cost) = cost {
+                        turn.billed += *cost;
                     }
+                    turn.tokens += usage.input.0 + usage.output.0;
                 }
             }
             Event::Tool {
@@ -472,7 +467,7 @@ impl History {
     }
 
     /// What `agent`'s turn spent so far, as a status says it: dollars
-    /// billed, else tokens under a subscription.
+    /// billed, else the tokens of calls whose price is unknown.
     pub(crate) fn turn_spent(&self, agent: &str) -> Option<String> {
         let turn = self.turns.get(agent)?;
         if turn.billed.0 > 0.0 {
@@ -605,7 +600,7 @@ mod tests {
             &mut history,
             Event::Joined {
                 agent: "lead".into(),
-                model: "claude-code/opus".into(),
+                model: "anthropic/claude-opus-5-5".into(),
                 by: PERSON.into(),
             },
         );
@@ -667,7 +662,7 @@ mod tests {
                 "",
                 "› fix the build",
                 "",
-                "● lead  claude-code/opus",
+                "● lead  anthropic/claude-opus-5-5",
                 "  I will look",
                 "  at the tests",
                 "  ✗ Bash cargo test",
@@ -684,13 +679,16 @@ mod tests {
         let p = Palette::new(Theme::Graphite, Depth::True);
         let mut board = Board::default();
         let mut history = History::default();
-        history.after_message("haiku", "→ on claude-code/haiku, as you named it".into());
+        history.after_message(
+            "haiku",
+            "→ on anthropic/claude-haiku-5-5, as you named it".into(),
+        );
         crew(
             &mut board,
             &mut history,
             Event::Joined {
                 agent: "haiku".into(),
-                model: "claude-code/haiku".into(),
+                model: "anthropic/claude-haiku-5-5".into(),
                 by: PERSON.into(),
             },
             &p,
@@ -710,7 +708,7 @@ mod tests {
             [
                 "",
                 "› avec haiku, corrige le test",
-                "  → on claude-code/haiku, as you named it",
+                "  → on anthropic/claude-haiku-5-5, as you named it",
             ]
         );
     }

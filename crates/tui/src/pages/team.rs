@@ -52,11 +52,9 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
                 _ => ("resting".to_owned(), p.faint),
             }
         };
-        let spent = match (agent.billed.0 > 0.0, agent.subscription.0 > 0) {
-            (true, true) => format!("{} · {} tokens", agent.billed, agent.subscription),
-            (true, false) => agent.billed.to_string(),
-            (false, true) => format!("{} tokens", agent.subscription),
-            (false, false) => "·".to_owned(),
+        let spent = match agent.context().0 {
+            0 => "·".to_owned(),
+            _ => format!("{} · context {}", agent.billed, agent.context()),
         };
         let by = if agent.by == PERSON {
             "by you".to_owned()

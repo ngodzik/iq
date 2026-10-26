@@ -5,10 +5,8 @@
 //! measure of the grader itself. Its answer is read as JSON and checked
 //! before it is kept: a grade for every letter, within the scale.
 
-use std::path::Path;
-
 use iq_agent::Report;
-use iq_core::{ChatModel, Delegate, Effort, ModelId};
+use iq_core::{ChatModel, Effort, ModelId};
 use serde::Deserialize;
 
 use crate::exercise::Exercise;
@@ -300,35 +298,29 @@ fn escaped(bytes: &[u8], at: usize) -> bool {
     slashes % 2 == 1
 }
 
-/// Asks `grader` for its answer to `prompt`: an agent with tools of its
-/// own reads only, in `directory`, keeping nothing of it; a model of the
-/// provider answers without tools. What it costs goes to `costs`. The
-/// answer says which model gave it, as precisely as its agent says.
+/// Asks `grader`, a model of the provider, for its answer to `prompt`,
+/// without tools. What it costs goes to `costs`. The answer says which
+/// model gave it.
 ///
 /// # Errors
 ///
 /// The grader could not answer.
-pub async fn ask<M, D>(
+pub async fn ask<M>(
     provider: &M,
-    agents: &D,
     grader: &ModelId,
     prompt: String,
-    directory: &Path,
     costs: &Report,
 ) -> Result<iq_agent::Answer, String>
 where
     M: ChatModel,
-    D: Delegate,
 {
     iq_agent::ask_once_by(
         provider,
-        agents,
         grader,
         INSTRUCTIONS,
         prompt,
         iq_agent::Asked {
             agent: "assay grader",
-            directory,
             effort: Effort::High,
             costs,
         },

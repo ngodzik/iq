@@ -13,8 +13,7 @@ use std::time::Duration;
 use iq_agent::{Crew, Event, Extension, Settings as CrewSettings};
 use iq_assay::{Allowed, Assay, Ending, Offer, Roster, Runner, Settings, State, Store, Told};
 use iq_core::{
-    ChatModel, ChatRequest, ChatResponse, CoreError, Delegate, DelegateEvent, DelegateReply,
-    DelegateRequest, ModelId, TokenCount, ToolCall, Usage, Usd,
+    ChatModel, ChatRequest, ChatResponse, CoreError, ModelId, TokenCount, ToolCall, Usage, Usd,
 };
 use iq_gate::{Gate, Helper};
 
@@ -44,22 +43,6 @@ impl ChatModel for Scripted {
             .get_mut(request.model.as_str())
             .and_then(VecDeque::pop_front);
         Ok(next.unwrap_or_else(|| say("nothing more")))
-    }
-}
-
-/// No agent with tools of its own is used here.
-#[derive(Clone, Default)]
-struct NoAgents;
-
-impl Delegate for NoAgents {
-    type Error = CoreError;
-
-    async fn run(
-        &self,
-        _: &DelegateRequest,
-        _: &mut (dyn FnMut(DelegateEvent) + Send),
-    ) -> Result<DelegateReply, CoreError> {
-        Err(CoreError::EmptyModelId)
     }
 }
 
@@ -101,8 +84,8 @@ fn helper() -> Helper {
 struct Fixture {
     _dir: tempfile::TempDir,
     store: Store,
-    assay: Assay<Scripted, NoAgents>,
-    crew: Crew<Scripted, NoAgents>,
+    assay: Assay<Scripted>,
+    crew: Crew<Scripted>,
     events: Arc<Mutex<Vec<Event>>>,
     costs: Arc<Mutex<Vec<Event>>>,
     told: Arc<Mutex<Vec<Told>>>,
@@ -124,10 +107,8 @@ fn fixture_allowing(model: Scripted, allowed: &[&str]) -> Fixture {
     let runner = Runner {
         provider: model.clone(),
         provider_name: Some("Scripted".into()),
-        agents: NoAgents,
         helper: helper(),
         gate: Arc::new(|folder: &Path| Gate::builder(folder).build().map_err(|e| e.to_string())),
-        reach: None,
         effort: None,
     };
     let assay = Assay::new(
@@ -140,8 +121,6 @@ fn fixture_allowing(model: Scripted, allowed: &[&str]) -> Fixture {
             ),
             reference: ModelId::new("acme/good-coder").unwrap(),
             parallel: 2,
-            mirrors: Vec::new(),
-            servers: Vec::new(),
             journal: None,
             labels: None,
             categories: iq_observe::Categories::default(),
@@ -167,7 +146,6 @@ fn fixture_allowing(model: Scripted, allowed: &[&str]) -> Fixture {
             offer("acme/reviewer"),
             offer("grader/model"),
         ],
-        harnesses: Vec::new(),
         missing: None,
     });
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -175,7 +153,6 @@ fn fixture_allowing(model: Scripted, allowed: &[&str]) -> Fixture {
     let (questions, mut asked) = tokio::sync::mpsc::unbounded_channel();
     let crew = Crew::new(
         model,
-        NoAgents,
         Gate::builder(store.root()).build().unwrap(),
         helper(),
         CrewSettings {
@@ -496,8 +473,7 @@ async fn a_team_runs_as_its_pattern_says_and_is_graded_again_with_its_reference(
 async fn a_freeze_runs_the_check_on_the_start_and_on_the_reference_first() {
     let f = fixture(Scripted::default());
     let folder = exercise(&f.store);
-    let planned =
-        |assay: Assay<Scripted, NoAgents>| async move { assay.plan_freeze("add-mul").await };
+    let planned = |assay: Assay<Scripted>| async move { assay.plan_freeze("add-mul").await };
     // Without a reference, it fails on the start, and says nothing shows it
     // can pass.
     let plan = planned(f.assay.clone()).await.unwrap();
@@ -547,13 +523,13 @@ async fn the_assays_tools_refuse_what_is_not_ready_or_allowed() {
     .unwrap_err();
     assert!(draft.contains("draft"), "{draft}");
     f.store.freeze("add-mul", 1).unwrap();
-    let harness = call(
+    let team = call(
         "assay_run",
-        serde_json::json!({"exercise": "add-mul", "candidates": ["claude-code/haiku"]}),
+        serde_json::json!({"exercise": "add-mul", "candidates": ["pair: acme/good-coder + acme/reviewer"]}),
     )
     .await
     .unwrap_err();
-    assert!(harness.contains("do not allow"), "{harness}");
+    assert!(team.contains("do not allow"), "{team}");
     let unknown = call(
         "assay_run",
         serde_json::json!({"exercise": "add-mul", "candidates": ["made/up"]}),

@@ -9,20 +9,12 @@ const BEFORE: [&str; 9] = [
     "with", "using", "via", "on", "by", "avec", "sur", "par", "en",
 ];
 
-/// The short names of the agents' models, as people say them.
-const ALIASES: [(&str, &str); 6] = [
-    ("opus", "claude-code/opus"),
-    ("sonnet", "claude-code/sonnet"),
-    ("haiku", "claude-code/haiku"),
-    ("claude", "claude-code"),
-    ("claude-code", "claude-code"),
-    ("codex", "codex"),
-];
-
-/// The models `text` names, in the order it names them: short names of
-/// the agents' models, an agent's model written whole (`claude-code/opus`,
-/// `codex/gpt-6.1-sol`), and models of `known`, the provider's, by their
-/// whole name or the part after the provider's. A name with a slash the
+/// The models `text` names, in the order it names them, among `known`,
+/// the provider's, in the order it lists them: by their whole name, the
+/// part after the provider's, or one word of it, as people say `opus` for
+/// `anthropic/claude-opus-5-5`. Of several a word names, the newest, as
+/// their numbers say, then one served without a region or a variant
+/// (`@eu`, `:flex`), then the first listed. A name with a slash the
 /// provider does not list is no model: `src/main.rs` is a path.
 ///
 /// # Examples
@@ -30,10 +22,16 @@ const ALIASES: [(&str, &str); 6] = [
 /// ```
 /// use iq_ui::named::named;
 ///
-/// let known = ["z-ai/glm-5.3-flash".to_owned()];
+/// let known = [
+///     "anthropic/claude-opus-4-1".to_owned(),
+///     "vertex/claude-opus-5-5@eu".to_owned(),
+///     "anthropic/claude-opus-5-5".to_owned(),
+///     "vertex/claude-opus-5-5".to_owned(),
+///     "z-ai/glm-5.3-flash".to_owned(),
+/// ];
 /// assert_eq!(
 ///     named("Fais la conception avec Opus, et le code avec glm-5.3-flash.", &known),
-///     ["claude-code/opus", "z-ai/glm-5.3-flash"]
+///     ["anthropic/claude-opus-5-5", "z-ai/glm-5.3-flash"]
 /// );
 /// assert!(named("Write a haiku about rust", &known).is_empty());
 /// ```
@@ -66,27 +64,47 @@ fn resolve(word: &str, known: &[String]) -> Option<String> {
     if word.is_empty() {
         return None;
     }
-    if let Some((_, model)) = ALIASES.iter().find(|(alias, _)| *alias == word) {
-        return Some((*model).to_owned());
-    }
-    if let Some(model) = known.iter().find(|m| {
-        m.eq_ignore_ascii_case(word)
-            || m.rsplit('/')
-                .next()
-                .is_some_and(|last| last.eq_ignore_ascii_case(word))
-    }) {
+    let last = |model: &str| model.rsplit('/').next().unwrap_or(model).to_owned();
+    if let Some(model) = known
+        .iter()
+        .find(|m| m.eq_ignore_ascii_case(word) || last(m).eq_ignore_ascii_case(word))
+    {
         return Some(model.clone());
     }
-    ["claude-code/", "codex/"]
-        .iter()
-        .find_map(|agent| word.strip_prefix(agent))
-        .filter(|model| {
-            !model.is_empty()
-                && model
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-._".contains(c))
-        })
-        .map(|_| word.to_owned())
+    // A word of a model's name, never a number alone: `opus`, `glm`.
+    if !word.chars().any(char::is_alphabetic) || word.contains('/') {
+        return None;
+    }
+    let mut best: Option<(&String, Rank)> = None;
+    for model in known {
+        let name = last(model);
+        if !name
+            .split(['-', '.', '_', ':', '@'])
+            .any(|part| part.eq_ignore_ascii_case(word))
+        {
+            continue;
+        }
+        let rank = rank(&name);
+        // Strictly better only: of equals, the first listed stays.
+        if best.as_ref().is_none_or(|(_, kept)| rank > *kept) {
+            best = Some((model, rank));
+        }
+    }
+    best.map(|(model, _)| model.clone())
+}
+
+/// How a model's name ranks among those a word names: its numbers as a
+/// version, then whether it is served without a region or a variant.
+type Rank = (Vec<u64>, bool);
+
+/// The rank of `name`, a model's name without its provider's.
+fn rank(name: &str) -> Rank {
+    let base = name.split(['@', ':']).next().unwrap_or(name);
+    let numbers = base
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    (numbers, base.len() == name.len())
 }
 
 #[cfg(test)]
@@ -95,10 +113,15 @@ mod tests {
 
     #[test]
     fn a_model_counts_only_after_a_word_that_names_it() {
-        let known = vec!["openai/gpt-6-luna".to_owned(), "z-ai/glm-5".to_owned()];
+        let known = vec![
+            "openai/gpt-6-luna".to_owned(),
+            "z-ai/glm-5".to_owned(),
+            "anthropic/claude-sonnet-5-9".to_owned(),
+            "anthropic/claude-sonnet-5-10".to_owned(),
+        ];
         assert_eq!(
-            named("réfléchis à ça avec opus", &known),
-            ["claude-code/opus"]
+            named("réfléchis à ça avec sonnet", &known),
+            ["anthropic/claude-sonnet-5-10"]
         );
         assert_eq!(
             named("run it on gpt-6-luna.", &known),
@@ -108,16 +131,14 @@ mod tests {
             named("with z-ai/glm-5, then with z-ai/glm-5", &known),
             ["z-ai/glm-5"]
         );
-        assert_eq!(
-            named("using codex/gpt-6.1-sol", &known),
-            ["codex/gpt-6.1-sol"]
-        );
-        // A haiku, a word after "with" that names nothing, a path.
+        // A haiku, a word after "with" that names nothing, a path, a
+        // number.
         assert!(named("write a haiku with care", &known).is_empty());
         assert!(named("work on src/main.rs", &known).is_empty());
+        assert!(named("do it in 5 steps, on 5", &known).is_empty());
         assert_eq!(
-            named("look at src/main.rs with sonnet", &known),
-            ["claude-code/sonnet"]
+            named("look at src/main.rs with luna", &known),
+            ["openai/gpt-6-luna"]
         );
     }
 }

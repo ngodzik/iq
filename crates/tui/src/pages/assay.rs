@@ -173,9 +173,9 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
     lines
 }
 
-/// The routing: for each kind of task, the agents new tasks of it start on,
-/// the first first, as the records route them and the person's choices
-/// leave them.
+/// The routing: for each kind of task, the agents the lead is told to
+/// start, the first first, as the records route them and the person's
+/// choices leave them.
 fn routing(seen: &Seen<'_>, lines: &mut Vec<Line<'static>>) {
     let p = seen.p;
     let book = seen.board.routes();
@@ -183,10 +183,10 @@ fn routing(seen: &Seen<'_>, lines: &mut Vec<Line<'static>>) {
         return;
     }
     let what = if book.choices.off {
-        "off, as your settings say: every chat on the model it starts on".to_owned()
+        "off, as your settings say: the lead is not told of it".to_owned()
     } else {
         format!(
-            "graded by {}; a new task of a kind starts on its first",
+            "graded by {}; the lead is told of it, and chooses",
             book.routing.grader
         )
     };
@@ -265,10 +265,10 @@ fn results(seen: &Seen<'_>, rows: &[Row], lines: &mut Vec<Line<'static>>) {
             } else {
                 p.bad
             };
-            let per_run = match (row.billed.0 > 0.0, row.subscription_tokens > 0) {
-                (true, _) => row.billed.to_string(),
-                (false, true) => format!("{} tok", TokenCount(row.subscription_tokens)),
-                (false, false) => "·".to_owned(),
+            let per_run = if row.billed.0 > 0.0 {
+                row.billed.to_string()
+            } else {
+                "·".to_owned()
             };
             let per_success = row
                 .per_success

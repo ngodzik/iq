@@ -1,28 +1,18 @@
 //! iq's state in the terminal: the crew, where the person writes and what
-//! page they look at, the costs and the subscriptions, the look and the
-//! keys, as what the program reads arrives and as the person acts. Every
+//! page they look at, the costs, the look and the keys, as what the program reads arrives and as the person acts. Every
 //! key the person presses is taken here, so that what it does is tested
 //! without a terminal.
 
-use iq_agent::{Event, PERSON, PROVIDER, STEWARD};
-use iq_core::{ModelId, SubscriptionCall};
+use iq_agent::{Event, PERSON};
 
 use crate::assay::{AssayView, CHAT, Overview, Progress};
 use crate::command::{self, Command, Completion};
-use crate::costs::{Costs, Payer, Spent};
+use crate::costs::{Costs, Spent};
 use crate::crew::{AssayAsk, CrewView, Question, Request};
 use crate::keys::{Action, Chord, Keymap};
 use crate::look::Look;
 use crate::observations::{By, Span};
 use crate::screen::{Page, Screen, Talk};
-use crate::steward::{self, Gauge, Limits, Pace, Steward};
-use crate::subscriptions::{Seen, Subscriptions};
-
-/// How often the steward looks again, in seconds.
-const STEWARD_EVERY: u64 = 5;
-
-/// How many of the steward's exchanges are kept to show.
-const STEWARD_KEPT: usize = 40;
 
 /// A message on the board, for the terminal to show it travel.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,35 +37,15 @@ impl Post {
     pub fn to_person(&self) -> bool {
         self.to == PERSON
     }
-
-    /// Whether the steward wrote it.
-    #[must_use]
-    pub fn from_steward(&self) -> bool {
-        self.from == STEWARD
-    }
-
-    /// Whether it was written to the steward.
-    #[must_use]
-    pub fn to_steward(&self) -> bool {
-        self.to == STEWARD
-    }
 }
 
 /// What the program sends the terminal.
 #[derive(Debug, Clone)]
 pub enum Update {
-    /// The agents' files, as just read.
-    Read(Read),
     /// What the crew just did.
     Crew(Event),
-    /// What iq kept of earlier sessions: the calls billed to the
-    /// provider, and the quotas heard.
-    Kept {
-        /// The calls billed, oldest first.
-        provider: Vec<Spent>,
-        /// The quotas.
-        quotas: Seen,
-    },
+    /// The calls iq kept of earlier sessions, oldest first.
+    Kept(Vec<Spent>),
     /// iq is asked to stop: the terminal is given back, the agents
     /// stopped.
     Quit,
@@ -121,16 +91,6 @@ pub struct Synced {
 /// offers it.
 pub const PERIODS: [u64; 4] = [3600, 6 * 3600, 24 * 3600, 7 * 24 * 3600];
 
-/// What the agents' files hold, as the program just read them: each call,
-/// and what it would cost at list prices.
-#[derive(Debug, Clone, Default)]
-pub struct Read {
-    /// The calls, oldest first.
-    pub calls: Vec<SubscriptionCall>,
-    /// What each call would cost, in the same order.
-    pub spent: Vec<Spent>,
-}
-
 /// iq's state in the terminal.
 #[derive(Debug, Clone)]
 pub struct Board {
@@ -141,29 +101,10 @@ pub struct Board {
     /// How far back the costs are summed, one of [`PERIODS`].
     period: u64,
     costs: Costs,
-    subscriptions: Subscriptions,
-    /// Whether the agents' files were read once.
-    read: bool,
-    /// Whether the costs count the person's own sessions of Claude Code
-    /// and Codex, beside iq's calls.
-    everyone: bool,
     /// The messages posted since the terminal last took them.
     posts: Vec<Post>,
     /// Whether iq was asked to stop.
     quitting: bool,
-    /// The limits the person set.
-    limits: Limits,
-    /// The steward.
-    steward: Steward,
-    /// How the limits stood when the steward last looked, and when.
-    gauges: Vec<Gauge>,
-    looked: u64,
-    /// The payers last closed.
-    closed: Vec<Payer>,
-    /// What each agent spent lately: when, who, on whom, how much.
-    spending: Vec<(u64, String, Payer, f64)>,
-    /// The steward's exchanges with the agents, oldest first.
-    letters: Vec<Post>,
     /// The assay.
     assay: AssayView,
     /// How the last sync went, when the machine syncs.
@@ -194,113 +135,14 @@ impl Board {
             look,
             period: PERIODS[2],
             costs: Costs::default(),
-            subscriptions: Subscriptions::default(),
-            read: false,
-            everyone: false,
             posts: Vec::new(),
             quitting: false,
-            limits: Limits::default(),
-            steward: Steward::default(),
-            gauges: Vec::new(),
-            looked: 0,
-            closed: Vec::new(),
-            spending: Vec::new(),
-            letters: Vec::new(),
             assay: AssayView::default(),
             synced: None,
             lens: crate::observations::Lens::default(),
             models: Vec::new(),
             routes: crate::routes::RouteBook::default(),
         }
-    }
-
-    /// iq with `limits`, the steward writing to the agents when
-    /// `steward` says so.
-    #[must_use]
-    pub fn with_limits(mut self, limits: Limits, steward: bool) -> Self {
-        self.limits = limits;
-        self.steward = Steward::new(steward);
-        self
-    }
-
-    /// The steward.
-    #[must_use]
-    pub fn steward(&self) -> &Steward {
-        &self.steward
-    }
-
-    /// How the limits stand, as the steward last saw them.
-    #[must_use]
-    pub fn gauges(&self) -> &[Gauge] {
-        &self.gauges
-    }
-
-    /// The steward's exchanges with the agents, oldest first.
-    #[must_use]
-    pub fn letters(&self) -> &[Post] {
-        &self.letters
-    }
-
-    /// The steward looks at `now`, every few seconds: how the limits
-    /// stand, which payers close, and to whom it writes. Returns what that
-    /// asks of the crew.
-    pub fn watch(&mut self, now: u64) -> Vec<Request> {
-        if now < self.looked + STEWARD_EVERY {
-            return Vec::new();
-        }
-        self.looked = now;
-        self.gauges = steward::gauges(&self.costs, &self.subscriptions, &self.limits, now);
-        let mut asked = Vec::new();
-        let closed = steward::closed(&self.gauges);
-        if closed != self.closed {
-            asked.push(Request::Closed(
-                closed
-                    .iter()
-                    .map(|payer| match payer {
-                        Payer::Provider => PROVIDER.to_owned(),
-                        Payer::Subscription(agent) | Payer::Key(agent) => agent.prefix().to_owned(),
-                    })
-                    .collect(),
-            ));
-            self.closed = closed;
-        }
-        self.spending
-            .retain(|(at, ..)| now.saturating_sub(*at) <= steward::KEPT);
-        let mut paces: Vec<Pace> = Vec::new();
-        for (_, agent, payer, amount) in &self.spending {
-            let working = self.crew.agent(agent).is_some_and(|a| a.working);
-            if !working {
-                continue;
-            }
-            match paces
-                .iter_mut()
-                .find(|p| p.agent == *agent && p.payer == *payer)
-            {
-                Some(pace) => pace.recent += amount,
-                None => paces.push(Pace {
-                    agent: agent.clone(),
-                    payer: *payer,
-                    recent: *amount,
-                }),
-            }
-        }
-        for advice in self.steward.advise(&self.gauges, &paces, now) {
-            asked.push(Request::Advise {
-                to: advice.to,
-                text: advice.text,
-            });
-        }
-        asked
-    }
-
-    /// Who pays for `agent`'s calls: its subscription when it is an agent
-    /// of its own, else the provider.
-    fn payer_of(&self, agent: &str) -> Payer {
-        self.crew
-            .agent(agent)
-            .and_then(|view| ModelId::new(&view.model).ok())
-            .and_then(|model| model.delegate().map(|(agent, _)| agent))
-            .map_or(Payer::Provider, Payer::Subscription)
     }
 
     /// Whether iq was asked to stop, for the terminal to be given back.
@@ -325,18 +167,6 @@ impl Board {
         if PERIODS.contains(&period) {
             self.period = period;
         }
-    }
-
-    /// Whether the costs count the person's own sessions of Claude Code
-    /// and Codex, beside iq's calls.
-    #[must_use]
-    pub fn everyone(&self) -> bool {
-        self.everyone
-    }
-
-    /// Counts the person's own sessions in the costs, or only iq's calls.
-    pub fn count_everyone(&mut self, everyone: bool) {
-        self.everyone = everyone;
     }
 
     /// The next period the costs are summed over, or the one before.
@@ -381,20 +211,22 @@ impl Board {
         self.crew.questions()
     }
 
-    /// The models a new chat is offered: the lead's first, then Claude
-    /// Code's and Codex.
+    /// The models a new chat is offered: the lead's first, then those the
+    /// routing gives first for a kind of task.
     #[must_use]
     pub fn models_offered(&self) -> Vec<String> {
+        let routed = self.routes.routing.routes.iter().filter_map(|route| {
+            let ladder = self
+                .routes
+                .routing
+                .route(&route.category, &self.routes.choices);
+            let candidate: iq_assay::Candidate = ladder.first()?.candidate.parse().ok()?;
+            Some(candidate.lead().to_string())
+        });
         let mut offered: Vec<String> = Vec::new();
-        for model in [
-            self.crew.lead(),
-            "claude-code/opus",
-            "claude-code/sonnet",
-            "claude-code/haiku",
-            "codex",
-        ] {
-            if !model.is_empty() && !offered.iter().any(|m| m == model) {
-                offered.push(model.to_owned());
+        for model in std::iter::once(self.crew.lead().to_owned()).chain(routed) {
+            if !model.is_empty() && !offered.contains(&model) {
+                offered.push(model);
             }
         }
         offered
@@ -582,7 +414,6 @@ impl Board {
             Page::Costs => match (key, letter) {
                 ("Left", _) => self.next_period(false),
                 ("Right", _) | (_, Some('p')) => self.next_period(true),
-                (_, Some('e')) => self.everyone = !self.everyone,
                 _ => {}
             },
             Page::Observations => {
@@ -650,7 +481,6 @@ impl Board {
             Action::Observations => self.screen.toggle(Page::Observations),
             Action::Keys => self.screen.toggle(Page::Keys),
             Action::Theme => self.look.next_theme(),
-            Action::Steward => self.steward.set_on(!self.steward.on()),
             Action::Autopilot => return Some(self.crew.toggle_autopilot()),
             Action::Internet => return Some(self.crew.toggle_internet()),
             Action::Allow | Action::Refuse => {
@@ -744,41 +574,9 @@ impl Board {
                     return Vec::new();
                 }
                 let role = Some(chat.role.trim().to_owned()).filter(|r| !r.is_empty());
-                // A model named in the task is the one it starts on; else
-                // the agent its kind of task is routed to, unless the
-                // person chose one; else the chat's.
+                // A model named in the task is the one it starts on, else
+                // the chat's: the lead's unless the person chose another.
                 let named = crate::named::named(&text, &self.models);
-                let mut chat = chat;
-                let mut routed = None;
-                if named.is_empty() && !chat.chosen && !chat.assay {
-                    match self.routes.route(&text, &self.closed) {
-                        crate::routes::Routed::Nowhere => {}
-                        crate::routes::Routed::To {
-                            category,
-                            candidate,
-                            said,
-                        } => {
-                            chat.model = candidate.lead().to_string();
-                            chat.pattern = candidate.pattern;
-                            chat.partner = candidate
-                                .models
-                                .get(1)
-                                .map(ToString::to_string)
-                                .unwrap_or_default();
-                            routed = Some(format!("routed for {category}: {said}"));
-                        }
-                        crate::routes::Routed::Closed(category) => {
-                            self.screen.notice(
-                                format!(
-                                    "Every agent routed for {category} tasks is at a limit you set: \
-                                     name one (\"with <model>\"), and it starts on it"
-                                ),
-                                now,
-                            );
-                            return Vec::new();
-                        }
-                    }
-                }
                 let model = named
                     .first()
                     .cloned()
@@ -807,7 +605,6 @@ impl Board {
                     partner,
                     assay: chat.assay,
                     named,
-                    routed,
                 }
             }
         };
@@ -820,12 +617,8 @@ impl Board {
         let open = |board: &mut Self, page: Page| board.screen.open(page);
         match command {
             Command::New(model) => {
-                let chosen = model.is_some();
                 let model = model.unwrap_or_else(|| self.crew.lead().to_owned());
                 self.screen.new_chat(&model);
-                if let Some(chat) = self.screen.new_chat_mut() {
-                    chat.chosen = chosen;
-                }
             }
             Command::Pattern(pattern, partner) => match self.screen.new_chat_mut() {
                 Some(chat) => {
@@ -857,9 +650,6 @@ impl Board {
             Command::AssayChat => self.assay_chat(),
             Command::Autopilot => return self.act(Action::Autopilot).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet).into_iter().collect(),
-            Command::Steward => {
-                self.act(Action::Steward);
-            }
             Command::Theme(None) => self.look.next_theme(),
             Command::Theme(Some(theme)) => self.look.set_theme(theme),
             Command::Stop(None) => return self.act(Action::Stop).into_iter().collect(),
@@ -896,13 +686,7 @@ impl Board {
     /// name, without its provider, made unique as the crew makes them.
     fn name_for(&self, model: &str) -> String {
         let model = model.trim();
-        let short = match model.split_once('/') {
-            Some(("claude-code", rest)) => rest,
-            Some(("codex", _)) => "codex",
-            Some((_, rest)) => rest,
-            None if model == "claude-code" => "claude",
-            None => model,
-        };
+        let short = model.rsplit_once('/').map_or(model, |(_, rest)| rest);
         let base: String = short
             .chars()
             .map(|c| {
@@ -1003,18 +787,6 @@ impl Board {
         &self.costs
     }
 
-    /// The subscriptions.
-    #[must_use]
-    pub fn subscriptions(&self) -> &Subscriptions {
-        &self.subscriptions
-    }
-
-    /// Whether the agents' files were read once.
-    #[must_use]
-    pub fn was_read(&self) -> bool {
-        self.read
-    }
-
     /// The crew.
     #[must_use]
     pub fn crew(&self) -> &CrewView {
@@ -1029,61 +801,20 @@ impl Board {
     /// Takes what the program sends.
     pub fn update(&mut self, update: Update) {
         match update {
-            Update::Read(read) => {
-                self.subscriptions.calls_read(read.calls);
-                self.costs.subscriptions_read(read.spent);
-                self.read = true;
-            }
             Update::Crew(event) => {
                 match &event {
-                    // A subscription's call is read from its agent's files.
-                    // A subscription's call counts in tokens toward its
-                    // agent's pace; its cost is read from the agent's files.
                     Event::Spent {
-                        agent,
-                        usage,
-                        billed: false,
-                        ..
+                        model, cost, usage, ..
                     } => {
-                        let payer = self.payer_of(agent);
-                        let tokens = (usage.input.0 + usage.output.0) as f64;
-                        self.spending
-                            .push((crate::now(), agent.clone(), payer, tokens));
-                    }
-                    Event::Spent {
-                        agent,
-                        model,
-                        cost,
-                        usage,
-                        billed: true,
-                    } => {
-                        let payer = Payer::billed_for(model);
-                        if let Some(cost) = cost {
-                            self.spending
-                                .push((crate::now(), agent.clone(), payer, cost.0));
-                        }
                         self.costs.add(Spent {
                             at: crate::now(),
-                            payer,
                             model: model.clone(),
                             cost: *cost,
                             tokens: usage.input.0 + usage.output.0,
-                            by_iq: true,
                         });
                     }
-                    Event::Quota(quota) => self.subscriptions.add(quota.clone()),
                     Event::Joined { agent, .. } => self.screen.joined(agent),
                     Event::Posted { from, to, text } => {
-                        if from == STEWARD || to == STEWARD {
-                            self.letters.push(Post {
-                                from: from.clone(),
-                                to: to.clone(),
-                                text: text.clone(),
-                            });
-                            if self.letters.len() > STEWARD_KEPT {
-                                self.letters.remove(0);
-                            }
-                        }
                         self.posts.push(Post {
                             from: from.clone(),
                             to: to.clone(),
@@ -1094,11 +825,10 @@ impl Board {
                 }
                 self.crew.event(event);
             }
-            Update::Kept { provider, quotas } => {
-                for spent in provider {
+            Update::Kept(kept) => {
+                for spent in kept {
                     self.costs.add(spent);
                 }
-                self.subscriptions.loaded(quotas);
             }
             Update::Quit => self.quitting = true,
             Update::Assay(overview) => self.assay.set(*overview),
@@ -1176,56 +906,64 @@ mod tests {
     #[test]
     fn a_new_chat_starts_its_agent_then_is_written_to() {
         let mut board = Board::default();
-        started(&mut board, "claude-code/opus");
+        started(&mut board, "anthropic/claude-opus-5-5");
         write(&mut board, "  fix the build ");
         assert_eq!(
             key(&mut board, "enter"),
             vec![Request::Start {
-                name: "opus".into(),
-                model: "claude-code/opus".into(),
+                name: "claude-opus-5-5".into(),
+                model: "anthropic/claude-opus-5-5".into(),
                 task: "fix the build".into(),
                 role: None,
                 pattern: iq_agent::Pattern::Solo,
                 partner: None,
                 assay: false,
                 named: Vec::new(),
-                routed: None,
             }]
         );
-        assert_eq!(board.screen().talking_to(), Some("opus"));
+        assert_eq!(board.screen().talking_to(), Some("claude-opus-5-5"));
         // Written to before it joined, it is not gone: it starts.
         write(&mut board, "and the tests");
-        assert!(
-            matches!(&key(&mut board, "enter")[..], [Request::Tell { to, .. }] if to == "opus")
-        );
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Tell { to, .. }] if to == "claude-opus-5-5"
+        ));
         // A second chat on the same model is named apart, a one-word role
         // names one.
         board.run(Command::New(None), 100);
         write(&mut board, "review it");
-        assert!(
-            matches!(&key(&mut board, "enter")[..], [Request::Start { name, .. }] if name == "opus-2")
-        );
-        board.run(Command::New(Some("codex".into())), 100);
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Start { name, .. }] if name == "claude-opus-5-5-2"
+        ));
+        board.run(Command::New(Some("openai/gpt-6".into())), 100);
         board.run(Command::Role("review".into()), 100);
         board.run(
-            Command::Pattern(iq_agent::Pattern::Pair, Some("claude-code/haiku".into())),
+            Command::Pattern(iq_agent::Pattern::Pair, Some("z-ai/glm-5".into())),
             100,
         );
         write(&mut board, "look at it");
         assert!(matches!(
             &key(&mut board, "enter")[..],
-            [Request::Start { name, role: Some(role), partner: Some(partner), .. }]
-                if name == "review" && role == "review" && partner == "claude-code/haiku"
+            [Request::Start { name, model, role: Some(role), partner: Some(partner), .. }]
+                if name == "review" && model == "openai/gpt-6" && role == "review"
+                    && partner == "z-ai/glm-5"
         ));
-        joined(&mut board, "opus", PERSON);
-        assert!(board.screen().starting().iter().all(|n| n != "opus"));
+        joined(&mut board, "claude-opus-5-5", PERSON);
+        assert!(
+            board
+                .screen()
+                .starting()
+                .iter()
+                .all(|n| n != "claude-opus-5-5")
+        );
         assert_eq!(key(&mut board, "enter"), vec![]);
     }
 
     #[test]
     fn messages_go_where_the_person_says_and_lines_go_on() {
         let mut board = Board::default();
-        started(&mut board, "codex");
+        started(&mut board, "openai/gpt-6");
         joined(&mut board, "lead", PERSON);
         joined(&mut board, "helper", "lead");
         board.screen_mut().talk_to("lead");
@@ -1269,7 +1007,7 @@ mod tests {
         key(&mut board, "ctrl+n");
         assert_eq!(board.screen().talking_to(), Some("helper"));
         key(&mut board, "ctrl+n");
-        assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "codex"));
+        assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "openai/gpt-6"));
         key(&mut board, "ctrl+n");
         assert_eq!(board.screen().talking_to(), Some("lead"));
     }
@@ -1277,16 +1015,20 @@ mod tests {
     #[test]
     fn a_model_named_in_a_message_starts_the_chat_or_goes_with_it() {
         let mut board = Board::default();
-        started(&mut board, "claude-code/opus");
-        board.update(Update::Models(vec!["z-ai/glm-5.3-flash".into()]));
+        started(&mut board, "anthropic/claude-opus-5-5");
+        board.update(Update::Models(vec![
+            "anthropic/claude-opus-5-5".into(),
+            "anthropic/claude-haiku-5".into(),
+            "z-ai/glm-5.3-flash".into(),
+        ]));
         write(&mut board, "avec haiku, corrige le test");
         assert!(matches!(
             &key(&mut board, "enter")[..],
             [Request::Start { model, named, .. }]
-                if model == "claude-code/haiku" && named == &["claude-code/haiku"]
+                if model == "anthropic/claude-haiku-5" && named == &["anthropic/claude-haiku-5"]
         ));
-        assert_eq!(board.screen().talking_to(), Some("haiku"));
-        joined(&mut board, "haiku", PERSON);
+        assert_eq!(board.screen().talking_to(), Some("claude-haiku-5"));
+        joined(&mut board, "claude-haiku-5", PERSON);
         write(
             &mut board,
             "fais la conception avec opus et le code avec glm-5.3-flash",
@@ -1294,14 +1036,14 @@ mod tests {
         assert!(matches!(
             &key(&mut board, "enter")[..],
             [Request::Tell { named, .. }]
-                if named == &["claude-code/opus", "z-ai/glm-5.3-flash"]
+                if named == &["anthropic/claude-opus-5-5", "z-ai/glm-5.3-flash"]
         ));
     }
 
     #[test]
-    fn a_new_task_starts_on_the_agent_its_kind_is_routed_to() {
+    fn a_new_task_starts_on_the_lead_and_the_routes_are_offered() {
         let mut board = Board::default();
-        started(&mut board, "claude-code/opus");
+        started(&mut board, "anthropic/claude-opus-5-5");
         let python = iq_assay::Category {
             name: "python".into(),
             files: vec!["*.py".into()],
@@ -1324,39 +1066,21 @@ mod tests {
                 routes: vec![iq_assay::Route {
                     category: "python".into(),
                     exercises: vec!["bug".into()],
-                    ladder: vec![choice("z-ai/glm-5"), choice("claude-code/sonnet")],
+                    ladder: vec![choice("z-ai/glm-5"), choice("openai/gpt-6")],
                 }],
             },
             choices: iq_assay::Choices::default(),
         })));
+        // The lead decides whom to give it: iq does not.
         write(&mut board, "fix add() in calc.py");
         assert!(matches!(
             &key(&mut board, "enter")[..],
-            [Request::Start { model, routed: Some(why), .. }]
-                if model == "z-ai/glm-5" && why.starts_with("routed for python: 2/2 passed")
+            [Request::Start { model, .. }] if model == "anthropic/claude-opus-5-5"
         ));
-        // A task of no routed kind goes to the chat's own model.
-        board.run(Command::New(None), 100);
-        write(&mut board, "rebase the branch");
-        assert!(matches!(
-            &key(&mut board, "enter")[..],
-            [Request::Start { model, routed: None, .. }] if model == "claude-code/opus"
-        ));
-        // A model chosen with /new is left alone.
-        board.run(Command::New(Some("codex".into())), 100);
-        write(&mut board, "fix calc.py");
-        assert!(matches!(
-            &key(&mut board, "enter")[..],
-            [Request::Start { model, routed: None, .. }] if model == "codex"
-        ));
-        // At its limit, the first is passed over for the next.
-        board.closed = vec![Payer::Provider];
-        board.run(Command::New(None), 100);
-        write(&mut board, "fix calc.py");
-        assert!(matches!(
-            &key(&mut board, "enter")[..],
-            [Request::Start { model, .. }] if model == "claude-code/sonnet"
-        ));
+        assert_eq!(
+            board.models_offered(),
+            ["anthropic/claude-opus-5-5", "z-ai/glm-5"]
+        );
     }
 
     #[test]
@@ -1368,9 +1092,8 @@ mod tests {
         assert_eq!(board.screen().page(), Some(&Page::Costs));
         assert!(board.screen().editor().is_empty());
         // On a page, letters choose and Escape closes; nothing is written.
-        let everyone = board.everyone();
-        board.press(&Chord::plain("e"), Some('e'), 100);
-        assert_ne!(board.everyone(), everyone);
+        board.press(&Chord::plain("p"), Some('p'), 100);
+        assert_eq!(board.period(), 7 * 24 * 3600);
         key(&mut board, "escape");
         assert_eq!(board.screen().page(), None);
         assert!(board.screen().editor().is_empty());
@@ -1469,50 +1192,25 @@ mod tests {
     }
 
     #[test]
-    fn the_steward_closes_what_is_reached_and_keeps_its_letters() {
-        let limits = Limits {
-            provider_month: Some(iq_core::Usd(1.0)),
-            ..Limits::default()
-        };
-        let mut board = Board::default().with_limits(limits, true);
-        joined(&mut board, "cheap", PERSON);
-        working(&mut board, "cheap");
-        board.update(Update::Crew(Event::Spent {
-            agent: "cheap".into(),
-            model: "m".into(),
-            usage: iq_core::Usage::default(),
-            cost: Some(iq_core::Usd(1.5)),
-            billed: true,
-        }));
-        let asked = board.watch(crate::now());
-        assert!(asked.contains(&Request::Closed(vec![PROVIDER.to_owned()])));
-        // The agent spending it is told.
-        assert!(
-            asked
-                .iter()
-                .any(|r| matches!(r, Request::Advise { to, .. } if to == "cheap"))
-        );
-        // Not again within a few seconds.
-        assert!(board.watch(crate::now()).is_empty());
+    fn posts_are_taken_once() {
+        let mut board = Board::default();
+        joined(&mut board, "lead", PERSON);
         board.update(Update::Crew(Event::Posted {
-            from: "cheap".into(),
-            to: STEWARD.into(),
-            text: "a long file".into(),
+            from: "lead".into(),
+            to: PERSON.into(),
+            text: "done".into(),
         }));
-        assert_eq!(board.letters().len(), 1);
         assert_eq!(board.take_posts().len(), 1);
         assert!(board.take_posts().is_empty());
-        board.act(Action::Steward);
-        assert!(!board.steward().on());
     }
 
     #[test]
     fn the_assays_chat_is_a_chat_on_the_model_written_to_then_written_to() {
         let mut board = Board::default();
-        started(&mut board, "claude-code/opus");
+        started(&mut board, "anthropic/claude-opus-5-5");
         board.update(Update::Crew(Event::Joined {
             agent: "lead".into(),
-            model: "codex".into(),
+            model: "openai/gpt-6".into(),
             by: PERSON.into(),
         }));
         board.screen_mut().talk_to("lead");
@@ -1521,12 +1219,13 @@ mod tests {
         assert_eq!(board.press(&Chord::plain("t"), Some('t'), 100), vec![]);
         assert_eq!(board.screen().page(), None);
         assert!(
-            matches!(board.screen().talk(), Talk::New(chat) if chat.assay && chat.model == "codex")
+            matches!(board.screen().talk(), Talk::New(chat) if chat.assay && chat.model == "openai/gpt-6")
         );
         write(&mut board, "test glm on every exercise");
         assert!(matches!(
             &key(&mut board, "enter")[..],
-            [Request::Start { name, model, assay: true, .. }] if name == CHAT && model == "codex"
+            [Request::Start { name, model, assay: true, .. }]
+                if name == CHAT && model == "openai/gpt-6"
         ));
         assert_eq!(board.screen().talking_to(), Some(CHAT));
         // Once there, it is written to.
@@ -1545,19 +1244,9 @@ mod tests {
             model: "openai/gpt-5-mini".into(),
             usage: iq_core::Usage::default(),
             cost: Some(iq_core::Usd(0.25)),
-            billed: true,
         }));
-        // A subscription's call is read from its agent's files instead.
-        board.update(Update::Crew(Event::Spent {
-            agent: "coder".into(),
-            model: "gpt-5.5".into(),
-            usage: iq_core::Usage::default(),
-            cost: Some(iq_core::Usd(4.0)),
-            billed: false,
-        }));
-        let totals = board.costs().totals(0, false);
+        let totals = board.costs().totals(0);
         assert_eq!(totals.len(), 1);
-        assert_eq!(totals[0].payer, Payer::Provider);
         assert_eq!(totals[0].cost, iq_core::Usd(0.25));
     }
 }

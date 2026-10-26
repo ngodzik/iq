@@ -9,11 +9,8 @@ description = "iq's agents: a model's loop with its tools through the gate, the 
 [dependencies]
 iq-core.workspace    = true
 iq-gate.workspace    = true
-thiserror.workspace  = true
-serde.workspace      = true
 serde_json.workspace = true
-tracing.workspace    = true
-tokio = { workspace = true, features = ["sync", "time", "net", "io-util", "rt"] }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
 
 [dev-dependencies]
 tokio.workspace    = true

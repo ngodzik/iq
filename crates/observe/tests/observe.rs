@@ -4,10 +4,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use iq_agent::Event;
-use iq_core::{
-    ChatModel, ChatRequest, ChatResponse, CoreError, Delegate, DelegateEvent, DelegateReply,
-    DelegateRequest, ModelId, TokenCount, Usage, Usd,
-};
+use iq_core::{ChatModel, ChatRequest, ChatResponse, CoreError, ModelId, TokenCount, Usage, Usd};
 use iq_observe::{Categories, Category, Labels, Observer, Settings, Task, category_of};
 
 /// Answers from a script, and keeps what it was asked.
@@ -34,21 +31,6 @@ impl ChatModel for Scripted {
             cost: Some(Usd(0.0001)),
             cache: None,
         })
-    }
-}
-
-#[derive(Clone, Default)]
-struct NoAgents;
-
-impl Delegate for NoAgents {
-    type Error = CoreError;
-
-    async fn run(
-        &self,
-        _: &DelegateRequest,
-        _: &mut (dyn FnMut(DelegateEvent) + Send),
-    ) -> Result<DelegateReply, CoreError> {
-        Err(CoreError::EmptyModelId)
     }
 }
 
@@ -107,7 +89,6 @@ async fn the_rules_place_first_and_a_cheap_model_the_rest_in_batches() {
     let labels = Labels::at(dir.path().join("labels.jsonl"));
     let observer = Observer::new(
         model.clone(),
-        NoAgents,
         Settings {
             model: ModelId::new("cheap/model").unwrap(),
             every: 2,
@@ -116,7 +97,6 @@ async fn the_rules_place_first_and_a_cheap_model_the_rest_in_batches() {
         journal.clone(),
         labels.clone(),
         Arc::new(move |event: Event| kept.lock().unwrap().push(event)),
-        dir.path().to_path_buf(),
     );
     // The rules place the first: nothing waits.
     observer.done(tasks[0].clone());
@@ -159,7 +139,6 @@ async fn the_rules_place_first_and_a_cheap_model_the_rest_in_batches() {
     );
     let again = Observer::new(
         model.clone(),
-        NoAgents,
         Settings {
             model: ModelId::new("cheap/model").unwrap(),
             every: 1,
@@ -168,7 +147,6 @@ async fn the_rules_place_first_and_a_cheap_model_the_rest_in_batches() {
         journal,
         labels.clone(),
         Arc::new(|_| {}),
-        dir.path().to_path_buf(),
     );
     again.catch_up(0);
     again.settled().await;
@@ -185,7 +163,6 @@ async fn without_categories_nothing_is_asked() {
     let model = Scripted::default();
     let observer = Observer::new(
         model.clone(),
-        NoAgents,
         Settings {
             model: ModelId::new("cheap/model").unwrap(),
             every: 1,
@@ -194,7 +171,6 @@ async fn without_categories_nothing_is_asked() {
         dir.path().join("tasks.jsonl"),
         Labels::at(dir.path().join("labels.jsonl")),
         Arc::new(|_| {}),
-        dir.path().to_path_buf(),
     );
     observer.done(task(1, "anything", &[]));
     observer.catch_up(0);

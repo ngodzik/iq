@@ -95,8 +95,6 @@ pub struct Group {
     pub failed: usize,
     /// What the provider billed them, in dollars.
     pub billed: f64,
-    /// What their calls under a subscription would cost at list prices.
-    pub listed: f64,
     /// The tokens they read and wrote.
     pub tokens: u64,
     /// How long they worked, in seconds.
@@ -104,17 +102,16 @@ pub struct Group {
 }
 
 impl Group {
-    /// What they are worth: dollars billed and list prices together.
+    /// What they cost, in dollars.
     #[must_use]
     pub fn cost(&self) -> f64 {
-        self.billed + self.listed
+        self.billed
     }
 
     fn add(&mut self, task: &TaskSpent) {
         self.tasks += 1;
         self.failed += usize::from(!task.ok);
         self.billed += task.billed.0;
-        self.listed += task.listed.0;
         self.tokens += task.tokens;
         self.seconds += task.seconds;
     }
@@ -257,14 +254,14 @@ pub fn see(tasks: &[TaskSpent], lens: Lens, now: u64, zone: &TimeZone) -> Seen {
                     within
                         .iter()
                         .filter(|t| t.at >= start && t.at < end && name(t) == group.name)
-                        .map(|t| t.billed.0 + t.listed.0)
+                        .map(|t| t.billed.0)
                         .sum()
                 })
                 .collect(),
         })
         .collect();
     let mut top: Vec<TaskSpent> = within.iter().map(|t| (*t).clone()).collect();
-    top.sort_by(|a, b| (b.billed.0 + b.listed.0).total_cmp(&(a.billed.0 + a.listed.0)));
+    top.sort_by(|a, b| b.billed.0.total_cmp(&a.billed.0));
     top.truncate(TOP);
     let before = (lens.span != Span::All)
         .then(|| period(tasks, lens.span, lens.back + 1, now, zone))
@@ -273,7 +270,7 @@ pub fn see(tasks: &[TaskSpent], lens: Lens, now: u64, zone: &TimeZone) -> Seen {
             tasks
                 .iter()
                 .filter(|t| t.at >= from && t.at < to)
-                .map(|t| t.billed.0 + t.listed.0)
+                .map(|t| t.billed.0)
                 .sum()
         });
     Seen {
@@ -398,7 +395,6 @@ mod tests {
             at,
             kind: kind.map(Into::into),
             billed: Usd(billed),
-            listed: Usd(0.0),
             tokens: 100,
             model: model.into(),
             agent: "lead".into(),

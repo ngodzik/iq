@@ -1,27 +1,15 @@
 //! Model providers for iq.
 //!
-//! The first provider speaks the OpenAI compatible chat completions protocol,
-//! which routers such as Requesty or OpenRouter expose for hundreds of models
-//! behind one key. Providers for other protocols are added next to it, each as
-//! an implementation of [`iq_core::ChatModel`]. Claude Code and Codex,
-//! agents rather than models, implement [`iq_core::Delegate`].
+//! The provider speaks the OpenAI compatible chat completions protocol,
+//! which routers such as Requesty expose for hundreds of models behind one
+//! key. Providers for other protocols would be added next to it, each as an
+//! implementation of [`iq_core::ChatModel`].
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-mod agents;
-mod claude_code;
-mod codex;
 mod error;
 mod openai_compat;
-mod prices;
-mod rankings;
-mod subscriptions;
 
-pub use agents::Agents;
-pub use claude_code::ClaudeCode;
-pub use codex::Codex;
 pub use error::LlmError;
 pub use openai_compat::{Listed, OpenAiCompatible};
-pub use prices::{PRICES_URL, PriceTable, Rates, Tokens, load_prices};
-pub use rankings::{ArtificialAnalysis, RANKINGS_SOURCE, Ranking, find as find_ranking};

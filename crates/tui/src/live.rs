@@ -5,13 +5,11 @@
 
 use std::collections::HashMap;
 
-use iq_agent::STEWARD;
 use iq_ui::Board;
 use iq_ui::assay::Phase;
 use iq_ui::crew::Entry;
 use iq_ui::keys::Action;
 use iq_ui::screen::Talk;
-use iq_ui::steward::Level;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -169,7 +167,7 @@ impl Live<'_> {
             let mut spans = vec![
                 Span::styled(format!("{} ", motion.spinner()), p.fg(p.accent)),
                 Span::styled(agent.name.clone(), p.bold(tint)),
-                Span::styled(format!(" · {} ", model_name(agent.serving())), p.fg(p.dim)),
+                Span::styled(format!(" · {} ", agent.serving()), p.fg(p.dim)),
             ];
             spans.extend(motion.shimmer("working…", p.dim, p.text, p));
             let lasted = self
@@ -257,7 +255,7 @@ impl Live<'_> {
             let line = vec![
                 Span::styled(mark, p.fg(tint)),
                 Span::styled("assay ", p.fg(p.faint)),
-                Span::styled(model_name(&run.candidate).to_owned(), p.bold(p.text)),
+                Span::styled(run.candidate.clone(), p.bold(p.text)),
                 Span::styled(format!(" · {} · ", run.exercise), p.fg(p.dim)),
                 Span::styled(said, p.fg(tint)),
                 Span::styled(
@@ -365,13 +363,9 @@ impl Live<'_> {
                 let view = self.board.crew().agent(agent);
                 let tint = agent_tint(self.board, agent, p);
                 let model = view.map(|v| v.model.clone()).unwrap_or_default();
-                let spent = view.map_or(String::new(), |v| {
-                    match (v.billed.0 > 0.0, v.subscription.0 > 0) {
-                        (true, true) => format!(" {} · {} tokens ", v.billed, v.subscription),
-                        (true, false) => format!(" {} ", v.billed),
-                        (false, true) => format!(" {} tokens ", v.subscription),
-                        (false, false) => String::new(),
-                    }
+                let spent = view.map_or(String::new(), |v| match v.context().0 {
+                    0 => String::new(),
+                    _ => format!(" {} · context {} ", v.billed, v.context()),
                 });
                 (
                     Line::from(vec![
@@ -396,8 +390,8 @@ impl Live<'_> {
                 }
                 let short_model = chat
                     .model
-                    .strip_prefix("claude-code/")
-                    .unwrap_or(&chat.model)
+                    .rsplit_once('/')
+                    .map_or(chat.model.as_str(), |(_, name)| name)
                     .to_owned();
                 (
                     Line::from(vec![
@@ -459,8 +453,8 @@ impl Live<'_> {
         }
     }
 
-    /// The status line: the autopilot, the internet when open, the
-    /// steward, the sync, the questions waiting; on its right the person
+    /// The status line: the autopilot, the internet when open, what the
+    /// session spent, the sync, the questions waiting; on its right the person
     /// and the agents. Returns where each mark is drawn, for the sparks.
     fn status(&self, frame: &mut Frame<'_>, row: Rect, motion: &Motion) -> HashMap<String, u16> {
         let p = self.p;
@@ -476,33 +470,14 @@ impl Live<'_> {
             left.push(sep());
             left.push(Span::styled("internet open", p.fg(p.warn)));
         }
-        let worst = self
-            .board
-            .gauges()
-            .iter()
-            .map(|g| g.level)
-            .max()
-            .unwrap_or(Level::Calm);
-        let (tint, said) = match worst {
-            Level::Calm => (p.ok, "calm"),
-            Level::Watch => (p.warn, "watching"),
-            Level::Alert => (p.bad, "a limit is near"),
-            Level::Reached => (p.bad, "a limit is reached"),
-        };
-        let lit = match worst {
-            Level::Alert | Level::Reached => p.faint.mix(tint, 0.4 + 0.6 * motion.pulse(4.0)),
-            _ => tint,
-        };
-        let lit = lit.mix(p.text, motion.glow(STEWARD));
-        left.push(sep());
-        let steward_at = spans_width(&left) as u16;
-        left.push(Span::styled("● ", p.fg(lit)));
-        let word = if self.board.steward().on() {
-            format!("steward {said}")
-        } else {
-            format!("steward off, {said}")
-        };
-        left.push(Span::styled(word, p.fg(p.dim)));
+        let mut spent = iq_core::Usd(0.0);
+        for agent in crew.agents() {
+            spent += agent.billed;
+        }
+        if spent.0 > 0.0 {
+            left.push(sep());
+            left.push(Span::styled(format!("{spent} spent"), p.fg(p.dim)));
+        }
         if let Some(synced) = self.board.synced() {
             left.push(sep());
             let ago = self.now.saturating_sub(synced.at) / 60;
@@ -579,24 +554,11 @@ impl Live<'_> {
                 Rect::new(start, row.top(), right_width as u16, 1),
             );
         }
-        let mut marks: HashMap<String, u16> = right_marks
+        right_marks
             .into_iter()
             .map(|(name, at)| (name, start + at))
-            .collect();
-        marks.insert(STEWARD.to_owned(), row.left() + steward_at);
-        marks
+            .collect()
     }
-}
-
-/// A model's name without the agent that serves it: `claude-opus-5-5` for
-/// `claude-code/claude-opus-5-5`, a provider's model as it is.
-pub(crate) fn model_name(model: &str) -> &str {
-    for agent in ["claude-code/", "codex/"] {
-        if let Some(rest) = model.strip_prefix(agent) {
-            return rest;
-        }
-    }
-    model
 }
 
 /// A key as a hint writes it, short: `Esc` for Escape.
@@ -716,15 +678,15 @@ mod tests {
         let mut board = Board::default();
         let mut history = History::default();
         board.update(Update::Started {
-            lead: "claude-code/opus".into(),
+            lead: "anthropic/claude-opus-5-5".into(),
             reviewer: "r".into(),
             autopilot: true,
             internet: false,
         });
         let rows = drawn(&board, &history, 60);
         assert_eq!(rows.len(), 4);
-        assert!(rows[0].contains("new chat · claude-code/opus"));
-        assert!(rows[1].contains("The task for opus…"));
+        assert!(rows[0].contains("new chat · anthropic/claude-opus-5-5"));
+        assert!(rows[1].contains("The task for claude-opus-5-5…"));
         assert!(rows[3].starts_with(" ⏵⏵ autopilot"));
         assert!(rows[3].ends_with("you"));
         crew(
@@ -732,7 +694,7 @@ mod tests {
             &mut history,
             Event::Joined {
                 agent: "lead".into(),
-                model: "claude-code/opus".into(),
+                model: "anthropic/claude-opus-5-5".into(),
                 by: PERSON.into(),
             },
             &p,
@@ -769,7 +731,11 @@ mod tests {
             &p,
         );
         let rows = drawn(&board, &history, 80);
-        assert!(rows[0].contains("lead · opus working…"), "{}", rows[0]);
+        assert!(
+            rows[0].contains("lead · anthropic/claude-opus-5-5 working…"),
+            "{}",
+            rows[0]
+        );
         assert!(rows[0].contains("Esc to stop"));
         assert!(rows[0].ends_with("Reading the tes"));
         assert!(rows[1].contains("lead asks"));
@@ -783,7 +749,7 @@ mod tests {
         assert!(status.ends_with("you ● lead"));
         // A run of the assay at work says who and what, and who grades it.
         board.update(Update::Assay(Box::new(iq_ui::assay::Overview {
-            grader: "claude-code/opus".into(),
+            grader: "anthropic/claude-opus-5-5".into(),
             ..iq_ui::assay::Overview::default()
         })));
         let run = |phase| iq_ui::assay::Progress {
@@ -800,7 +766,7 @@ mod tests {
         board.update(Update::AssayRunning(vec![run(Phase::Judging)]));
         let rows = drawn(&board, &history, 100);
         assert!(
-            rows[1].contains("assay z-ai/glm-5 · add-fix · graded by claude-code/opus"),
+            rows[1].contains("assay z-ai/glm-5 · add-fix · graded by anthropic/claude-opus-5-5"),
             "{}",
             rows[1]
         );

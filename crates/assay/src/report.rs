@@ -4,7 +4,7 @@
 //! kind of task, the same summed; and the cheapest candidate that does as
 //! well as the reference.
 
-use iq_core::{TokenCount, Usd};
+use iq_core::Usd;
 
 use crate::candidate::Kind;
 use crate::exercise::Exercise;
@@ -41,8 +41,6 @@ pub struct Row {
     pub score: Option<f32>,
     /// What a run was billed, on average.
     pub billed: Usd,
-    /// The tokens a subscription paid a run, on average.
-    pub subscription_tokens: u64,
     /// What a success cost: all that was billed over the runs that passed.
     pub per_success: Option<Usd>,
     /// How long a run took, on average, in seconds.
@@ -95,7 +93,7 @@ pub fn rows_by(records: &[&Record], providers: bool) -> Vec<Row> {
     for record in records {
         let name = match record.kind {
             Kind::Model => record.model.clone(),
-            Kind::Harness | Kind::Team => record.candidate.to_string(),
+            Kind::Team => record.candidate.to_string(),
         };
         let key = (
             name,
@@ -128,11 +126,6 @@ pub fn rows_by(records: &[&Record], providers: bool) -> Vec<Row> {
                 tests: mean(&shares),
                 score: mean(&scores),
                 billed: Usd(billed / n as f64),
-                subscription_tokens: runs
-                    .iter()
-                    .map(|r| r.spent.subscription_tokens)
-                    .sum::<u64>()
-                    / n as u64,
                 per_success: (passed > 0).then(|| Usd(billed / passed as f64)),
                 seconds: runs.iter().map(|r| r.seconds).sum::<u64>() / n as u64,
             }
@@ -195,13 +188,12 @@ pub fn category(category: &str, exercises: &[(Exercise, Vec<Record>)]) -> Vec<Ro
 /// The cheapest of `rows` that does as well as `reference`, a model or a
 /// candidate as written: as many of its runs passed, give or take a few,
 /// and its judges gave it about as much. Without the reference among them,
-/// the cheapest that passes most of its runs. Only models and teams are
-/// weighed, which the provider bills.
+/// the cheapest that passes most of its runs.
 #[must_use]
 pub fn cheapest_fit<'a>(rows: &'a [Row], reference: &str) -> Option<&'a Row> {
     let reference = rows.iter().find(|r| r.candidate == reference);
     rows.iter()
-        .filter(|row| row.kind != Kind::Harness && row.per_success.is_some())
+        .filter(|row| row.per_success.is_some())
         .filter(|row| match reference {
             Some(best) => {
                 row.rate() + AS_WELL_RATE >= best.rate()
@@ -239,18 +231,10 @@ pub fn text(rows: &[Row]) -> String {
             let score = row
                 .score
                 .map_or("not judged".to_owned(), |s| format!("score {s:.1}"));
-            let cost = match (row.billed.0 > 0.0, row.subscription_tokens > 0) {
-                (true, true) => format!(
-                    "{} and {} tokens of subscription a run",
-                    row.billed,
-                    TokenCount(row.subscription_tokens)
-                ),
-                (true, false) => format!("{} a run", row.billed),
-                (false, true) => format!(
-                    "{} tokens of subscription a run",
-                    TokenCount(row.subscription_tokens)
-                ),
-                (false, false) => "nothing billed".to_owned(),
+            let cost = if row.billed.0 > 0.0 {
+                format!("{} a run", row.billed)
+            } else {
+                "nothing billed".to_owned()
             };
             let per = row
                 .per_success
@@ -297,7 +281,6 @@ mod tests {
             candidate,
             model: model.into(),
             provider: Some("Requesty".into()),
-            harness: "iq".into(),
             started: 0,
             seconds: 60,
             ending: Ending::Answered,
@@ -349,7 +332,6 @@ mod tests {
             record("other/glm-5", "glm5", false, 0.05, 5.0),
             record("tiny/model", "tinymodel", true, 0.01, 6.0),
             record("tiny/model", "tinymodel", false, 0.01, 3.0),
-            record("claude-code/haiku", "claude-code/haiku", true, 0.0, 8.0),
         ];
         let refs: Vec<&Record> = records.iter().collect();
         let rows = rows(&refs);
@@ -358,7 +340,6 @@ mod tests {
         // One model, whoever served it.
         assert_eq!((glm.runs, glm.passed), (3, 2));
         assert!((glm.per_success.unwrap().0 - 0.075).abs() < 1e-9);
-        assert_eq!(rows.last().unwrap().kind, Kind::Harness);
         // glm passes 2 of 3 against the lead's 2 of 2: not as well.
         assert_eq!(
             cheapest_fit(&rows, "claudesonnet45").unwrap().candidate,
@@ -386,6 +367,5 @@ mod tests {
         assert!(shown.contains(
             "Models:\n- claudesonnet45 [Requesty]: 2/2 passed, 100% of tests, score 8.8"
         ));
-        assert!(shown.contains("Harnesses:\n- claude-code/haiku"));
     }
 }

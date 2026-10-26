@@ -3,7 +3,6 @@
 //! bits where the terminal says it takes them, else the nearest of the 256
 //! colours every terminal has.
 
-use iq_ui::costs::Payer;
 use iq_ui::look::Theme;
 use ratatui::style::{Color, Modifier, Style};
 
@@ -171,16 +170,6 @@ impl Palette {
     /// The colour of the agent that joined at `at`.
     pub(crate) fn agent(&self, at: usize) -> Rgb {
         self.agents[at % self.agents.len()]
-    }
-
-    /// Each payer's colour.
-    pub(crate) fn payer(&self, payer: Payer) -> Rgb {
-        match payer {
-            Payer::Provider => self.ok,
-            Payer::Subscription(iq_core::Agent::ClaudeCode) => self.accent,
-            Payer::Subscription(iq_core::Agent::Codex) => self.info,
-            Payer::Key(_) => self.warn,
-        }
     }
 }
 

@@ -85,7 +85,7 @@ impl FromStr for Pattern {
 /// The lead's part, the cheaper models it may give its agents named.
 pub(crate) fn lead_role(cheaper: &[String]) -> String {
     let workers = if cheaper.is_empty() {
-        "claude-code/haiku, or a cheap model of the provider".to_owned()
+        "a cheap model of the provider".to_owned()
     } else {
         cheaper.join(", ")
     };

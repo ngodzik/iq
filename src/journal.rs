@@ -23,19 +23,11 @@ const PROMPT_CHARS: usize = 300;
 /// How many files and commands of one task are kept.
 const MOST_KEPT: usize = 60;
 
-/// The tools that write files, as iq's agents, Claude Code and Codex name
-/// them.
-const WRITING: &[&str] = &[
-    "write_file",
-    "edit_file",
-    "Write",
-    "Edit",
-    "MultiEdit",
-    "NotebookEdit",
-];
+/// The tools that write files, as iq's agents name them.
+const WRITING: &[&str] = &["write_file", "edit_file"];
 
 /// The tools that run commands.
-const RUNNING: &[&str] = &["run", "Bash"];
+const RUNNING: &[&str] = &["run"];
 
 /// The journal.
 pub(crate) struct Journal {
@@ -102,20 +94,11 @@ impl Journal {
                 }
             }
             Event::Spent {
-                agent,
-                usage,
-                cost,
-                billed,
-                ..
+                agent, usage, cost, ..
             } => {
                 if let Some(task) = tasks.get_mut(agent) {
                     task.tokens += usage.input.0 + usage.output.0;
-                    let cost = cost.map_or(0.0, |c| c.0);
-                    if *billed {
-                        task.billed += cost;
-                    } else {
-                        task.listed += cost;
-                    }
+                    task.billed += cost.map_or(0.0, |c| c.0);
                 }
             }
             Event::Done { agent, outcome } => {
@@ -214,7 +197,6 @@ mod tests {
                     output: TokenCount(100),
                 },
                 cost: Some(Usd(0.01)),
-                billed: true,
             },
             Event::Done {
                 agent: "lead".into(),

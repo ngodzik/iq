@@ -11,7 +11,7 @@ Deterministic tools before models, security as the foundation, and every cost in
 ## Usage
 
 ```bash
-export REQUESTY_API_KEY=...   # without one, only Claude Code and Codex answer
+export REQUESTY_API_KEY=...   # every model answers through Requesty
 iq                            # runs in the terminal
 iq do "..."                   # hands a task to the agents in the terminal
 iq --help
@@ -29,8 +29,6 @@ git config core.hooksPath .githooks # run those checks before every commit
 
 None of this data ships with the program: each install fetches it for its own use and says where it comes from.
 
-- **Model prices** for Claude Code's and Codex's calls come from [LiteLLM](https://github.com/BerriAI/litellm)'s public list, [`model_prices_and_context_window.json`](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json), under the MIT licence. They are list prices: an estimate, not a bill.
-- **Model scores** come from [Artificial Analysis](https://artificialanalysis.ai/)' free API, with your own key in `ARTIFICIAL_ANALYSIS_API_KEY`, under their terms, which ask that they be credited wherever scores show.
 - **Model lists, prices and context windows** for the provider's models come from the provider itself.
 
 ## License

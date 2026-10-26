@@ -3,36 +3,26 @@
 //!
 //! ```toml
 //! base_url = "https://router.requesty.ai/v1"  # the provider: another region's router, any OpenAI compatible endpoint
-//! model = "anthropic/claude-sonnet-4-5"  # the lead: a model of the provider, or claude-code, codex
-//! reviewer = "openai/gpt-5-mini"         # answers for the person when the autopilot is on
-//! budget = 2.0                           # the most the provider is billed per session, in dollars
-//! effort = "high"
+//! model = "anthropic/claude-opus-5-5"    # the lead, which decides who does what
+//! reviewer = "anthropic/claude-haiku-5-5"  # answers for the person when the autopilot is on
+//! effort = "high"                        # how hard the models think; /effort changes an agent's
 //! autopilot = false
 //! autopilot_internet = true              # the reviewer also answers what only reaches the internet
 //! internet = false                       # true: every command reaches the internet
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //!
-//! steward = true                         # the steward writes to who spends too fast; Ctrl-G
-//!
 //! [keys]                                 # any shortcut moved, "" for none; Ctrl-S lists them
 //! costs = "ctrl+o"
 //!
-//! [limits]                               # what iq may use; what you spend outside iq counts too
-//! requesty_month = 20.0                  # dollars the provider may bill in a month
-//! claude_5h = 80                         # percent of Claude Code's five hours
-//! claude_week = 70
-//! codex_5h = 80
-//! codex_week = 70
-//!
 //! [assay]                                # agents tried on the same exercises; Ctrl-L
-//! grader = "claude-code/opus"            # grades every run, always the same so that grades compare
-//! candidates = ["models"]                # "models", "harnesses", "teams", or names; all when unset
+//! grader = "anthropic/claude-opus-5-5"   # grades every run, always the same so that grades compare
+//! candidates = ["models"]                # "models", "teams", or names; all when unset
 //! folder = "~/.local/share/iq/assay"     # its exercises and results, plain files
 //! parallel = 2                           # runs at once
 //!
 //! [observe]                              # what your work goes to; iq's own, never synced
-//! model = "openai/gpt-5-mini"            # who places what no rule places: a cheap one; claude-code/haiku without a key
-//! every = 1                              # tasks placed at once: more pays less per task with Claude Code
+//! model = "anthropic/claude-haiku-5-5"   # who places what no rule places: a cheap one
+//! every = 1                              # tasks placed at once
 //!
 //! [[observe.category]]                   # your categories of work, any number
 //! name = "Python"
@@ -41,41 +31,35 @@
 //! commands = ["pytest"]
 //! words = ["django"]
 //!
-//! [route]                                # the assay's results choose agents by kind of task; your choices
-//! vetoed = { "acme/slow" = "holds requests ten minutes" }  # never routed, why
-//! pinned = { design = "claude-code/opus" }                 # this kind, this agent, whatever the results
-//! off = false                            # true: every chat on the model it starts on
+//! [route]                                # what the lead is told of the assay's results; your choices
+//! vetoed = { "acme/slow" = "holds requests ten minutes" }  # never to be started, why
+//! pinned = { design = "z-ai/glm-5" }                       # this kind, this agent, whatever the results
+//! off = false                            # true: the lead is told nothing of it
 //!
 //! [sync]                                 # iq's data kept in a private repository of yours, any name
 //! remote = "https://github.com/someone/any-name.git"
 //! branch = "main"                        # another when main must go through pull requests
 //! keep = ["~/notes", "~/.zshrc"]         # files and folders of the home kept too, put back on a new machine
-//!
-//! [mcp.notion]                           # an MCP server, by its name: any server, not only this one
-//! url = "https://mcp.notion.com/mcp"     # over HTTP; or command = "npx", args = [...]
-//! headers = { Authorization = "NOTION_AUTHORIZATION" }  # each value read from that variable
-//! env = ["NOTION_TOKEN"]                 # for a command: variables passed from iq's environment
-//! mirror = "a page named Assay"          # the assay's judge keeps a copy of its results there
 //! ```
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use iq_core::{Agent, Effort, ModelId, Usd};
+use iq_core::{Effort, ModelId};
 use serde::Deserialize;
 
-/// The lead's model when a key for the provider is there and the settings
-/// name none.
-const LEAD: &str = "anthropic/claude-sonnet-4-5";
+/// The lead's model when the settings name none: the one that decides
+/// who does what, and grades the assay's runs.
+const LEAD: &str = "anthropic/claude-opus-5-5";
 
-/// The reviewer's, likewise: cheap, as it answers often and briefly.
-const REVIEWER: &str = "openai/gpt-5-mini";
+/// The reviewer's, likewise: cheap, as it answers often and briefly; the
+/// observer's too.
+const REVIEWER: &str = "anthropic/claude-haiku-5-5";
 
-/// The lead's and the reviewer's without a key: Claude Code, paid by its
-/// subscription.
-const LEAD_WITHOUT_KEY: &str = "claude-code";
-const REVIEWER_WITHOUT_KEY: &str = "claude-code/haiku";
+/// What the settings once held and iq reads no more, since it works with
+/// the provider's models alone and lets the lead spend as it judges.
+const RETIRED: [&str; 4] = ["budget", "steward", "[limits]", "[mcp]"];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,7 +68,6 @@ pub(crate) struct Settings {
     base_url: Option<String>,
     model: Option<String>,
     reviewer: Option<String>,
-    budget: Option<f64>,
     effort: Option<Effort>,
     #[serde(default)]
     pub(crate) autopilot: bool,
@@ -100,18 +83,9 @@ pub(crate) struct Settings {
     /// The shortcuts moved: an action's name and its key.
     #[serde(default)]
     keys: BTreeMap<String, String>,
-    /// Whether the steward writes to the agents that spend too fast.
-    #[serde(default)]
-    pub(crate) steward: bool,
-    /// What iq may use of each payer.
-    #[serde(default)]
-    limits: LimitsFile,
     /// The assay.
     #[serde(default)]
     assay: AssayFile,
-    /// MCP servers, by name.
-    #[serde(default)]
-    mcp: BTreeMap<String, McpFile>,
     /// Where iq's data is synced.
     #[serde(default)]
     sync: SyncFile,
@@ -121,6 +95,16 @@ pub(crate) struct Settings {
     /// The person's own choices of routing.
     #[serde(default)]
     route: RouteFile,
+    /// What iq reads no more, in the order of [`RETIRED`]: read, so that
+    /// older settings still open, and said, for the person to remove it.
+    #[serde(default)]
+    budget: Option<toml::Value>,
+    #[serde(default)]
+    steward: Option<toml::Value>,
+    #[serde(default)]
+    limits: Option<toml::Value>,
+    #[serde(default)]
+    mcp: Option<toml::Value>,
 }
 
 /// The routing as the settings write it: the person's own choices, beside
@@ -128,10 +112,10 @@ pub(crate) struct Settings {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RouteFile {
-    /// No routing: every chat on the model it was started on.
+    /// No routing: the lead is told nothing of it.
     #[serde(default)]
     off: bool,
-    /// Models never routed, each with why.
+    /// Models never to be started, each with why.
     #[serde(default)]
     vetoed: BTreeMap<String, String>,
     /// A model pinned to a kind of task.
@@ -152,13 +136,9 @@ struct ObserveFile {
     category: Vec<iq_observe::Category>,
 }
 
-/// How many tasks wait before a model of the provider places them: one,
-/// as each call is small.
+/// How many tasks wait before a model places them: one, as each call is
+/// small.
 const OBSERVE_EVERY: usize = 1;
-
-/// The same for an agent with tools of its own, each of whose calls
-/// carries its own large context: a batch, to pay it once for several.
-const OBSERVE_EVERY_AGENT: usize = 10;
 
 /// The sync as the settings write it.
 #[derive(Debug, Default, Deserialize)]
@@ -171,27 +151,6 @@ struct SyncFile {
     /// The files and folders of the home kept too, each `~/…`.
     #[serde(default)]
     keep: Vec<String>,
-}
-
-/// An MCP server as written: a command or an address, and what of iq's
-/// environment it gets. Values never go in the settings: only the names
-/// of the variables that hold them.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct McpFile {
-    command: Option<String>,
-    #[serde(default)]
-    args: Vec<String>,
-    url: Option<String>,
-    /// For a command: the variables passed from iq's environment.
-    #[serde(default)]
-    env: Vec<String>,
-    /// For an address: each header, and the variable its value is read
-    /// from.
-    #[serde(default)]
-    headers: BTreeMap<String, String>,
-    /// Where in it the assay's judge keeps a copy of the assay.
-    mirror: Option<String>,
 }
 
 /// The assay's settings as written.
@@ -221,18 +180,6 @@ pub(crate) fn data_folder(home: &Path) -> PathBuf {
 /// How many runs of the assay go at once unless the settings say.
 const PARALLEL: usize = 2;
 
-/// The limits as the settings write them, each left to its default when
-/// unset.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LimitsFile {
-    requesty_month: Option<f64>,
-    claude_5h: Option<f64>,
-    claude_week: Option<f64>,
-    codex_5h: Option<f64>,
-    codex_week: Option<f64>,
-}
-
 impl Settings {
     /// The settings in `folder`, the defaults when there are none.
     pub(crate) fn load(folder: &Path) -> Result<Self> {
@@ -253,10 +200,42 @@ impl Settings {
             .map(str::to_owned)
     }
 
-    /// The lead's model: as set, else by whether there is a key.
-    pub(crate) fn lead(&self, keyed: bool) -> Result<ModelId> {
-        let default = if keyed { LEAD } else { LEAD_WITHOUT_KEY };
-        Ok(ModelId::new(self.model.as_deref().unwrap_or(default))?)
+    /// The lead's model: as set, else Opus.
+    pub(crate) fn lead(&self) -> Result<ModelId> {
+        Ok(ModelId::new(self.model.as_deref().unwrap_or(LEAD))?)
+    }
+
+    /// What the settings hold that iq reads no more.
+    pub(crate) fn retired(&self) -> Vec<&'static str> {
+        [
+            self.budget.is_some(),
+            self.steward.is_some(),
+            self.limits.is_some(),
+            self.mcp.is_some(),
+        ]
+        .into_iter()
+        .zip(RETIRED)
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect()
+    }
+
+    /// The models the settings name that were Claude Code's or Codex's,
+    /// each with where: they reach the provider no more.
+    pub(crate) fn agents_named(&self) -> Vec<(&'static str, String)> {
+        let agent = |model: &str| {
+            let first = model.trim().split('/').next().unwrap_or_default();
+            first == "claude-code" || first == "codex"
+        };
+        [
+            ("model", self.model.as_deref()),
+            ("reviewer", self.reviewer.as_deref()),
+            ("[observe] model", self.observe.model.as_deref()),
+            ("[assay] grader", self.assay.grader.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(key, model)| Some((key, model?.to_owned())))
+        .filter(|(_, model)| agent(model))
+        .collect()
     }
 
     /// The look: its theme, as set.
@@ -272,31 +251,6 @@ impl Settings {
     /// internet.
     pub(crate) fn autopilot_internet(&self) -> bool {
         self.autopilot_internet.unwrap_or(true)
-    }
-
-    /// The limits, the defaults changed as set.
-    pub(crate) fn limits(&self) -> iq_ui::steward::Limits {
-        use iq_core::Agent;
-        let mut limits = iq_ui::steward::Limits {
-            provider_month: self.limits.requesty_month.map(Usd),
-            ..iq_ui::steward::Limits::default()
-        };
-        for (agent, short, week) in [
-            (
-                Agent::ClaudeCode,
-                self.limits.claude_5h,
-                self.limits.claude_week,
-            ),
-            (Agent::Codex, self.limits.codex_5h, self.limits.codex_week),
-        ] {
-            if let Some(share) = short {
-                limits.short.insert(agent, share);
-            }
-            if let Some(share) = week {
-                limits.week.insert(agent, share);
-            }
-        }
-        limits
     }
 
     /// The shortcuts, the defaults moved as set.
@@ -316,10 +270,9 @@ impl Settings {
         }
     }
 
-    /// Who grades the assay's runs: as set, else the strongest model a
-    /// subscription pays for, as it costs less, else the lead. Always the
+    /// Who grades the assay's runs: as set, else the lead. Always the
     /// same, so that grades compare.
-    pub(crate) fn assay_grader(&self, installed: &[Agent], lead: &ModelId) -> Result<ModelId> {
+    pub(crate) fn assay_grader(&self, lead: &ModelId) -> Result<ModelId> {
         let named = self.assay.grader.clone().or_else(|| {
             self.assay
                 .judges
@@ -329,11 +282,7 @@ impl Settings {
         if let Some(grader) = named.filter(|g| !g.trim().is_empty()) {
             return Ok(ModelId::new(grader.trim())?);
         }
-        Ok(match installed.first() {
-            Some(Agent::ClaudeCode) => ModelId::new("claude-code/opus")?,
-            Some(Agent::Codex) => ModelId::agent(Agent::Codex),
-            None => lead.clone(),
-        })
+        Ok(lead.clone())
     }
 
     /// Which candidates the assay may test.
@@ -358,23 +307,11 @@ impl Settings {
     /// What the observer is set with: the model that places what no rule
     /// places (as set, else the reviewer's cheap one), and how many tasks
     /// wait for it.
-    pub(crate) fn observing(&self, keyed: bool) -> Result<iq_observe::Settings> {
-        let model = match &self.observe.model {
-            Some(model) => ModelId::new(model.as_str())?,
-            None => ModelId::new(if keyed {
-                REVIEWER
-            } else {
-                REVIEWER_WITHOUT_KEY
-            })?,
-        };
-        let every = self.observe.every.unwrap_or(if model.delegate().is_some() {
-            OBSERVE_EVERY_AGENT
-        } else {
-            OBSERVE_EVERY
-        });
+    pub(crate) fn observing(&self) -> Result<iq_observe::Settings> {
+        let model = ModelId::new(self.observe.model.as_deref().unwrap_or(REVIEWER))?;
         Ok(iq_observe::Settings {
             model,
-            every: every.clamp(1, 50),
+            every: self.observe.every.unwrap_or(OBSERVE_EVERY).clamp(1, 50),
             categories: self.categories(),
         })
     }
@@ -402,80 +339,11 @@ impl Settings {
         self.assay.parallel.unwrap_or(PARALLEL).clamp(1, 8)
     }
 
-    /// The servers the assay's judge keeps a copy in, with where in each,
-    /// their variables read through `var`; and what is wrong with those
-    /// that cannot be handed, for the person to see.
-    pub(crate) fn mirrors(
-        &self,
-        var: impl Fn(&str) -> Option<String>,
-    ) -> (Vec<(iq_core::McpServer, String)>, Vec<String>) {
-        let mut mirrors = Vec::new();
-        let mut wrong = Vec::new();
-        for (name, server) in &self.mcp {
-            let Some(place) = server.mirror.as_ref().filter(|m| !m.trim().is_empty()) else {
-                continue;
-            };
-            let mut missing = Vec::new();
-            let mut read = |variable: &str| -> String {
-                var(variable).unwrap_or_else(|| {
-                    missing.push(variable.to_owned());
-                    String::new()
-                })
-            };
-            let reach = match (&server.command, &server.url) {
-                (Some(program), None) => iq_core::McpReach::Command {
-                    program: program.clone(),
-                    args: server.args.clone(),
-                    env: server
-                        .env
-                        .iter()
-                        .map(|variable| (variable.clone(), read(variable)))
-                        .collect(),
-                },
-                (None, Some(url)) => iq_core::McpReach::Http {
-                    url: url.clone(),
-                    headers: server
-                        .headers
-                        .iter()
-                        .map(|(header, variable)| (header.clone(), read(variable)))
-                        .collect(),
-                },
-                _ => {
-                    wrong.push(format!(
-                        "[mcp.{name}] needs a command or a url, one of them"
-                    ));
-                    continue;
-                }
-            };
-            if !missing.is_empty() {
-                wrong.push(format!(
-                    "[mcp.{name}]: iq's environment does not set {}",
-                    missing.join(", ")
-                ));
-                continue;
-            }
-            mirrors.push((
-                iq_core::McpServer {
-                    name: name.clone(),
-                    reach,
-                },
-                place.clone(),
-            ));
-        }
-        (mirrors, wrong)
-    }
-
     /// What the crew starts with.
-    pub(crate) fn crew(&self, keyed: bool) -> Result<iq_agent::Settings> {
-        let default = if keyed {
-            REVIEWER
-        } else {
-            REVIEWER_WITHOUT_KEY
-        };
+    pub(crate) fn crew(&self) -> Result<iq_agent::Settings> {
         Ok(iq_agent::Settings {
-            reviewer: ModelId::new(self.reviewer.as_deref().unwrap_or(default))?,
+            reviewer: Some(ModelId::new(self.reviewer.as_deref().unwrap_or(REVIEWER))?),
             effort: self.effort,
-            budget: self.budget.map(Usd),
             ..iq_agent::Settings::default()
         })
     }
@@ -486,21 +354,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn without_settings_the_key_decides_the_models() {
+    fn without_settings_opus_leads_and_haiku_reviews() {
         let settings = Settings::default();
-        assert_eq!(settings.lead(true).unwrap().as_str(), LEAD);
-        assert_eq!(settings.lead(false).unwrap().as_str(), "claude-code");
+        assert_eq!(settings.lead().unwrap().as_str(), LEAD);
         assert_eq!(
-            settings.crew(false).unwrap().reviewer.as_str(),
-            "claude-code/haiku"
+            settings.crew().unwrap().reviewer.unwrap().as_str(),
+            REVIEWER
         );
+        assert!(settings.retired().is_empty());
         let set: Settings = toml::from_str(
-            "model = \"codex\"\nbudget = 1.5\neffort = \"low\"\nautopilot = true\ninternet = true\nbase_url = \" https://router.example/v1 \"",
+            "model = \"openai/gpt-6-sol\"\neffort = \"low\"\nautopilot = true\ninternet = true\nbase_url = \" https://router.example/v1 \"",
         )
         .unwrap();
         assert_eq!(set.base_url().as_deref(), Some("https://router.example/v1"));
-        assert_eq!(set.lead(true).unwrap().as_str(), "codex");
-        assert_eq!(set.crew(true).unwrap().budget, Some(Usd(1.5)));
+        assert_eq!(set.lead().unwrap().as_str(), "openai/gpt-6-sol");
+        assert_eq!(set.crew().unwrap().effort, Some(Effort::Low));
         assert!(set.autopilot && set.internet);
         assert!(toml::from_str::<Settings>("modle = \"x\"").is_err());
         let looks: Settings =
@@ -515,40 +383,45 @@ mod tests {
         );
         let wrong: Settings = toml::from_str("theme = \"neon\"").unwrap();
         assert!(wrong.look().is_err());
-        let limited: Settings =
-            toml::from_str("steward = true\n[limits]\nrequesty_month = 20.0\nclaude_5h = 50")
-                .unwrap();
-        let limits = limited.limits();
-        assert!(limited.steward);
-        assert_eq!(limits.provider_month, Some(Usd(20.0)));
-        assert_eq!(limits.short[&iq_core::Agent::ClaudeCode], 50.0);
-        assert_eq!(limits.week[&iq_core::Agent::Codex], 70.0);
-        assert!(toml::from_str::<Settings>("[limits]\nclaude_6h = 1").is_err());
+        // Older settings still open, what iq reads no more said.
+        let older: Settings = toml::from_str(
+            "budget = 2.0\nsteward = true\n[limits]\nrequesty_month = 20.0\n[mcp.notes]\nurl = \"https://notes.example/mcp\"",
+        )
+        .unwrap();
+        assert_eq!(older.retired(), RETIRED);
+        let agents: Settings = toml::from_str(
+            "model = \"claude-code/opus\"\nreviewer = \"z-ai/glm-5\"\n[assay]\ngrader = \"codex\"",
+        )
+        .unwrap();
+        assert_eq!(
+            agents.agents_named(),
+            [
+                ("model", "claude-code/opus".to_owned()),
+                ("[assay] grader", "codex".to_owned())
+            ]
+        );
     }
 
     #[test]
-    fn the_assay_is_graded_by_one_grader_a_subscriptions_first() {
-        let lead = ModelId::new("anthropic/claude-sonnet-4-5").unwrap();
-        let unset = Settings::default();
-        let grader = |s: &Settings, installed: &[Agent]| -> String {
-            s.assay_grader(installed, &lead).unwrap().to_string()
-        };
-        assert_eq!(
-            grader(&unset, &[Agent::ClaudeCode, Agent::Codex]),
-            "claude-code/opus"
-        );
-        assert_eq!(grader(&unset, &[]), "anthropic/claude-sonnet-4-5");
+    fn the_assay_is_graded_by_one_grader_the_lead_unless_set() {
+        let lead = ModelId::new("anthropic/claude-opus-5-5").unwrap();
+        let grader = |s: &Settings| -> String { s.assay_grader(&lead).unwrap().to_string() };
+        assert_eq!(grader(&Settings::default()), "anthropic/claude-opus-5-5");
         let set: Settings = toml::from_str(
-            "[assay]\ngrader = \"codex\"\ncandidates = [\"models\"]\nfolder = \"~/lab\"\nparallel = 40",
+            "[assay]\ngrader = \"openai/gpt-6-sol\"\ncandidates = [\"models\"]\nfolder = \"~/lab\"\nparallel = 40",
         )
         .unwrap();
-        assert_eq!(grader(&set, &[Agent::ClaudeCode]), "codex");
-        let before: Settings = toml::from_str("[assay]\njudges = [\"codex\", \"x/y\"]").unwrap();
-        assert_eq!(grader(&before, &[Agent::ClaudeCode]), "codex");
+        assert_eq!(grader(&set), "openai/gpt-6-sol");
+        let before: Settings =
+            toml::from_str("[assay]\njudges = [\"openai/gpt-6-sol\", \"x/y\"]").unwrap();
+        assert_eq!(grader(&before), "openai/gpt-6-sol");
         assert_eq!(set.assay_folder(Path::new("/h")), PathBuf::from("/h/lab"));
         assert_eq!(set.assay_parallel(), 8);
         assert!(set.assay_allowed().allows(iq_assay::Kind::Model, "a/b"));
-        assert!(!set.assay_allowed().allows(iq_assay::Kind::Harness, "codex"));
+        assert!(
+            !set.assay_allowed()
+                .allows(iq_assay::Kind::Team, "pair: a/b + c/d")
+        );
         assert!(toml::from_str::<Settings>("[assay]\njudge = \"x\"").is_err());
     }
 
@@ -556,18 +429,13 @@ mod tests {
     fn the_categories_and_who_places_tasks_are_set_in_the_settings() {
         let none = Settings::default();
         assert!(none.categories().is_empty());
-        assert_eq!(
-            none.observing(true).unwrap().model.as_str(),
-            "openai/gpt-5-mini"
-        );
-        let without_key = none.observing(false).unwrap();
-        assert_eq!(without_key.model.as_str(), "claude-code/haiku");
-        assert_eq!(without_key.every, 10);
+        assert_eq!(none.observing().unwrap().model.as_str(), REVIEWER);
+        assert_eq!(none.observing().unwrap().every, 1);
         let set: Settings = toml::from_str(
             "[observe]\nmodel = \"cheap/one\"\n\n[[observe.category]]\nname = \"Python\"\nfiles = [\"*.py\"]\n\n[[observe.category]]\nname = \"Reviews\"\ndescription = \"reading others' changes\"",
         )
         .unwrap();
-        let observing = set.observing(true).unwrap();
+        let observing = set.observing().unwrap();
         assert_eq!(
             (observing.model.as_str(), observing.every),
             ("cheap/one", 1)
@@ -592,39 +460,5 @@ mod tests {
         assert_eq!(sync.kept(), ["~/notes"]);
         assert_eq!(sync.refused().len(), 1);
         assert!(toml::from_str::<Settings>("[sync]\nremot = \"x\"").is_err());
-    }
-
-    #[test]
-    fn a_server_is_handed_with_values_read_from_the_environment_only() {
-        let set: Settings = toml::from_str(
-            r#"
-[mcp.notes]
-url = "https://notes.example/mcp"
-headers = { Authorization = "NOTES_AUTH" }
-mirror = "a page named Assay"
-
-[mcp.local]
-command = "notes-server"
-env = ["NOTES_TOKEN"]
-mirror = "the assay notebook"
-
-[mcp.other]
-command = "x"
-"#,
-        )
-        .unwrap();
-        let var = |name: &str| (name == "NOTES_AUTH").then(|| "Bearer secret".to_owned());
-        let (mirrors, wrong) = set.mirrors(var);
-        assert_eq!(mirrors.len(), 1);
-        assert_eq!(mirrors[0].0.name, "notes");
-        assert_eq!(mirrors[0].1, "a page named Assay");
-        assert!(
-            matches!(&mirrors[0].0.reach, iq_core::McpReach::Http { headers, .. } if headers[0].1 == "Bearer secret")
-        );
-        assert_eq!(
-            wrong,
-            ["[mcp.local]: iq's environment does not set NOTES_TOKEN"]
-        );
-        assert!(toml::from_str::<Settings>("[mcp.x]\ntoken = \"t\"").is_err());
     }
 }

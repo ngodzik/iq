@@ -5,7 +5,8 @@
 //! of the best; among those, the cheapest leads, the others following in
 //! cost, for when it cannot be used. An agent never tried on a kind is
 //! never routed to it, and a kind no agent was tried on routes nothing:
-//! the chat's own agent does the work.
+//! the chat's own agent does the work. The routing is what the lead is
+//! told, never a rule it is held to: the lead decides whom it starts.
 //!
 //! The routing is written as a file in the assay's folder, made again
 //! whenever the records change, and read as it is when iq starts: two
@@ -18,11 +19,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use iq_agent::{Called, Crew, Extension};
-use iq_core::{ChatModel, Delegate, ToolSpec};
+use iq_core::{ChatModel, ToolSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::candidate::Candidate;
 use crate::exercise::{Exercise, State};
 use crate::record::Record;
 
@@ -40,8 +40,7 @@ edit it. Your own choices go in [route] of ~/.iq/settings.toml.\n\n";
 /// An agent the routing gives a kind of task, with its evidence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Choice {
-    /// The candidate, as it is written to be run: a model, an agent, a
-    /// team.
+    /// The candidate, as it is written to be run: a model, a team.
     pub candidate: String,
     /// Its runs on the kind's exercises.
     pub runs: usize,
@@ -50,7 +49,7 @@ pub struct Choice {
     /// The grader's mean grade, when it graded them all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grade: Option<f32>,
-    /// What a run cost, billed and at list prices under a subscription.
+    /// What a run cost, billed.
     pub cost: f64,
     /// How long a run took, on average.
     pub seconds: u64,
@@ -229,10 +228,9 @@ impl Routing {
     }
 
     /// What an agent starting others is told of the routing, in a few
-    /// lines: each kind's agents, those never to use, and `pace`, how the
-    /// person's limits stand.
+    /// lines: each kind's agents, and those the person never wants used.
     #[must_use]
-    pub fn card(&self, choices: &Choices, pace: Option<&str>) -> Option<String> {
+    pub fn card(&self, choices: &Choices) -> Option<String> {
         if choices.off {
             return None;
         }
@@ -262,90 +260,35 @@ impl Routing {
             return None;
         }
         let mut card = format!(
-            "The agents to start for each kind of task, from the assay's results (graded by {}): \
-             when you start an agent for a task of one of these kinds, start it on the first, \
-             else on one that follows. iq refuses another for these kinds, unless the person \
-             named it.\n{}",
+            "What the assay's results say of the agents to start for each kind of task (graded \
+             by {}): the cheapest that did as well as the reference first, then the next. Where \
+             a cheaper agent does the work as well, hand it the work, with only what it needs to \
+             do it; keep for yourself what needs your judgment. A model the person named is the \
+             one to use.\n{}",
             self.grader,
             lines.join("\n")
         );
         for (agent, why) in &choices.vetoed {
-            card.push_str(&format!("\nNever start an agent on {agent}: {why}."));
-        }
-        if let Some(pace) = pace {
-            card.push_str(&format!("\n{pace}"));
-        }
-        Some(card)
-    }
-
-    /// Whether an agent may start another on `model` for a task of
-    /// `category`: a model the person named, or one the route gives; on a
-    /// kind no route covers, any but those vetoed. Else why not, with
-    /// those it may.
-    ///
-    /// # Errors
-    ///
-    /// Why the model may not take the task, and which may.
-    pub fn allows(
-        &self,
-        category: Option<&str>,
-        model: &str,
-        named: &[String],
-        choices: &Choices,
-    ) -> Result<(), String> {
-        if choices.off || named.iter().any(|n| n == model) {
-            return Ok(());
-        }
-        let routed: Vec<Choice> = category.map(|c| self.route(c, choices)).unwrap_or_default();
-        if let Some(why) = choices.vetoed.get(model) {
-            let instead = routed
-                .first()
-                .map_or(String::new(), |c| format!("; start it on {}", c.candidate));
-            return Err(format!(
-                "{model} is never to be used, as the person set it: {why}{instead}"
+            card.push_str(&format!(
+                "\nThe person never wants an agent started on {agent}: {why}."
             ));
         }
-        let (Some(category), false) = (category, routed.is_empty()) else {
-            return Ok(());
-        };
-        let runs_it = |choice: &Choice| {
-            choice.candidate == model
-                || choice
-                    .candidate
-                    .parse::<Candidate>()
-                    .is_ok_and(|c| c.models.iter().any(|m| m.as_str() == model))
-        };
-        if routed.iter().any(runs_it) {
-            return Ok(());
-        }
-        Err(format!(
-            "for a {category} task, the assay's results route {}: start it on one of them, unless \
-             the person names {model}",
-            routed
-                .iter()
-                .map(|c| format!("{} ({})", c.candidate, c.said()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))
+        Some(card)
     }
 }
 
 /// The routing as agents of a crew are told it, each turn as it stands:
-/// a few lines among their instructions, no tool. What they start is held
-/// to it by the crew's guard, not by what they are told.
+/// a few lines among their instructions, no tool.
 pub struct Card {
     /// The routing, as the records last made it.
     pub routing: Arc<Mutex<Routing>>,
     /// The person's own choices.
     pub choices: Choices,
-    /// How the person's limits stand, in a line, when they set some.
-    pub pace: Arc<dyn Fn() -> Option<String> + Send + Sync>,
 }
 
-impl<M, D> Extension<M, D> for Card
+impl<M> Extension<M> for Card
 where
     M: ChatModel + Clone + 'static,
-    D: Delegate + Clone + 'static,
 {
     fn tools(&self, _: &str) -> Vec<ToolSpec> {
         Vec::new()
@@ -353,10 +296,10 @@ where
 
     fn instructions(&self, _: &str) -> Option<String> {
         let routing = self.routing.lock().ok()?.clone();
-        routing.card(&self.choices, (self.pace)().as_deref())
+        routing.card(&self.choices)
     }
 
-    fn call(&self, _: Crew<M, D>, _: String, name: String, _: Value) -> Called {
+    fn call(&self, _: Crew<M>, _: String, name: String, _: Value) -> Called {
         Box::pin(async move { Err(format!("the routing has no tool named {name:?}")) })
     }
 }
@@ -381,11 +324,7 @@ fn ladder(
         let grade =
             (scores.len() == runs.len()).then(|| scores.iter().sum::<f32>() / scores.len() as f32);
         let n = runs.len();
-        let cost: f64 = runs
-            .iter()
-            .map(|r| r.spent.billed.0 + r.spent.listed.0)
-            .sum::<f64>()
-            / n as f64;
+        let cost: f64 = runs.iter().map(|r| r.spent.billed.0).sum::<f64>() / n as f64;
         passing.push(Choice {
             candidate: candidate.clone(),
             runs: n,
@@ -450,7 +389,6 @@ mod tests {
             kind: crate::Kind::Model,
             model: candidate.into(),
             provider: None,
-            harness: "iq".into(),
             started: 100,
             seconds: 60,
             ending: Ending::Answered,
@@ -533,40 +471,23 @@ mod tests {
     }
 
     #[test]
-    fn agents_are_started_as_routed_unless_the_person_named_another() {
+    fn the_lead_is_told_the_routes_and_what_the_person_never_wants() {
         let routing = routing();
-        let none = Choices::default();
-        assert!(
-            routing
-                .allows(Some("python"), "a/cheap", &[], &none)
-                .is_ok()
-        );
-        let refused = routing
-            .allows(Some("python"), "a/weak", &[], &none)
-            .unwrap_err();
-        assert!(refused.contains("route a/cheap"), "{refused}");
-        assert!(
-            routing
-                .allows(Some("python"), "a/weak", &["a/weak".into()], &none)
-                .is_ok()
-        );
-        // A kind with no route, or none at all, is the agents' to choose.
-        assert!(
-            routing
-                .allows(Some("cooking"), "a/weak", &[], &none)
-                .is_ok()
-        );
-        assert!(routing.allows(None, "a/weak", &[], &none).is_ok());
         let mut vetoed = Choices::default();
         vetoed
             .vetoed
             .insert("a/weak".into(), "it never answers".into());
-        assert!(routing.allows(None, "a/weak", &[], &vetoed).is_err());
-        let card = routing
-            .card(&vetoed, Some("The provider's month: 34% of its limit."))
-            .unwrap();
+        let card = routing.card(&vetoed).unwrap();
         assert!(card.contains("- python: a/cheap (2/2 passed"), "{card}");
-        assert!(card.contains("Never start an agent on a/weak"), "{card}");
+        assert!(
+            card.contains("never wants an agent started on a/weak"),
+            "{card}"
+        );
+        let off = Choices {
+            off: true,
+            ..Choices::default()
+        };
+        assert_eq!(routing.card(&off), None);
     }
 
     #[test]
