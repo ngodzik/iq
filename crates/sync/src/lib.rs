@@ -821,6 +821,11 @@ impl Git {
         }
         let output = command
             .args(args)
+            // The folder's repository, whatever repository iq was started
+            // from, as by a hook of another, which names its own.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             // Nobody is there to answer a prompt: a sync fails rather
             // than waits.
             .env("GIT_TERMINAL_PROMPT", "0")
