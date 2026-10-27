@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn a_model_counts_only_after_a_word_that_names_it() {
         let known = vec![
-            "openai/gpt-6-luna".to_owned(),
+            "lab/model-7-quill".to_owned(),
             "z-ai/glm-5".to_owned(),
             "anthropic/claude-sonnet-5-9".to_owned(),
             "anthropic/claude-sonnet-5-10".to_owned(),
@@ -124,8 +124,8 @@ mod tests {
             ["anthropic/claude-sonnet-5-10"]
         );
         assert_eq!(
-            named("run it on gpt-6-luna.", &known),
-            ["openai/gpt-6-luna"]
+            named("run it on model-7-quill.", &known),
+            ["lab/model-7-quill"]
         );
         assert_eq!(
             named("with z-ai/glm-5, then with z-ai/glm-5", &known),
@@ -137,8 +137,8 @@ mod tests {
         assert!(named("work on src/main.rs", &known).is_empty());
         assert!(named("do it in 5 steps, on 5", &known).is_empty());
         assert_eq!(
-            named("look at src/main.rs with luna", &known),
-            ["openai/gpt-6-luna"]
+            named("look at src/main.rs with quill", &known),
+            ["lab/model-7-quill"]
         );
     }
 }
