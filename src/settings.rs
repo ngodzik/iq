@@ -14,12 +14,6 @@
 //! [keys]                                 # any shortcut moved, "" for none; Ctrl-S lists them
 //! costs = "ctrl+o"
 //!
-//! [assay]                                # agents tried on the same exercises; Ctrl-L
-//! grader = "anthropic/claude-opus-5-5"   # grades every run, always the same so that grades compare
-//! candidates = ["models"]                # "models", "teams", or names; all when unset
-//! folder = "~/.local/share/iq/assay"     # its exercises and results, plain files
-//! parallel = 2                           # runs at once
-//!
 //! [observe]                              # what your work goes to; iq's own, never synced
 //! model = "anthropic/claude-haiku-5-5"   # who places what no rule places: a cheap one
 //! every = 1                              # tasks placed at once
@@ -30,11 +24,6 @@
 //! files = ["*.py"]                       # rules iq applies itself before any model, all optional
 //! commands = ["pytest"]
 //! words = ["django"]
-//!
-//! [route]                                # what the lead is told of the assay's results; your choices
-//! vetoed = { "acme/slow" = "holds requests ten minutes" }  # never to be started, why
-//! pinned = { design = "z-ai/glm-5" }                       # this kind, this agent, whatever the results
-//! off = false                            # true: the lead is told nothing of it
 //!
 //! [sync]                                 # iq's data kept in a private repository of yours, any name
 //! remote = "https://github.com/someone/any-name.git"
@@ -50,7 +39,7 @@ use iq_core::{Effort, ModelId};
 use serde::Deserialize;
 
 /// The lead's model when the settings name none: the one that decides
-/// who does what, and grades the assay's runs.
+/// who does what.
 const LEAD: &str = "anthropic/claude-opus-5-5";
 
 /// The reviewer's, likewise: cheap, as it answers often and briefly; the
@@ -58,8 +47,10 @@ const LEAD: &str = "anthropic/claude-opus-5-5";
 const REVIEWER: &str = "anthropic/claude-haiku-5-5";
 
 /// What the settings once held and iq reads no more, since it works with
-/// the provider's models alone and lets the lead spend as it judges.
-const RETIRED: [&str; 4] = ["budget", "steward", "[limits]", "[mcp]"];
+/// the provider's models alone and lets the lead decide.
+const RETIRED: [&str; 6] = [
+    "budget", "steward", "[limits]", "[mcp]", "[assay]", "[route]",
+];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,18 +74,12 @@ pub(crate) struct Settings {
     /// The shortcuts moved: an action's name and its key.
     #[serde(default)]
     keys: BTreeMap<String, String>,
-    /// The assay.
-    #[serde(default)]
-    assay: AssayFile,
     /// Where iq's data is synced.
     #[serde(default)]
     sync: SyncFile,
     /// What the work goes to.
     #[serde(default)]
     observe: ObserveFile,
-    /// The person's own choices of routing.
-    #[serde(default)]
-    route: RouteFile,
     /// What iq reads no more, in the order of [`RETIRED`]: read, so that
     /// older settings still open, and said, for the person to remove it.
     #[serde(default)]
@@ -105,22 +90,10 @@ pub(crate) struct Settings {
     limits: Option<toml::Value>,
     #[serde(default)]
     mcp: Option<toml::Value>,
-}
-
-/// The routing as the settings write it: the person's own choices, beside
-/// what the assay's records route.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RouteFile {
-    /// No routing: the lead is told nothing of it.
     #[serde(default)]
-    off: bool,
-    /// Models never to be started, each with why.
+    assay: Option<toml::Value>,
     #[serde(default)]
-    vetoed: BTreeMap<String, String>,
-    /// A model pinned to a kind of task.
-    #[serde(default)]
-    pinned: BTreeMap<String, String>,
+    route: Option<toml::Value>,
 }
 
 /// The observations as the settings write them.
@@ -153,21 +126,8 @@ struct SyncFile {
     keep: Vec<String>,
 }
 
-/// The assay's settings as written.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AssayFile {
-    /// Who grades every run, always the same so that grades compare.
-    grader: Option<String>,
-    /// Kept from before there was one grader: the first is it.
-    judges: Option<Vec<String>>,
-    candidates: Option<Vec<String>>,
-    folder: Option<String>,
-    parallel: Option<usize>,
-}
-
-/// iq's folder of data: the assay, the projects' memory, a copy of the
-/// settings and what the person keeps, synced when the machine names a
+/// iq's folder of data: the projects' memory, a copy of the settings and
+/// what the person keeps, synced when the machine names a
 /// repository. Out of `~/.iq`, which agents' tools cannot reach.
 pub(crate) fn data_folder(home: &Path) -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
@@ -176,9 +136,6 @@ pub(crate) fn data_folder(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".local/share"))
         .join("iq")
 }
-
-/// How many runs of the assay go at once unless the settings say.
-const PARALLEL: usize = 2;
 
 impl Settings {
     /// The settings in `folder`, the defaults when there are none.
@@ -212,6 +169,8 @@ impl Settings {
             self.steward.is_some(),
             self.limits.is_some(),
             self.mcp.is_some(),
+            self.assay.is_some(),
+            self.route.is_some(),
         ]
         .into_iter()
         .zip(RETIRED)
@@ -230,7 +189,6 @@ impl Settings {
             ("model", self.model.as_deref()),
             ("reviewer", self.reviewer.as_deref()),
             ("[observe] model", self.observe.model.as_deref()),
-            ("[assay] grader", self.assay.grader.as_deref()),
         ]
         .into_iter()
         .filter_map(|(key, model)| Some((key, model?.to_owned())))
@@ -256,47 +214,6 @@ impl Settings {
     /// The shortcuts, the defaults moved as set.
     pub(crate) fn keymap(&self) -> Result<iq_ui::keys::Keymap> {
         Ok(iq_ui::keys::Keymap::with(&self.keys)?)
-    }
-
-    /// The assay's folder: as set, a leading `~` the home, else iq's data
-    /// folder, out of `~/.iq`, where the agents' tools cannot reach.
-    pub(crate) fn assay_folder(&self, home: &Path) -> PathBuf {
-        match &self.assay.folder {
-            Some(folder) => match folder.strip_prefix("~/") {
-                Some(rest) => home.join(rest),
-                None => PathBuf::from(folder),
-            },
-            None => data_folder(home).join("assay"),
-        }
-    }
-
-    /// Who grades the assay's runs: as set, else the lead. Always the
-    /// same, so that grades compare.
-    pub(crate) fn assay_grader(&self, lead: &ModelId) -> Result<ModelId> {
-        let named = self.assay.grader.clone().or_else(|| {
-            self.assay
-                .judges
-                .as_ref()
-                .and_then(|judges| judges.first().cloned())
-        });
-        if let Some(grader) = named.filter(|g| !g.trim().is_empty()) {
-            return Ok(ModelId::new(grader.trim())?);
-        }
-        Ok(lead.clone())
-    }
-
-    /// Which candidates the assay may test.
-    pub(crate) fn assay_allowed(&self) -> iq_assay::Allowed {
-        iq_assay::Allowed::from_words(self.assay.candidates.as_deref().unwrap_or_default())
-    }
-
-    /// The person's own choices of routing.
-    pub(crate) fn route_choices(&self) -> iq_assay::Choices {
-        iq_assay::Choices {
-            off: self.route.off,
-            vetoed: self.route.vetoed.clone(),
-            pinned: self.route.pinned.clone(),
-        }
     }
 
     /// The person's categories of work.
@@ -334,11 +251,6 @@ impl Settings {
         Some(sync)
     }
 
-    /// How many of the assay's runs go at once.
-    pub(crate) fn assay_parallel(&self) -> usize {
-        self.assay.parallel.unwrap_or(PARALLEL).clamp(1, 8)
-    }
-
     /// What the crew starts with.
     pub(crate) fn crew(&self) -> Result<iq_agent::Settings> {
         Ok(iq_agent::Settings {
@@ -363,11 +275,11 @@ mod tests {
         );
         assert!(settings.retired().is_empty());
         let set: Settings = toml::from_str(
-            "model = \"openai/gpt-6-sol\"\neffort = \"low\"\nautopilot = true\ninternet = true\nbase_url = \" https://router.example/v1 \"",
+            "model = \"lab/lead\"\neffort = \"low\"\nautopilot = true\ninternet = true\nbase_url = \" https://router.example/v1 \"",
         )
         .unwrap();
         assert_eq!(set.base_url().as_deref(), Some("https://router.example/v1"));
-        assert_eq!(set.lead().unwrap().as_str(), "openai/gpt-6-sol");
+        assert_eq!(set.lead().unwrap().as_str(), "lab/lead");
         assert_eq!(set.crew().unwrap().effort, Some(Effort::Low));
         assert!(set.autopilot && set.internet);
         assert!(toml::from_str::<Settings>("modle = \"x\"").is_err());
@@ -385,44 +297,21 @@ mod tests {
         assert!(wrong.look().is_err());
         // Older settings still open, what iq reads no more said.
         let older: Settings = toml::from_str(
-            "budget = 2.0\nsteward = true\n[limits]\nrequesty_month = 20.0\n[mcp.notes]\nurl = \"https://notes.example/mcp\"",
+            "budget = 2.0\nsteward = true\n[limits]\nrequesty_month = 20.0\n[mcp.notes]\nurl = \"https://notes.example/mcp\"\n[assay]\ngrader = \"x/y\"\n[route]\noff = true",
         )
         .unwrap();
         assert_eq!(older.retired(), RETIRED);
         let agents: Settings = toml::from_str(
-            "model = \"claude-code/opus\"\nreviewer = \"z-ai/glm-5\"\n[assay]\ngrader = \"codex\"",
+            "model = \"claude-code/opus\"\nreviewer = \"z-ai/glm-5\"\n[observe]\nmodel = \"codex\"",
         )
         .unwrap();
         assert_eq!(
             agents.agents_named(),
             [
                 ("model", "claude-code/opus".to_owned()),
-                ("[assay] grader", "codex".to_owned())
+                ("[observe] model", "codex".to_owned())
             ]
         );
-    }
-
-    #[test]
-    fn the_assay_is_graded_by_one_grader_the_lead_unless_set() {
-        let lead = ModelId::new("anthropic/claude-opus-5-5").unwrap();
-        let grader = |s: &Settings| -> String { s.assay_grader(&lead).unwrap().to_string() };
-        assert_eq!(grader(&Settings::default()), "anthropic/claude-opus-5-5");
-        let set: Settings = toml::from_str(
-            "[assay]\ngrader = \"openai/gpt-6-sol\"\ncandidates = [\"models\"]\nfolder = \"~/lab\"\nparallel = 40",
-        )
-        .unwrap();
-        assert_eq!(grader(&set), "openai/gpt-6-sol");
-        let before: Settings =
-            toml::from_str("[assay]\njudges = [\"openai/gpt-6-sol\", \"x/y\"]").unwrap();
-        assert_eq!(grader(&before), "openai/gpt-6-sol");
-        assert_eq!(set.assay_folder(Path::new("/h")), PathBuf::from("/h/lab"));
-        assert_eq!(set.assay_parallel(), 8);
-        assert!(set.assay_allowed().allows(iq_assay::Kind::Model, "a/b"));
-        assert!(
-            !set.assay_allowed()
-                .allows(iq_assay::Kind::Team, "pair: a/b + c/d")
-        );
-        assert!(toml::from_str::<Settings>("[assay]\njudge = \"x\"").is_err());
     }
 
     #[test]

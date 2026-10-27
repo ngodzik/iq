@@ -60,18 +60,10 @@ pub struct Settings {
     pub reviewer: Option<ModelId>,
     /// How hard models think; `None` leaves it to them.
     pub effort: Option<Effort>,
-    /// The most the provider's key may be billed for the crew's calls,
-    /// from its start, as an assay's exercise allows each run; `None`, as
-    /// in the person's sessions, for no limit: the lead spends as it
-    /// judges, and the person follows what it costs.
-    pub budget: Option<Usd>,
     /// How long a question waits for the person before it is refused.
     pub patience: Duration,
     /// The most calls to its model one turn of an agent of iq's makes.
     pub steps: usize,
-    /// The only models agents may start others on, when the crew is held
-    /// to them, as a candidate of the assay is to its own; `None` for any.
-    pub models: Option<Vec<ModelId>>,
 }
 
 impl Default for Settings {
@@ -79,10 +71,8 @@ impl Default for Settings {
         Self {
             reviewer: None,
             effort: None,
-            budget: None,
             patience: Duration::from_secs(50 * 60),
             steps: 200,
-            models: None,
         }
     }
 }
@@ -839,9 +829,6 @@ where
             if let Some(news) = self.unread(name) {
                 messages.push(Message::user(news));
             }
-            if let Err(error) = self.within_budget() {
-                return (messages, Err(error));
-            }
             // Read at each call, so that a change reaches a turn under way.
             let effort = lock(&self.inner.board)
                 .members
@@ -1006,7 +993,6 @@ where
         match name {
             "start_agent" => {
                 let model = ModelId::new(args.text("model")?).map_err(|e| e.to_string())?;
-                self.held_to(&model)?;
                 let role = args
                     .text("role")
                     .ok()
@@ -1210,7 +1196,6 @@ where
             .reviewer
             .as_ref()
             .ok_or("no reviewer is set")?;
-        self.within_budget()?;
         let request = ChatRequest {
             model: model.clone(),
             messages: vec![Message::system(review::INSTRUCTIONS), Message::user(prompt)],
@@ -1242,93 +1227,6 @@ where
     /// are always the person's.
     pub fn set_autopilot_internet(&self, may: bool) {
         self.inner.gate.set_reviewer_internet(may);
-    }
-
-    /// Asks the person whether `agent` may do `action`, which the gate
-    /// does not judge, such as spending on a run of agents: `reason` says
-    /// what it costs. The person alone answers, autopilot or not; nobody
-    /// answering in time is a no.
-    pub async fn confirm(&self, agent: &str, action: String, reason: String) -> bool {
-        let id = self.inner.next_question.fetch_add(1, Ordering::Relaxed);
-        let (reply, answer) = oneshot::channel();
-        lock(&self.inner.questions).insert(id, reply);
-        self.report(Event::Asked {
-            id,
-            agent: agent.to_owned(),
-            action,
-            reason,
-            widens: false,
-        });
-        let answer = tokio::time::timeout(self.inner.settings.patience, answer).await;
-        lock(&self.inner.questions).remove(&id);
-        let approved = matches!(answer, Ok(Ok(true)));
-        self.report(Event::Answered { id, approved });
-        approved
-    }
-
-    /// Judges `action` for `agent` as one of its own tools would be: the
-    /// gate allows it, asks whoever answers for the person, or denies it.
-    ///
-    /// # Errors
-    ///
-    /// Why it was refused.
-    pub async fn permit(&self, agent: &str, action: Action) -> Result<Permit, String> {
-        self.act(agent, action).await
-    }
-
-    /// Writes to `to` as `from`, a part of iq rather than an agent, and
-    /// wakes it if it rests: what it waited for has come.
-    ///
-    /// # Errors
-    ///
-    /// No agent of that name.
-    pub fn deliver(&self, from: &str, to: &str, text: String) -> Result<(), String> {
-        let resting = lock(&self.inner.board)
-            .members
-            .get(to)
-            .is_some_and(|m| m.turn.as_ref().is_none_or(JoinHandle::is_finished));
-        self.post(from, to, text)?;
-        if resting && let Some(news) = self.unread(to) {
-            self.wake(to, news);
-        }
-        Ok(())
-    }
-
-    /// Runs the command `permit` allows in the crew's sandbox, as its
-    /// agents' commands run: what it printed, with how it ended, and
-    /// whether it succeeded.
-    ///
-    /// # Errors
-    ///
-    /// The sandbox could not run it.
-    pub async fn run_permitted(&self, permit: Permit) -> Result<(String, bool), String> {
-        self.run(permit, OWN_ASK).await
-    }
-
-    /// Fails when the crew is held to other models than `model`.
-    fn held_to(&self, model: &ModelId) -> Result<(), String> {
-        match &self.inner.settings.models {
-            Some(models) if !models.contains(model) => Err(format!(
-                "this crew starts agents only on {}: start it on one of them",
-                models
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            _ => Ok(()),
-        }
-    }
-
-    /// Fails once the provider's key was billed the budget, when the crew
-    /// has one.
-    fn within_budget(&self) -> Result<(), String> {
-        match self.inner.settings.budget {
-            Some(budget) if self.billed() >= budget => Err(format!(
-                "the budget of {budget} for the provider is spent; raise it to go on"
-            )),
-            _ => Ok(()),
-        }
     }
 
     fn spent(&self, agent: &str, model: &str, usage: iq_core::Usage, cost: Option<Usd>) {

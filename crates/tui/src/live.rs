@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 
 use iq_ui::Board;
-use iq_ui::assay::Phase;
 use iq_ui::crew::Entry;
 use iq_ui::keys::Action;
 use iq_ui::screen::Talk;
@@ -209,68 +208,6 @@ impl Live<'_> {
                 p.fg(p.faint),
             )));
         }
-        lines.extend(self.runs(motion, width));
-        lines
-    }
-
-    /// A line for each run of the assay at work: its candidate, its
-    /// exercise, where it stands, what it spent; graded, by whom.
-    fn runs(&self, motion: &Motion, width: usize) -> Vec<Line<'static>> {
-        let p = self.p;
-        let assay = self.board.assay();
-        let running = assay.running();
-        let grader = assay
-            .overview()
-            .graded_by
-            .clone()
-            .unwrap_or_else(|| assay.grader().to_owned());
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for run in running.iter().take(WORKING) {
-            let (mark, said, tint) = match run.phase {
-                Phase::Waiting => ("◦ ".to_owned(), "waiting its turn".to_owned(), p.faint),
-                Phase::Working => (
-                    format!("{} ", motion.spinner()),
-                    "working".to_owned(),
-                    p.accent,
-                ),
-                Phase::Checking => (
-                    format!("{} ", motion.spinner()),
-                    "its tests run".to_owned(),
-                    p.info,
-                ),
-                Phase::Judging => (
-                    format!("{} ", motion.spinner()),
-                    format!("graded by {grader}"),
-                    p.info,
-                ),
-                Phase::Done(true) => ("✔ ".to_owned(), "passed".to_owned(), p.ok),
-                Phase::Done(false) => ("✘ ".to_owned(), "failed".to_owned(), p.bad),
-            };
-            let mut spent = String::new();
-            if run.billed.0 > 0.0 {
-                spent.push_str(&format!(" · {}", run.billed));
-            } else if run.tokens > 0 {
-                spent.push_str(&format!(" · {} tokens", iq_core::TokenCount(run.tokens)));
-            }
-            let line = vec![
-                Span::styled(mark, p.fg(tint)),
-                Span::styled("assay ", p.fg(p.faint)),
-                Span::styled(run.candidate.clone(), p.bold(p.text)),
-                Span::styled(format!(" · {} · ", run.exercise), p.fg(p.dim)),
-                Span::styled(said, p.fg(tint)),
-                Span::styled(
-                    format!(" {}{spent}", seconds(self.now.saturating_sub(run.since))),
-                    p.fg(p.faint),
-                ),
-            ];
-            lines.push(fit(line, width.saturating_sub(1)));
-        }
-        if running.len() > WORKING {
-            lines.push(Line::from(Span::styled(
-                format!("  and {} more runs of the assay", running.len() - WORKING),
-                p.fg(p.faint),
-            )));
-        }
         lines
     }
 
@@ -401,14 +338,7 @@ impl Live<'_> {
                     .to_owned();
                 (
                     Line::from(vec![
-                        Span::styled(
-                            if chat.assay {
-                                " new chat in the assay"
-                            } else {
-                                " new chat"
-                            },
-                            p.bold(p.accent),
-                        ),
+                        Span::styled(" new chat", p.bold(p.accent)),
                         Span::styled(said, p.fg(p.faint)),
                     ]),
                     Line::default(),
@@ -753,29 +683,6 @@ mod tests {
         let status = rows.last().unwrap();
         assert!(status.contains("1 waiting for you"));
         assert!(status.ends_with("you ● lead"));
-        // A run of the assay at work says who and what, and who grades it.
-        board.update(Update::Assay(Box::new(iq_ui::assay::Overview {
-            grader: "anthropic/claude-opus-5-5".into(),
-            ..iq_ui::assay::Overview::default()
-        })));
-        let run = |phase| iq_ui::assay::Progress {
-            exercise: "add-fix".into(),
-            batch: "b".into(),
-            label: "A".into(),
-            candidate: "z-ai/glm-5".into(),
-            phase,
-            tools: 3,
-            billed: iq_core::Usd(0.01),
-            tokens: 900,
-            since: iq_ui::now(),
-        };
-        board.update(Update::AssayRunning(vec![run(Phase::Judging)]));
-        let rows = drawn(&board, &history, 100);
-        assert!(
-            rows[1].contains("assay z-ai/glm-5 · add-fix · graded by anthropic/claude-opus-5-5"),
-            "{}",
-            rows[1]
-        );
     }
 
     #[test]

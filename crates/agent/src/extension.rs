@@ -1,5 +1,5 @@
 //! Tools a part of iq offers some of the crew's agents beside the crew's
-//! own, such as the assay's to its judge: which agents get them, what they
+//! own, such as the memory's: which agents get them, what they
 //! are told of them, and what a call does. A call acts through the crew it
 //! is given, so through the gate, and asks the person through it.
 

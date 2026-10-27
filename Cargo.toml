@@ -4,7 +4,6 @@ members = [
     "crates/llm",
     "crates/gate",
     "crates/agent",
-    "crates/assay",
     "crates/memory",
     "crates/observe",
     "crates/sync",
@@ -28,7 +27,6 @@ iq-core  = { path = "crates/core", version = "0.1.0" }
 iq-llm   = { path = "crates/llm", version = "0.1.0" }
 iq-gate  = { path = "crates/gate", version = "0.1.0" }
 iq-agent = { path = "crates/agent", version = "0.1.0" }
-iq-assay = { path = "crates/assay", version = "0.1.0" }
 iq-sync  = { path = "crates/sync", version = "0.1.0" }
 iq-memory = { path = "crates/memory", version = "0.1.0" }
 iq-observe = { path = "crates/observe", version = "0.1.0" }
@@ -89,7 +87,6 @@ iq-core.workspace            = true
 iq-llm.workspace             = true
 iq-gate.workspace            = true
 iq-agent.workspace           = true
-iq-assay.workspace           = true
 iq-sync.workspace            = true
 iq-memory.workspace          = true
 iq-observe.workspace         = true

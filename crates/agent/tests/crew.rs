@@ -696,35 +696,6 @@ async fn a_reply_of_nothing_is_urged_on_once_then_fails_the_turn() {
 }
 
 #[tokio::test]
-async fn a_crew_held_to_its_models_starts_no_agent_on_another() {
-    let f = fixture(
-        &[(
-            "lead",
-            vec![
-                calls(
-                    "start_agent",
-                    serde_json::json!({"name": "helper", "model": "dear/model", "task": "help"}),
-                ),
-                say("Alone, then."),
-            ],
-        )],
-        Settings {
-            models: Some(vec![model("cheap/model")]),
-            ..Settings::default()
-        },
-    );
-    f.crew
-        .start("lead", &model("cheap/model"), "go".into(), PERSON);
-    f.settled().await;
-    assert!(f.crew.list().iter().all(|a| a.name != "helper"));
-    assert!(
-        f.model
-            .seen_by("lead")
-            .contains("starts agents only on cheap/model")
-    );
-}
-
-#[tokio::test]
 async fn the_lead_starts_its_agents_on_the_models_it_chooses() {
     let f = fixture(
         &[(
@@ -786,32 +757,4 @@ async fn the_lead_chooses_how_hard_its_agents_think_and_the_person_its_own() {
     f.settled().await;
     assert_eq!(f.model.efforts_of("lead").last(), Some(&Some(Effort::Max)));
     assert!(f.crew.set_effort("nobody", Effort::Low).is_err());
-}
-
-#[tokio::test]
-async fn the_budget_stops_the_calls() {
-    let f = fixture(
-        &[(
-            "lead",
-            vec![
-                calls("list_agents", serde_json::json!({})),
-                say("never said"),
-            ],
-        )],
-        Settings {
-            budget: Some(Usd(0.0005)),
-            ..Settings::default()
-        },
-    );
-    f.crew
-        .start("lead", &model("cheap/model"), "go".into(), PERSON);
-    f.settled().await;
-    let failed = f.events().into_iter().find_map(|event| match event {
-        Event::Done {
-            outcome: Err(error),
-            ..
-        } => Some(error),
-        _ => None,
-    });
-    assert!(failed.unwrap().contains("budget"));
 }

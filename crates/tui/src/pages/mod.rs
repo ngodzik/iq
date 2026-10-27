@@ -3,7 +3,6 @@
 //! question when one waits, the page's lines scrolled as the person reads
 //! them, and the keys it takes at its foot.
 
-mod assay;
 mod costs;
 mod keys;
 mod observations;
@@ -73,10 +72,6 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, &'static str) {
         ),
         Page::Thread(agent) => (team::thread(seen, agent), "↑↓ scroll · ← the team"),
         Page::Costs => (costs::lines(seen), "← → the period · ↑↓ scroll"),
-        Page::Assay => (
-            assay::lines(seen),
-            "t the assay's chat · s stop the runs · ↑↓ scroll",
-        ),
         Page::Observations => (
             observations::lines(seen),
             "← → earlier, later · s the span · b by · n now · ↑↓ scroll",

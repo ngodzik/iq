@@ -1,5 +1,5 @@
 //! iq's own files kept in a git repository the person chose, a private one
-//! of theirs: the assay, the projects' memory, a copy of the settings. The
+//! of theirs: the projects' memory, a copy of the settings. The
 //! folder they live in is a git repository; a sync commits what changed
 //! here, takes what changed elsewhere, and sends the rest. Git decides,
 //! never a model, with three rules:
@@ -36,7 +36,7 @@ use tokio::sync::Mutex;
 pub const BRANCH: &str = "main";
 
 /// What a sync leaves out: what only this machine needs, or what is built
-/// again from the rest.
+/// again from the rest, such as the work folders of the assay iq once had.
 const IGNORED: &str = "# What only this machine needs, or what is built again from the rest.
 assay/runs/*/*/*/work/
 assay/judging/

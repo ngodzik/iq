@@ -2,8 +2,8 @@
 //! written into the terminal's own scrollback as it happens, scrolled,
 //! selected and copied as any output; below it a live part, drawn again as
 //! things move: the agents at work, the question waiting, where the person
-//! writes, the status line; and the pages (the crew, the costs, the assay,
-//! the observations, the keys) on the terminal's other screen, which gives
+//! writes, the status line; and the pages (the crew, the costs, the
+//! observations, the keys) on the terminal's other screen, which gives
 //! the conversation back as it was when they close.
 //!
 //! It draws `iq-ui`'s state and hands it the keys, which it turns into what
@@ -234,14 +234,10 @@ impl Iq {
                 self.history.after_message(name, said);
             }
             Request::Tell { to, named, .. } if !named.is_empty() => {
-                let said = if to == iq_ui::assay::CHAT {
-                    format!("→ {}, as you named it", named.join(", "))
-                } else {
-                    format!(
-                        "→ {to} may start agents on {}, as you named them",
-                        named.join(", ")
-                    )
-                };
+                let said = format!(
+                    "→ {to} may start agents on {}, as you named them",
+                    named.join(", ")
+                );
                 self.history.after_message(to, said);
             }
             _ => {}

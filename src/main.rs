@@ -16,12 +16,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use iq_agent::{Crew, Event, Report};
-use iq_assay::{Assay, Told};
 use iq_core::ModelId;
 use iq_gate::{Action, Approver, Gate, HELPER_FLAG, HOLD_FLAG, Helper, Judged, Rules};
 use iq_llm::OpenAiCompatible;
 use iq_ui::Update;
-use iq_ui::crew::{AssayAsk, Request};
+use iq_ui::crew::Request;
 use tracing_subscriber::EnvFilter;
 
 use crate::journal::Journal;
@@ -86,12 +85,6 @@ enum Command {
     },
     /// The provider's models, with what they charge per million tokens.
     Models,
-    /// The assay's exercises and their results, as its folder holds them;
-    /// or, named after it, an exercise frozen or run.
-    Assay {
-        #[command(subcommand)]
-        act: Option<AssayAct>,
-    },
     /// Syncs iq's folder of data now with the repository the settings'
     /// [sync] names: what changed here sent, what changed elsewhere taken;
     /// a new machine takes everything first. iq does it on its own as it runs.
@@ -105,30 +98,6 @@ enum Command {
         /// otherwise.
         #[arg(long)]
         network: bool,
-    },
-}
-
-/// What the assay is asked from the command line.
-#[derive(Subcommand)]
-enum AssayAct {
-    /// Freezes an exercise as it is: from then on every candidate is given
-    /// exactly the same. Asks first.
-    Freeze {
-        /// The exercise.
-        exercise: String,
-    },
-    /// Runs frozen exercises on candidates, each in a folder of its own,
-    /// checked, then judged blind: one exercise, every exercise of a kind
-    /// of task, or `all`. Says what it should cost, and asks first.
-    Run {
-        /// An exercise, a kind of task, or `all`.
-        which: String,
-        /// A model (`z-ai/glm-5`), or a team (`pair: writer + reviewer`).
-        #[arg(required = true)]
-        candidates: Vec<String>,
-        /// Runs of each candidate, 3 at most.
-        #[arg(long, default_value_t = 1)]
-        times: u64,
     },
 }
 
@@ -282,98 +251,19 @@ impl Cli {
     }
 }
 
-/// The assay of the settings' folder, and the crew its judge works in,
-/// in that folder: its runs' gates hold the person's rules, its costs go
-/// to `report` with the rest, what changes in it is told on `told`. Must
-/// run within the runtime.
-#[allow(clippy::too_many_arguments)]
-fn assay(
-    cli: &Cli,
-    settings: &Settings,
-    lead: &ModelId,
-    report: Report,
-    told: std::sync::mpsc::Sender<Told>,
-    journal: &Path,
-) -> Result<(Assay<OpenAiCompatible>, Crew<OpenAiCompatible>)> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set")?;
-    let store = iq_assay::Store::open(settings.assay_folder(&home))
-        .context("opening the assay's folder")?;
-    let provider = provider(cli);
-    let crew_settings = settings.crew()?;
-    let runner = iq_assay::Runner {
-        provider: provider.clone(),
-        provider_name: Some(provider.name()),
-        helper: Helper::this_program()?,
-        gate: Arc::new(|work: &Path| gate_in(work, false, false).map_err(|e| format!("{e:#}"))),
-        effort: crew_settings.effort,
-    };
-    let assay = Assay::new(
-        store,
-        runner,
-        iq_assay::Settings {
-            grader: settings.assay_grader(lead)?,
-            allowed: settings.assay_allowed(),
-            reference: lead.clone(),
-            parallel: settings.assay_parallel(),
-            journal: Some(journal.to_path_buf()),
-            labels: Some(journal.with_file_name(LABELS)),
-            categories: settings.categories(),
-            notices: Vec::new(),
-        },
-        Arc::clone(&report),
-        Arc::new(move |news| {
-            let _ = told.send(news);
-        }),
-    );
-    let crew = Crew::new(
-        provider,
-        gate_in(
-            assay.store().root(),
-            settings.internet,
-            settings.autopilot_internet(),
-        )?,
-        Helper::this_program()?,
-        crew_settings,
-        report,
-    );
-    crew.set_autopilot(settings.autopilot);
-    assay.serve(iq_assay::CHAT);
-    crew.extend(Arc::new(assay.clone()));
-    Ok((assay, crew))
-}
-
-/// Who the assay may test: the provider's models as it lists them, with
-/// their prices.
-async fn roster(provider: &OpenAiCompatible, keyed: bool) -> iq_assay::Roster {
-    let mut roster = iq_assay::Roster {
-        provider: Some(provider.name()),
-        ..iq_assay::Roster::default()
-    };
+/// The models the provider lists, which the person may name; none
+/// without a key, or when the list cannot be had.
+async fn listed(provider: &OpenAiCompatible, keyed: bool) -> Vec<String> {
     if !keyed {
-        roster.missing =
-            Some("there is no key for the provider: iq reads it from REQUESTY_API_KEY".into());
-        return roster;
+        return Vec::new();
     }
     match provider.list().await {
-        Ok(listed) => {
-            roster.models = listed
-                .into_iter()
-                .map(|model| iq_assay::Offer {
-                    id: model.id,
-                    canonical: model.canonical,
-                    input: model.input_price,
-                    output: model.output_price,
-                    context: model.context_window,
-                    tools: model.tool_calling,
-                    description: model.description,
-                })
-                .collect();
+        Ok(listed) => listed.into_iter().map(|model| model.id).collect(),
+        Err(error) => {
+            tracing::warn!("the provider's models: {:#}", anyhow::Error::new(error));
+            Vec::new()
         }
-        Err(error) => roster.missing = Some(format!("{:#}", anyhow::Error::new(error))),
     }
-    roster
 }
 
 /// What the crew does, kept in iq's folder as it happens: the calls billed
@@ -584,74 +474,14 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     };
     let crew = {
         let _inside = runtime.enter();
-        crew(cli, &settings, Arc::clone(&report))?
+        crew(cli, &settings, report)?
     };
-    let (told, heard) = std::sync::mpsc::channel::<Told>();
-    let (assay, assay_crew) = {
-        let _inside = runtime.enter();
-        assay(cli, &settings, &lead, report, told, journal.file())?
-    };
-    // The routing, as its file says it: made again only as the assay's
-    // records change, never as iq starts, but for the first time.
-    let routing = Arc::new(std::sync::Mutex::new(
-        iq_assay::Routing::load(assay.store().root()).unwrap_or_else(|| assay.refresh_routing()),
-    ));
-    let book = {
-        let categories = settings.categories();
-        let choices = settings.route_choices();
-        move |routing: &iq_assay::Routing| iq_ui::routes::RouteBook {
-            categories: categories.clone(),
-            routing: routing.clone(),
-            choices: choices.clone(),
-        }
-    };
-    if let Ok(now) = routing.lock() {
-        let _ = send.send(Update::Routes(Box::new(book(&now))));
-    }
-    // Agents are told the routing each turn, for the lead to decide whom
-    // it starts: iq holds no agent to it.
-    crew.extend(Arc::new(iq_assay::Card {
-        routing: Arc::clone(&routing),
-        choices: settings.route_choices(),
-    }));
-    // What the assay's folder holds is read on a thread of its own, never
-    // where the terminal is drawn, at once and whenever it changes, the
-    // routing made again with it.
     {
-        let send = send.clone();
-        let assay = assay.clone();
-        let routing = Arc::clone(&routing);
-        std::thread::spawn(move || {
-            let _ = send.send(Update::Assay(Box::new(assay.overview())));
-            for news in heard {
-                let update = match news {
-                    Told::Store => {
-                        let made = assay.refresh_routing();
-                        let _ = send.send(Update::Routes(Box::new(book(&made))));
-                        if let Ok(mut now) = routing.lock() {
-                            *now = made;
-                        }
-                        Update::Assay(Box::new(assay.overview()))
-                    }
-                    Told::Running(running) => Update::AssayRunning(running),
-                };
-                if send.send(update).is_err() {
-                    return;
-                }
-            }
-        });
-    }
-    {
-        let assay = assay.clone();
         let provider = provider(cli);
         let send = send.clone();
         runtime.spawn(async move {
-            let roster = roster(&provider, keyed).await;
             // The models the person may name in what they write.
-            let _ = send.send(Update::Models(
-                roster.models.iter().map(|offer| offer.id.clone()).collect(),
-            ));
-            assay.set_roster(roster);
+            let _ = send.send(Update::Models(listed(&provider, keyed).await));
         });
     }
 
@@ -690,13 +520,8 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     }
     let handle = runtime.handle().clone();
     let working = crew.clone();
-    let judging = assay_crew.clone();
-    let assaying = assay.clone();
     std::thread::spawn(move || {
         let _inside = handle.enter();
-        // The assay's chat works in a crew of its own, in the assay's
-        // folder: what is asked of an agent goes to the crew it is in.
-        let judge_has = |name: &str| judging.list().iter().any(|a| a.name == name);
         for request in requests {
             match request {
                 Request::Start {
@@ -706,55 +531,27 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     role,
                     pattern,
                     partner,
-                    assay,
                     named,
                     effort,
                 } => match ModelId::new(&model) {
                     Ok(model) => {
                         let mut models = vec![model];
                         models.extend(partner.and_then(|p| ModelId::new(&p).ok()));
-                        // The assay's chat works in the assay's folder, in
-                        // a crew of its own, with the assay's tools.
-                        let crew = if assay { &judging } else { &working };
-                        let task = with_named(task, &named[named.len().min(1)..], assay);
-                        crew.launch(pattern, &name, &models, task, role, effort);
+                        let task = with_named(task, &named[named.len().min(1)..]);
+                        working.launch(pattern, &name, &models, task, role, effort);
                     }
                     Err(error) => tracing::warn!("no chat on `{model}`: {error}"),
                 },
                 Request::Tell { to, text, named } => {
-                    let assay = judge_has(&to);
-                    let crew = if assay { &judging } else { &working };
-                    let _ = crew.tell(&to, with_named(text, &named, assay));
+                    let _ = working.tell(&to, with_named(text, &named));
                 }
-                // Each crew numbers its questions apart: the one that
-                // asked takes the answer.
-                Request::Answer { id, approved } => {
-                    working.answer(id, approved);
-                    judging.answer(id, approved);
-                }
-                Request::Autopilot(on) => {
-                    working.set_autopilot(on);
-                    judging.set_autopilot(on);
-                }
-                Request::Internet(open) => {
-                    working.set_internet(open);
-                    judging.set_internet(open);
-                }
+                Request::Answer { id, approved } => working.answer(id, approved),
+                Request::Autopilot(on) => working.set_autopilot(on),
+                Request::Internet(open) => working.set_internet(open),
                 Request::Effort { agent, effort } => {
-                    let _ = if judge_has(&agent) {
-                        judging.set_effort(&agent, effort)
-                    } else {
-                        working.set_effort(&agent, effort)
-                    };
+                    let _ = working.set_effort(&agent, effort);
                 }
-                Request::Stop { agent } => {
-                    if judge_has(&agent) {
-                        judging.stop(&agent);
-                    } else {
-                        working.stop(&agent);
-                    }
-                }
-                Request::Assay(AssayAsk::Stop) => assaying.stop(),
+                Request::Stop { agent } => working.stop(&agent),
             }
         }
     });
@@ -762,15 +559,6 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let board = iq_ui::Board::new(settings.keymap()?, settings.look()?);
     let ran = iq_tui::run(feed, ask, board).context("running in the terminal");
     runtime.block_on(async {
-        // The runs stop, and end their crews, before iq does.
-        assay.stop();
-        for _ in 0..100 {
-            if assay.running().is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assay_crew.end().await;
         crew.end().await;
         // What changed since the last sync leaves with iq.
         if let Some(sync) = &sync
@@ -787,10 +575,8 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
 }
 
 /// `text`, the models the person named in it told to the agent: "with
-/// opus" is the person's choice, and what they name is what works. In the
-/// assay's chat, a model named is one to test: only its whole name is
-/// told.
-fn with_named(text: String, named: &[String], assay: bool) -> String {
+/// opus" is the person's choice, and what they name is what works.
+fn with_named(text: String, named: &[String]) -> String {
     let models: Vec<ModelId> = named.iter().filter_map(|m| ModelId::new(m).ok()).collect();
     if models.is_empty() {
         return text;
@@ -800,9 +586,6 @@ fn with_named(text: String, named: &[String], assay: bool) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    if assay {
-        return format!("{text}\n\n(iq: the models named are, whole: {list}.)");
-    }
     format!(
         "{text}\n\n(iq: the person names {list} for this. Do as they say with them: start an agent \
          on each, with start_agent, for the part they name it for.)"
@@ -904,120 +687,6 @@ fn gate_in(workspace: &Path, internet: bool, reviewer_internet: bool) -> Result<
     Ok(gate.build()?)
 }
 
-/// Freezes or runs exercises of the assay from the command line, each
-/// action told and asked first, what it spends kept as iq keeps any call.
-async fn assay_act(cli: &Cli, act: &AssayAct) -> Result<()> {
-    let folder = home_folder()?;
-    let (settings, lead) = chosen(cli, &folder)?;
-    let ledger = Arc::new(Ledger::open(&folder));
-    let journal = Arc::new(Journal::open(&folder, &project()));
-    let report: Report = {
-        let ledger = Arc::clone(&ledger);
-        let journal = Arc::clone(&journal);
-        Arc::new(move |event: Event| {
-            let _ = keep(&ledger, &journal, &event);
-        })
-    };
-    let (told, heard) = std::sync::mpsc::channel::<Told>();
-    let (assay, crew) = assay(cli, &settings, &lead, report, told, journal.file())?;
-    // Each run's step, said as it changes.
-    std::thread::spawn(move || {
-        let mut said: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for news in heard {
-            let Told::Running(running) = news else {
-                continue;
-            };
-            for progress in running {
-                let phase = format!("{:?}", progress.phase).to_lowercase();
-                let key = format!("{}/{}", progress.batch, progress.label);
-                if said.get(&key) != Some(&phase) {
-                    println!(
-                        "  {} {} on {}: {phase}",
-                        progress.label, progress.candidate, progress.exercise
-                    );
-                    said.insert(key, phase);
-                }
-            }
-        }
-    });
-    match act {
-        AssayAct::Freeze { exercise } => {
-            match assay
-                .plan_freeze(exercise)
-                .await
-                .map_err(anyhow::Error::msg)?
-            {
-                iq_assay::Planned::Done(said) => println!("{said}"),
-                iq_assay::Planned::Ready(plan) => {
-                    if agree(&plan.action, &plan.reason)? {
-                        println!(
-                            "{}",
-                            assay.freeze_now(exercise).map_err(anyhow::Error::msg)?
-                        );
-                    } else {
-                        println!("Not frozen.");
-                    }
-                }
-            }
-        }
-        AssayAct::Run {
-            which,
-            candidates,
-            times,
-        } => {
-            assay.set_roster(roster(&provider(cli), cli.api_key.is_some()).await);
-            let exercises = assay_exercises(assay.store(), which)?;
-            let named: Vec<&str> = candidates.iter().map(String::as_str).collect();
-            let plans = exercises
-                .iter()
-                .map(|id| assay.plan_run(id, &named, *times))
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(anyhow::Error::msg)?;
-            for plan in &plans {
-                println!("To {}: {}.", plan.plan.action, plan.plan.reason);
-            }
-            if !agree("run them all", "they spend what each says")? {
-                println!("Nothing ran.");
-            } else {
-                for plan in plans {
-                    println!("\n{}", assay.run_now(plan).await);
-                }
-            }
-        }
-    }
-    crew.end().await;
-    ledger.trim();
-    Ok(())
-}
-
-/// The exercises `which` names: one, every frozen one of a kind of task,
-/// or every frozen one.
-fn assay_exercises(store: &iq_assay::Store, which: &str) -> Result<Vec<String>> {
-    let exercises = store.exercises()?;
-    if exercises.iter().any(|e| e.id == which) {
-        return Ok(vec![which.to_owned()]);
-    }
-    let frozen = |e: &&iq_assay::Exercise| matches!(e.state, iq_assay::State::Frozen(_));
-    let chosen: Vec<String> = exercises
-        .iter()
-        .filter(frozen)
-        .filter(|e| which == "all" || e.categories.iter().any(|c| c.eq_ignore_ascii_case(which)))
-        .map(|e| e.id.clone())
-        .collect();
-    if chosen.is_empty() {
-        let names: Vec<&str> = exercises.iter().map(|e| e.id.as_str()).collect();
-        bail!(
-            "`{which}` names no exercise, and no frozen exercise is of that kind of task; the exercises are {}",
-            if names.is_empty() {
-                "none yet".to_owned()
-            } else {
-                names.join(", ")
-            }
-        );
-    }
-    Ok(chosen)
-}
-
 /// Says at start what the settings hold that iq reads no more, and the
 /// models they name that it runs no more, for the person to change them.
 fn retired(settings: &Settings) {
@@ -1034,20 +703,6 @@ fn retired(settings: &Settings) {
              iq runs the provider's models only, such as anthropic/claude-opus-5-5."
         );
     }
-}
-
-/// Asks the person on the terminal whether `action` may be done.
-fn agree(action: &str, reason: &str) -> Result<bool> {
-    let mut chars = action.chars();
-    let action: String = chars
-        .next()
-        .map(|first| first.to_uppercase().chain(chars).collect())
-        .unwrap_or_default();
-    print!("{action}? It is asked because {reason}. [y/N] ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
 /// Asks the person on the terminal whether `reason` may be overridden.
@@ -1110,34 +765,6 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
             let kept = sync.kept();
             if !kept.is_empty() {
                 println!("Kept from the home: {}", kept.join(", "));
-            }
-        }
-        Command::Assay { act: Some(act) } => assay_act(cli, act).await?,
-        Command::Assay { act: None } => {
-            let folder = home_folder()?;
-            let settings = Settings::load(&folder)?;
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .context("HOME is not set")?;
-            let store = iq_assay::Store::open(settings.assay_folder(&home))?;
-            println!("The assay's folder: {}", store.root().display());
-            let exercises = store.exercises()?;
-            if exercises.is_empty() {
-                println!("No exercise yet: write one with an agent, in iq's assay (Ctrl-L).");
-            }
-            for exercise in &exercises {
-                let state = match &exercise.state {
-                    iq_assay::State::Draft => "draft".to_owned(),
-                    iq_assay::State::Frozen(v) => format!("frozen, version {v}"),
-                    iq_assay::State::Changed(v) => format!("changed since version {v}"),
-                    iq_assay::State::Broken(why) => format!("broken: {why}"),
-                };
-                println!("\n{} ({}): {state}", exercise.id, exercise.title);
-                let records = store.records(&exercise.id);
-                if !records.is_empty() {
-                    let table = iq_assay::table(exercise, &records);
-                    print!("{}", iq_assay::report::text(&table.rows));
-                }
             }
         }
         Command::Run { line, network } => {

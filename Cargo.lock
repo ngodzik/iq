@@ -980,7 +980,6 @@ dependencies = [
  "anyhow",
  "clap",
  "iq-agent",
- "iq-assay",
  "iq-core",
  "iq-gate",
  "iq-llm",
@@ -1007,23 +1006,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "iq-assay"
-version = "0.1.0"
-dependencies = [
- "iq-agent",
- "iq-core",
- "iq-gate",
- "iq-observe",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
 ]
 
 [[package]]
@@ -1117,7 +1099,6 @@ name = "iq-ui"
 version = "0.1.0"
 dependencies = [
  "iq-agent",
- "iq-assay",
  "iq-core",
  "jiff",
  "thiserror",

@@ -33,35 +33,6 @@ pub async fn ask_once<M>(
 where
     M: ChatModel,
 {
-    ask_once_by(provider, model, instructions, prompt, asked)
-        .await
-        .map(|answer| answer.text)
-}
-
-/// An answer, and the model that gave it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Answer {
-    /// What it said.
-    pub text: String,
-    /// The model that answered.
-    pub model: String,
-}
-
-/// As [`ask_once`], with the model that answered.
-///
-/// # Errors
-///
-/// The model could not answer, and why.
-pub async fn ask_once_by<M>(
-    provider: &M,
-    model: &ModelId,
-    instructions: &str,
-    prompt: String,
-    asked: Asked<'_>,
-) -> Result<Answer, String>
-where
-    M: ChatModel,
-{
     let shown = model.to_string();
     let request = ChatRequest {
         model: model.clone(),
@@ -83,8 +54,5 @@ where
         usage: response.usage,
         cost,
     });
-    Ok(Answer {
-        text: response.content.unwrap_or_default(),
-        model: shown,
-    })
+    Ok(response.content.unwrap_or_default())
 }

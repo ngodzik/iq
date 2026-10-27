@@ -22,8 +22,6 @@ pub enum Action {
     Team,
     /// The costs' page.
     Costs,
-    /// The assay's page.
-    Assay,
     /// What the work went to, over time.
     Observations,
     /// The shortcuts and the commands.
@@ -46,11 +44,10 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order the list of shortcuts gives them.
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 12] = [
         Action::NextAgent,
         Action::Team,
         Action::Costs,
-        Action::Assay,
         Action::Observations,
         Action::Keys,
         Action::Theme,
@@ -69,7 +66,6 @@ impl Action {
             Action::NextAgent => "next_agent",
             Action::Team => "team",
             Action::Costs => "costs",
-            Action::Assay => "assay",
             Action::Observations => "observations",
             Action::Keys => "keys",
             Action::Theme => "theme",
@@ -89,7 +85,6 @@ impl Action {
             Action::NextAgent => "write to the next agent, or start a new chat",
             Action::Team => "the crew: each agent, what it does and spends",
             Action::Costs => "the costs: by model, by kind of task, over time",
-            Action::Assay => "the assay: agents tried on the same exercises",
             Action::Observations => "what the work went to, over time",
             Action::Keys => "this list",
             Action::Theme => "the next theme",
@@ -108,7 +103,6 @@ impl Action {
             Action::NextAgent => "ctrl+n",
             Action::Team => "ctrl+t",
             Action::Costs => "ctrl+o",
-            Action::Assay => "ctrl+l",
             Action::Observations => "ctrl+j",
             Action::Keys => "ctrl+s",
             // Seldom wanted: the commands do them, `/theme`, `/internet`.
@@ -259,6 +253,10 @@ impl Default for Keymap {
     }
 }
 
+/// The actions iq had and has no more: a setting that moves one is left,
+/// so that older settings still open.
+const RETIRED: [&str; 2] = ["assay", "steward"];
+
 impl Keymap {
     /// The defaults, changed as the settings' `[keys]` say: an action's
     /// name and its key, `""` for none.
@@ -270,6 +268,9 @@ impl Keymap {
     pub fn with(changes: &BTreeMap<String, String>) -> Result<Self, UiError> {
         let mut chords = Self::default().chords;
         for (name, text) in changes {
+            if RETIRED.contains(&name.as_str()) {
+                continue;
+            }
             let action = Action::named(name).ok_or_else(|| {
                 let names: Vec<&str> = Action::ALL.iter().map(|a| a.name()).collect();
                 UiError::UnknownAction(name.clone(), names.join(", "))
@@ -365,8 +366,10 @@ mod tests {
             Err(UiError::BadChord { .. })
         ));
         assert!(matches!(
-            Keymap::with(&changes(&[("costs", "ctrl+l")])),
+            Keymap::with(&changes(&[("costs", "ctrl+t")])),
             Err(UiError::Taken { .. })
         ));
+        // A shortcut of an action iq had once is left, not refused.
+        assert!(Keymap::with(&changes(&[("assay", "ctrl+l")])).is_ok());
     }
 }

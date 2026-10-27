@@ -5,10 +5,9 @@
 
 use iq_agent::{Event, PERSON};
 
-use crate::assay::{AssayView, CHAT, Overview, Progress};
 use crate::command::{self, Command, Completion};
 use crate::costs::{Costs, Spent};
-use crate::crew::{AssayAsk, CrewView, Question, Request};
+use crate::crew::{CrewView, Question, Request};
 use crate::keys::{Action, Chord, Keymap};
 use crate::look::Look;
 use crate::observations::{By, Span};
@@ -49,18 +48,12 @@ pub enum Update {
     /// iq is asked to stop: the terminal is given back, the agents
     /// stopped.
     Quit,
-    /// The assay's store, as just read.
-    Assay(Box<Overview>),
-    /// The assay's runs at work, as they go.
-    AssayRunning(Vec<Progress>),
-    /// iq's tasks, by the kinds of task the assay's rules place them in.
+    /// iq's tasks, by the kinds of task the person's rules place them in.
     Tasks(Vec<crate::costs::TaskSpent>),
     /// A sync of iq's data ended.
     Synced(Synced),
     /// The provider's models, as it lists them: what the person may name.
     Models(Vec<String>),
-    /// The routing, as the assay's records last made it.
-    Routes(Box<crate::routes::RouteBook>),
     /// How the crew starts: the lead's model, the reviewer's, whether
     /// the reviewer answers for the person, and whether every command has
     /// the internet.
@@ -105,16 +98,12 @@ pub struct Board {
     posts: Vec<Post>,
     /// Whether iq was asked to stop.
     quitting: bool,
-    /// The assay.
-    assay: AssayView,
     /// How the last sync went, when the machine syncs.
     synced: Option<Synced>,
     /// How the work is looked at.
     lens: crate::observations::Lens,
     /// The provider's models, as it lists them.
     models: Vec<String>,
-    /// The routing, once the program read it.
-    routes: crate::routes::RouteBook,
 }
 
 impl Default for Board {
@@ -137,11 +126,9 @@ impl Board {
             costs: Costs::default(),
             posts: Vec::new(),
             quitting: false,
-            assay: AssayView::default(),
             synced: None,
             lens: crate::observations::Lens::default(),
             models: Vec::new(),
-            routes: crate::routes::RouteBook::default(),
         }
     }
 
@@ -211,25 +198,13 @@ impl Board {
         self.crew.questions()
     }
 
-    /// The models a new chat is offered: the lead's first, then those the
-    /// routing gives first for a kind of task.
+    /// The models a new chat is offered: the lead's.
     #[must_use]
     pub fn models_offered(&self) -> Vec<String> {
-        let routed = self.routes.routing.routes.iter().filter_map(|route| {
-            let ladder = self
-                .routes
-                .routing
-                .route(&route.category, &self.routes.choices);
-            let candidate: iq_assay::Candidate = ladder.first()?.candidate.parse().ok()?;
-            Some(candidate.lead().to_string())
-        });
-        let mut offered: Vec<String> = Vec::new();
-        for model in std::iter::once(self.crew.lead().to_owned()).chain(routed) {
-            if !model.is_empty() && !offered.contains(&model) {
-                offered.push(model);
-            }
-        }
-        offered
+        Some(self.crew.lead().to_owned())
+            .filter(|lead| !lead.is_empty())
+            .into_iter()
+            .collect()
     }
 
     /// What completes what the person writes, while it is a command or an
@@ -438,11 +413,6 @@ impl Board {
                 }
                 self.lens = lens;
             }
-            Page::Assay => match (key, letter) {
-                ("Enter", _) | (_, Some('t')) => self.assay_chat(),
-                (_, Some('s')) => return self.stop_runs().into_iter().collect(),
-                _ => {}
-            },
             Page::Team => {
                 let agent = self
                     .crew
@@ -477,7 +447,6 @@ impl Board {
             Action::NextAgent => self.next_agent(),
             Action::Team => self.screen.toggle(Page::Team),
             Action::Costs => self.screen.toggle(Page::Costs),
-            Action::Assay => self.screen.toggle(Page::Assay),
             Action::Observations => self.screen.toggle(Page::Observations),
             Action::Keys => self.screen.toggle(Page::Keys),
             Action::Theme => self.look.next_theme(),
@@ -581,17 +550,12 @@ impl Board {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| chat.model.trim().to_owned());
-                // A one-word role names the agent, else its model does; the
-                // assay's chat is the assay's.
+                // A one-word role names the agent, else its model does.
                 let base = match &role {
                     Some(role) if !role.contains(char::is_whitespace) => role.clone(),
                     _ => model.clone(),
                 };
-                let name = if chat.assay {
-                    CHAT.to_owned()
-                } else {
-                    self.name_for(&base)
-                };
+                let name = self.name_for(&base);
                 let partner = Some(chat.partner.trim().to_owned())
                     .filter(|p| !p.is_empty() && chat.pattern.takes_partner());
                 self.screen.starts(&name);
@@ -603,7 +567,6 @@ impl Board {
                     role,
                     pattern: chat.pattern,
                     partner,
-                    assay: chat.assay,
                     named,
                     effort: chat.effort,
                 }
@@ -645,10 +608,8 @@ impl Board {
             }
             Command::Team => open(self, Page::Team),
             Command::Costs => open(self, Page::Costs),
-            Command::Assay => open(self, Page::Assay),
             Command::Observations => open(self, Page::Observations),
             Command::Keys => open(self, Page::Keys),
-            Command::AssayChat => self.assay_chat(),
             Command::Autopilot => return self.act(Action::Autopilot).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet).into_iter().collect(),
             Command::Theme(None) => self.look.next_theme(),
@@ -773,49 +734,10 @@ impl Board {
         )
     }
 
-    /// The routing, as the program last read it.
-    #[must_use]
-    pub fn routes(&self) -> &crate::routes::RouteBook {
-        &self.routes
-    }
-
     /// How the last sync went, when the machine syncs.
     #[must_use]
     pub fn synced(&self) -> Option<&Synced> {
         self.synced.as_ref()
-    }
-
-    /// The assay.
-    #[must_use]
-    pub fn assay(&self) -> &AssayView {
-        &self.assay
-    }
-
-    /// Writes to the chat in the assay's folder from now on, the page
-    /// closed: a new one, on the model of the agent the person wrote to,
-    /// else the lead's, when there is none yet. Its first message starts
-    /// it, as any chat's.
-    pub fn assay_chat(&mut self) {
-        self.screen.close_all();
-        if self.crew.agent(CHAT).is_some() || self.screen.starting().iter().any(|n| n == CHAT) {
-            self.screen.talk_to(CHAT);
-            return;
-        }
-        let model = self
-            .screen
-            .talking_to()
-            .and_then(|agent| self.crew.agent(agent))
-            .map_or_else(|| self.crew.lead().to_owned(), |agent| agent.model.clone());
-        self.screen.new_chat(&model);
-        if let Some(chat) = self.screen.new_chat_mut() {
-            chat.assay = true;
-        }
-    }
-
-    /// Stops the assay's runs.
-    #[must_use]
-    pub fn stop_runs(&self) -> Option<Request> {
-        (!self.assay.running().is_empty()).then_some(Request::Assay(AssayAsk::Stop))
     }
 
     /// The costs.
@@ -868,12 +790,9 @@ impl Board {
                 }
             }
             Update::Quit => self.quitting = true,
-            Update::Assay(overview) => self.assay.set(*overview),
-            Update::AssayRunning(running) => self.assay.set_running(running),
             Update::Tasks(tasks) => self.costs.tasks_read(tasks),
             Update::Synced(synced) => self.synced = Some(synced),
             Update::Models(models) => self.models = models,
-            Update::Routes(routes) => self.routes = *routes,
             Update::Started {
                 lead,
                 reviewer,
@@ -954,7 +873,6 @@ mod tests {
                 role: None,
                 pattern: iq_agent::Pattern::Solo,
                 partner: None,
-                assay: false,
                 named: Vec::new(),
                 effort: None,
             }]
@@ -974,7 +892,7 @@ mod tests {
             &key(&mut board, "enter")[..],
             [Request::Start { name, .. }] if name == "claude-opus-5-5-2"
         ));
-        board.run(Command::New(Some("openai/gpt-6".into())), 100);
+        board.run(Command::New(Some("lab/second".into())), 100);
         board.run(Command::Role("review".into()), 100);
         board.run(
             Command::Pattern(iq_agent::Pattern::Pair, Some("z-ai/glm-5".into())),
@@ -984,7 +902,7 @@ mod tests {
         assert!(matches!(
             &key(&mut board, "enter")[..],
             [Request::Start { name, model, role: Some(role), partner: Some(partner), .. }]
-                if name == "review" && model == "openai/gpt-6" && role == "review"
+                if name == "review" && model == "lab/second" && role == "review"
                     && partner == "z-ai/glm-5"
         ));
         joined(&mut board, "claude-opus-5-5", PERSON);
@@ -1001,7 +919,7 @@ mod tests {
     #[test]
     fn messages_go_where_the_person_says_and_lines_go_on() {
         let mut board = Board::default();
-        started(&mut board, "openai/gpt-6");
+        started(&mut board, "lab/second");
         joined(&mut board, "lead", PERSON);
         joined(&mut board, "helper", "lead");
         board.screen_mut().talk_to("lead");
@@ -1045,7 +963,7 @@ mod tests {
         key(&mut board, "ctrl+n");
         assert_eq!(board.screen().talking_to(), Some("helper"));
         key(&mut board, "ctrl+n");
-        assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "openai/gpt-6"));
+        assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "lab/second"));
         key(&mut board, "ctrl+n");
         assert_eq!(board.screen().talking_to(), Some("lead"));
     }
@@ -1079,46 +997,15 @@ mod tests {
     }
 
     #[test]
-    fn a_new_task_starts_on_the_lead_and_the_routes_are_offered() {
+    fn a_new_task_starts_on_the_lead_which_decides_whom_to_give_it() {
         let mut board = Board::default();
         started(&mut board, "anthropic/claude-opus-5-5");
-        let python = iq_assay::Category {
-            name: "python".into(),
-            files: vec!["*.py".into()],
-            ..iq_assay::Category::default()
-        };
-        let choice = |candidate: &str| iq_assay::Choice {
-            candidate: candidate.into(),
-            runs: 2,
-            passed: 2,
-            grade: Some(9.0),
-            cost: 0.01,
-            seconds: 60,
-            last: 0,
-        };
-        board.update(Update::Routes(Box::new(crate::routes::RouteBook {
-            categories: iq_assay::Categories::new(vec![python]),
-            routing: iq_assay::Routing {
-                grader: "g".into(),
-                made: 0,
-                routes: vec![iq_assay::Route {
-                    category: "python".into(),
-                    exercises: vec!["bug".into()],
-                    ladder: vec![choice("z-ai/glm-5"), choice("openai/gpt-6")],
-                }],
-            },
-            choices: iq_assay::Choices::default(),
-        })));
-        // The lead decides whom to give it: iq does not.
         write(&mut board, "fix add() in calc.py");
         assert!(matches!(
             &key(&mut board, "enter")[..],
             [Request::Start { model, .. }] if model == "anthropic/claude-opus-5-5"
         ));
-        assert_eq!(
-            board.models_offered(),
-            ["anthropic/claude-opus-5-5", "z-ai/glm-5"]
-        );
+        assert_eq!(board.models_offered(), ["anthropic/claude-opus-5-5"]);
     }
 
     #[test]
@@ -1270,38 +1157,6 @@ mod tests {
         }));
         assert_eq!(board.take_posts().len(), 1);
         assert!(board.take_posts().is_empty());
-    }
-
-    #[test]
-    fn the_assays_chat_is_a_chat_on_the_model_written_to_then_written_to() {
-        let mut board = Board::default();
-        started(&mut board, "anthropic/claude-opus-5-5");
-        board.update(Update::Crew(Event::Joined {
-            agent: "lead".into(),
-            model: "openai/gpt-6".into(),
-            by: PERSON.into(),
-        }));
-        board.screen_mut().talk_to("lead");
-        key(&mut board, "ctrl+l");
-        assert_eq!(board.screen().page(), Some(&Page::Assay));
-        assert_eq!(board.press(&Chord::plain("t"), Some('t'), 100), vec![]);
-        assert_eq!(board.screen().page(), None);
-        assert!(
-            matches!(board.screen().talk(), Talk::New(chat) if chat.assay && chat.model == "openai/gpt-6")
-        );
-        write(&mut board, "test glm on every exercise");
-        assert!(matches!(
-            &key(&mut board, "enter")[..],
-            [Request::Start { name, model, assay: true, .. }]
-                if name == CHAT && model == "openai/gpt-6"
-        ));
-        assert_eq!(board.screen().talking_to(), Some(CHAT));
-        // Once there, it is written to.
-        joined(&mut board, CHAT, PERSON);
-        board.screen_mut().talk_to("lead");
-        board.run(Command::AssayChat, 100);
-        assert_eq!(board.screen().talking_to(), Some(CHAT));
-        assert_eq!(board.stop_runs(), None);
     }
 
     #[test]

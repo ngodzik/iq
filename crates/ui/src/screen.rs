@@ -21,9 +21,6 @@ pub struct NewChat {
     /// The second model, for a pattern that takes one: empty for the
     /// first's.
     pub partner: String,
-    /// Whether it is the chat in the assay's folder, with the assay's
-    /// tools, rather than one in the project.
-    pub assay: bool,
     /// How hard its agent thinks, when the person chose; else as the
     /// settings say.
     pub effort: Option<iq_core::Effort>,
@@ -47,8 +44,6 @@ pub enum Page {
     Thread(String),
     /// The costs: by model, by kind of task, over time.
     Costs,
-    /// The assay.
-    Assay,
     /// What the work went to, over time.
     Observations,
     /// The shortcuts and the commands.
@@ -63,7 +58,6 @@ impl Page {
             Page::Team => "Team".to_owned(),
             Page::Thread(agent) => format!("Thread of {agent}"),
             Page::Costs => "Costs".to_owned(),
-            Page::Assay => "Assay".to_owned(),
             Page::Observations => "Observations".to_owned(),
             Page::Keys => "Keys and commands".to_owned(),
         }

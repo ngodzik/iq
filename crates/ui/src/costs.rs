@@ -34,7 +34,7 @@ pub struct Total {
     pub tokens: u64,
 }
 
-/// One task of iq's agents, by the kind of task the assay's rules place
+/// One task of iq's agents, by the kind of task the person's rules place
 /// it in: the kinds are the person's, named in their settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskSpent {

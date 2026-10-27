@@ -24,6 +24,6 @@ mod tools;
 pub use crew::{ALL, Crew, Listed, Posted, Report, Settings};
 pub use event::{Event, PERSON};
 pub use extension::{Called, Extension};
-pub use once::{Answer, Asked, ask_once, ask_once_by};
+pub use once::{Asked, ask_once};
 pub use team::Pattern;
 pub use tools::board as board_tools;

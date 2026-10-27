@@ -9,6 +9,5 @@ description = "iq's state in the terminal: what it shows and what the person did
 [dependencies]
 iq-core.workspace  = true
 iq-agent.workspace = true
-iq-assay.workspace = true
 thiserror.workspace = true
 jiff.workspace    = true

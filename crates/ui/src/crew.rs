@@ -23,8 +23,6 @@ pub enum Request {
         /// The second model, for a pattern that takes one: the reviewer's,
         /// a second voice's.
         partner: Option<String>,
-        /// Whether it is the chat in the assay's folder.
-        assay: bool,
         /// The models the person named in the task: the first is the one
         /// it starts on.
         named: Vec<String>,
@@ -66,15 +64,6 @@ pub enum Request {
         /// The agent.
         agent: String,
     },
-    /// Something of the assay.
-    Assay(AssayAsk),
-}
-
-/// What the person asks of the assay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssayAsk {
-    /// Stop the runs at work, and those waiting.
-    Stop,
 }
 
 /// One thing in an agent's thread.

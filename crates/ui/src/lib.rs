@@ -4,7 +4,6 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod assay;
 pub mod board;
 pub mod command;
 pub mod costs;
@@ -15,7 +14,6 @@ pub mod keys;
 pub mod look;
 pub mod named;
 pub mod observations;
-pub mod routes;
 pub mod screen;
 
 pub use board::{Board, PERIODS, Post, Synced, Update};
