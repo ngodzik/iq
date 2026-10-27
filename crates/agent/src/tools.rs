@@ -91,9 +91,9 @@ pub fn board() -> Vec<ToolSpec> {
         ToolSpec {
             name: "start_agent".into(),
             description: "Starts another agent on a task, beside you. `model` is a model of the \
-                          provider, such as `openai/gpt-5-mini`; `effort`, how hard it thinks, \
-                          lower for plain work, as it costs less. It returns at once; the agent's \
-                          answer comes to you as a message."
+                          provider, by its whole name; `effort`, how hard it thinks, lower for \
+                          plain work, as it costs less. It returns at once; the agent's answer \
+                          comes to you as a message."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -105,6 +105,37 @@ pub fn board() -> Vec<ToolSpec> {
                     "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "How hard it thinks; left out, as the crew's settings say."},
                 },
                 "required": ["name", "model", "task"],
+            }),
+        },
+        ToolSpec {
+            name: "start_team".into(),
+            description: "Starts a team on a task: agents with the roles you give them, each on \
+                          its model, who write to each other. The first member works on the task \
+                          at once, and its answer comes to you as a message; the others wait until \
+                          a teammate writes to them, and answer the first. Each sees the task, the \
+                          team and its own part, nothing of your conversation."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "A short name for the team, one word: its members are named after it and their roles."},
+                    "task": {"type": "string", "description": "The brief all members share: all they need to know of the work."},
+                    "members": {
+                        "type": "array",
+                        "description": "The members, the one that works first first.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "role": {"type": "string", "description": "Its role, one word: writer, reviewer, tests."},
+                                "model": {"type": "string", "description": "A model of the provider, by its whole name."},
+                                "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "How hard it thinks; left out, as the crew's settings say."},
+                                "does": {"type": "string", "description": "What it does, and how it works with the others: when it writes to whom, how many rounds at most."},
+                            },
+                            "required": ["role", "model", "does"],
+                        },
+                    },
+                },
+                "required": ["name", "task", "members"],
             }),
         },
         ToolSpec {

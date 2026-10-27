@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "What agents remember of a project between sessions: notes kept by the project's repository, offered to every agent of the crew."
+description = "What the agents the person starts know beyond their task: the project's memory, kept by its repository, Claude Code's notes of it, and the person's skills."
 
 [dependencies]
 iq-core.workspace    = true

@@ -1,11 +1,88 @@
 //! How a team works on a task: the patterns the person may start one in,
-//! and the turns iq hands between its agents. The handing is iq's, not a
-//! model's: who works next, on what, is decided here from what each turn
-//! ended with.
+//! and the turns iq hands between their agents, decided here from what each
+//! turn ended with; and the teams an agent starts with the roles it gives
+//! them, as its skills say, which work as their roles say.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
+
+use iq_core::{Effort, ModelId};
+use serde_json::Value;
+
+/// One member of a team an agent starts: its part, its model, how hard it
+/// thinks, and what it does.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Seat {
+    /// Its role, in a word: writer, reviewer.
+    pub(crate) role: String,
+    /// Its model.
+    pub(crate) model: ModelId,
+    /// How hard it thinks; as the settings say when `None`.
+    pub(crate) effort: Option<Effort>,
+    /// What it does, and how it works with the others.
+    pub(crate) does: String,
+}
+
+/// The seats of a team, as `start_team`'s `members` gives them.
+pub(crate) fn seats(members: &Value) -> Result<Vec<Seat>, String> {
+    let members = members
+        .as_array()
+        .filter(|members| !members.is_empty())
+        .ok_or("`members` must list the team's members, one at least")?;
+    members
+        .iter()
+        .enumerate()
+        .map(|(at, member)| {
+            let text = |key: &str| {
+                member[key]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| format!("member {} has no `{key}`", at + 1))
+            };
+            let effort = match member["effort"].as_str().map(str::trim) {
+                Some(level) if !level.is_empty() => Some(level.parse::<Effort>()?),
+                _ => None,
+            };
+            Ok(Seat {
+                role: text("role")?.to_owned(),
+                model: ModelId::new(text("model")?).map_err(|e| e.to_string())?,
+                effort,
+                does: text("does")?.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// What the member at `at` of a team is told of it: who is in it, whom it
+/// writes to, and where its answer goes. `names` are the members', in the
+/// order of `seats`; the first answers `by`, who started the team.
+pub(crate) fn roster(names: &[String], seats: &[Seat], at: usize, by: &str) -> String {
+    let members: Vec<String> = names
+        .iter()
+        .zip(seats)
+        .map(|(name, seat)| format!("- {name}, {}: {}", seat.role, seat.does))
+        .collect();
+    let answer = if at == 0 {
+        format!(
+            "You work on it now. Your answer, once the work is done, goes to {by}, who started \
+             the team."
+        )
+    } else {
+        format!(
+            "You wait until a teammate writes to you. Your answer at the end of each turn goes \
+             to {}.",
+            names[0]
+        )
+    };
+    format!(
+        "You are {}, in a team of {}:\n{}\nWrite to a teammate with send_message. {answer}",
+        names[at],
+        names.len(),
+        members.join("\n")
+    )
+}
 
 /// The most rounds a writer and a reviewer go before the person decides.
 pub(crate) const PAIR_ROUNDS: usize = 3;
@@ -224,5 +301,33 @@ mod tests {
         let prompt = others_prompt("a", &answers);
         assert!(prompt.contains("use a list") && !prompt.contains("use a map"));
         assert!(summing_prompt(&answers).contains("use a map"));
+    }
+
+    #[test]
+    fn a_team_is_read_from_its_members_and_each_told_the_others() {
+        let members = serde_json::json!([
+            {"role": "writer", "model": "lab/a", "effort": "high", "does": "writes the change"},
+            {"role": "reviewer", "model": "lab/b", "does": "reads its diff, two rounds at most"},
+        ]);
+        let team = seats(&members).unwrap();
+        assert_eq!(team[0].effort, Some(Effort::High));
+        assert_eq!((team[1].model.as_str(), team[1].effort), ("lab/b", None));
+        let names = ["code-writer".to_owned(), "code-reviewer".to_owned()];
+        let first = roster(&names, &team, 0, "lead");
+        assert!(first.contains("You are code-writer") && first.contains("goes to lead"));
+        assert!(first.contains("- code-reviewer, reviewer: reads its diff, two rounds at most"));
+        assert!(roster(&names, &team, 1, "lead").contains("goes to code-writer"));
+        assert!(seats(&serde_json::json!([])).is_err());
+        assert!(
+            seats(&serde_json::json!([{"role": "writer", "model": "lab/a"}]))
+                .unwrap_err()
+                .contains("`does`")
+        );
+        assert!(
+            seats(
+                &serde_json::json!([{"role": "w", "model": "lab/a", "does": "x", "effort": "huge"}])
+            )
+            .is_err()
+        );
     }
 }

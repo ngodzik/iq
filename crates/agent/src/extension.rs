@@ -21,6 +21,13 @@ pub trait Extension<M>: Send + Sync {
     /// The tools `agent` gets, none for most.
     fn tools(&self, agent: &str) -> Vec<ToolSpec>;
 
+    /// Whether only the agents the person started get its tools and are
+    /// told of them, as a lead is: those agents give the ones they start
+    /// what their part needs.
+    fn leads_only(&self) -> bool {
+        false
+    }
+
     /// What `agent` is told of them, added to its standing instructions.
     fn instructions(&self, agent: &str) -> Option<String> {
         let _ = agent;

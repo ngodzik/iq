@@ -18,6 +18,7 @@ mod event;
 mod extension;
 mod once;
 mod review;
+mod rules;
 mod team;
 mod tools;
 
@@ -25,5 +26,6 @@ pub use crew::{ALL, Crew, Listed, Posted, Report, Settings};
 pub use event::{Event, PERSON};
 pub use extension::{Called, Extension};
 pub use once::{Asked, ask_once};
+pub use rules::{RulesFile, with_imports};
 pub use team::Pattern;
 pub use tools::board as board_tools;

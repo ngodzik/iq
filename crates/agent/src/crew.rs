@@ -20,7 +20,8 @@ use tokio::task::JoinHandle;
 use crate::event::{Event, PERSON};
 use crate::extension::Extension;
 use crate::review;
-use crate::team::{self, Pattern, Phase, Team};
+use crate::rules::{self, RulesFile};
+use crate::team::{self, Pattern, Phase, Seat, Team};
 use crate::tools::{self, Args};
 
 /// Reports what the crew does, as it does it.
@@ -45,12 +46,9 @@ const PEER_SPAN: Duration = Duration::from_secs(10 * 60);
 /// one window shows several.
 static CREWS: AtomicU64 = AtomicU64::new(0);
 
-/// The files a project's rules for agents are read from, the first found:
-/// the shared format, then Claude Code's, which may import the other.
+/// The files a project's rules for agents are read from, each found: the
+/// shared format, then Claude Code's, which often imports the other.
 const RULES_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
-
-/// The most of a project's rules an agent is given, in bytes.
-const RULES_MOST: usize = 40_000;
 
 /// What the crew starts with.
 #[derive(Debug, Clone)]
@@ -64,6 +62,9 @@ pub struct Settings {
     pub patience: Duration,
     /// The most calls to its model one turn of an agent of iq's makes.
     pub steps: usize,
+    /// The person's own rules, read from their files, given to the agents
+    /// the person starts, with the project's.
+    pub rules: Vec<RulesFile>,
 }
 
 impl Default for Settings {
@@ -73,6 +74,7 @@ impl Default for Settings {
             effort: None,
             patience: Duration::from_secs(50 * 60),
             steps: 200,
+            rules: Vec::new(),
         }
     }
 }
@@ -211,20 +213,38 @@ where
         lock(&self.inner.extensions).clone()
     }
 
+    /// The extensions that serve an agent started `by` the person or
+    /// another agent: those for leads serve only the person's.
+    fn extensions_for(&self, by: &str) -> Vec<Arc<dyn Extension<M>>> {
+        self.extensions()
+            .into_iter()
+            .filter(|extension| by == PERSON || !extension.leads_only())
+            .collect()
+    }
+
+    /// Who started `agent`: the person, or another agent.
+    fn started_by(&self, agent: &str) -> String {
+        lock(&self.inner.board)
+            .members
+            .get(agent)
+            .map(|member| member.by.clone())
+            .unwrap_or_default()
+    }
+
     /// The tools `agent` finds through iq: the board's, and those
     /// extensions offer it.
     pub fn tools_for(&self, agent: &str) -> Vec<ToolSpec> {
         let mut tools = tools::board();
-        for extension in self.extensions() {
+        for extension in self.extensions_for(&self.started_by(agent)) {
             tools.extend(extension.tools(agent));
         }
         tools
     }
 
-    /// What extensions tell `agent` of their tools, as a paragraph of its
-    /// instructions, if any does.
-    fn extended(&self, agent: &str) -> String {
-        self.extensions()
+    /// What extensions tell `agent`, started `by`, of their tools, as a
+    /// paragraph of its instructions, if any does.
+    fn extended(&self, agent: &str, by: &str) -> String {
+        self.extensions_for(by)
             .iter()
             .filter_map(|extension| extension.instructions(agent))
             .map(|text| format!("\n\n{text}"))
@@ -491,34 +511,35 @@ where
         role: Option<String>,
         effort: Option<Effort>,
     ) -> String {
+        let name = self.join(name, model, task.clone(), by, role, effort, true);
+        self.wake(&name, task);
+        name
+    }
+
+    /// Puts an agent on the board, its name `name` made unique, and gives
+    /// it. One that `works` is about to be woken on `task`; another holds
+    /// its task and waits until it is written to.
+    #[allow(clippy::too_many_arguments)]
+    fn join(
+        &self,
+        name: &str,
+        model: &ModelId,
+        task: String,
+        by: &str,
+        role: Option<String>,
+        effort: Option<Effort>,
+        works: bool,
+    ) -> String {
         let mut board = lock(&self.inner.board);
-        let base: String = name
-            .trim()
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' {
-                    c.to_ascii_lowercase()
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let base = if base.is_empty() || base == ALL || base == PERSON {
-            "agent".to_owned()
-        } else {
-            base
-        };
-        let mut name = base.clone();
-        let mut n = 2;
-        while board.members.contains_key(&name) {
-            name = format!("{base}-{n}");
-            n += 1;
-        }
-        let messages = vec![Message::system(self.instructions(
+        let name = free_name(&board.members, &base_name(name), &[]);
+        let mut messages = vec![Message::system(self.instructions(
             &name,
             by,
             role.as_deref(),
         ))];
+        if !works {
+            messages.push(Message::user(task.clone()));
+        }
         let read = board.messages.len();
         board.members.insert(
             name.clone(),
@@ -543,8 +564,65 @@ where
             agent: name.clone(),
             effort: effort.or(self.inner.settings.effort),
         });
-        self.wake(&name, task);
         name
+    }
+
+    /// Starts a team, named `team`, on `task` for `by`: one agent for each
+    /// seat, told the others. The first works at once and answers `by`;
+    /// the others wait until a teammate writes to them, and answer the
+    /// first. Says what was started, as the agent that asked reads it.
+    fn start_team(&self, by: &str, team: &str, task: &str, seats: &[Seat]) -> String {
+        let names: Vec<String> = {
+            let board = lock(&self.inner.board);
+            let mut names: Vec<String> = Vec::new();
+            for seat in seats {
+                let base = base_name(&format!("{team}-{}", seat.role));
+                names.push(free_name(&board.members, &base, &names));
+            }
+            names
+        };
+        let brief = |at: usize| format!("{task}\n\n{}", team::roster(&names, seats, at, by));
+        let role = |seat: &Seat| Some(format!("{} in the team {team}: {}", seat.role, seat.does));
+        // Those who wait join first, so that the first finds them when it
+        // writes to them.
+        for (at, seat) in seats.iter().enumerate().skip(1) {
+            self.join(
+                &names[at],
+                &seat.model,
+                brief(at),
+                &names[0],
+                role(seat),
+                seat.effort,
+                false,
+            );
+        }
+        let first = &seats[0];
+        let lead = self.start_with(
+            &names[0],
+            &first.model,
+            brief(0),
+            by,
+            role(first),
+            first.effort,
+        );
+        let waiting: Vec<String> = names[1..]
+            .iter()
+            .zip(&seats[1..])
+            .map(|(name, seat)| format!("{name} on {}", seat.model))
+            .collect();
+        let waits = match waiting.len() {
+            0 => String::new(),
+            1 => format!(" {} waits for a teammate to write to it.", waiting[0]),
+            _ => format!(
+                " {} wait for a teammate to write to them.",
+                waiting.join(", ")
+            ),
+        };
+        format!(
+            "The team {team} is started: {lead} works on it now, on {}.{waits} {lead}'s answer \
+             will come to you as a message.",
+            first.model
+        )
     }
 
     /// Has `agent` think with `effort` from its next call to its model.
@@ -1015,6 +1093,10 @@ where
                     "{started} started on {model}. Its answer will come to you as a message."
                 ))
             }
+            "start_team" => {
+                let seats = team::seats(&args.value()["members"])?;
+                Ok(self.start_team(agent, args.text("name")?, args.text("task")?, &seats))
+            }
             "send_message" => {
                 self.post(agent, args.text("to")?, args.text("text")?.to_owned())?;
                 Ok("Sent.".into())
@@ -1045,7 +1127,7 @@ where
                 .join("\n")),
             _ => {
                 let extension = self
-                    .extensions()
+                    .extensions_for(&self.started_by(agent))
                     .into_iter()
                     .find(|extension| extension.tools(agent).iter().any(|t| t.name == name));
                 match extension {
@@ -1270,21 +1352,49 @@ where
              Read before you change, check your work with the project's own tools (its build, \
              tests, linters), and be brief. When the task is done, answer with what you did and \
              call no tool.{}{}",
-            self.project_rules()
-                .map(|(file, rules)| format!(
-                    "\n\nThe project's rules for agents, from its {file}, which you follow:\n\n{rules}"
-                ))
-                .unwrap_or_default(),
-            self.extended(name)
+            if by == PERSON {
+                self.known()
+            } else {
+                String::new()
+            },
+            self.extended(name, by)
         )
     }
 
-    /// The project's rules for agents, and the file they came from: its
-    /// `AGENTS.md`, else its `CLAUDE.md`, whose `@file` lines are the
-    /// files they import. Read through the gate, as an agent's reads are,
-    /// and never asked of the person: what the gate does not allow at once
-    /// is left out.
-    fn project_rules(&self) -> Option<(&'static str, String)> {
+    /// What an agent the person started is told beyond its task: the
+    /// person's rules and the project's, and that the agents it starts
+    /// know none of what it knows but what it gives them.
+    fn known(&self) -> String {
+        let mut out = String::new();
+        for file in &self.inner.settings.rules {
+            if let Some(text) = rules::kept(&file.text) {
+                out.push_str(&format!(
+                    "\n\nThe person's rules, from their {}, which you follow:\n\n{text}",
+                    file.from
+                ));
+            }
+        }
+        for (file, text) in self.project_rules() {
+            out.push_str(&format!(
+                "\n\nThe project's rules for agents, from its {file}, which you follow:\n\n{text}"
+            ));
+        }
+        out.push_str(
+            "\n\nAn agent or a team you start sees only the task you give it: nothing of your \
+             conversation, nor of these rules, nor of what else you are told beside your task. \
+             Write into its task what its part needs of them (the rules its work must follow, the \
+             facts it must know, the files it works on), and nothing more: it reads all of it on \
+             every call.",
+        );
+        out
+    }
+
+    /// The project's rules for agents, each with the file it came from: its
+    /// `AGENTS.md`, then its `CLAUDE.md`, whose `@file` lines are the
+    /// files they import, a file given already left out. Read through the
+    /// gate, as an agent's reads are, and never asked of the person: what
+    /// the gate does not allow at once is left out.
+    fn project_rules(&self) -> Vec<(&'static str, String)> {
         let workspace = self.inner.gate.workspace().to_path_buf();
         let read = |path: std::path::PathBuf| -> Option<String> {
             match self.inner.gate.judge(Action::Read { path }).ok()? {
@@ -1292,39 +1402,65 @@ where
                 Judged::Asked { .. } | Judged::Denied { .. } => None,
             }
         };
-        RULES_FILES.into_iter().find_map(|file| {
+        let mut given: Vec<(&'static str, String)> = Vec::new();
+        for file in RULES_FILES {
             let path = workspace.join(file);
             if !path.is_file() {
-                return None;
+                continue;
             }
-            let text = read(path)?;
+            let Some(text) = read(path) else {
+                continue;
+            };
             let text: String = text
                 .lines()
-                .map(|line| {
-                    let imported = line
-                        .trim()
-                        .strip_prefix('@')
-                        .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))
-                        .and_then(|name| read(workspace.join(name)));
-                    imported.unwrap_or_else(|| line.to_owned()) + "\n"
+                .map(|line| match rules::import(line) {
+                    // As `AGENTS.md` is, imported by `CLAUDE.md`.
+                    Some(name) if given.iter().any(|(file, _)| *file == name) => "\n".to_owned(),
+                    Some(name) => {
+                        read(workspace.join(name)).unwrap_or_else(|| line.to_owned()) + "\n"
+                    }
+                    None => line.to_owned() + "\n",
                 })
                 .collect();
-            let text = text.trim();
-            if text.is_empty() {
-                return None;
+            if let Some(text) = rules::kept(&text) {
+                given.push((file, text));
             }
-            let mut cut = text.len().min(RULES_MOST);
-            while !text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            let more = if cut < text.len() {
-                "\n[the rest of the file is left out: read it whole with read_file]"
-            } else {
-                ""
-            };
-            Some((file, format!("{}{more}", &text[..cut])))
-        })
+        }
+        given
     }
+}
+
+/// `name` as the board writes names: lower case, letters, digits and
+/// dashes, never one the board keeps for itself.
+fn base_name(name: &str) -> String {
+    let base: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if base.is_empty() || base == ALL || base == PERSON {
+        "agent".to_owned()
+    } else {
+        base
+    }
+}
+
+/// `base`, or `base-2`, `base-3`…: the first no member has, nor `taken`.
+fn free_name(members: &BTreeMap<String, Member>, base: &str, taken: &[String]) -> String {
+    let free = |name: &str| !members.contains_key(name) && !taken.iter().any(|t| t == name);
+    let mut name = base.to_owned();
+    let mut n = 2;
+    while !free(&name) {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    name
 }
 
 /// The line of an agent's instructions that gives it its part, if any.

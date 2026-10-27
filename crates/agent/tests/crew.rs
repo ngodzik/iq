@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iq_agent::{Crew, Event, PERSON, Pattern, Settings};
+use iq_agent::{Called, Crew, Event, Extension, PERSON, Pattern, RulesFile, Settings};
 use iq_core::{
     ChatModel, ChatRequest, ChatResponse, CoreError, Message, ModelId, TokenCount, ToolCall, Usage,
     Usd,
@@ -53,6 +53,20 @@ impl Scripted {
             .filter(|(name, _)| name == agent)
             .map(|(_, request)| request.effort)
             .collect()
+    }
+
+    /// The standing instructions of `agent`'s first call.
+    fn instructions_of(&self, agent: &str) -> String {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name == agent)
+            .and_then(|(_, request)| match request.messages.first() {
+                Some(Message::System(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     /// Everything `agent` was sent, as one text.
@@ -408,16 +422,44 @@ async fn the_autopilot_gives_the_internet_when_let_and_asks_the_person_otherwise
 }
 
 #[tokio::test]
-async fn an_agent_follows_the_projects_rules_from_agents_md_or_claude_md() {
-    let f = fixture(&[], Settings::default());
+async fn the_lead_follows_the_rules_and_gives_its_agents_what_they_need_of_them() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "start_agent",
+                    serde_json::json!({"name": "helper", "model": "cheap/model", "task": "fix it, with no dashes"}),
+                ),
+                say("Started."),
+            ],
+        )],
+        Settings {
+            rules: vec![RulesFile {
+                from: "~/.claude/CLAUDE.md".into(),
+                text: "Answer in French.".into(),
+            }],
+            ..Settings::default()
+        },
+    );
     std::fs::write(f.root.join("AGENTS.md"), "# Rules\n\nNo dashes in prose.\n").unwrap();
+    std::fs::write(f.root.join("CLAUDE.md"), "@AGENTS.md\nTests first.\n").unwrap();
     f.crew
         .start("lead", &model("cheap/model"), "go".into(), PERSON);
     f.settled().await;
-    let seen = f.model.seen_by("lead");
-    assert!(seen.contains("from its AGENTS.md") && seen.contains("No dashes in prose."));
+    let lead = f.model.instructions_of("lead");
+    assert!(lead.contains("from their ~/.claude/CLAUDE.md") && lead.contains("Answer in French."));
+    assert!(lead.contains("from its AGENTS.md") && lead.contains("from its CLAUDE.md"));
+    assert!(lead.contains("Tests first."));
+    // AGENTS.md, imported by CLAUDE.md, is given once.
+    assert_eq!(lead.matches("No dashes in prose.").count(), 1);
+    // The agent it starts reads only what it was given.
+    let helper = f.model.seen_by("helper");
+    assert!(helper.contains("fix it, with no dashes"));
+    assert!(!helper.contains("Answer in French.") && !helper.contains("Tests first."));
+    assert!(!helper.contains("rules for agents"));
 
-    // Claude Code's file, importing another, when there is no AGENTS.md.
+    // Claude Code's file alone, importing another.
     let g = fixture(&[], Settings::default());
     std::fs::write(g.root.join("CLAUDE.md"), "Read these:\n@docs/rules.md\n").unwrap();
     std::fs::create_dir_all(g.root.join("docs")).unwrap();
@@ -435,6 +477,158 @@ async fn an_agent_follows_the_projects_rules_from_agents_md_or_claude_md() {
         .start("lead", &model("cheap/model"), "go".into(), PERSON);
     h.settled().await;
     assert!(!h.model.seen_by("lead").contains("rules for agents"));
+}
+
+/// Tools for leads alone, as the memory's and the skills' are.
+struct ForLeads;
+
+impl<M> Extension<M> for ForLeads {
+    fn tools(&self, _agent: &str) -> Vec<iq_core::ToolSpec> {
+        vec![iq_core::ToolSpec {
+            name: "recall".into(),
+            description: "Reads a note.".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn leads_only(&self) -> bool {
+        true
+    }
+
+    fn instructions(&self, _agent: &str) -> Option<String> {
+        Some("Your notes: none yet.".into())
+    }
+
+    fn call(
+        &self,
+        _crew: Crew<M>,
+        _agent: String,
+        _name: String,
+        _args: serde_json::Value,
+    ) -> Called {
+        Box::pin(std::future::ready(Ok("A note.".to_owned())))
+    }
+}
+
+#[tokio::test]
+async fn what_serves_leads_alone_is_not_the_agents_they_start() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"name": "helper", "model": "cheap/model", "task": "help"}),
+                    ),
+                    say("Started."),
+                ],
+            ),
+            (
+                "helper",
+                vec![calls("recall", serde_json::json!({})), say("Done.")],
+            ),
+        ],
+        Settings::default(),
+    );
+    f.crew.extend(Arc::new(ForLeads));
+    f.crew
+        .start("lead", &model("cheap/model"), "go".into(), PERSON);
+    f.settled().await;
+    assert!(
+        f.model
+            .instructions_of("lead")
+            .contains("Your notes: none yet.")
+    );
+    assert!(f.crew.tools_for("lead").iter().any(|t| t.name == "recall"));
+    assert!(!f.model.instructions_of("helper").contains("Your notes"));
+    assert!(
+        f.crew
+            .tools_for("helper")
+            .iter()
+            .all(|t| t.name != "recall")
+    );
+    assert!(
+        f.model
+            .seen_by("helper")
+            .contains("there is no tool named \\\"recall\\\"")
+    );
+}
+
+#[tokio::test]
+async fn a_team_works_as_the_roles_it_was_given_say_and_answers_who_started_it() {
+    use iq_core::Effort;
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_team",
+                        serde_json::json!({
+                            "name": "code",
+                            "task": "Add a greeting to hello.txt.",
+                            "members": [
+                                {"role": "writer", "model": "lab/a", "effort": "high", "does": "writes the change, then has it reviewed"},
+                                {"role": "reviewer", "model": "lab/b", "does": "reads the diff; APPROVE or what to change, two rounds at most"},
+                            ],
+                        }),
+                    ),
+                    say("Started."),
+                    say("Thanks."),
+                ],
+            ),
+            (
+                "code-writer",
+                vec![
+                    calls(
+                        "send_message",
+                        serde_json::json!({"to": "code-reviewer", "text": "Review my change."}),
+                    ),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 5})),
+                    say("Written and approved."),
+                ],
+            ),
+            ("code-reviewer", vec![say("APPROVE")]),
+        ],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "greet".into(), PERSON);
+    f.settled().await;
+    let listed = f.crew.list();
+    let member = |name: &str| listed.iter().find(|a| a.name == name).unwrap().clone();
+    assert_eq!(
+        (
+            member("code-writer").model.as_str(),
+            member("code-writer").by.as_str()
+        ),
+        ("lab/a", "lead")
+    );
+    assert_eq!(
+        (
+            member("code-reviewer").model.as_str(),
+            member("code-reviewer").by.as_str()
+        ),
+        ("lab/b", "code-writer")
+    );
+    assert!(
+        f.model
+            .efforts_of("code-writer")
+            .iter()
+            .all(|e| *e == Some(Effort::High))
+    );
+    assert_eq!(f.model.efforts_of("code-reviewer"), [None]);
+    // The reviewer waited for the writer, its brief and its team before it.
+    let reviewer = f.model.seen_by("code-reviewer");
+    assert!(reviewer.contains("Add a greeting to hello.txt."));
+    assert!(reviewer.contains("You are code-reviewer") && reviewer.contains("goes to code-writer"));
+    assert!(reviewer.contains("Review my change."));
+    assert!(f.model.seen_by("code-writer").contains("APPROVE"));
+    // Only the writer's answer reached the lead.
+    let lead = f.model.seen_by("lead");
+    assert!(lead.contains("The team code is started") && lead.contains("Written and approved."));
+    assert!(!lead.contains("Message from code-reviewer"));
 }
 
 #[tokio::test]

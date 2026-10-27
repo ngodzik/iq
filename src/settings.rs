@@ -10,6 +10,9 @@
 //! autopilot_internet = true              # the reviewer also answers what only reaches the internet
 //! internet = false                       # true: every command reaches the internet
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
+//! rules = ["~/.claude/CLAUDE.md"]        # your rules for every project, given to the agents you start; this one unless set
+//! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set
+//! claude_memory = true                   # Claude Code's notes of the project read beside iq's own
 //!
 //! [keys]                                 # any shortcut moved, "" for none; Ctrl-S lists them
 //! costs = "ctrl+o"
@@ -46,6 +49,13 @@ const LEAD: &str = "anthropic/claude-opus-5-5";
 /// observer's too.
 const REVIEWER: &str = "anthropic/claude-haiku-5-5";
 
+/// The person's rules unless the settings list others: Claude Code's, which
+/// many already keep.
+const RULES: [&str; 1] = ["~/.claude/CLAUDE.md"];
+
+/// The folders of the person's skills unless the settings list others.
+const SKILLS: [&str; 1] = ["~/.iq/skills"];
+
 /// What the settings once held and iq reads no more, since it works with
 /// the provider's models alone and lets the lead decide.
 const RETIRED: [&str; 6] = [
@@ -71,6 +81,12 @@ pub(crate) struct Settings {
     pub(crate) internet: bool,
     /// The theme.
     theme: Option<String>,
+    /// The person's rules for every project, files of their home.
+    rules: Option<Vec<String>>,
+    /// The folders of the person's skills.
+    skills: Option<Vec<String>>,
+    /// Whether Claude Code's notes of the project are read beside iq's.
+    claude_memory: Option<bool>,
     /// The shortcuts moved: an action's name and its key.
     #[serde(default)]
     keys: BTreeMap<String, String>,
@@ -196,6 +212,40 @@ impl Settings {
         .collect()
     }
 
+    /// The files of the person's rules, as the settings write them and
+    /// where they are: `~/` in `home`.
+    pub(crate) fn rules_files(&self, home: &Path) -> Vec<(String, PathBuf)> {
+        let listed = self
+            .rules
+            .clone()
+            .unwrap_or_else(|| RULES.map(str::to_owned).to_vec());
+        listed
+            .into_iter()
+            .filter(|file| !file.trim().is_empty())
+            .map(|file| {
+                let path = placed(file.trim(), home, home);
+                (file, path)
+            })
+            .collect()
+    }
+
+    /// The folders of the person's skills: `~/` in `home`, others in
+    /// `workspace`.
+    pub(crate) fn skill_folders(&self, home: &Path, workspace: &Path) -> Vec<PathBuf> {
+        self.skills
+            .clone()
+            .unwrap_or_else(|| SKILLS.map(str::to_owned).to_vec())
+            .iter()
+            .filter(|folder| !folder.trim().is_empty())
+            .map(|folder| placed(folder.trim(), home, workspace))
+            .collect()
+    }
+
+    /// Whether Claude Code's notes of the project are read beside iq's.
+    pub(crate) fn claude_memory(&self) -> bool {
+        self.claude_memory.unwrap_or(true)
+    }
+
     /// The look: its theme, as set.
     pub(crate) fn look(&self) -> Result<iq_ui::look::Look> {
         let theme = match &self.theme {
@@ -261,6 +311,15 @@ impl Settings {
     }
 }
 
+/// Where `path` is: `~/` in `home`, a relative path in `base`.
+fn placed(path: &str, home: &Path, base: &Path) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None if path == "~" => home.to_path_buf(),
+        None => base.join(path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +371,37 @@ mod tests {
                 ("[observe] model", "codex".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn the_rules_and_the_skills_are_claude_codes_and_iqs_unless_set() {
+        let (home, work) = (Path::new("/h"), Path::new("/w"));
+        let none = Settings::default();
+        assert_eq!(
+            none.rules_files(home),
+            [(
+                "~/.claude/CLAUDE.md".to_owned(),
+                PathBuf::from("/h/.claude/CLAUDE.md")
+            )]
+        );
+        assert_eq!(
+            none.skill_folders(home, work),
+            [PathBuf::from("/h/.iq/skills")]
+        );
+        assert!(none.claude_memory());
+        let set: Settings = toml::from_str(
+            "rules = []\nskills = [\"~/.claude/skills\", \".claude/skills\"]\nclaude_memory = false",
+        )
+        .unwrap();
+        assert!(set.rules_files(home).is_empty());
+        assert_eq!(
+            set.skill_folders(home, work),
+            [
+                PathBuf::from("/h/.claude/skills"),
+                PathBuf::from("/w/.claude/skills")
+            ]
+        );
+        assert!(!set.claude_memory());
     }
 
     #[test]

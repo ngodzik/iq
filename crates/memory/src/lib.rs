@@ -1,9 +1,14 @@
-//! What agents remember of a project between sessions: notes, each a
-//! Markdown file with its name and a line saying what it holds, kept in a
-//! folder of the project's own, named after its repository's address so
-//! that the same project on another machine finds them, wherever it was
-//! cloned. Every agent of the crew is told which notes there are, reads
-//! one with `recall`, and keeps what it learnt with `remember`.
+//! What the agents the person starts know beyond their task: the
+//! project's memory, and the person's skills.
+//!
+//! The memory is notes, each a Markdown file with its name and a line
+//! saying what it holds, kept in a folder of the project's own, named
+//! after its repository's address so that the same project on another
+//! machine finds them, wherever it was cloned. Claude Code's notes of the
+//! project are read beside them, never changed. An agent the person
+//! started is told which notes there are, reads one with `recall`, and
+//! keeps what it learnt with `remember`; the agents it starts are given
+//! what they need of them.
 //!
 //! ```text
 //! memory/github.com/org/repo/
@@ -18,11 +23,18 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod skills;
+
 use std::path::{Path, PathBuf};
 
 use iq_agent::{Called, Crew, Extension};
 use iq_core::ToolSpec;
 use serde_json::{Value, json};
+
+pub use skills::{Skill, Skills};
+
+/// The file of Claude Code's memory that lists its notes, which is not one.
+const CLAUDE_INDEX: &str = "MEMORY.md";
 
 /// The longest note kept, in bytes.
 const NOTE_MOST: usize = 20_000;
@@ -51,6 +63,8 @@ const SECRET_SIGNS: &[&str] = &[
 pub struct Memory {
     folder: PathBuf,
     project: String,
+    /// Claude Code's notes of the project, read and never changed.
+    claude: Option<PathBuf>,
 }
 
 /// One note, as listed.
@@ -72,7 +86,16 @@ impl Memory {
         Self {
             folder: root.join(&project),
             project,
+            claude: None,
         }
+    }
+
+    /// Reads Claude Code's notes of the project too, kept in `folder`, as
+    /// [`claude_folder`] finds it.
+    #[must_use]
+    pub fn with_claude(mut self, folder: Option<PathBuf>) -> Self {
+        self.claude = folder;
+        self
     }
 
     /// The project's name, as its memory is kept under: its repository's
@@ -85,26 +108,13 @@ impl Memory {
     /// The notes, by name.
     #[must_use]
     pub fn notes(&self) -> Vec<Note> {
-        let Ok(entries) = std::fs::read_dir(&self.folder) else {
-            return Vec::new();
-        };
-        let mut notes: Vec<Note> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|e| e == "md"))
-            .filter_map(|file| {
-                let text = std::fs::read_to_string(&file).ok()?;
-                let (name, description, _) = parse(&text);
-                let fallback = file.file_stem()?.to_string_lossy().into_owned();
-                Some(Note {
-                    name: name.unwrap_or(fallback),
-                    description: description.unwrap_or_default(),
-                    file,
-                })
-            })
-            .collect();
-        notes.sort_by_key(|note| note.name.to_lowercase());
-        notes
+        notes_in(&self.folder)
+    }
+
+    /// Claude Code's notes of the project, by name.
+    #[must_use]
+    pub fn claude_notes(&self) -> Vec<Note> {
+        self.claude.as_deref().map(notes_in).unwrap_or_default()
     }
 
     /// Keeps a note, replacing the one of the same name.
@@ -149,15 +159,30 @@ impl Memory {
         })
     }
 
-    /// A note's text, by its name.
+    /// A note's text, by its name: one of the memory's, else one of
+    /// Claude Code's.
     ///
     /// # Errors
     ///
-    /// There is no such note.
+    /// There is no such note, or it holds what looks like a secret.
     pub fn recall(&self, name: &str) -> Result<String, String> {
-        let note = self.find(name)?;
+        let note = self.find(name).or_else(|why| {
+            let claude = self.claude_notes();
+            find_in(&claude, name).ok_or_else(|| {
+                if claude.is_empty() {
+                    why
+                } else {
+                    format!("{why}; Claude Code's are {}", names(&claude))
+                }
+            })
+        })?;
         let text = std::fs::read_to_string(&note.file)
             .map_err(|e| format!("{}: {e}", note.file.display()))?;
+        if let Some(sign) = secret(&text) {
+            return Err(format!(
+                "the note holds what looks like a secret (`{sign}…`), which is never given"
+            ));
+        }
         let (_, _, body) = parse(&text);
         Ok(format!(
             "{}: {}\n\n{}",
@@ -167,7 +192,7 @@ impl Memory {
         ))
     }
 
-    /// Removes a note.
+    /// Removes a note of the memory's own.
     ///
     /// # Errors
     ///
@@ -178,30 +203,19 @@ impl Memory {
         Ok(format!("The note \"{}\" is gone.", note.name))
     }
 
+    /// One of the memory's own notes, by its name.
     fn find(&self, name: &str) -> Result<Note, String> {
-        let wanted = slug(name);
         let notes = self.notes();
-        notes
-            .iter()
-            .find(|note| {
-                slug(&note.name) == wanted
-                    || note
-                        .file
-                        .file_stem()
-                        .is_some_and(|s| s.to_string_lossy() == wanted)
-            })
-            .cloned()
-            .ok_or_else(|| {
-                let names: Vec<&str> = notes.iter().map(|n| n.name.as_str()).collect();
-                if names.is_empty() {
-                    "there is no note yet".to_owned()
-                } else {
-                    format!(
-                        "no note is named \"{name}\": the notes are {}",
-                        names.join(", ")
-                    )
-                }
-            })
+        find_in(&notes, name).ok_or_else(|| {
+            if notes.is_empty() {
+                "there is no note yet".to_owned()
+            } else {
+                format!(
+                    "no note is named \"{name}\": the notes are {}",
+                    names(&notes)
+                )
+            }
+        })
     }
 
     /// What the agents are told of the memory.
@@ -219,18 +233,120 @@ impl Memory {
             self.project
         );
         if notes.is_empty() {
-            out.push_str("There is no note yet.");
-            return out;
+            out.push_str("There is no note yet.\n");
+        } else {
+            out.push_str("The notes:\n");
+            listed(&mut out, &notes);
         }
-        out.push_str("The notes:\n");
-        for note in notes.iter().take(LISTED) {
-            out.push_str(&format!("- {}: {}\n", note.name, note.description));
+        let claude = self.claude_notes();
+        if !claude.is_empty() {
+            out.push_str(
+                "Claude Code's notes of this project, which recall reads too and which you do \
+                 not change:\n",
+            );
+            listed(&mut out, &claude);
         }
-        if notes.len() > LISTED {
-            out.push_str(&format!("… and {} more.\n", notes.len() - LISTED));
-        }
-        out
+        out.trim_end().to_owned()
     }
+}
+
+/// `notes`, a line each, the first [`LISTED`], the others counted.
+fn listed(out: &mut String, notes: &[Note]) {
+    for note in notes.iter().take(LISTED) {
+        out.push_str(&format!("- {}: {}\n", note.name, note.description));
+    }
+    if notes.len() > LISTED {
+        out.push_str(&format!("… and {} more.\n", notes.len() - LISTED));
+    }
+}
+
+/// The note of `notes` that `name` names, by its name or its file's.
+fn find_in(notes: &[Note], name: &str) -> Option<Note> {
+    let wanted = slug(name);
+    notes
+        .iter()
+        .find(|note| {
+            slug(&note.name) == wanted
+                || note
+                    .file
+                    .file_stem()
+                    .is_some_and(|s| s.to_string_lossy() == wanted)
+        })
+        .cloned()
+}
+
+/// The names of `notes`, in a line.
+fn names(notes: &[Note]) -> String {
+    notes
+        .iter()
+        .map(|n| n.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The notes in `folder`, by name: its Markdown files, each named as its
+/// head says, else as its file is; Claude Code's list of them left out.
+fn notes_in(folder: &Path) -> Vec<Note> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut notes: Vec<Note> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "md"))
+        .filter(|path| path.file_name().is_none_or(|name| name != CLAUDE_INDEX))
+        .filter_map(|file| {
+            let text = std::fs::read_to_string(&file).ok()?;
+            let (name, description, _) = parse(&text);
+            let fallback = file.file_stem()?.to_string_lossy().into_owned();
+            Some(Note {
+                name: name.unwrap_or(fallback),
+                description: description.unwrap_or_default(),
+                file,
+            })
+        })
+        .collect();
+    notes.sort_by_key(|note| note.name.to_lowercase());
+    notes
+}
+
+/// Where Claude Code keeps its notes of the project in `workspace`, under
+/// its folder of projects `projects` (`~/.claude/projects`): named after
+/// the project's path, every sign but letters and digits a dash, the
+/// workspace's own or its repository's top; `None` when it has none.
+///
+/// # Examples
+///
+/// ```
+/// let projects = tempfile::tempdir().unwrap();
+/// let notes = projects.path().join("-home-me-my-app/memory");
+/// std::fs::create_dir_all(&notes).unwrap();
+/// let found = iq_memory::claude_folder(projects.path(), std::path::Path::new("/home/me/my_app"));
+/// assert_eq!(found, Some(notes));
+/// ```
+#[must_use]
+pub fn claude_folder(projects: &Path, workspace: &Path) -> Option<PathBuf> {
+    let top = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor=", "-C"])
+        .arg(workspace)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));
+    std::iter::once(workspace.to_path_buf())
+        .chain(top)
+        .map(|path| {
+            let named: String = path
+                .to_string_lossy()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            projects.join(named).join("memory")
+        })
+        .find(|folder| folder.is_dir())
 }
 
 /// The name a project's memory is kept under: the address of its
@@ -301,7 +417,7 @@ fn segment(part: &str) -> Option<String> {
 }
 
 /// A note's file name, from its name.
-fn slug(name: &str) -> String {
+pub(crate) fn slug(name: &str) -> String {
     let mut out = String::new();
     for c in name.trim().chars() {
         if c.is_alphanumeric() {
@@ -315,7 +431,7 @@ fn slug(name: &str) -> String {
 }
 
 /// A note's name, description and body.
-fn parse(text: &str) -> (Option<String>, Option<String>, &str) {
+pub(crate) fn parse(text: &str) -> (Option<String>, Option<String>, &str) {
     let Some(rest) = text.strip_prefix("---\n") else {
         return (None, None, text);
     };
@@ -335,7 +451,7 @@ fn parse(text: &str) -> (Option<String>, Option<String>, &str) {
 }
 
 /// The start of what looks like a secret in `text`, if any.
-fn secret(text: &str) -> Option<&'static str> {
+pub(crate) fn secret(text: &str) -> Option<&'static str> {
     SECRET_SIGNS.iter().copied().find(|sign| {
         text.match_indices(sign).any(|(at, _)| {
             let after = &text[at + sign.len()..];
@@ -396,6 +512,10 @@ where
         tools()
     }
 
+    fn leads_only(&self) -> bool {
+        true
+    }
+
     fn instructions(&self, _agent: &str) -> Option<String> {
         Some(self.told())
     }
@@ -443,6 +563,7 @@ mod tests {
         let memory = Memory {
             folder: dir.path().join("github.com/org/repo"),
             project: "github.com/org/repo".into(),
+            claude: None,
         };
         assert!(memory.told().contains("There is no note yet."));
         assert_eq!(
@@ -495,11 +616,58 @@ mod tests {
     }
 
     #[test]
+    fn claude_codes_notes_are_read_beside_and_never_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("MEMORY.md"),
+            "- [Deploy](deploy.md) — how it ships\n",
+        )
+        .unwrap();
+        std::fs::write(
+            claude.join("deploy.md"),
+            "---\nname: deploy\ndescription: how it ships\nmetadata:\n  type: project\n---\n\nTag, then push the tag.\n",
+        )
+        .unwrap();
+        let memory = Memory {
+            folder: dir.path().join("iq"),
+            project: "p".into(),
+            claude: Some(claude.clone()),
+        };
+        let told = memory.told();
+        assert!(told.contains("There is no note yet."));
+        assert!(told.contains("Claude Code's notes") && told.contains("- deploy: how it ships"));
+        assert!(!told.contains("MEMORY"));
+        assert!(
+            memory
+                .recall("deploy")
+                .unwrap()
+                .ends_with("Tag, then push the tag.")
+        );
+        assert!(memory.forget("deploy").is_err());
+        assert!(claude.join("deploy.md").exists());
+        let missing = memory.recall("nothing").unwrap_err();
+        assert!(missing.contains("Claude Code's are deploy"));
+        // Kept in the memory's own folder, a note of the same name comes first.
+        memory
+            .remember("deploy", "ours", "Run make release.")
+            .unwrap();
+        assert!(
+            memory
+                .recall("deploy")
+                .unwrap()
+                .ends_with("Run make release.")
+        );
+    }
+
+    #[test]
     fn a_secret_is_never_kept() {
         let dir = tempfile::tempdir().unwrap();
         let memory = Memory {
             folder: dir.path().to_path_buf(),
             project: "p".into(),
+            claude: None,
         };
         // Made here rather than written whole, so that no scanner takes
         // the source for a leak.

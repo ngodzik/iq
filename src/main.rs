@@ -165,21 +165,62 @@ fn main() -> Result<()> {
 /// The crew of the current folder, what it does reported to `report`.
 /// Must run within the runtime.
 fn crew(cli: &Cli, settings: &Settings, report: Report) -> Result<Crew<OpenAiCompatible>> {
+    let home = home_dir()?;
+    let workspace = std::env::current_dir().context("reading the current folder")?;
+    let mut crew_settings = settings.crew()?;
+    crew_settings.rules = person_rules(&settings.rules_files(&home), &home);
     let crew = Crew::new(
         provider(cli),
         gate(settings.internet, settings.autopilot_internet())?,
         Helper::this_program()?,
-        settings.crew()?,
+        crew_settings,
         report,
     );
     crew.set_autopilot(settings.autopilot);
-    // What the agents remember of this project, kept with iq's data.
-    let memory = iq_memory::Memory::open(
-        &settings::data_folder(&home_dir()?).join("memory"),
-        &std::env::current_dir().context("reading the current folder")?,
-    );
+    // What the agents the person starts remember of this project, kept
+    // with iq's data, and what Claude Code noted of it.
+    let claude = settings
+        .claude_memory()
+        .then(|| iq_memory::claude_folder(&home.join(".claude/projects"), &workspace))
+        .flatten();
+    let memory = iq_memory::Memory::open(&settings::data_folder(&home).join("memory"), &workspace)
+        .with_claude(claude);
     crew.extend(Arc::new(memory));
+    // And the skills the person wrote for them.
+    crew.extend(Arc::new(iq_memory::Skills::new(
+        settings.skill_folders(&home, &workspace),
+    )));
     Ok(crew)
+}
+
+/// The person's rules, from the files the settings list, as written and
+/// where they are: each with the files it imports, `~/` in `home`, others
+/// beside it. A file that is not there, or that its name says holds
+/// secrets, is left out; its folder may be one of credentials, as
+/// Claude Code's is, which holds its rules beside them.
+fn person_rules(files: &[(String, PathBuf)], home: &Path) -> Vec<iq_agent::RulesFile> {
+    files
+        .iter()
+        .filter(|(_, path)| !iq_gate::holds_secrets(path, None))
+        .filter_map(|(written, path)| {
+            let text = std::fs::read_to_string(path).ok()?;
+            let folder = path.parent().unwrap_or(home);
+            let text = iq_agent::with_imports(&text, |name| {
+                let imported = match name.strip_prefix("~/") {
+                    Some(rest) => home.join(rest),
+                    None => folder.join(name),
+                };
+                if iq_gate::holds_secrets(&imported, None) {
+                    return None;
+                }
+                std::fs::read_to_string(imported).ok()
+            });
+            Some(iq_agent::RulesFile {
+                from: written.clone(),
+                text,
+            })
+        })
+        .collect()
 }
 
 /// The person's home.
