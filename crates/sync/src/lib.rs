@@ -16,10 +16,15 @@
 //!
 //! Beside iq's own files, the person may keep any file or folder of their
 //! home there, as their settings list them: a new machine, taking the
-//! settings with the rest, puts each file back in its place. What holds secrets is never kept, as the
-//! gate tells it; nor what is too large, nor what is rebuilt. A sync
-//! never removes a file of the home: what another machine removed stays
-//! in the history.
+//! settings with the rest, puts each file back in its place. What holds
+//! secrets is never kept, as the gate tells it; in a folder of credentials
+//! of the home, such as Claude Code's, only the Markdown files are: the
+//! rules and notes written there. Nor what is too large, nor what is
+//! rebuilt. A sync never removes a file of the home: what another machine
+//! removed stays in the history.
+//!
+//! What a sync would send is listed before, for the person to say whether
+//! it goes.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -97,8 +102,9 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> SyncError + '_ {
     }
 }
 
-/// A file kept outside the folder, copied in to be synced and out once
-/// synced, as the settings are, which iq reads from its own folder.
+/// A file or a folder kept outside the folder, copied in to be synced and
+/// out once synced, as the settings and the skills are, which iq reads from
+/// its own folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mirrored {
     /// Where it lives.
@@ -123,12 +129,16 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    /// In a few words.
+    /// In a few words, what was sent named.
     #[must_use]
     pub fn said(&self) -> String {
         let mut parts = Vec::new();
         if !self.sent.is_empty() {
-            parts.push(format!("{} sent", count(self.sent.len())));
+            parts.push(format!(
+                "{} sent ({})",
+                count(self.sent.len()),
+                named(&self.sent)
+            ));
         }
         if !self.taken.is_empty() {
             parts.push(format!("{} taken", count(self.taken.len())));
@@ -145,6 +155,22 @@ impl Outcome {
             parts.join(", ")
         }
     }
+}
+
+/// The first few of `files`, and how many more.
+#[must_use]
+pub fn named(files: &[String]) -> String {
+    const NAMED: usize = 3;
+    let mut said = files
+        .iter()
+        .take(NAMED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if files.len() > NAMED {
+        said.push_str(&format!(" and {} more", files.len() - NAMED));
+    }
+    said
 }
 
 fn count(files: usize) -> String {
@@ -248,7 +274,7 @@ impl Sync {
             ));
         }
         let outside = home.join(relative);
-        if iq_gate::holds_secrets(&outside, Some(home)) {
+        if !outside.is_dir() && !keeps_file(&outside, Some(home)) {
             return Err(format!("{entry} holds secrets, which are never kept"));
         }
         if outside.starts_with(&self.root) || relative.starts_with(".iq") {
@@ -428,38 +454,111 @@ impl Sync {
         Ok(outcome)
     }
 
-    /// Whether this machine has something to send: a file of the folder
-    /// changed, or a mirrored file changed where it lives. Reads only, and
-    /// reaches no repository.
+    /// Whether this machine has something to send, or never synced. Reads
+    /// only, and reaches no repository.
     pub async fn pending(&self) -> bool {
-        if !self.root.join(".git").exists() {
-            return true;
+        self.fresh() || !self.changes().await.is_empty()
+    }
+
+    /// Whether this machine never synced with the repository.
+    #[must_use]
+    pub fn fresh(&self) -> bool {
+        !self.root.join(".git").exists()
+    }
+
+    /// What a sync would send, as the repository names it: the files of
+    /// the folder changed, and those mirrored or kept that changed where
+    /// they live. Reads only, and reaches no repository; nothing on a
+    /// machine that never synced, which takes first.
+    pub async fn changes(&self) -> Vec<String> {
+        if self.fresh() {
+            return Vec::new();
         }
-        let mirrored_changed = self.mirrored.iter().any(|file| {
-            std::fs::read(&file.outside).ok().is_some_and(|here| {
-                std::fs::read(self.root.join(&file.inside)).ok().as_deref() != Some(here.as_slice())
-            })
-        });
-        let kept_changed = self.kept_places().iter().any(|(_, outside, inside)| {
-            let here = files_kept(outside, self.home.as_deref());
-            let copied = files_kept(inside, None);
-            (outside.is_dir() && here != copied)
-                || here.iter().any(|relative| {
-                    let (from, to) = if relative.as_os_str().is_empty() {
-                        (outside.clone(), inside.clone())
-                    } else {
-                        (outside.join(relative), inside.join(relative))
-                    };
-                    std::fs::read(&from).ok() != std::fs::read(&to).ok()
-                })
-        });
-        if mirrored_changed || kept_changed {
-            return true;
+        let differs = |from: &Path, to: &Path| std::fs::read(from).ok() != std::fs::read(to).ok();
+        let mut changed: Vec<String> = Vec::new();
+        for (outside, inside) in self.mirrored_files() {
+            let sent = if outside.exists() {
+                differs(&outside, &inside)
+            } else {
+                self.removed_here(&outside)
+            };
+            if sent {
+                changed.push(self.named_inside(&inside));
+            }
+        }
+        for (_, outside, inside) in self.kept_places() {
+            let here = files_kept(&outside, self.home.as_deref());
+            let copied = files_kept(&inside, None);
+            let at = |place: &Path, relative: &PathBuf| {
+                if relative.as_os_str().is_empty() {
+                    place.to_path_buf()
+                } else {
+                    place.join(relative)
+                }
+            };
+            for relative in &here {
+                if differs(&at(&outside, relative), &at(&inside, relative)) {
+                    changed.push(self.named_inside(&at(&inside, relative)));
+                }
+            }
+            if outside.is_dir() {
+                for relative in copied.iter().filter(|r| !here.contains(r)) {
+                    changed.push(self.named_inside(&at(&inside, relative)));
+                }
+            }
         }
         let git = Git::new(&self.root, &self.remote, &self.machine).await;
-        git.run(&["status", "--porcelain"])
-            .await
-            .map_or(true, |status| !status.trim().is_empty())
+        if let Ok(status) = git.run(&["status", "--porcelain", "-uall"]).await {
+            changed.extend(
+                status
+                    .lines()
+                    .filter_map(|line| line.get(3..))
+                    .map(|name| name.trim_matches('"').to_owned()),
+            );
+        }
+        changed.sort();
+        changed.dedup();
+        changed
+    }
+
+    /// A path of the folder, as the repository names it.
+    fn named_inside(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Whether `outside`, a file of a mirrored folder that is here, is no
+    /// longer in it: its copy goes too.
+    fn removed_here(&self, outside: &Path) -> bool {
+        !outside.exists()
+            && self.mirrored.iter().any(|m| {
+                m.outside.is_dir() && outside.starts_with(&m.outside) && outside != m.outside
+            })
+    }
+
+    /// Each mirrored file, where it lives and where its copy is: a file
+    /// mirrored, or each of a folder's, on either side.
+    fn mirrored_files(&self) -> Vec<(PathBuf, PathBuf)> {
+        let mut pairs = Vec::new();
+        for mirrored in &self.mirrored {
+            let inside = self.root.join(&mirrored.inside);
+            if !mirrored.outside.is_dir() && !inside.is_dir() {
+                pairs.push((mirrored.outside.clone(), inside));
+                continue;
+            }
+            let mut files = files_kept(&mirrored.outside, None);
+            files.extend(files_kept(&inside, None));
+            files.sort();
+            files.dedup();
+            pairs.extend(
+                files
+                    .into_iter()
+                    .map(|relative| (mirrored.outside.join(&relative), inside.join(relative))),
+            );
+        }
+        pairs
     }
 
     /// Takes what the repository holds beyond this machine's history.
@@ -551,13 +650,16 @@ impl Sync {
         }
     }
 
-    /// Copies the mirrored files in, as they are here.
+    /// Copies the mirrored files in, as they are here: of a folder that is
+    /// here, what it no longer holds goes from the copy.
     fn copy_in(&self) -> Result<(), SyncError> {
-        for file in &self.mirrored {
-            let Ok(here) = std::fs::read(&file.outside) else {
+        for (outside, inside) in self.mirrored_files() {
+            let Ok(here) = std::fs::read(&outside) else {
+                if self.removed_here(&outside) && inside.exists() {
+                    std::fs::remove_file(&inside).map_err(io(&inside))?;
+                }
                 continue;
             };
-            let inside = self.root.join(&file.inside);
             if std::fs::read(&inside).ok().as_deref() != Some(here.as_slice()) {
                 if let Some(parent) = inside.parent() {
                     std::fs::create_dir_all(parent).map_err(io(parent))?;
@@ -572,23 +674,38 @@ impl Sync {
     /// new to the repository, what it had is kept beside, as it was never
     /// sent.
     fn copy_out(&self, fresh: bool) -> Result<(), SyncError> {
-        for file in &self.mirrored {
-            let Ok(synced) = std::fs::read(self.root.join(&file.inside)) else {
+        for (outside, inside) in self.mirrored_files() {
+            let Ok(synced) = std::fs::read(&inside) else {
                 continue;
             };
-            let here = std::fs::read(&file.outside).ok();
+            let here = std::fs::read(&outside).ok();
             if here.as_deref() == Some(synced.as_slice()) {
                 continue;
             }
             if fresh && let Some(here) = &here {
-                let mut beside = file.outside.clone().into_os_string();
+                let mut beside = outside.clone().into_os_string();
                 beside.push(".before-sync");
                 let beside = PathBuf::from(beside);
                 write_private(&beside, here)?;
             }
-            write_private(&file.outside, &synced)?;
+            write_private(&outside, &synced)?;
         }
         Ok(())
+    }
+}
+
+/// Whether the file at `path` may be kept: not one whose name says it
+/// holds secrets, nor, in a folder of credentials of `home`, one that is
+/// not Markdown, as the rules and notes kept there are.
+fn keeps_file(path: &Path, home: Option<&Path>) -> bool {
+    if iq_gate::holds_secrets(path, None) {
+        return false;
+    }
+    match home {
+        Some(home) if iq_gate::holds_secrets(path, Some(home)) => {
+            path.extension().is_some_and(|ending| ending == "md")
+        }
+        _ => true,
     }
 }
 
@@ -598,7 +715,7 @@ impl Sync {
 /// left out.
 fn files_kept(place: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let keeps = |path: &Path| {
-        !home.is_some_and(|home| iq_gate::holds_secrets(path, Some(home)))
+        home.is_none_or(|home| keeps_file(path, Some(home)))
             && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() <= KEPT_MOST)
     };
     let Ok(meta) = std::fs::symlink_metadata(place) else {
@@ -623,9 +740,9 @@ fn files_kept(place: &Path, home: Option<&Path>) -> Vec<PathBuf> {
                 continue;
             };
             if kind.is_dir() {
-                if !LEFT_OUT.iter().any(|left| entry.file_name() == *left)
-                    && !home.is_some_and(|home| iq_gate::holds_secrets(&entry.path(), Some(home)))
-                {
+                // A folder of credentials within is walked: only its
+                // Markdown files are kept.
+                if !LEFT_OUT.iter().any(|left| entry.file_name() == *left) {
                     folders.push(relative);
                 }
             } else if kind.is_file() && keeps(&entry.path()) {
@@ -767,7 +884,9 @@ mod tests {
         };
         assert_eq!(
             outcome.said(),
-            "1 file sent, 2 files taken, 1 file changed on both sides and merged, this machine's lines kept where they met"
+            "1 file sent (a), 2 files taken, 1 file changed on both sides and merged, this machine's lines kept where they met"
         );
+        let many: Vec<String> = ["a", "b", "c", "d", "e"].map(str::to_owned).to_vec();
+        assert_eq!(named(&many), "a, b, c and 2 more");
     }
 }

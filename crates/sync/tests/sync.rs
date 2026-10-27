@@ -279,3 +279,76 @@ async fn what_the_person_keeps_comes_back_on_a_new_machine_without_its_secrets()
         Some("buy milk\n")
     );
 }
+
+#[tokio::test]
+async fn rules_and_notes_are_kept_from_a_folder_of_credentials_and_a_folder_mirrored_whole() {
+    let w = world();
+    let listed = [
+        "~/.claude/CLAUDE.md",
+        "~/.claude/projects/app/memory",
+        "~/.claude/.credentials.json",
+    ];
+    let skills = |name: &str| w.root.join(name).join("home/.iq/skills");
+    let a = w.keeping("a", &listed).mirror(skills("a"), "config/skills");
+    let home = w.home("a");
+    write(&home, ".claude/CLAUDE.md", "Answer in French.\n");
+    write(&home, ".claude/.credentials.json", "{}\n");
+    write(
+        &home,
+        ".claude/projects/app/memory/deploy.md",
+        "Tag first.\n",
+    );
+    write(&home, ".claude/projects/app/memory/log.jsonl", "{}\n");
+    write(
+        &home,
+        ".iq/skills/teams/SKILL.md",
+        "A writer, a reviewer.\n",
+    );
+    assert_eq!(
+        a.kept(),
+        ["~/.claude/CLAUDE.md", "~/.claude/projects/app/memory"]
+    );
+    assert!(a.refused()[0].contains("holds secrets"));
+    // Never synced: it takes first, nothing is asked.
+    assert!(a.changes().await.is_empty() && a.pending().await);
+    let sent = a.run().await.unwrap().sent;
+    for file in [
+        "home/.claude/CLAUDE.md",
+        "home/.claude/projects/app/memory/deploy.md",
+        "config/skills/teams/SKILL.md",
+    ] {
+        assert!(sent.contains(&file.to_owned()), "{sent:?}");
+    }
+    assert!(
+        sent.iter()
+            .all(|f| !f.contains("credentials") && !f.ends_with(".jsonl"))
+    );
+    assert!(a.changes().await.is_empty());
+
+    // What changed is listed before anything is sent.
+    write(&home, ".claude/CLAUDE.md", "Answer in English.\n");
+    write(&home, ".iq/skills/compact.md", "Between tasks.\n");
+    std::fs::remove_file(home.join(".iq/skills/teams/SKILL.md")).unwrap();
+    assert_eq!(
+        a.changes().await,
+        [
+            "config/skills/compact.md",
+            "config/skills/teams/SKILL.md",
+            "home/.claude/CLAUDE.md"
+        ]
+    );
+    a.run().await.unwrap();
+
+    // Another machine finds the skills in its own iq folder.
+    let b = w.keeping("b", &listed).mirror(skills("b"), "config/skills");
+    b.run().await.unwrap();
+    assert_eq!(
+        read(&skills("b"), "compact.md").as_deref(),
+        Some("Between tasks.\n")
+    );
+    assert!(read(&skills("b"), "teams/SKILL.md").is_none());
+    assert_eq!(
+        read(&w.home("b"), ".claude/CLAUDE.md").as_deref(),
+        Some("Answer in English.\n")
+    );
+}

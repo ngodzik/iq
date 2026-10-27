@@ -52,6 +52,9 @@ pub enum Update {
     Tasks(Vec<crate::costs::TaskSpent>),
     /// A sync of iq's data ended.
     Synced(Synced),
+    /// What changed waits to be sent to the sync's repository, for the
+    /// person to say whether it goes.
+    SyncAsk(SyncAsk),
     /// The provider's models, as it lists them: what the person may name.
     Models(Vec<String>),
     /// How the crew starts: the lead's model, the reviewer's, whether
@@ -80,6 +83,15 @@ pub struct Synced {
     pub said: String,
 }
 
+/// What a sync would send, asked of the person before it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncAsk {
+    /// The repository.
+    pub remote: String,
+    /// The files that changed, as the repository names them.
+    pub files: Vec<String>,
+}
+
 /// How far back the costs are summed, in seconds, as the costs' page
 /// offers it.
 pub const PERIODS: [u64; 4] = [3600, 6 * 3600, 24 * 3600, 7 * 24 * 3600];
@@ -100,6 +112,8 @@ pub struct Board {
     quitting: bool,
     /// How the last sync went, when the machine syncs.
     synced: Option<Synced>,
+    /// What waits to be sent, asked of the person.
+    sync_ask: Option<SyncAsk>,
     /// How the work is looked at.
     lens: crate::observations::Lens,
     /// The provider's models, as it lists them.
@@ -127,6 +141,7 @@ impl Board {
             posts: Vec::new(),
             quitting: false,
             synced: None,
+            sync_ask: None,
             lens: crate::observations::Lens::default(),
             models: Vec::new(),
         }
@@ -453,8 +468,15 @@ impl Board {
             Action::Autopilot => return Some(self.crew.toggle_autopilot()),
             Action::Internet => return Some(self.crew.toggle_internet()),
             Action::Allow | Action::Refuse => {
-                let id = self.crew.questions().first().map(|q| q.id)?;
-                return Some(self.crew.answer(id, action == Action::Allow));
+                // The agents' questions first: they hold work.
+                if let Some(id) = self.crew.questions().first().map(|q| q.id) {
+                    return Some(self.crew.answer(id, action == Action::Allow));
+                }
+                self.sync_ask.take()?;
+                return Some(Request::Sync {
+                    send: action == Action::Allow,
+                    always: false,
+                });
             }
             Action::Stop => {
                 let agent = self.screen.talking_to()?.to_owned();
@@ -615,6 +637,10 @@ impl Board {
             Command::Theme(None) => self.look.next_theme(),
             Command::Theme(Some(theme)) => self.look.set_theme(theme),
             Command::Effort(effort) => return self.effort(effort, now),
+            Command::Sync(always) => {
+                self.sync_ask = None;
+                return vec![Request::Sync { send: true, always }];
+            }
             Command::Stop(None) => return self.act(Action::Stop).into_iter().collect(),
             Command::Stop(Some(all)) if all == "all" => {
                 return self
@@ -740,6 +766,13 @@ impl Board {
         self.synced.as_ref()
     }
 
+    /// What waits to be sent to the sync's repository, asked of the
+    /// person.
+    #[must_use]
+    pub fn sync_ask(&self) -> Option<&SyncAsk> {
+        self.sync_ask.as_ref()
+    }
+
     /// The costs.
     #[must_use]
     pub fn costs(&self) -> &Costs {
@@ -791,7 +824,11 @@ impl Board {
             }
             Update::Quit => self.quitting = true,
             Update::Tasks(tasks) => self.costs.tasks_read(tasks),
-            Update::Synced(synced) => self.synced = Some(synced),
+            Update::Synced(synced) => {
+                self.synced = Some(synced);
+                self.sync_ask = None;
+            }
+            Update::SyncAsk(ask) => self.sync_ask = Some(ask),
             Update::Models(models) => self.models = models,
             Update::Started {
                 lead,
@@ -1157,6 +1194,45 @@ mod tests {
         }));
         assert_eq!(board.take_posts().len(), 1);
         assert!(board.take_posts().is_empty());
+    }
+
+    #[test]
+    fn what_changed_is_sent_once_the_person_says_so() {
+        let mut board = Board::default();
+        assert_eq!(board.act(Action::Allow), None);
+        let ask = || {
+            Update::SyncAsk(SyncAsk {
+                remote: "https://example.com/notes.git".into(),
+                files: vec!["config/skills/teams/SKILL.md".into()],
+            })
+        };
+        board.update(ask());
+        assert!(board.sync_ask().is_some());
+        assert_eq!(
+            board.act(Action::Refuse),
+            Some(Request::Sync {
+                send: false,
+                always: false
+            })
+        );
+        assert!(board.sync_ask().is_none());
+        board.update(ask());
+        assert_eq!(
+            board.act(Action::Allow),
+            Some(Request::Sync {
+                send: true,
+                always: false
+            })
+        );
+        board.update(ask());
+        assert_eq!(
+            board.run(Command::Sync(true), 100),
+            [Request::Sync {
+                send: true,
+                always: true
+            }]
+        );
+        assert!(board.sync_ask().is_none());
     }
 
     #[test]

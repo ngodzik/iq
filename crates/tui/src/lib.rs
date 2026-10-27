@@ -213,6 +213,18 @@ impl Iq {
                     internet,
                 });
             }
+            Update::Synced(synced) => {
+                // What moved is said in the conversation; a sync that moved
+                // nothing only in the status line.
+                if !synced.ok {
+                    self.history
+                        .say(&format!("the sync failed: {}", synced.said), &self.p);
+                } else if synced.said != "nothing changed" {
+                    self.history
+                        .say(&format!("synced: {}", synced.said), &self.p);
+                }
+                self.board.update(Update::Synced(synced));
+            }
             other => self.board.update(other),
         }
     }

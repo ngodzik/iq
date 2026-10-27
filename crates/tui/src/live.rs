@@ -215,7 +215,9 @@ impl Live<'_> {
     fn question(&self, width: usize) -> Option<Part> {
         let p = self.p;
         let questions = self.board.questions();
-        let question = questions.first()?;
+        let Some(question) = questions.first() else {
+            return self.sync_question(width);
+        };
         let inner = width.saturating_sub(4);
         let pad = [Span::raw(" ")];
         let mut lines = wrap(
@@ -255,6 +257,65 @@ impl Live<'_> {
             title: Line::from(vec![
                 Span::raw(" "),
                 Span::styled(question.agent.clone(), p.bold(tint)),
+                Span::styled(" asks ", p.fg(p.warn)),
+            ]),
+            lines,
+            tint: p.warn,
+        })
+    }
+
+    /// What a sync would send, asked in a box, when no agent asks
+    /// anything: the files, and the keys that answer.
+    fn sync_question(&self, width: usize) -> Option<Part> {
+        let p = self.p;
+        let ask = self.board.sync_ask()?;
+        let inner = width.saturating_sub(4);
+        let pad = [Span::raw(" ")];
+        const NAMED: usize = 3;
+        let mut files = ask
+            .files
+            .iter()
+            .take(NAMED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if ask.files.len() > NAMED {
+            files.push_str(&format!(" and {} more", ask.files.len() - NAMED));
+        }
+        let mut lines = wrap(
+            &[Span::styled(
+                format!("send what changed to {}?", ask.remote),
+                p.fg(p.text),
+            )],
+            inner,
+            &pad,
+            &pad,
+        );
+        lines.extend(wrap(
+            &[Span::styled(format!("changed: {files}"), p.fg(p.dim))],
+            inner,
+            &pad,
+            &pad,
+        ));
+        let key = |action| {
+            self.board
+                .keys()
+                .chord(action)
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(key(Action::Allow), p.bold(p.ok)),
+            Span::styled(" send  ", p.fg(p.dim)),
+            Span::styled(key(Action::Refuse), p.bold(p.bad)),
+            Span::styled(" not now", p.fg(p.dim)),
+            Span::styled("  · /sync auto never asks", p.fg(p.faint)),
+        ]));
+        Some(Part::Boxed {
+            title: Line::from(vec![
+                Span::raw(" "),
+                Span::styled("sync", p.bold(p.info)),
                 Span::styled(" asks ", p.fg(p.warn)),
             ]),
             lines,

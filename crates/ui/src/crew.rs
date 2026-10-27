@@ -64,6 +64,13 @@ pub enum Request {
         /// The agent.
         agent: String,
     },
+    /// Sync iq's data with the repository, or not, as asked.
+    Sync {
+        /// Whether what changed is sent now.
+        send: bool,
+        /// Whether what changes is sent from now on without asking.
+        always: bool,
+    },
 }
 
 /// One thing in an agent's thread.

@@ -12,6 +12,7 @@ use std::io::{BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -405,9 +406,22 @@ async fn work(
 fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let folder = home_folder()?;
     // What other machines sent comes first, the settings among it: a new
-    // machine takes everything before it sends anything.
+    // machine takes everything before it sends anything. What this one
+    // changed is sent only as the person says, unless the settings send it
+    // on their own.
     let sync = machine_sync()?;
-    let first = sync.as_ref().map(|sync| {
+    let auto = Arc::new(AtomicBool::new(
+        Settings::load(&folder).is_ok_and(|settings| settings.sync_auto()),
+    ));
+    let first = sync.as_ref().and_then(|sync| {
+        let waiting = runtime.block_on(sync.changes());
+        if !waiting.is_empty() && !auto.load(Ordering::Relaxed) {
+            eprintln!(
+                "iq: changed since the last sync: {}. iq asks before it sends.",
+                iq_sync::named(&waiting)
+            );
+            return None;
+        }
         eprintln!("iq: syncing with {}…", sync.remote());
         let result = runtime
             .block_on(async { tokio::time::timeout(sync::OPENING, sync_now(sync)).await })
@@ -420,7 +434,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
             Ok(outcome) => eprintln!("iq: synced, {}", outcome.said()),
             Err(error) => eprintln!("iq: the sync failed, iq opens without it: {error}"),
         }
-        synced(&result)
+        Some(synced(&result))
     });
     let (settings, lead) = chosen(cli, &folder)?;
     retired(&settings);
@@ -451,22 +465,45 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     if let Some(first) = first {
         let _ = send.send(Update::Synced(first));
     }
-    // While iq runs, what changed is sent every few minutes, and what
-    // other machines sent is taken now and then.
+    // While iq runs, what changed is asked of the person, or sent and said
+    // when the settings say so, and what other machines sent is taken now
+    // and then.
     if let Some(sync) = sync.clone() {
         let send = send.clone();
+        let auto = Arc::clone(&auto);
         runtime.spawn(async move {
             let mut last = std::time::Instant::now();
+            let mut asked: Vec<String> = Vec::new();
             loop {
-                tokio::time::sleep(sync::LOOK_EVERY).await;
-                if !sync.pending().await && last.elapsed() < sync::TAKE_EVERY {
-                    continue;
-                }
-                let result = sync.run().await;
-                last = std::time::Instant::now();
-                if send.send(Update::Synced(synced(&result))).is_err() {
+                let changes = sync.changes().await;
+                let update = if changes.is_empty() {
+                    asked.clear();
+                    if last.elapsed() < sync::TAKE_EVERY {
+                        None
+                    } else {
+                        last = std::time::Instant::now();
+                        Some(Update::Synced(synced(&sync.run().await)))
+                    }
+                } else if auto.load(Ordering::Relaxed) {
+                    last = std::time::Instant::now();
+                    Some(Update::Synced(synced(&sync.run().await)))
+                } else if changes != asked {
+                    // Asked once for what changed: what the person put off
+                    // is asked again only as more changes.
+                    asked = changes.clone();
+                    Some(Update::SyncAsk(iq_ui::SyncAsk {
+                        remote: sync.remote().to_owned(),
+                        files: changes,
+                    }))
+                } else {
+                    None
+                };
+                if let Some(update) = update
+                    && send.send(update).is_err()
+                {
                     return;
                 }
+                tokio::time::sleep(sync::LOOK_EVERY).await;
             }
         });
     }
@@ -526,6 +563,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         });
     }
 
+    let told = send.clone();
     let files = {
         let journal = journal.file().to_path_buf();
         let categories = settings.categories();
@@ -561,6 +599,8 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     }
     let handle = runtime.handle().clone();
     let working = crew.clone();
+    let syncing = sync.clone();
+    let always = Arc::clone(&auto);
     std::thread::spawn(move || {
         let _inside = handle.enter();
         for request in requests {
@@ -593,6 +633,31 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     let _ = working.set_effort(&agent, effort);
                 }
                 Request::Stop { agent } => working.stop(&agent),
+                Request::Sync { send, always: on } => {
+                    if on {
+                        always.store(true, Ordering::Relaxed);
+                    }
+                    if !send {
+                        continue;
+                    }
+                    let told = told.clone();
+                    match syncing.clone() {
+                        Some(sync) => {
+                            tokio::spawn(async move {
+                                let result = sync.run().await;
+                                let _ = told.send(Update::Synced(synced(&result)));
+                            });
+                        }
+                        None => {
+                            let _ = told.send(Update::Synced(iq_ui::Synced {
+                                at: iq_ui::now(),
+                                ok: false,
+                                said: "no repository is set: [sync] remote in ~/.iq/settings.toml"
+                                    .into(),
+                            }));
+                        }
+                    }
+                }
             }
         }
     });
@@ -601,9 +666,13 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let ran = iq_tui::run(feed, ask, board).context("running in the terminal");
     runtime.block_on(async {
         crew.end().await;
-        // What changed since the last sync leaves with iq.
+        // What changed since the last sync leaves with iq, as the person
+        // says.
         if let Some(sync) = &sync
             && sync.pending().await
+            && (sync.fresh()
+                || auto.load(Ordering::Relaxed)
+                || send_changes(sync.remote(), &sync.changes().await))
         {
             match tokio::time::timeout(sync::CLOSING, sync.run()).await {
                 Ok(Ok(outcome)) => eprintln!("iq: synced, {}", outcome.said()),
@@ -744,6 +813,21 @@ fn retired(settings: &Settings) {
              iq runs the provider's models only, such as anthropic/claude-opus-5-5."
         );
     }
+}
+
+/// Asks the person on the terminal whether what changed, `files`, goes to
+/// `remote` as iq ends; no when they cannot answer.
+fn send_changes(remote: &str, files: &[String]) -> bool {
+    print!(
+        "iq: changed since the last sync: {}. Send to {remote}? [y/N] ",
+        iq_sync::named(files)
+    );
+    if std::io::stdout().flush().is_err() {
+        return false;
+    }
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer).is_ok()
+        && matches!(answer.trim(), "y" | "Y" | "yes")
 }
 
 /// Asks the person on the terminal whether `reason` may be overridden.

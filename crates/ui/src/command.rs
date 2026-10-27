@@ -18,7 +18,7 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 14] = [
+pub const COMMANDS: [Spec; 15] = [
     Spec {
         name: "new",
         args: "[model]",
@@ -70,6 +70,11 @@ pub const COMMANDS: [Spec; 14] = [
         what: "the internet open to every command, or only to what fetches packages",
     },
     Spec {
+        name: "sync",
+        args: "[auto]",
+        what: "send what changed to your sync repository now; auto, from now on without asking",
+    },
+    Spec {
         name: "effort",
         args: "[low|medium|high|xhigh|max]",
         what: "how hard the agent you write to thinks, or the new chat's",
@@ -117,6 +122,9 @@ pub enum Command {
     /// How hard the agent written to thinks, or the new chat's; none to
     /// be told.
     Effort(Option<iq_core::Effort>),
+    /// Send what changed to the sync's repository now; and from now on
+    /// without asking, when true.
+    Sync(bool),
     /// The next theme, or this one.
     Theme(Option<Theme>),
     /// Stop the agent written to, this one, or `all`.
@@ -183,6 +191,11 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "keys" | "help" => bare(Command::Keys),
         "autopilot" => bare(Command::Autopilot),
         "internet" => bare(Command::Internet),
+        "sync" => match one("auto")?.as_deref() {
+            None => Ok(Command::Sync(false)),
+            Some("auto") => Ok(Command::Sync(true)),
+            Some(_) => Err("/sync takes nothing, or auto".to_owned()),
+        },
         "effort" => match one("effort")? {
             None => Ok(Command::Effort(None)),
             Some(level) => level
@@ -271,6 +284,10 @@ pub fn complete(line: &str, agents: &[&str], models: &[&str]) -> Vec<Completion>
             .iter()
             .map(|e| (e.as_str().to_owned(), "an effort".to_owned()))
             .collect(),
+        "sync" => vec![(
+            "auto".to_owned(),
+            "send what changes without asking, and say it".to_owned(),
+        )],
         "theme" => Theme::ALL
             .iter()
             .map(|t| (t.name().to_owned(), "a theme".to_owned()))

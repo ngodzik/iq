@@ -32,7 +32,8 @@
 //! [sync]                                 # iq's data kept in a private repository of yours, any name
 //! remote = "https://github.com/someone/any-name.git"
 //! branch = "main"                        # another when main must go through pull requests
-//! keep = ["~/notes", "~/.zshrc"]         # files and folders of the home kept too, put back on a new machine
+//! keep = ["~/notes", "~/.zshrc"]         # files and folders of the home kept too, put back on a new machine; your rules and skills are
+//! auto = false                           # true: what changes is sent without asking, and said; else iq asks first
 //! ```
 
 use std::collections::BTreeMap;
@@ -144,6 +145,9 @@ struct SyncFile {
     /// The files and folders of the home kept too, each `~/…`.
     #[serde(default)]
     keep: Vec<String>,
+    /// Whether what changes is sent without asking the person.
+    #[serde(default)]
+    auto: bool,
 }
 
 /// iq's folder of data: the projects' memory, a copy of the settings and
@@ -287,9 +291,15 @@ impl Settings {
         })
     }
 
+    /// Whether what changes is sent without asking the person.
+    pub(crate) fn sync_auto(&self) -> bool {
+        self.sync.auto
+    }
+
     /// The machine's sync of iq's folder of data `data`, with the settings
     /// and rules of iq's `folder` mirrored in it and the files of `home`
-    /// they list kept; none without a repository.
+    /// they list kept, the person's rules and skills among them, as those
+    /// in iq's folder are mirrored; none without a repository.
     pub(crate) fn sync(&self, folder: &Path, data: &Path, home: &Path) -> Option<iq_sync::Sync> {
         let remote = self.sync.remote.as_deref()?.trim();
         if remote.is_empty() {
@@ -297,8 +307,33 @@ impl Settings {
         }
         let mut sync = iq_sync::Sync::new(data, remote, crate::sync::machine())
             .mirror(folder.join("settings.toml"), "config/settings.toml")
-            .mirror(folder.join("rules.toml"), "config/rules.toml")
-            .keeping(home, self.sync.keep.clone());
+            .mirror(folder.join("rules.toml"), "config/rules.toml");
+        let mut keep = self.sync.keep.clone();
+        let rules = self
+            .rules
+            .clone()
+            .unwrap_or_else(|| RULES.map(str::to_owned).to_vec());
+        let skills = self
+            .skills
+            .clone()
+            .unwrap_or_else(|| SKILLS.map(str::to_owned).to_vec());
+        for written in rules.iter().chain(&skills).map(|w| w.trim()) {
+            let Some(relative) = written.strip_prefix("~/") else {
+                // A project's own, which its repository keeps.
+                continue;
+            };
+            let place = home.join(relative);
+            match place.strip_prefix(folder) {
+                Ok(inside) => {
+                    sync = sync.mirror(&place, format!("config/{}", inside.display()));
+                }
+                Err(_) if !keep.iter().any(|k| k.trim() == written) => {
+                    keep.push(written.to_owned());
+                }
+                Err(_) => {}
+            }
+        }
+        let mut sync = sync.keeping(home, keep);
         if let Some(branch) = self.sync.branch.as_deref().filter(|b| !b.trim().is_empty()) {
             sync = sync.on_branch(branch.trim());
         }
@@ -441,11 +476,20 @@ mod tests {
         )
         .unwrap();
         let sync = set
-            .sync(dir.path(), &dir.path().join("data"), dir.path())
+            .sync(
+                &dir.path().join(".iq"),
+                &dir.path().join("data"),
+                dir.path(),
+            )
             .unwrap();
         assert_eq!(sync.remote(), "https://github.com/someone/any-name.git");
-        assert_eq!(sync.kept(), ["~/notes"]);
+        // The person's rules are kept with what they list.
+        assert_eq!(sync.kept(), ["~/notes", "~/.claude/CLAUDE.md"]);
         assert_eq!(sync.refused().len(), 1);
+        assert!(!set.sync_auto());
+        let auto: Settings =
+            toml::from_str("[sync]\nremote = \"https://example.com/n.git\"\nauto = true").unwrap();
+        assert!(auto.sync_auto());
         assert!(toml::from_str::<Settings>("[sync]\nremot = \"x\"").is_err());
     }
 }

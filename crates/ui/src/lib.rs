@@ -16,7 +16,7 @@ pub mod named;
 pub mod observations;
 pub mod screen;
 
-pub use board::{Board, PERIODS, Post, Synced, Update};
+pub use board::{Board, PERIODS, Post, SyncAsk, Synced, Update};
 pub use error::UiError;
 pub use iq_agent::Pattern;
 
