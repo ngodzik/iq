@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use iq_core::{ChatModel, ChatRequest, Effort, Message, ModelId, ToolCall, ToolSpec, Usd};
+use iq_core::{
+    ChatModel, ChatRequest, Effort, Message, ModelId, TokenCount, ToolCall, ToolSpec, Usd,
+};
 use iq_gate::{Action, Approver, Gate, Helper, Judged, Pending, Permit, Sandbox, Scope};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
@@ -50,6 +52,10 @@ static CREWS: AtomicU64 = AtomicU64::new(0);
 /// shared format, then Claude Code's, which often imports the other.
 const RULES_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 
+/// How many tokens an agent's conversation grows between two words to it
+/// of its size, unless the settings say.
+pub const CONTEXT_EVERY: u64 = 25_000;
+
 /// What the crew starts with.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -65,6 +71,9 @@ pub struct Settings {
     /// The person's own rules, read from their files, given to the agents
     /// the person starts, with the project's.
     pub rules: Vec<RulesFile>,
+    /// How many tokens an agent's conversation grows between two words to
+    /// it of its size, which it compacts as its skills say; 0 for none.
+    pub context_every: u64,
 }
 
 impl Default for Settings {
@@ -75,6 +84,7 @@ impl Default for Settings {
             patience: Duration::from_secs(50 * 60),
             steps: 200,
             rules: Vec::new(),
+            context_every: CONTEXT_EVERY,
         }
     }
 }
@@ -149,6 +159,13 @@ struct Member {
     /// How hard it thinks: as it was started or changed, else as the
     /// settings say.
     effort: Option<Effort>,
+    /// The tokens its last call read: its conversation, as it is now.
+    context: u64,
+    /// Its size when it was last told it.
+    told: u64,
+    /// The summary it wrote of its conversation, which replaces it once its
+    /// turn ends.
+    compacted: Option<String>,
 }
 
 /// An agent of the crew, as listed.
@@ -552,6 +569,9 @@ where
                 turn: None,
                 messages,
                 effort,
+                context: 0,
+                told: 0,
+                compacted: None,
             },
         );
         drop(board);
@@ -849,10 +869,30 @@ where
             return;
         };
         let (messages, outcome) = self.own_turn(&name, &model, messages, prompt).await;
+        let mut compacted_from = None;
         if let Some(member) = lock(&self.inner.board).members.get_mut(&name) {
-            member.messages = messages;
+            member.messages = match member.compacted.take() {
+                // Its request done, its conversation is its summary.
+                Some(summary) => {
+                    compacted_from = Some(member.context);
+                    member.context = 0;
+                    member.told = 0;
+                    compacted(&messages, &member.task, &summary, outcome.as_ref().ok())
+                }
+                None => messages,
+            };
             // It rests from now: what is posted to it wakes it.
             member.turn = None;
+        }
+        if let Some(before) = compacted_from {
+            self.report(Event::Notice {
+                agent: name.clone(),
+                text: format!(
+                    "compacted: its calls read {} tokens; from its next turn, its task and its \
+                     summary",
+                    TokenCount(before)
+                ),
+            });
         }
         self.report(Event::Done {
             agent: name.clone(),
@@ -878,6 +918,33 @@ where
         {
             self.wake(&name, news);
         }
+    }
+
+    /// What `agent` on `model` is told of its conversation's size, once it
+    /// grew by the settings' step since it was last told: how much each
+    /// call reads, and where its model's price rises, when the provider
+    /// says. Counted as told.
+    async fn context_note(&self, agent: &str, model: &ModelId) -> Option<String> {
+        let step = self.inner.settings.context_every;
+        if step == 0 {
+            return None;
+        }
+        let context = {
+            let mut board = lock(&self.inner.board);
+            let member = board.members.get_mut(agent)?;
+            if member.context < member.told + step {
+                return None;
+            }
+            member.told = member.context;
+            member.context
+        };
+        let rises = self
+            .inner
+            .provider
+            .pricing(model)
+            .await
+            .and_then(|pricing| pricing.rises_at());
+        Some(context_said(TokenCount(context), rises))
     }
 
     /// Whether the person wrote to `agent` since it last read the board.
@@ -907,6 +974,9 @@ where
             if let Some(news) = self.unread(name) {
                 messages.push(Message::user(news));
             }
+            if let Some(note) = self.context_note(name, model).await {
+                messages.push(Message::user(note));
+            }
             // Read at each call, so that a change reaches a turn under way.
             let effort = lock(&self.inner.board)
                 .members
@@ -933,6 +1003,9 @@ where
                     .map(|pricing| pricing.cost(&response.usage)),
             };
             self.spent(name, model.as_str(), response.usage, cost);
+            if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
+                member.context = response.usage.input.0;
+            }
             let said = response
                 .content
                 .as_ref()
@@ -1096,6 +1169,20 @@ where
             "start_team" => {
                 let seats = team::seats(&args.value()["members"])?;
                 Ok(self.start_team(agent, args.text("name")?, args.text("task")?, &seats))
+            }
+            "compact" => {
+                let summary = args.text("summary")?.trim();
+                if summary.is_empty() {
+                    return Err("write the summary in `summary`".into());
+                }
+                if let Some(member) = lock(&self.inner.board).members.get_mut(agent) {
+                    member.compacted = Some(summary.to_owned());
+                }
+                Ok(
+                    "Kept: once you answer, your conversation is your task and this summary. \
+                    Answer now."
+                        .into(),
+                )
             }
             "send_message" => {
                 self.post(agent, args.text("to")?, args.text("text")?.to_owned())?;
@@ -1463,6 +1550,41 @@ fn free_name(members: &BTreeMap<String, Member>, base: &str, taken: &[String]) -
     name
 }
 
+/// What an agent is told of its conversation's size: `context` tokens read
+/// on each call, and where its model's price rises, when known.
+fn context_said(context: TokenCount, rises: Option<TokenCount>) -> String {
+    let past = match rises {
+        Some(rises) if context >= rises => {
+            format!(": past the {rises} where your model's price per token rises")
+        }
+        Some(rises) => format!("; your model's price per token rises once a call reads {rises}"),
+        None => String::new(),
+    };
+    format!("(iq: your conversation is {context} tokens now, read again on each call{past}.)")
+}
+
+/// A conversation compacted: its standing instructions, its task and the
+/// summary its agent wrote of the rest, then its last answer.
+fn compacted(
+    messages: &[Message],
+    task: &str,
+    summary: &str,
+    answer: Option<&String>,
+) -> Vec<Message> {
+    let mut kept: Vec<Message> = messages.first().cloned().into_iter().collect();
+    kept.push(Message::user(format!(
+        "{task}\n\n(iq: what came after, as you summed it up when you compacted your \
+         conversation:)\n\n{summary}"
+    )));
+    if let Some(answer) = answer.filter(|answer| !answer.trim().is_empty()) {
+        kept.push(Message::Assistant {
+            content: Some(answer.clone()),
+            tool_calls: Vec::new(),
+        });
+    }
+    kept
+}
+
 /// The line of an agent's instructions that gives it its part, if any.
 fn role_line(role: Option<&str>) -> String {
     role.map(|role| {
@@ -1541,4 +1663,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_agent_is_told_where_its_models_price_rises() {
+        assert_eq!(
+            context_said(TokenCount(200_000), Some(TokenCount(272_000))),
+            "(iq: your conversation is 200.0k tokens now, read again on each call; your model's \
+             price per token rises once a call reads 272.0k.)"
+        );
+        assert!(
+            context_said(TokenCount(280_000), Some(TokenCount(272_000)))
+                .ends_with(": past the 272.0k where your model's price per token rises.)")
+        );
+    }
 }

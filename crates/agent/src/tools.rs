@@ -139,6 +139,22 @@ pub fn board() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "compact".into(),
+            description: "Replaces your conversation with a summary you write, so that each \
+                          call reads less: when your skills or your task say, or when you are \
+                          told it grew past where your model's price rises. Finish the request \
+                          you work on first, call it last, then answer: from your next turn, \
+                          your conversation is your task and this summary."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "All you need to go on: what the person asked and still wants, the decisions and why, what is done (the files changed), what remains, the agents and teams you started and where they are, what you promised."},
+                },
+                "required": ["summary"],
+            }),
+        },
+        ToolSpec {
             name: "send_message".into(),
             description: "Writes to another agent by its name, to `all`, or to `person`.".into(),
             parameters: json!({

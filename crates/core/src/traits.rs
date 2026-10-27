@@ -23,9 +23,9 @@ pub trait ChatModel: Send + Sync {
         std::future::ready(None)
     }
 
-    /// What `model` charges, when the provider says. Used to stop before a
-    /// call that would spend more than the budget; `None` checks only what
-    /// was already spent.
+    /// What `model` charges, when the provider says: what a call costs when
+    /// the provider did not say, and where its price rises, which its
+    /// agent is told.
     fn pricing(&self, model: &ModelId) -> impl Future<Output = Option<Pricing>> + Send {
         let _ = model;
         std::future::ready(None)

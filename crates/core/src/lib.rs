@@ -16,6 +16,6 @@ pub use change::{Change, DiffLine, Hunk};
 pub use error::CoreError;
 pub use traits::ChatModel;
 pub use types::{
-    CacheTtl, CacheUse, ChatRequest, ChatResponse, Effort, Message, ModelId, Pricing, TokenCount,
-    ToolCall, ToolSpec, Usage, Usd,
+    CacheTtl, CacheUse, ChatRequest, ChatResponse, Dearer, Effort, Message, ModelId, Pricing,
+    TokenCount, ToolCall, ToolSpec, Usage, Usd,
 };

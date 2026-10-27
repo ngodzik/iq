@@ -304,12 +304,7 @@ fn parse_known(body: &str) -> HashMap<String, Known> {
             list.data
                 .into_iter()
                 .map(|m| {
-                    let pricing = match (m.input_price, m.output_price) {
-                        (Some(input), Some(output)) => {
-                            Pricing::per_token(Usd(input), Usd(output)).ok()
-                        }
-                        _ => None,
-                    };
+                    let pricing = priced(&m).ok().flatten();
                     let known = Known {
                         window: m.context_window,
                         output: m.max_output_tokens,
@@ -542,6 +537,16 @@ struct WireModel {
     supports_vision: Option<bool>,
     #[serde(default)]
     model_canonical_name: Option<String>,
+    /// Requesty's tiers: prices from a size of conversation on.
+    #[serde(default)]
+    pricing: Vec<WireTier>,
+}
+
+#[derive(Deserialize)]
+struct WireTier {
+    prompt_tokens_threshold: u64,
+    input_price: f64,
+    output_price: f64,
 }
 
 pub(crate) fn malformed(url: &str, reason: impl Into<String>) -> LlmError {
@@ -599,10 +604,31 @@ fn parse_pricing(url: &str, body: &str, model: &ModelId) -> Result<Pricing, LlmE
         .into_iter()
         .find(|m| m.id == model.as_str())
         .ok_or_else(|| LlmError::UnknownModel(model.to_string()))?;
-    let (Some(input), Some(output)) = (entry.input_price, entry.output_price) else {
-        return Err(LlmError::UnknownModel(model.to_string()));
+    priced(&entry)
+        .map_err(|e| malformed(url, e.to_string()))?
+        .ok_or_else(|| LlmError::UnknownModel(model.to_string()))
+}
+
+/// A listed model's prices: none when it is listed without; dearer from
+/// the first size of conversation where Requesty's tiers raise them.
+fn priced(model: &WireModel) -> Result<Option<Pricing>, iq_core::CoreError> {
+    let (Some(input), Some(output)) = (model.input_price, model.output_price) else {
+        return Ok(None);
     };
-    Pricing::per_token(Usd(input), Usd(output)).map_err(|e| malformed(url, e.to_string()))
+    let pricing = Pricing::per_token(Usd(input), Usd(output))?;
+    let dearer = model
+        .pricing
+        .iter()
+        .filter(|tier| tier.prompt_tokens_threshold > 0)
+        .min_by_key(|tier| tier.prompt_tokens_threshold);
+    Ok(Some(match dearer {
+        Some(tier) => pricing.dearer_from(
+            TokenCount(tier.prompt_tokens_threshold),
+            Usd(tier.input_price),
+            Usd(tier.output_price),
+        )?,
+        None => pricing,
+    }))
 }
 
 #[cfg(test)]
@@ -862,6 +888,33 @@ mod tests {
             parse_pricing(URL, body, &unpriced),
             Err(LlmError::UnknownModel(_))
         ));
+    }
+
+    #[test]
+    fn a_price_that_rises_past_a_size_of_conversation_is_read_from_its_tiers() {
+        let body = r#"{"data": [
+            {"id": "a/tiered", "input_price": 2e-6, "output_price": 1e-5, "pricing": [
+                {"prompt_tokens_threshold": 0, "input_price": 2e-6, "caching_price": 0, "cached_price": 2e-7, "output_price": 1e-5},
+                {"prompt_tokens_threshold": 272000, "input_price": 4e-6, "caching_price": 0, "cached_price": 4e-7, "output_price": 1.5e-5}
+            ]},
+            {"id": "b/flat", "input_price": 2e-6, "output_price": 1e-5, "pricing": [
+                {"prompt_tokens_threshold": 0, "input_price": 2e-6, "output_price": 1e-5}
+            ]}
+        ]}"#;
+        let tiered = parse_pricing(URL, body, &ModelId::new("a/tiered").unwrap()).unwrap();
+        assert_eq!(tiered.rises_at(), Some(TokenCount(272_000)));
+        let past = Usage {
+            input: TokenCount(300_000),
+            output: TokenCount(1_000),
+        };
+        assert!((tiered.cost(&past).0 - 1.215).abs() < 1e-9);
+        let flat = parse_pricing(URL, body, &ModelId::new("b/flat").unwrap()).unwrap();
+        assert_eq!(flat.rises_at(), None);
+        let known = parse_known(body);
+        assert_eq!(
+            known["a/tiered"].pricing.and_then(|p| p.rises_at()),
+            Some(TokenCount(272_000))
+        );
     }
 
     #[test]

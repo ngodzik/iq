@@ -55,6 +55,17 @@ impl Scripted {
             .collect()
     }
 
+    /// Every request of `agent`'s, in order.
+    fn requests_of(&self, agent: &str) -> Vec<ChatRequest> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == agent)
+            .map(|(_, request)| request.clone())
+            .collect()
+    }
+
     /// The standing instructions of `agent`'s first call.
     fn instructions_of(&self, agent: &str) -> String {
         self.requests
@@ -146,6 +157,12 @@ fn calls(tool: &str, arguments: serde_json::Value) -> ChatResponse {
         }],
         ..say("")
     }
+}
+
+/// `response`, as a call that read `tokens`.
+fn reading(tokens: u64, mut response: ChatResponse) -> ChatResponse {
+    response.usage.input = TokenCount(tokens);
+    response
 }
 
 struct Fixture {
@@ -951,4 +968,56 @@ async fn the_lead_chooses_how_hard_its_agents_think_and_the_person_its_own() {
     f.settled().await;
     assert_eq!(f.model.efforts_of("lead").last(), Some(&Some(Effort::Max)));
     assert!(f.crew.set_effort("nobody", Effort::Low).is_err());
+}
+
+#[tokio::test]
+async fn an_agent_is_told_its_conversation_grows_and_compacts_it_once_its_request_is_done() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                reading(30_000, calls("list_agents", serde_json::json!({}))),
+                reading(
+                    31_000,
+                    calls(
+                        "compact",
+                        serde_json::json!({"summary": "Listed the agents; the tests remain."}),
+                    ),
+                ),
+                reading(32_000, say("Done.")),
+                say("On it."),
+            ],
+        )],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "list them".into(), PERSON);
+    f.settled().await;
+    let requests = f.model.requests_of("lead");
+    // Told once, as its conversation passed the step.
+    assert!(!format!("{:?}", requests[0].messages).contains("(iq: your conversation"));
+    assert!(
+        format!("{:?}", requests[1].messages)
+            .contains("(iq: your conversation is 30.0k tokens now, read again on each call.)")
+    );
+    assert_eq!(
+        format!("{:?}", requests[2].messages)
+            .matches("(iq: your conversation")
+            .count(),
+        1
+    );
+    assert!(f.events().iter().any(|event| matches!(
+        event,
+        Event::Notice { agent, text } if agent == "lead" && text.starts_with("compacted: its calls read 32.0k tokens")
+    )));
+    // Its request done, its conversation is its task, its summary and its
+    // answer.
+    f.crew.tell("lead", "now the tests".into()).unwrap();
+    f.settled().await;
+    let last = f.model.requests_of("lead").pop().unwrap();
+    assert_eq!(last.messages.len(), 4, "{:?}", last.messages);
+    let seen = format!("{:?}", last.messages);
+    assert!(seen.contains("list them") && seen.contains("Listed the agents; the tests remain."));
+    assert!(seen.contains("Done.") && seen.contains("now the tests"));
+    assert!(!seen.contains("call-list_agents"));
 }

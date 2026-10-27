@@ -143,11 +143,26 @@ impl fmt::Display for Usd {
     }
 }
 
-/// What a model charges, per token, for what it reads and what it writes.
+/// What a model charges, per token, for what it reads and what it writes;
+/// more, for some, once a call reads past a size of conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Pricing {
     input_per_token: Usd,
     output_per_token: Usd,
+    #[serde(default)]
+    dearer: Option<Dearer>,
+}
+
+/// Where a model's price per token rises: from a call that reads that many
+/// tokens, these prices.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Dearer {
+    /// The tokens a call reads from which it is dearer.
+    pub from: TokenCount,
+    /// Dollars per token read, from there.
+    pub input_per_token: Usd,
+    /// Dollars per token written, from there.
+    pub output_per_token: Usd,
 }
 
 impl Pricing {
@@ -166,25 +181,60 @@ impl Pricing {
         Ok(Self {
             input_per_token: input,
             output_per_token: output,
+            dearer: None,
         })
     }
 
-    /// What `usage` costs at these prices.
+    /// These prices, and `input` and `output` per token for a call that
+    /// reads `from` tokens or more.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidPrice`] when either amount is negative,
+    /// infinite or not a number.
+    pub fn dearer_from(self, from: TokenCount, input: Usd, output: Usd) -> Result<Self, CoreError> {
+        let dearer = Self::per_token(input, output)?;
+        Ok(Self {
+            dearer: Some(Dearer {
+                from,
+                input_per_token: dearer.input_per_token,
+                output_per_token: dearer.output_per_token,
+            }),
+            ..self
+        })
+    }
+
+    /// The tokens a call reads from which its price rises, when it does.
+    #[must_use]
+    pub fn rises_at(&self) -> Option<TokenCount> {
+        self.dearer.map(|dearer| dearer.from)
+    }
+
+    /// What `usage` costs at these prices, the dearer ones for a call
+    /// that read past where they start.
     ///
     /// # Examples
     ///
     /// ```
     /// use iq_core::{Pricing, TokenCount, Usage, Usd};
     ///
-    /// let pricing = Pricing::per_token(Usd(1e-6), Usd(4e-6))?;
+    /// let pricing = Pricing::per_token(Usd(1e-6), Usd(4e-6))?
+    ///     .dearer_from(TokenCount(10_000), Usd(2e-6), Usd(6e-6))?;
     /// let usage = Usage { input: TokenCount(1_000), output: TokenCount(500) };
     /// assert!((pricing.cost(&usage).0 - 0.003).abs() < 1e-12);
+    /// let long = Usage { input: TokenCount(10_000), output: TokenCount(500) };
+    /// assert!((pricing.cost(&long).0 - 0.023).abs() < 1e-12);
     /// # Ok::<(), iq_core::CoreError>(())
     /// ```
     pub fn cost(&self, usage: &Usage) -> Usd {
+        let (input, output) = match self.dearer {
+            Some(dearer) if usage.input >= dearer.from => {
+                (dearer.input_per_token, dearer.output_per_token)
+            }
+            _ => (self.input_per_token, self.output_per_token),
+        };
         // Token counts stay far below 2^53, so the conversion is exact.
-        Usd(usage.input.0 as f64 * self.input_per_token.0
-            + usage.output.0 as f64 * self.output_per_token.0)
+        Usd(usage.input.0 as f64 * input.0 + usage.output.0 as f64 * output.0)
     }
 }
 

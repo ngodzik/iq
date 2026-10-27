@@ -6,6 +6,7 @@
 //! model = "anthropic/claude-opus-5-5"    # the lead, which decides who does what
 //! reviewer = "anthropic/claude-haiku-5-5"  # answers for the person when the autopilot is on
 //! effort = "high"                        # how hard the models think; /effort changes an agent's
+//! context_every = 25000                  # tokens an agent's conversation grows between two words to it of its size; 0 never
 //! autopilot = false
 //! autopilot_internet = true              # the reviewer also answers what only reaches the internet
 //! internet = false                       # true: every command reaches the internet
@@ -70,6 +71,9 @@ pub(crate) struct Settings {
     model: Option<String>,
     reviewer: Option<String>,
     effort: Option<Effort>,
+    /// How many tokens an agent's conversation grows between two words to
+    /// it of its size.
+    context_every: Option<u64>,
     #[serde(default)]
     pub(crate) autopilot: bool,
     /// Whether the autopilot's reviewer also answers what only reaches the
@@ -306,6 +310,7 @@ impl Settings {
         Ok(iq_agent::Settings {
             reviewer: Some(ModelId::new(self.reviewer.as_deref().unwrap_or(REVIEWER))?),
             effort: self.effort,
+            context_every: self.context_every.unwrap_or(iq_agent::CONTEXT_EVERY),
             ..iq_agent::Settings::default()
         })
     }
@@ -340,6 +345,9 @@ mod tests {
         assert_eq!(set.base_url().as_deref(), Some("https://router.example/v1"));
         assert_eq!(set.lead().unwrap().as_str(), "lab/lead");
         assert_eq!(set.crew().unwrap().effort, Some(Effort::Low));
+        assert_eq!(set.crew().unwrap().context_every, iq_agent::CONTEXT_EVERY);
+        let quiet: Settings = toml::from_str("context_every = 0").unwrap();
+        assert_eq!(quiet.crew().unwrap().context_every, 0);
         assert!(set.autopilot && set.internet);
         assert!(toml::from_str::<Settings>("modle = \"x\"").is_err());
         let looks: Settings =
