@@ -18,7 +18,7 @@
 //! worktree = false                       # true: each chat you start works in a worktree of its own, on a branch iq/<chat>; your checkout is left as it is
 //! worktree_from = "HEAD"                 # what a worktree starts from: your checkout's commit, or a branch such as "origin/main"
 //! worktree_setup = ["uv sync"]           # commands run in a worktree as it is made, on your machine, to give it the project's environment
-//! worktree_keep = 30                     # days a worktree may go untouched before iq removes it as it starts, when nothing in it is uncommitted; 0 never
+//! chat_keep = 30                         # days a chat may go untouched before iq forgets it as it starts, its worktree with it when nothing there is uncommitted; 0 never
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
@@ -73,9 +73,9 @@ const CLAUDE_RULES: &str = "~/.claude/CLAUDE.md";
 /// The folders of the person's skills unless the settings list others.
 const SKILLS: [&str; 1] = ["~/.iq/skills"];
 
-/// How many days a worktree may go untouched before iq removes it, unless
-/// the settings say.
-const WORKTREE_KEEP_DAYS: u64 = 30;
+/// How many days a chat may go untouched before iq forgets it, unless the
+/// settings say.
+const CHAT_KEEP_DAYS: u64 = 30;
 
 /// What the settings once held and iq reads no more, since it works with
 /// the provider's models alone and lets the lead decide.
@@ -126,8 +126,8 @@ pub(crate) struct Settings {
     /// The commands run in a worktree as it is made.
     #[serde(default)]
     worktree_setup: Vec<String>,
-    /// Days a worktree may go untouched before it is removed; 0 never.
-    worktree_keep: Option<u64>,
+    /// Days a chat may go untouched before it is forgotten; 0 never.
+    chat_keep: Option<u64>,
     /// The theme.
     theme: Option<String>,
     /// The person's rules for every project, files of their home.
@@ -315,10 +315,10 @@ impl Settings {
             .collect()
     }
 
-    /// How long a worktree may go untouched before it is removed; `None`
-    /// never.
-    pub(crate) fn worktree_keep(&self) -> Option<std::time::Duration> {
-        let days = self.worktree_keep.unwrap_or(WORKTREE_KEEP_DAYS);
+    /// How long a chat may go untouched before it is forgotten, its
+    /// worktree with it; `None` never.
+    pub(crate) fn chat_keep(&self) -> Option<std::time::Duration> {
+        let days = self.chat_keep.unwrap_or(CHAT_KEEP_DAYS);
         (days > 0).then(|| std::time::Duration::from_secs(days * 24 * 3600))
     }
 
@@ -454,15 +454,15 @@ mod tests {
         assert!(set.autopilot && set.internet);
         assert!(!set.worktree);
         assert_eq!(set.worktree_from(), "HEAD");
-        assert_eq!(set.worktree_keep().unwrap().as_secs(), 30 * 24 * 3600);
+        assert_eq!(set.chat_keep().unwrap().as_secs(), 30 * 24 * 3600);
         let apart: Settings = toml::from_str(
-            "worktree = true\nworktree_from = \" origin/main \"\nworktree_setup = [\"uv sync\", \" \"]\nworktree_keep = 0",
+            "worktree = true\nworktree_from = \" origin/main \"\nworktree_setup = [\"uv sync\", \" \"]\nchat_keep = 0",
         )
         .unwrap();
         assert!(apart.worktree);
         assert_eq!(apart.worktree_from(), "origin/main");
         assert_eq!(apart.worktree_setup(), ["uv sync"]);
-        assert!(apart.worktree_keep().is_none());
+        assert!(apart.chat_keep().is_none());
         assert!(set.autopilot_skill.is_none());
         let local: Settings = toml::from_str("autopilot_skill = \"local-review\"").unwrap();
         assert_eq!(local.autopilot_skill.as_deref(), Some("local-review"));

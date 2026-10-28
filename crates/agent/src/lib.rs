@@ -8,6 +8,8 @@
 //! to each other, and to the person, on a board. When the person wants it,
 //! each agent they start is given a place of its own by a [`Placer`], a
 //! worktree of the project, and the agents it starts work there with it.
+//! Each chat is given to a [`Keeper`] at every turn's end, and resumed
+//! from what it kept when iq starts again.
 //!
 //! The crew is generic over [`iq_core::ChatModel`], so that it is tested
 //! against scripted models, with no network.
@@ -18,6 +20,7 @@
 mod crew;
 mod event;
 mod extension;
+mod keep;
 mod make;
 mod once;
 mod place;
@@ -32,6 +35,7 @@ pub use crew::{
 };
 pub use event::{Event, PERSON};
 pub use extension::{Called, Extension};
+pub use keep::{Keeper, Saved};
 pub use once::{Asked, ask_once};
 pub use place::{Placed, Placer};
 pub use rules::{RulesFile, with_imports};

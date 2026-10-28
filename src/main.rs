@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+mod chats;
 mod journal;
 mod ledger;
 mod lock;
@@ -202,6 +203,11 @@ fn crew(cli: &Cli, settings: &Settings, report: Report) -> Result<Crew<OpenAiCom
         let placer = worktrees(settings, &home, &workspace)?;
         crew.set_placer(Some(Arc::new(placer)));
     }
+    // Each chat kept at every turn's end, to come back when iq starts.
+    crew.set_keeper(Some(Arc::new(chats::Chats::open(
+        &home_folder()?,
+        &project(),
+    ))));
     // What the agents the person starts remember of this project, kept
     // with iq's data, and the notes kept of it under ~/.claude.
     let claude = settings
@@ -233,23 +239,68 @@ fn worktrees(settings: &Settings, home: &Path, workspace: &Path) -> Result<workt
     .map_err(|why| anyhow::anyhow!("no worktree for the chats: {why}"))
 }
 
-/// What iq says at start of the worktrees it removed, untouched for as
-/// long as the settings say, and of those it left; nothing when the chats
-/// do not work in worktrees, or outside a repository.
-fn pruned_worktrees(settings: &Settings) -> Vec<String> {
-    let Some(keep) = settings.worktree_keep() else {
+/// Puts the project's chats kept from earlier sessions back on the board,
+/// resting, each in its worktree when it still has one; the chats and the
+/// worktrees untouched for as long as the settings say forgotten first.
+/// What was forgotten is said; what came back is said to each chat.
+fn resume_chats(
+    settings: &Settings,
+    crew: &Crew<OpenAiCompatible>,
+    tell: &std::sync::mpsc::Sender<Update>,
+) -> Vec<String> {
+    let (Ok(folder), Ok(home), Ok(workspace)) =
+        (home_folder(), home_dir(), std::env::current_dir())
+    else {
         return Vec::new();
     };
-    let (Ok(home), Ok(workspace)) = (home_dir(), std::env::current_dir()) else {
-        return Vec::new();
-    };
-    if !settings.worktree {
-        return Vec::new();
+    let chats = chats::Chats::open(&folder, &project());
+    let mut said = Vec::new();
+    if let Some(keep) = settings.chat_keep() {
+        said.extend(chats.prune(keep));
     }
-    match worktrees(settings, &home, &workspace) {
-        Ok(worktrees) => worktrees.prune(keep),
-        Err(_) => Vec::new(),
+    let worktrees = settings
+        .worktree
+        .then(|| worktrees(settings, &home, &workspace).ok())
+        .flatten();
+    let now = iq_ui::now();
+    for found in chats.list() {
+        let name = found.chat.name.clone();
+        let place = match (&found.chat.folder, &worktrees) {
+            (Some(folder), Some(worktrees)) if folder.is_dir() => Some(iq_agent::Placed {
+                folder: folder.clone(),
+                writable: vec![worktrees.common().to_path_buf()],
+                said: String::new(),
+            }),
+            (Some(folder), _) => {
+                said.push(format!(
+                    "the chat {name} worked in {}, which is gone: it goes on in this folder",
+                    folder.display()
+                ));
+                None
+            }
+            (None, _) => None,
+        };
+        let task: String = found.chat.task.chars().take(80).collect();
+        match crew.resume(found.chat, place) {
+            Ok(name) => {
+                let days = now.saturating_sub(found.at) / (24 * 3600);
+                let ago = match days {
+                    0 => "today".to_owned(),
+                    1 => "yesterday".to_owned(),
+                    days => format!("{days} days ago"),
+                };
+                let _ = tell.send(Update::Crew(Event::Notice {
+                    agent: name,
+                    text: format!("resumed from {ago}: its task was \"{task}\""),
+                }));
+            }
+            Err(why) => said.push(format!("the chat {name} could not be resumed: {why}")),
+        }
     }
+    if let (Some(keep), Some(worktrees)) = (settings.chat_keep(), &worktrees) {
+        said.extend(worktrees.prune(keep, &chats.places()));
+    }
+    said
 }
 
 /// The person's rules, from the files the settings list, as written and
@@ -452,11 +503,7 @@ async fn work(
 ) -> Result<()> {
     let folder = home_folder()?;
     let (settings, lead) = chosen(cli, &folder)?;
-    for note in retired(&settings)
-        .into_iter()
-        .chain(left_over(&settings))
-        .chain(pruned_worktrees(&settings))
-    {
+    for note in retired(&settings).into_iter().chain(left_over(&settings)) {
         eprintln!("iq: {note}");
     }
     let ledger = Arc::new(Ledger::open(&folder));
@@ -573,7 +620,6 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     // the terminal is taken is cleared with it.
     let mut notes = retired(&settings);
     notes.extend(left_over(&settings));
-    notes.extend(pruned_worktrees(&settings));
     if cli.api_key.is_none() {
         notes.push("REQUESTY_API_KEY is not set: no model will answer.".to_owned());
     }
@@ -707,6 +753,10 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         let _inside = runtime.enter();
         crew(cli, &settings, report)?
     };
+    // The chats of earlier sessions come back before the person writes.
+    for note in resume_chats(&settings, &crew, &send) {
+        let _ = send.send(Update::Said(note));
+    }
     {
         let provider = provider(cli);
         let send = send.clone();

@@ -84,15 +84,25 @@ impl Worktrees {
         })
     }
 
-    /// Removes the worktrees iq made that nobody touched for `keep`: those
-    /// with nothing uncommitted, and their branch with them when its work
-    /// is merged into what the person has checked out. Says what it did,
-    /// and what it left and why.
-    pub(crate) fn prune(&self, keep: Duration) -> Vec<String> {
+    /// The repository's own folder, which commands in a worktree may
+    /// write.
+    pub(crate) fn common(&self) -> &Path {
+        &self.common
+    }
+
+    /// Removes the worktrees iq made that nobody touched for `keep`, but
+    /// those of `kept`, the chats still on the board: those with nothing
+    /// uncommitted, and their branch with them when its work is merged into
+    /// what the person has checked out. Says what it did, and what it left
+    /// and why.
+    pub(crate) fn prune(&self, keep: Duration, kept: &[PathBuf]) -> Vec<String> {
         let _ = git(&self.top, &["worktree", "prune"]);
         let now = SystemTime::now();
         let mut said = Vec::new();
         for found in self.found() {
+            if kept.contains(&found.folder) {
+                continue;
+            }
             let Some(touched) = self.touched(&found) else {
                 continue;
             };
@@ -461,9 +471,19 @@ mod tests {
         std::fs::write(dirty.folder.join("draft"), "draft\n").unwrap();
         std::fs::write(apart.folder.join("file"), "apart\n").unwrap();
         run_git(&apart.folder, &["commit", "-qam", "Work apart"]);
-        // Nothing is old enough yet.
-        assert!(placer.prune(Duration::from_secs(3600)).is_empty());
-        let said = placer.prune(Duration::ZERO);
+        // Nothing is old enough yet; a chat still on the board is kept.
+        assert!(placer.prune(Duration::from_secs(3600), &[]).is_empty());
+        assert!(
+            placer
+                .prune(
+                    Duration::ZERO,
+                    &[merged.folder.clone(), apart.folder.clone()]
+                )
+                .iter()
+                .all(|s| s.contains("dirty")),
+        );
+        assert!(merged.folder.exists() && apart.folder.exists());
+        let said = placer.prune(Duration::ZERO, &[]);
         assert_eq!(said.len(), 3, "{said:?}");
         assert!(
             said.iter()

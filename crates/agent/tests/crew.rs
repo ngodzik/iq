@@ -1472,3 +1472,79 @@ async fn the_persons_agents_work_in_places_of_their_own_with_those_they_start() 
         outcome: Ok("Both written.".into()),
     }));
 }
+
+/// Keeps every chat given, as a file would.
+#[derive(Default)]
+struct Kept(Mutex<HashMap<String, iq_agent::Saved>>);
+
+impl iq_agent::Keeper for Kept {
+    fn keep(&self, chat: &iq_agent::Saved) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(chat.name.clone(), chat.clone());
+    }
+}
+
+#[tokio::test]
+async fn a_chat_is_kept_at_each_turn_and_resumed_where_it_stopped() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![say("I renamed the module."), say("And tested it.")],
+        )],
+        Settings::default(),
+    );
+    let kept = Arc::new(Kept::default());
+    let keeper: Arc<dyn iq_agent::Keeper> = Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>;
+    f.crew.set_keeper(Some(keeper));
+    f.crew.start(
+        "lead",
+        &model("cheap/model"),
+        "rename the module".into(),
+        PERSON,
+    );
+    f.settled().await;
+    let saved = kept.0.lock().unwrap().get("lead").cloned().unwrap();
+    assert_eq!(saved.task, "rename the module");
+    assert_eq!(saved.model, "cheap/model");
+    assert_eq!(saved.by, PERSON);
+    assert!(saved.folder.is_none());
+    // Its instructions, its task, and what it said.
+    assert!(matches!(saved.messages.first(), Some(Message::System(_))));
+    assert!(saved.messages.contains(&Message::user("rename the module")));
+    assert!(saved.messages.iter().any(|m| matches!(
+        m,
+        Message::Assistant { content: Some(text), .. } if text == "I renamed the module."
+    )));
+
+    // Another session: the chat comes back, resting, and goes on when
+    // written to, its conversation as it was.
+    let again = fixture(
+        &[("lead", vec![say("Tested it too.")])],
+        Settings::default(),
+    );
+    let name = again.crew.resume(saved, None).unwrap();
+    assert_eq!(name, "lead");
+    let listed = again.crew.list();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].working);
+    assert!(
+        again
+            .events()
+            .iter()
+            .all(|e| !matches!(e, Event::Working { .. }))
+    );
+    again.crew.tell("lead", "and the tests?".into()).unwrap();
+    again.settled().await;
+    let seen = again.model.seen_by("lead");
+    assert!(seen.contains("I renamed the module."), "{seen}");
+    assert!(seen.contains("and the tests?"), "{seen}");
+    // Its instructions are written again for this session.
+    assert!(
+        again
+            .model
+            .instructions_of("lead")
+            .contains(&format!("working in {}", again.root.display()))
+    );
+}

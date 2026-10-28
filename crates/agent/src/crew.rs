@@ -22,7 +22,8 @@ use tokio::task::JoinHandle;
 
 use crate::event::{Event, PERSON};
 use crate::extension::Extension;
-use crate::place::Placer;
+use crate::keep::{Keeper, Saved};
+use crate::place::{Placed, Placer};
 use crate::review;
 use crate::rules::{self, RulesFile};
 use crate::team::{self, Pattern, Phase, Seat, Team};
@@ -151,6 +152,8 @@ struct Inner<M> {
     /// What gives the agents the person starts a place of their own, when
     /// they want one.
     placer: Mutex<Option<Arc<dyn Placer>>>,
+    /// What keeps the chats between sessions, when the person wants it.
+    keeper: Mutex<Option<Arc<dyn Keeper>>>,
     settings: Settings,
     report: Report,
     autopilot: AtomicBool,
@@ -275,6 +278,7 @@ where
                 place: Arc::new(Place { gate, sandbox }),
                 helper,
                 placer: Mutex::new(None),
+                keeper: Mutex::new(None),
                 settings,
                 report,
                 autopilot: AtomicBool::new(false),
@@ -352,6 +356,119 @@ where
     /// The agents one starts work where it does.
     pub fn set_placer(&self, placer: Option<Arc<dyn Placer>>) {
         *lock(&self.inner.placer) = placer;
+    }
+
+    /// Gives each chat to `keeper` as it joins and at every turn's end,
+    /// to be resumed with [`Self::resume`] when iq starts again; or to
+    /// nobody.
+    pub fn set_keeper(&self, keeper: Option<Arc<dyn Keeper>>) {
+        *lock(&self.inner.keeper) = keeper;
+    }
+
+    /// Gives `agent` to the keeper, as it stands now.
+    fn keep(&self, agent: &str) {
+        let Some(keeper) = lock(&self.inner.keeper).clone() else {
+            return;
+        };
+        let saved = {
+            let board = lock(&self.inner.board);
+            let Some(member) = board.members.get(agent) else {
+                return;
+            };
+            Saved {
+                name: agent.to_owned(),
+                model: member.model.to_string(),
+                by: member.by.clone(),
+                role: member.role.clone(),
+                task: member.task.clone(),
+                effort: member.effort,
+                folder: (!Arc::ptr_eq(&member.place, &self.inner.place))
+                    .then(|| member.place.gate.workspace().to_path_buf()),
+                context: member.context,
+                messages: member.messages.clone(),
+            }
+        };
+        keeper.keep(&saved);
+    }
+
+    /// Puts a chat kept from an earlier session back on the board, resting
+    /// until it is written to: its conversation as kept, its standing
+    /// instructions written again, in `place` when it had one of its own
+    /// that is still there, else in the crew's workspace. Returns its name:
+    /// the one kept, unless an agent holds it.
+    ///
+    /// # Errors
+    ///
+    /// Its model is no model's name, or its place cannot be resolved.
+    pub fn resume(&self, saved: Saved, place: Option<Placed>) -> Result<String, String> {
+        let model = ModelId::new(saved.model.as_str()).map_err(|e| e.to_string())?;
+        let place = match place {
+            Some(placed) => {
+                let gate = self
+                    .inner
+                    .place
+                    .gate
+                    .within(&placed.folder, placed.writable)
+                    .map_err(|e| chain(&e))?;
+                let sandbox = gate
+                    .sandbox(self.inner.helper.clone())
+                    .with_timeout(self.inner.settings.command_timeout)
+                    .with_quiet(self.inner.settings.command_quiet);
+                Arc::new(Place { gate, sandbox })
+            }
+            None => Arc::clone(&self.inner.place),
+        };
+        let mut board = lock(&self.inner.board);
+        let name = free_name(&board.members, &base_name(&saved.name), &[]);
+        let instructions =
+            Message::system(self.instructions(&name, &saved.by, saved.role.as_deref(), &place));
+        let mut messages = saved.messages;
+        match messages.first_mut() {
+            Some(first @ Message::System(_)) => *first = instructions,
+            _ => messages.insert(0, instructions),
+        }
+        if messages.len() == 1 {
+            messages.push(Message::user(saved.task.clone()));
+        }
+        let read = board.messages.len();
+        let own = !Arc::ptr_eq(&place, &self.inner.place);
+        let workspace = place.gate.workspace().to_path_buf();
+        board.members.insert(
+            name.clone(),
+            Member {
+                model: model.clone(),
+                by: saved.by.clone(),
+                role: saved.role,
+                task: saved.task,
+                read,
+                turn: None,
+                messages,
+                effort: saved.effort,
+                context: saved.context,
+                told: saved.context,
+                compacted: None,
+                rules_given: Vec::new(),
+                place,
+            },
+        );
+        drop(board);
+        self.report(Event::Joined {
+            agent: name.clone(),
+            model: model.to_string(),
+            by: saved.by,
+        });
+        if own {
+            self.report(Event::Placed {
+                agent: name.clone(),
+                folder: workspace,
+                said: None,
+            });
+        }
+        self.report(Event::Effort {
+            agent: name.clone(),
+            effort: saved.effort.or(self.inner.settings.effort),
+        });
+        Ok(name)
     }
 
     /// Where `agent` works: its place, or the crew's own for one unknown.
@@ -742,6 +859,7 @@ where
             agent: name.clone(),
             effort: effort.or(self.inner.settings.effort),
         });
+        self.keep(&name);
         (name, true)
     }
 
@@ -1065,6 +1183,7 @@ where
                 ),
             });
         }
+        self.keep(&name);
         self.report(Event::Done {
             agent: name.clone(),
             outcome: outcome.clone(),
