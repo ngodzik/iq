@@ -75,10 +75,15 @@ impl Worktrees {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "repository".to_owned());
         let from = from.trim();
+        // Resolved, as git lists worktrees by their resolved paths: on
+        // macOS a temporary folder is reached through a link.
+        let folder = folder.join(name);
+        let _ = std::fs::create_dir_all(&folder);
+        let folder = folder.canonicalize().unwrap_or(folder);
         Ok(Self {
             top,
             common,
-            folder: folder.join(name),
+            folder,
             from: if from.is_empty() { "HEAD" } else { from }.to_owned(),
             setup,
         })
@@ -288,8 +293,6 @@ impl Placer for Worktrees {
                     .is_err()
             })
             .ok_or_else(|| format!("{MOST_NAMES} worktrees are named after {name} already"))?;
-        std::fs::create_dir_all(&self.folder)
-            .map_err(|e| format!("making {}: {e}", self.folder.display()))?;
         let folder_arg = folder.to_string_lossy().into_owned();
         git(
             &self.top,
@@ -379,8 +382,9 @@ mod tests {
         let second = placer.place("lead").unwrap();
         let top = dir.path().canonicalize().unwrap();
         let name = top.file_name().unwrap().to_str().unwrap().to_owned();
-        assert_eq!(first.folder, worktrees.path().join(&name).join("lead"));
-        assert_eq!(second.folder, worktrees.path().join(&name).join("lead-2"));
+        let under = worktrees.path().canonicalize().unwrap().join(&name);
+        assert_eq!(first.folder, under.join("lead"));
+        assert_eq!(second.folder, under.join("lead-2"));
         assert_eq!(first.writable, [top.join(".git")]);
         assert!(
             first.said.contains("on the branch iq/lead from"),
