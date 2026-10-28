@@ -9,11 +9,13 @@
 
 mod change;
 mod error;
+mod glob;
 mod traits;
 mod types;
 
 pub use change::{Change, DiffLine, Hunk};
 pub use error::CoreError;
+pub use glob::glob_matches;
 pub use traits::ChatModel;
 pub use types::{
     CacheTtl, CacheUse, ChatRequest, ChatResponse, Dearer, Effort, Message, ModelId, Pricing,

@@ -52,6 +52,14 @@ static CREWS: AtomicU64 = AtomicU64::new(0);
 /// shared format, then Claude Code's, which often imports the other.
 const RULES_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 
+/// The folder of the project's rules, each a Markdown file, for the whole
+/// project or, as its head names `paths`, for those files.
+const RULES_FOLDER: &str = ".claude/rules";
+
+/// How long the project's rules for some files are read once for, before
+/// they are read again for what changed.
+const SCOPED_FRESH: Duration = Duration::from_secs(30);
+
 /// How many tokens an agent's conversation grows between two words to it
 /// of its size, unless the settings say.
 pub const CONTEXT_EVERY: u64 = 25_000;
@@ -125,6 +133,8 @@ struct Inner<M> {
     teams: Mutex<Vec<Team>>,
     /// The tools other parts of iq offer some agents.
     extensions: Mutex<Vec<Arc<dyn Extension<M>>>>,
+    /// The project's rules for some of its files, as last read, and when.
+    scoped: Mutex<Option<(Instant, Vec<rules::Scoped>)>>,
 }
 
 #[derive(Default)]
@@ -166,6 +176,8 @@ struct Member {
     /// The summary it wrote of its conversation, which replaces it once its
     /// turn ends.
     compacted: Option<String>,
+    /// The project's rules for some files it was given, by their files.
+    rules_given: Vec<String>,
 }
 
 /// An agent of the crew, as listed.
@@ -215,6 +227,7 @@ where
                 peer_wakes: Mutex::new(Vec::new()),
                 teams: Mutex::new(Vec::new()),
                 extensions: Mutex::new(Vec::new()),
+                scoped: Mutex::new(None),
             }),
         }
     }
@@ -572,6 +585,7 @@ where
                 context: 0,
                 told: 0,
                 compacted: None,
+                rules_given: Vec::new(),
             },
         );
         drop(board);
@@ -877,6 +891,9 @@ where
                     compacted_from = Some(member.context);
                     member.context = 0;
                     member.told = 0;
+                    // Its summary may not hold them: given again as it
+                    // touches their files.
+                    member.rules_given.clear();
                     compacted(&messages, &member.task, &summary, outcome.as_ref().ok())
                 }
                 None => messages,
@@ -1088,27 +1105,30 @@ where
         let workspace = self.inner.gate.workspace().to_path_buf();
         match name {
             "read_file" => {
-                let path = args.text("path")?.into();
-                let permit = self.act(agent, Action::Read { path }).await?;
+                let path: std::path::PathBuf = args.text("path")?.into();
+                let permit = self.act(agent, Action::Read { path: path.clone() }).await?;
                 let bytes = permit.read().map_err(|e| chain(&e))?;
                 let text = String::from_utf8(bytes)
                     .map_err(|_| "the file is not text: run a command to look into it")?;
-                Ok(tools::numbered(
-                    &text,
-                    args.number("offset"),
-                    args.number("limit"),
-                ))
+                Ok(
+                    tools::numbered(&text, args.number("offset"), args.number("limit"))
+                        + &self.scoped_for(agent, &path),
+                )
             }
             "write_file" => {
-                let path = args.text("path")?.into();
+                let path: std::path::PathBuf = args.text("path")?.into();
                 let content = args.text("content")?;
-                let permit = self.act(agent, Action::Write { path }).await?;
+                let permit = self
+                    .act(agent, Action::Write { path: path.clone() })
+                    .await?;
                 permit.write(content.as_bytes()).map_err(|e| chain(&e))?;
-                Ok(format!("Wrote {} bytes.", content.len()))
+                Ok(format!("Wrote {} bytes.", content.len()) + &self.scoped_for(agent, &path))
             }
             "edit_file" => {
-                let path = args.text("path")?.into();
-                let permit = self.act(agent, Action::Write { path }).await?;
+                let path: std::path::PathBuf = args.text("path")?.into();
+                let permit = self
+                    .act(agent, Action::Write { path: path.clone() })
+                    .await?;
                 let bytes = permit.read().map_err(|e| chain(&e))?;
                 let text = String::from_utf8(bytes).map_err(|_| "the file is not text")?;
                 let edited = tools::replaced(
@@ -1118,7 +1138,9 @@ where
                     args.flag("all"),
                 )?;
                 permit.write(edited.as_bytes()).map_err(|e| chain(&e))?;
-                Ok("Edited.".into())
+                // Given once the edit is made: an edit refused would give
+                // them to nobody.
+                Ok(format!("Edited.{}", self.scoped_for(agent, &path)))
             }
             "run" => {
                 let line = args.text("command")?.to_owned();
@@ -1466,6 +1488,17 @@ where
                 "\n\nThe project's rules for agents, from its {file}, which you follow:\n\n{text}"
             ));
         }
+        let scoped = self.scoped_rules();
+        if !scoped.is_empty() {
+            out.push_str(
+                "\n\nThe project's rules for some of its files, which an agent is given as it \
+                 first reads or writes one of them: read those that bear on work you give, and \
+                 put what it needs of them in its task.",
+            );
+            for rule in &scoped {
+                out.push_str(&format!("\n- {}: {}", rule.file, rule.paths.join(", ")));
+            }
+        }
         out.push_str(
             "\n\nAn agent or a team you start sees only the task you give it: nothing of your \
              conversation, nor of these rules, nor of what else you are told beside your task. \
@@ -1476,44 +1509,154 @@ where
         out
     }
 
+    /// Reads `path` in the workspace through the gate, as an agent's reads
+    /// are, never asking the person: what the gate does not allow at once
+    /// is not read.
+    fn read_quietly(&self, path: std::path::PathBuf) -> Option<String> {
+        match self.inner.gate.judge(Action::Read { path }).ok()? {
+            Judged::Allowed(permit) => String::from_utf8(permit.read().ok()?).ok(),
+            Judged::Asked { .. } | Judged::Denied { .. } => None,
+        }
+    }
+
     /// The project's rules for agents, each with the file it came from: its
     /// `AGENTS.md`, then its `CLAUDE.md`, whose `@file` lines are the
-    /// files they import, a file given already left out. Read through the
-    /// gate, as an agent's reads are, and never asked of the person: what
-    /// the gate does not allow at once is left out.
-    fn project_rules(&self) -> Vec<(&'static str, String)> {
+    /// files they import, a file given already left out; then those of its
+    /// `.claude/rules` for the whole project.
+    fn project_rules(&self) -> Vec<(String, String)> {
         let workspace = self.inner.gate.workspace().to_path_buf();
-        let read = |path: std::path::PathBuf| -> Option<String> {
-            match self.inner.gate.judge(Action::Read { path }).ok()? {
-                Judged::Allowed(permit) => String::from_utf8(permit.read().ok()?).ok(),
-                Judged::Asked { .. } | Judged::Denied { .. } => None,
-            }
-        };
-        let mut given: Vec<(&'static str, String)> = Vec::new();
+        let mut given: Vec<(String, String)> = Vec::new();
         for file in RULES_FILES {
             let path = workspace.join(file);
             if !path.is_file() {
                 continue;
             }
-            let Some(text) = read(path) else {
+            let Some(text) = self.read_quietly(path) else {
                 continue;
             };
             let text: String = text
                 .lines()
                 .map(|line| match rules::import(line) {
                     // As `AGENTS.md` is, imported by `CLAUDE.md`.
-                    Some(name) if given.iter().any(|(file, _)| *file == name) => "\n".to_owned(),
+                    Some(name) if given.iter().any(|(file, _)| file == name) => "\n".to_owned(),
                     Some(name) => {
-                        read(workspace.join(name)).unwrap_or_else(|| line.to_owned()) + "\n"
+                        self.read_quietly(workspace.join(name))
+                            .unwrap_or_else(|| line.to_owned())
+                            + "\n"
                     }
                     None => line.to_owned() + "\n",
                 })
                 .collect();
             if let Some(text) = rules::kept(&text) {
-                given.push((file, text));
+                given.push((file.to_owned(), text));
+            }
+        }
+        for (file, text) in self.rules_folder() {
+            let (paths, body) = rules::scope(&text);
+            if paths.is_empty()
+                && let Some(body) = rules::kept(body)
+            {
+                given.push((file, body));
             }
         }
         given
+    }
+
+    /// The files of the project's `.claude/rules`, each with what it says,
+    /// in the order of their names.
+    fn rules_folder(&self) -> Vec<(String, String)> {
+        let workspace = self.inner.gate.workspace().to_path_buf();
+        let mut found = Vec::new();
+        let mut folders = vec![workspace.join(RULES_FOLDER)];
+        while let Some(folder) = folders.pop() {
+            let Ok(entries) = std::fs::read_dir(&folder) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    folders.push(path);
+                } else if path.extension().is_some_and(|ending| ending == "md") {
+                    found.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
+            .into_iter()
+            .filter_map(|path| {
+                let file = path
+                    .strip_prefix(&workspace)
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned();
+                Some((file, self.read_quietly(path)?))
+            })
+            .collect()
+    }
+
+    /// The project's rules for some of its files, read again once they are
+    /// older than [`SCOPED_FRESH`].
+    fn scoped_rules(&self) -> Vec<rules::Scoped> {
+        if let Some((read, rules)) = lock(&self.inner.scoped).as_ref()
+            && read.elapsed() < SCOPED_FRESH
+        {
+            return rules.clone();
+        }
+        let rules: Vec<rules::Scoped> = self
+            .rules_folder()
+            .into_iter()
+            .filter_map(|(file, text)| {
+                let (paths, body) = rules::scope(&text);
+                let text = rules::kept(body)?;
+                (!paths.is_empty()).then_some(rules::Scoped { file, paths, text })
+            })
+            .collect();
+        *lock(&self.inner.scoped) = Some((Instant::now(), rules.clone()));
+        rules
+    }
+
+    /// The project's rules for `path` that `agent` was not given yet, as
+    /// it reads or writes it, to follow on the tool's answer; marked given.
+    fn scoped_for(&self, agent: &str, path: &std::path::Path) -> String {
+        let workspace = self.inner.gate.workspace();
+        let relative = if path.is_absolute() {
+            match path.strip_prefix(workspace) {
+                Ok(relative) => relative,
+                Err(_) => return String::new(),
+            }
+        } else {
+            path
+        };
+        let relative = relative.to_string_lossy();
+        let matching: Vec<rules::Scoped> = self
+            .scoped_rules()
+            .into_iter()
+            .filter(|rule| {
+                rule.paths
+                    .iter()
+                    .any(|pattern| iq_core::glob_matches(pattern, &relative))
+            })
+            .collect();
+        if matching.is_empty() {
+            return String::new();
+        }
+        let mut board = lock(&self.inner.board);
+        let Some(member) = board.members.get_mut(agent) else {
+            return String::new();
+        };
+        let mut out = String::new();
+        for rule in matching {
+            if member.rules_given.contains(&rule.file) {
+                continue;
+            }
+            out.push_str(&format!(
+                "\n\n[iq: the project's rules for {relative}, from its {}, which you follow:]\n{}",
+                rule.file, rule.text
+            ));
+            member.rules_given.push(rule.file);
+        }
+        out
     }
 }
 

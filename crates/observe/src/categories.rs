@@ -141,27 +141,9 @@ fn starts(command: &str, start: &str) -> bool {
         })
 }
 
-/// Whether `path`, or its name, matches `pattern`: `*` any letters but
-/// `/`, `**` any, `?` one.
+/// Whether `path`, or its name, matches `pattern`, as a shell reads it.
 fn matches(pattern: &str, path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    glob(pattern.as_bytes(), path.as_bytes())
-        || (!pattern.contains('/') && glob(pattern.as_bytes(), name.as_bytes()))
-}
-
-fn glob(pattern: &[u8], text: &[u8]) -> bool {
-    match pattern {
-        [] => text.is_empty(),
-        [b'*', b'*', rest @ ..] => {
-            let rest = rest.strip_prefix(b"/").unwrap_or(rest);
-            (0..=text.len()).any(|at| glob(rest, &text[at..]))
-        }
-        [b'*', rest @ ..] => (0..=text.len())
-            .take_while(|at| *at == 0 || text[at - 1] != b'/')
-            .any(|at| glob(rest, &text[at..])),
-        [b'?', rest @ ..] => !text.is_empty() && text[0] != b'/' && glob(rest, &text[1..]),
-        [c, rest @ ..] => text.first() == Some(c) && glob(rest, &text[1..]),
-    }
+    iq_core::glob_matches(pattern, path)
 }
 
 #[cfg(test)]

@@ -1021,3 +1021,74 @@ async fn an_agent_is_told_its_conversation_grows_and_compacts_it_once_its_reques
     assert!(seen.contains("Done.") && seen.contains("now the tests"));
     assert!(!seen.contains("call-list_agents"));
 }
+
+#[tokio::test]
+async fn an_agent_is_given_the_rules_for_the_files_it_touches_once() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"name": "helper", "model": "cheap/model", "task": "fix the api"}),
+                    ),
+                    say("Started."),
+                ],
+            ),
+            (
+                "helper",
+                vec![
+                    calls(
+                        "read_file",
+                        serde_json::json!({"path": "src/api/routes.ts"}),
+                    ),
+                    calls(
+                        "read_file",
+                        serde_json::json!({"path": "./src/api/models.ts"}),
+                    ),
+                    calls("read_file", serde_json::json!({"path": "src/ui/page.tsx"})),
+                    say("Fixed."),
+                ],
+            ),
+        ],
+        Settings::default(),
+    );
+    std::fs::create_dir_all(f.root.join(".claude/rules/web")).unwrap();
+    std::fs::write(
+        f.root.join(".claude/rules/api.md"),
+        "---\npaths:\n  - \"src/api/**\"\n---\nValidate every input at the edge.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        f.root.join(".claude/rules/web/ui.md"),
+        "---\npaths: src/ui/**/*.{ts,tsx}\n---\nNo inline styles.\n",
+    )
+    .unwrap();
+    std::fs::write(f.root.join(".claude/rules/style.md"), "Short functions.\n").unwrap();
+    std::fs::create_dir_all(f.root.join("src/api")).unwrap();
+    std::fs::create_dir_all(f.root.join("src/ui")).unwrap();
+    for file in ["src/api/routes.ts", "src/api/models.ts", "src/ui/page.tsx"] {
+        std::fs::write(f.root.join(file), "export {}\n").unwrap();
+    }
+    f.crew
+        .start("lead", &model("cheap/model"), "go".into(), PERSON);
+    f.settled().await;
+    // The lead reads the rules for the whole project, and is told of the
+    // others and their files.
+    let lead = f.model.instructions_of("lead");
+    assert!(lead.contains("from its .claude/rules/style.md") && lead.contains("Short functions."));
+    assert!(lead.contains("- .claude/rules/api.md: src/api/**"));
+    assert!(lead.contains("- .claude/rules/web/ui.md: src/ui/**/*.{ts,tsx}"));
+    assert!(!lead.contains("Validate every input"));
+    // The helper, as it first touches their files, once each in its
+    // conversation.
+    let last = f.model.requests_of("helper").pop().unwrap();
+    let helper = format!("{:?}", last.messages);
+    assert_eq!(
+        helper.matches("Validate every input at the edge.").count(),
+        1
+    );
+    assert!(helper.contains("No inline styles."));
+    assert!(!helper.contains("Short functions."));
+}
