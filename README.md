@@ -17,6 +17,12 @@ iq do "..."                   # hands a task to the agents in the terminal
 iq --help
 ```
 
+## Local autopilot policy
+
+The autopilot can use a skill written for the machine and project where iq runs. Set `autopilot_skill = "local-review"` in `~/.iq/settings.toml`, and keep a skill with that name in a configured skills folder, normally `~/.iq/skills/local-review/SKILL.md`. Describe which operations serve the local workflow and which should be refused or left to the person. The reviewer reads it again for every decision, so edits take effect during a session.
+
+The skill must be outside the workspace, including its resolved symlink target, so commands cannot rewrite their own approval policy. A missing, unreadable, oversized or secret-bearing skill leaves the decision to the person. Without this setting, the default review policy applies. A skill cannot widen the sandbox, authorize publishing or bypass the gate; access to host services still requires support in the gate.
+
 ## Building
 
 ```bash

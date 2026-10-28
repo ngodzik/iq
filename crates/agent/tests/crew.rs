@@ -310,6 +310,75 @@ async fn what_the_gate_asks_waits_for_the_person() {
     assert!(f.model.seen_by("reviewer").is_empty(), "no reviewer");
 }
 
+struct ReviewPolicy(Result<Option<String>, String>);
+
+impl Extension<Model> for ReviewPolicy {
+    fn tools(&self, _agent: &str) -> Vec<iq_core::ToolSpec> {
+        Vec::new()
+    }
+
+    fn review_instructions(&self) -> Result<Option<String>, String> {
+        self.0.clone()
+    }
+
+    fn call(
+        &self,
+        _crew: Crew<Model>,
+        _agent: String,
+        _name: String,
+        _args: serde_json::Value,
+    ) -> Called {
+        Box::pin(std::future::ready(Err("no tools".into())))
+    }
+}
+
+#[tokio::test]
+async fn the_reviewer_receives_local_policy_and_errors_go_to_the_person() {
+    for policy in [
+        Ok(Some("Preserve local database fixtures.".into())),
+        Err("review skill unavailable".into()),
+    ] {
+        let failed = policy.is_err();
+        let f = fixture(
+            &[
+                (
+                    "lead",
+                    vec![
+                        calls("run", serde_json::json!({"command": "git reset --hard"})),
+                        say("Blocked."),
+                    ],
+                ),
+                ("reviewer", vec![say("REFUSE: preserve the fixtures.")]),
+            ],
+            Settings {
+                reviewer: Some(model("cheap/reviewer")),
+                ..Settings::default()
+            },
+        );
+        f.crew.extend(Arc::new(ReviewPolicy(policy)));
+        f.crew.set_autopilot(true);
+        f.crew.start(
+            "lead",
+            &model("cheap/model"),
+            "Inspect the project".into(),
+            PERSON,
+        );
+        if failed {
+            let id = f.question().await;
+            f.crew.answer(id, false);
+        }
+        f.settled().await;
+        let seen = f.model.seen_by("reviewer");
+        if failed {
+            assert!(seen.is_empty());
+            assert!(f.events().iter().any(|event| matches!(event, Event::Notice { text, .. } if text.contains("review skill unavailable"))));
+        } else {
+            assert!(seen.contains("Preserve local database fixtures."), "{seen}");
+            assert!(seen.contains("never yours to approve"), "{seen}");
+        }
+    }
+}
+
 fn assert_refusal_guidance(seen: &str) {
     assert!(seen.contains("Do not work around this refusal"), "{seen}");
     assert!(seen.contains("replacement tool"), "{seen}");

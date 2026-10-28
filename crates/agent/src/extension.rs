@@ -34,6 +34,12 @@ pub trait Extension<M>: Send + Sync {
         None
     }
 
+    /// Local policy for the permission reviewer, read again for each decision.
+    /// An error leaves the decision to the person. This cannot widen the gate.
+    fn review_instructions(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     /// Runs the tool `name` for `agent` with `args`, a JSON object. The
     /// crew is the one the agent works in: what the call does on the
     /// machine, it asks of the crew's gate, and what it must ask the

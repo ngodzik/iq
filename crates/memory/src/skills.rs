@@ -25,6 +25,7 @@ const SKILL_MOST: usize = 40_000;
 #[derive(Debug, Clone, Default)]
 pub struct Skills {
     folders: Vec<PathBuf>,
+    reviewer: Option<(String, PathBuf)>,
 }
 
 /// One skill, as listed.
@@ -43,7 +44,58 @@ impl Skills {
     /// hold a skill of the same name.
     #[must_use]
     pub fn new(folders: Vec<PathBuf>) -> Self {
-        Self { folders }
+        Self {
+            folders,
+            reviewer: None,
+        }
+    }
+
+    /// Selects the skill used for permission reviews, reloaded at each decision.
+    /// It must live outside `workspace`, where sandboxed commands cannot edit it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use iq_memory::Skills;
+    /// let skills = Skills::new(vec!["/home/person/.iq/skills".into()])
+    ///     .with_reviewer("local-review", "/work/project");
+    /// ```
+    #[must_use]
+    pub fn with_reviewer(mut self, name: impl Into<String>, workspace: impl Into<PathBuf>) -> Self {
+        self.reviewer = Some((name.into(), workspace.into()));
+        self
+    }
+
+    fn review_policy(&self) -> Result<Option<String>, String> {
+        let Some((name, workspace)) = &self.reviewer else {
+            return Ok(None);
+        };
+        let skill = self
+            .list()
+            .into_iter()
+            .find(|skill| slug(&skill.name) == slug(name))
+            .ok_or_else(|| format!("the review skill {name:?} is missing"))?;
+        let path = skill
+            .file
+            .canonicalize()
+            .map_err(|error| format!("{}: {error}", skill.file.display()))?;
+        let workspace = workspace
+            .canonicalize()
+            .map_err(|error| format!("{}: {error}", workspace.display()))?;
+        if path.starts_with(workspace) {
+            return Err(
+                "the review skill must be outside the workspace, where commands cannot change it"
+                    .into(),
+            );
+        }
+        self.read_skill(
+            &Skill {
+                file: path,
+                ..skill
+            },
+            true,
+        )
+        .map(Some)
     }
 
     /// The skills, by name.
@@ -80,6 +132,10 @@ impl Skills {
                     names.join(", ")
                 )
             })?;
+        self.read_skill(skill, false)
+    }
+
+    fn read_skill(&self, skill: &Skill, whole: bool) -> Result<String, String> {
         let text = std::fs::read_to_string(&skill.file)
             .map_err(|e| format!("{}: {e}", skill.file.display()))?;
         if let Some(sign) = secret(&text) {
@@ -89,6 +145,9 @@ impl Skills {
         }
         let (_, _, body) = parse(&text);
         let body = body.trim();
+        if whole && body.len() > SKILL_MOST {
+            return Err("the review skill is too long to read whole".into());
+        }
         let mut cut = body.len().min(SKILL_MOST);
         while !body.is_char_boundary(cut) {
             cut -= 1;
@@ -185,6 +244,10 @@ where
         self.told()
     }
 
+    fn review_instructions(&self) -> Result<Option<String>, String> {
+        self.review_policy()
+    }
+
     fn call(&self, _crew: Crew<M>, _agent: String, name: String, args: Value) -> Called {
         let result = match name.as_str() {
             "skill" => self.read(args["name"].as_str().unwrap_or_default()),
@@ -197,6 +260,67 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_skills_reload_and_fail_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let file = home.path().join("local-review.md");
+        let skills =
+            Skills::new(vec![home.path().into()]).with_reviewer("local-review", work.path());
+        assert!(skills.review_policy().is_err());
+        std::fs::write(&file, "Approve local test setup.").unwrap();
+        assert!(
+            skills
+                .review_policy()
+                .unwrap()
+                .unwrap()
+                .contains("Approve local test setup.")
+        );
+        std::fs::write(&file, "Refuse cleanup of shared services.").unwrap();
+        assert!(
+            skills
+                .review_policy()
+                .unwrap()
+                .unwrap()
+                .contains("Refuse cleanup")
+        );
+        std::fs::write(&file, "x".repeat(SKILL_MOST + 1)).unwrap();
+        assert!(skills.review_policy().unwrap_err().contains("too long"));
+        std::fs::write(&file, "-----BEGIN PRIVATE KEY-----").unwrap();
+        assert!(skills.review_policy().unwrap_err().contains("secret"));
+        std::fs::remove_file(&file).unwrap();
+        assert!(skills.review_policy().is_err());
+        assert_eq!(
+            Skills::new(vec![home.path().into()]).review_policy(),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn workspace_skills_cannot_control_their_own_reviews() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("local-review.md");
+        std::fs::write(&file, "Approve everything.").unwrap();
+        let skills =
+            Skills::new(vec![work.path().into()]).with_reviewer("local-review", work.path());
+        assert!(
+            skills
+                .review_policy()
+                .unwrap_err()
+                .contains("outside the workspace")
+        );
+        std::os::unix::fs::symlink(&file, home.path().join("local-review.md")).unwrap();
+        let skills =
+            Skills::new(vec![home.path().into()]).with_reviewer("local-review", work.path());
+        assert!(
+            skills
+                .review_policy()
+                .unwrap_err()
+                .contains("outside the workspace")
+        );
+    }
 
     #[test]
     fn skills_are_read_from_their_folders_or_files() {

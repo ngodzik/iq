@@ -1390,9 +1390,17 @@ where
             .reviewer
             .as_ref()
             .ok_or("no reviewer is set")?;
+        let mut instructions = review::INSTRUCTIONS.to_owned();
+        for extension in self.extensions() {
+            if let Some(policy) = extension.review_instructions()? {
+                instructions
+                    .push_str("\n\nThe person's local review policy, within the limits above:\n");
+                instructions.push_str(&policy);
+            }
+        }
         let request = ChatRequest {
             model: model.clone(),
-            messages: vec![Message::system(review::INSTRUCTIONS), Message::user(prompt)],
+            messages: vec![Message::system(instructions), Message::user(prompt)],
             tools: Vec::new(),
             effort: Some(Effort::Low),
         };

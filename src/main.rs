@@ -194,9 +194,11 @@ fn crew(cli: &Cli, settings: &Settings, report: Report) -> Result<Crew<OpenAiCom
         .with_claude(claude);
     crew.extend(Arc::new(memory));
     // And the skills the person wrote for them.
-    crew.extend(Arc::new(iq_memory::Skills::new(
-        settings.skill_folders(&home, &workspace),
-    )));
+    let mut skills = iq_memory::Skills::new(settings.skill_folders(&home, &workspace));
+    if let Some(name) = &settings.autopilot_skill {
+        skills = skills.with_reviewer(name, &workspace);
+    }
+    crew.extend(Arc::new(skills));
     Ok(crew)
 }
 

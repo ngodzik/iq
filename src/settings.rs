@@ -12,6 +12,7 @@
 //! internet = false                       # true: every command reaches the internet
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
+//! autopilot_skill = "local-review"     # optional review policy, outside the workspace, reloaded for each decision
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set
 //! claude_memory = true                   # the notes kept of the project under ~/.claude read beside iq's own
 //!
@@ -85,6 +86,8 @@ pub(crate) struct Settings {
     /// Whether the autopilot's reviewer also answers what only reaches the
     /// internet, rather than the person; true unless set.
     autopilot_internet: Option<bool>,
+    /// A skill from the configured folders, read by the permission reviewer.
+    pub(crate) autopilot_skill: Option<String>,
     /// Every command reaches the internet, rather than what a rule gives
     /// it to and what the person allows.
     #[serde(default)]
@@ -376,6 +379,9 @@ mod tests {
         let quiet: Settings = toml::from_str("context_every = 0").unwrap();
         assert_eq!(quiet.crew().unwrap().context_every, 0);
         assert!(set.autopilot && set.internet);
+        assert!(set.autopilot_skill.is_none());
+        let local: Settings = toml::from_str("autopilot_skill = \"local-review\"").unwrap();
+        assert_eq!(local.autopilot_skill.as_deref(), Some("local-review"));
         assert!(toml::from_str::<Settings>("modle = \"x\"").is_err());
         let looks: Settings =
             toml::from_str("theme = \"Ink\"\n[keys]\ncosts = \"ctrl+u\"").unwrap();
