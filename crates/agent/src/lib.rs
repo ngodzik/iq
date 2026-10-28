@@ -22,7 +22,7 @@ mod rules;
 mod team;
 mod tools;
 
-pub use crew::{ALL, CONTEXT_EVERY, Crew, Listed, Posted, Report, Settings};
+pub use crew::{ALL, CONTEXT_EVERY, Crew, Listed, Posted, REFUSALS, Report, Settings};
 pub use event::{Event, PERSON};
 pub use extension::{Called, Extension};
 pub use once::{Asked, ask_once};

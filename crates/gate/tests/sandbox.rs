@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use iq_gate::{Action, Approver, Gate, Helper, Judged, Ran, Sandbox};
+use iq_gate::{Action, Approver, Gate, Helper, Judged, Ran, Rules, Sandbox};
 
 struct Fixture {
     _dirs: (tempfile::TempDir, tempfile::TempDir),
@@ -42,6 +42,7 @@ async fn run_in(f: &Fixture, line: &str, folder: &Path, network: bool) -> Ran {
         line: line.to_owned(),
         folder: folder.to_path_buf(),
         network,
+        host: false,
     };
     let permit = match f.gate.judge(action).unwrap() {
         Judged::Allowed(permit) => permit,
@@ -214,6 +215,7 @@ async fn a_command_out_of_time_is_stopped_with_its_children() {
         line: "(sleep 30; echo late > late.txt) & sleep 30".to_owned(),
         folder: f.root.clone(),
         network: false,
+        host: false,
     };
     let Judged::Allowed(permit) = f.gate.judge(action).unwrap() else {
         panic!("not allowed")
@@ -222,4 +224,68 @@ async fn a_command_out_of_time_is_stopped_with_its_children() {
     assert!(ran.timed_out);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(!f.root.join("late.txt").exists());
+}
+
+#[tokio::test]
+async fn what_the_person_lets_on_the_machine_runs_outside_the_sandbox() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let rules = Rules::parse(
+        r#"
+        [[rule]]
+        prefix = ["touch"]
+        decision = "ask"
+        host = true
+        match = ["touch x"]
+        "#,
+    )
+    .unwrap();
+    let gate = Gate::builder(&root).rules(rules).build().unwrap();
+    let sandbox = gate.sandbox(Helper::new(
+        env!("CARGO_BIN_EXE_iq-sandbox"),
+        Vec::<String>::new(),
+    ));
+    let away = outside.path().canonicalize().unwrap().join("made-here");
+    let line = format!("touch {} && echo sandbox=$IQ_SANDBOX", away.display());
+    let Judged::Asked { pending, .. } = gate
+        .judge(Action::Run {
+            line,
+            folder: root.clone(),
+            network: false,
+            host: false,
+        })
+        .unwrap()
+    else {
+        panic!("not asked")
+    };
+    // Approved, it runs as the person would run it: outside the sandbox.
+    let permit = gate.approve(pending, Approver::Person).unwrap();
+    assert!(matches!(permit.action(), Action::Run { host: true, .. }));
+    let ran = sandbox.run(permit).await.unwrap();
+    assert_eq!(ran.status, Some(0), "{}", ran.output);
+    assert!(away.exists());
+    assert_eq!(ran.output.trim(), "sandbox=");
+    // What it writes where code runs later is put back, as a sandboxed
+    // command's is.
+    let Judged::Asked { pending, .. } = gate
+        .judge(Action::Run {
+            line: "git init -q . && touch .git/hooks/pre-commit && echo done".to_owned(),
+            folder: root.clone(),
+            network: false,
+            host: true,
+        })
+        .unwrap()
+    else {
+        panic!("not asked")
+    };
+    let ran = sandbox
+        .run(gate.approve(pending, Approver::Person).unwrap())
+        .await
+        .unwrap();
+    if ran.output.trim() != "done" {
+        return;
+    }
+    assert!(ran.restored.contains(&root.join(".git/hooks/pre-commit")));
+    assert!(!root.join(".git/hooks/pre-commit").exists());
 }

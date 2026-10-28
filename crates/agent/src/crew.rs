@@ -64,6 +64,10 @@ const SCOPED_FRESH: Duration = Duration::from_secs(30);
 /// of its size, unless the settings say.
 pub const CONTEXT_EVERY: u64 = 25_000;
 
+/// How many actions of one agent the reviewer refuses in a row before the
+/// next is asked of the person, unless the settings say.
+pub const REFUSALS: u32 = 3;
+
 /// What the crew starts with.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -82,6 +86,9 @@ pub struct Settings {
     /// How many tokens an agent's conversation grows between two words to
     /// it of its size, which it compacts as its skills say; 0 for none.
     pub context_every: u64,
+    /// How many actions of one agent the reviewer refuses in a row before
+    /// the next is asked of the person instead; 0 never.
+    pub refusals: u32,
 }
 
 impl Default for Settings {
@@ -93,6 +100,7 @@ impl Default for Settings {
             steps: 200,
             rules: Vec::new(),
             context_every: CONTEXT_EVERY,
+            refusals: REFUSALS,
         }
     }
 }
@@ -118,6 +126,8 @@ struct Inner<M> {
     settings: Settings,
     report: Report,
     autopilot: AtomicBool,
+    /// How many actions of each agent the reviewer refused in a row.
+    refused: Mutex<HashMap<String, u32>>,
     /// Turns under way, the answers they post included.
     busy: AtomicUsize,
     next_question: AtomicU64,
@@ -218,6 +228,7 @@ where
                 settings,
                 report,
                 autopilot: AtomicBool::new(false),
+                refused: Mutex::new(HashMap::new()),
                 busy: AtomicUsize::new(0),
                 next_question: AtomicU64::new((CREWS.fetch_add(1, Ordering::Relaxed) << 32) | 1),
                 questions: Mutex::new(HashMap::new()),
@@ -1148,6 +1159,7 @@ where
                     line,
                     folder: workspace,
                     network: args.flag("network"),
+                    host: args.flag("host"),
                 };
                 let permit = self.act(agent, action).await?;
                 self.run(permit, OWN_ASK).await.map(|(text, _)| text)
@@ -1260,7 +1272,14 @@ where
     /// it succeeded. A command that failed without the internet, as one
     /// that needs it does, is told how to ask for it: `ask`.
     pub(crate) async fn run(&self, permit: Permit, ask: &str) -> Result<(String, bool), String> {
-        let offline = matches!(permit.action(), Action::Run { network: false, .. });
+        let offline = matches!(
+            permit.action(),
+            Action::Run {
+                network: false,
+                host: false,
+                ..
+            }
+        );
         let ran = self
             .inner
             .sandbox
@@ -1307,19 +1326,33 @@ where
         }
     }
 
-    /// Asks the reviewer, the autopilot being on and the action staying
-    /// within the sandbox, else the person.
+    /// Asks the reviewer, the autopilot being on and the action one it may
+    /// answer, else the person. After as many refusals in a row as the
+    /// settings say, an agent's next action goes to the person: the
+    /// reviewer and the agent are not getting anywhere.
     async fn ask(&self, agent: &str, reason: String, pending: Pending) -> Result<Permit, String> {
         let action = describe(pending.action());
-        // The reviewer answers what stays within the sandbox, and what only
-        // reaches the internet when the person lets it; never more.
+        // The reviewer answers what stays within the sandbox, what only
+        // reaches the internet and what runs on the machine when the
+        // person lets it; never more.
         let reviewable = match pending.scope() {
             Scope::Sandbox => true,
             Scope::Internet => self.inner.gate.reviewer_internet(),
+            Scope::Host => self.inner.gate.reviewer_host(),
             Scope::Beyond => false,
         };
-        if self.autopilot() && reviewable {
-            match self.review(agent, &action, &reason).await {
+        let most = self.inner.settings.refusals;
+        let refused = lock(&self.inner.refused).get(agent).copied().unwrap_or(0);
+        if self.autopilot() && reviewable && most > 0 && refused >= most {
+            self.report(Event::Notice {
+                agent: agent.to_owned(),
+                text: format!(
+                    "the reviewer refused {refused} actions of {agent} in a row: the person is \
+                     asked this one"
+                ),
+            });
+        } else if self.autopilot() && reviewable {
+            match self.review(agent, &action, pending.scope(), &reason).await {
                 Ok((approved, why)) => {
                     self.report(Event::Reviewed {
                         agent: agent.to_owned(),
@@ -1328,6 +1361,13 @@ where
                         approved,
                         why: why.clone(),
                     });
+                    let mut refused = lock(&self.inner.refused);
+                    if approved {
+                        refused.remove(agent);
+                    } else {
+                        *refused.entry(agent.to_owned()).or_default() += 1;
+                    }
+                    drop(refused);
                     return if approved {
                         self.inner
                             .gate
@@ -1357,6 +1397,8 @@ where
         lock(&self.inner.questions).remove(&id);
         let approved = matches!(answer, Ok(Ok(true)));
         self.report(Event::Answered { id, approved });
+        // The person's answer, whichever it is, starts the count over.
+        lock(&self.inner.refused).remove(agent);
         match answer {
             Ok(Ok(true)) => self
                 .inner
@@ -1372,11 +1414,12 @@ where
         }
     }
 
-    /// The reviewer's verdict on an action of `agent`'s.
+    /// The reviewer's verdict on an action of `agent`'s, of `scope`.
     async fn review(
         &self,
         agent: &str,
         action: &str,
+        scope: Scope,
         reason: &str,
     ) -> Result<(bool, String), String> {
         let task = lock(&self.inner.board)
@@ -1384,7 +1427,7 @@ where
             .get(agent)
             .map(|member| member.task.clone())
             .unwrap_or_default();
-        let prompt = review::prompt(&task, action, reason);
+        let prompt = review::prompt(&task, action, review::place(scope), reason);
         let model = self
             .inner
             .settings
@@ -1430,6 +1473,14 @@ where
     /// are always the person's.
     pub fn set_autopilot_internet(&self, may: bool) {
         self.inner.gate.set_reviewer_internet(may);
+    }
+
+    /// Lets the reviewer let a command run on the machine itself, the
+    /// autopilot on, following the policy the person wrote for it, or
+    /// leaves that to the person. What changes what others share is always
+    /// the person's.
+    pub fn set_autopilot_host(&self, may: bool) {
+        self.inner.gate.set_reviewer_host(may);
     }
 
     fn spent(&self, agent: &str, model: &str, usage: iq_core::Usage, cost: Option<Usd>) {
@@ -1810,9 +1861,16 @@ fn describe(action: &Action) -> String {
             line,
             folder,
             network,
+            host,
         } => {
-            let network = if *network { ", with the internet" } else { "" };
-            format!("run `{line}` in {}{network}", folder.display())
+            let more = if *host {
+                ", on the machine itself, outside the sandbox"
+            } else if *network {
+                ", with the internet"
+            } else {
+                ""
+            };
+            format!("run `{line}` in {}{more}", folder.display())
         }
         Action::Fetch { target } => format!("reach the network for {target}"),
     }

@@ -101,6 +101,10 @@ enum Command {
         /// otherwise.
         #[arg(long)]
         network: bool,
+        /// Lets it ask for the machine itself, outside the sandbox, as
+        /// what the rules know needs it is asked.
+        #[arg(long)]
+        host: bool,
     },
 }
 
@@ -178,7 +182,11 @@ fn crew(cli: &Cli, settings: &Settings, report: Report) -> Result<Crew<OpenAiCom
     crew_settings.rules = person_rules(&settings.rules_files(&home), &home);
     let crew = Crew::new(
         provider(cli),
-        gate(settings.internet, settings.autopilot_internet())?,
+        gate(
+            settings.internet,
+            settings.autopilot_internet(),
+            settings.autopilot_host(),
+        )?,
         Helper::this_program()?,
         crew_settings,
         report,
@@ -878,22 +886,29 @@ fn home_folder() -> Result<PathBuf> {
 
 /// The gate of the current folder, with the person's rules when they wrote
 /// some, the internet open to every command or not.
-fn gate(internet: bool, reviewer_internet: bool) -> Result<Gate> {
+fn gate(internet: bool, reviewer_internet: bool, reviewer_host: bool) -> Result<Gate> {
     gate_in(
         &std::env::current_dir().context("reading the current folder")?,
         internet,
         reviewer_internet,
+        reviewer_host,
     )
 }
 
 /// The gate of `workspace`, as [`gate`]'s. Rules are never read from the
 /// workspace: a command could write them there.
-fn gate_in(workspace: &Path, internet: bool, reviewer_internet: bool) -> Result<Gate> {
+fn gate_in(
+    workspace: &Path,
+    internet: bool,
+    reviewer_internet: bool,
+    reviewer_host: bool,
+) -> Result<Gate> {
     let folder = home_folder()?;
     let mut gate = Gate::builder(workspace)
         .audit(folder.join("audit.log"))
         .internet(internet)
-        .reviewer_internet(reviewer_internet);
+        .reviewer_internet(reviewer_internet)
+        .reviewer_host(reviewer_host);
     let rules = folder.join("rules.toml");
     if rules.exists() {
         let text = std::fs::read_to_string(&rules)
@@ -1029,12 +1044,17 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
                 println!("Kept from the home: {}", kept.join(", "));
             }
         }
-        Command::Run { line, network } => {
-            let gate = gate(cli.internet, false)?;
+        Command::Run {
+            line,
+            network,
+            host,
+        } => {
+            let gate = gate(cli.internet, false, false)?;
             let action = Action::Run {
                 line: line.clone(),
                 folder: gate.workspace().to_path_buf(),
                 network: *network,
+                host: *host,
             };
             let permit = match gate.judge(action)? {
                 Judged::Allowed(permit) => permit,

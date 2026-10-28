@@ -279,6 +279,7 @@ enum Event<'a> {
         line: &'a str,
         folder: &'a Path,
         network: bool,
+        host: bool,
     },
     Ran {
         status: Option<i32>,
@@ -358,17 +359,22 @@ impl Sandbox {
         self
     }
 
-    /// Runs the command `permit` allows.
+    /// Runs the command `permit` allows: in the sandbox, or on the machine
+    /// itself when the permit says so, as the person would run it, with
+    /// their environment but iq's own variables. Either way its output is
+    /// cleared of secrets, and what it wrote where code runs later is put
+    /// back.
     pub async fn run(&self, permit: Permit) -> Result<Ran, GateError> {
         let Action::Run {
             line,
             folder,
             network,
+            host,
         } = permit.action
         else {
             return Err(GateError::NotACommand);
         };
-        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        if !host && !cfg!(any(target_os = "linux", target_os = "macos")) {
             return Err(GateError::Unsupported(format!(
                 "iq holds no command in a sandbox on {} yet",
                 std::env::consts::OS
@@ -401,30 +407,39 @@ impl Sandbox {
                 line: &line,
                 folder: &folder,
                 network,
+                host,
             })?;
         }
-        let mut command = tokio::process::Command::new(&self.helper.program);
+        // Errors land with the output, in order.
+        let shell = ["/bin/sh", "-c", &format!("exec 2>&1; {line}")];
+        let mut command = if host {
+            let mut command = tokio::process::Command::new(shell[0]);
+            command.args(&shell[1..]).envs(kept(std::env::vars_os()));
+            command
+        } else {
+            let mut command = tokio::process::Command::new(&self.helper.program);
+            command
+                .args(&self.helper.args)
+                .arg(policy)
+                .arg("--")
+                .args(shell)
+                .env_clear()
+                .envs(passed(std::env::vars_os()))
+                .env("TMPDIR", own.path())
+                .env("IQ_SANDBOX", "1");
+            if !network {
+                // Without it cargo tries the network, and fails, on each build.
+                command.env("CARGO_NET_OFFLINE", "true");
+            }
+            command
+        };
         command
-            .args(&self.helper.args)
-            .arg(policy)
-            .arg("--")
-            .args(["/bin/sh", "-c"])
-            // Errors land with the output, in order.
-            .arg(format!("exec 2>&1; {line}"))
             .current_dir(&folder)
-            .env_clear()
-            .envs(passed(std::env::vars_os()))
-            .env("TMPDIR", own.path())
-            .env("IQ_SANDBOX", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true);
-        if !network {
-            // Without it cargo tries the network, and fails, on each build.
-            command.env("CARGO_NET_OFFLINE", "true");
-        }
         let watch = Watch::take(workspace);
         let child = command.spawn().map_err(GateError::Spawn)?;
         let group = child.id();
@@ -485,7 +500,19 @@ impl Sandbox {
     }
 }
 
-/// The variables of `env` a command gets.
+/// The variables of `env` a command on the machine itself gets: the
+/// person's own, as they would run it, but iq's, which are of no use to
+/// it, its provider's key among them.
+fn kept(
+    env: impl IntoIterator<Item = (OsString, OsString)>,
+) -> impl Iterator<Item = (OsString, OsString)> {
+    env.into_iter().filter(|(name, _)| {
+        name.to_str()
+            .is_none_or(|name| !name.starts_with("IQ_") && !name.starts_with("REQUESTY_"))
+    })
+}
+
+/// The variables of `env` a command in the sandbox gets.
 fn passed(
     env: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> impl Iterator<Item = (OsString, OsString)> {

@@ -9,6 +9,8 @@
 //! context_every = 25000                  # tokens an agent's conversation grows between two words to it of its size; 0 never
 //! autopilot = false
 //! autopilot_internet = true              # the reviewer also answers what only reaches the internet
+//! autopilot_host = true                  # the reviewer also answers what runs on the machine itself (containers, clusters, the forge), as your skill says; true once a skill is set
+//! autopilot_refusals = 3                 # refusals of the reviewer in a row before an agent's next action is asked of you; 0 never
 //! internet = false                       # true: every command reaches the internet
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
@@ -88,6 +90,12 @@ pub(crate) struct Settings {
     autopilot_internet: Option<bool>,
     /// A skill from the configured folders, read by the permission reviewer.
     pub(crate) autopilot_skill: Option<String>,
+    /// Whether the autopilot's reviewer also answers what runs on the
+    /// machine itself, outside the sandbox; true once a skill is set.
+    autopilot_host: Option<bool>,
+    /// How many refusals of the reviewer in a row before an agent's next
+    /// action is asked of the person.
+    autopilot_refusals: Option<u32>,
     /// Every command reaches the internet, rather than what a rule gives
     /// it to and what the person allows.
     #[serde(default)]
@@ -270,6 +278,13 @@ impl Settings {
         self.autopilot_internet.unwrap_or(true)
     }
 
+    /// Whether the autopilot's reviewer answers what runs on the machine
+    /// itself: when the person says, else once they wrote a skill for it.
+    pub(crate) fn autopilot_host(&self) -> bool {
+        self.autopilot_host
+            .unwrap_or_else(|| self.autopilot_skill.is_some())
+    }
+
     /// The shortcuts, the defaults moved as set.
     pub(crate) fn keymap(&self) -> Result<iq_ui::keys::Keymap> {
         Ok(iq_ui::keys::Keymap::with(&self.keys)?)
@@ -341,6 +356,7 @@ impl Settings {
             reviewer: Some(ModelId::new(self.reviewer.as_deref().unwrap_or(REVIEWER))?),
             effort: self.effort,
             context_every: self.context_every.unwrap_or(iq_agent::CONTEXT_EVERY),
+            refusals: self.autopilot_refusals.unwrap_or(iq_agent::REFUSALS),
             ..iq_agent::Settings::default()
         })
     }
@@ -382,6 +398,17 @@ mod tests {
         assert!(set.autopilot_skill.is_none());
         let local: Settings = toml::from_str("autopilot_skill = \"local-review\"").unwrap();
         assert_eq!(local.autopilot_skill.as_deref(), Some("local-review"));
+        // The machine itself is the reviewer's once a skill says what runs
+        // there, unless the person says.
+        assert!(!set.autopilot_host());
+        assert!(local.autopilot_host());
+        let kept: Settings = toml::from_str(
+            "autopilot_skill = \"x\"\nautopilot_host = false\nautopilot_refusals = 5",
+        )
+        .unwrap();
+        assert!(!kept.autopilot_host());
+        assert_eq!(kept.crew().unwrap().refusals, 5);
+        assert_eq!(set.crew().unwrap().refusals, iq_agent::REFUSALS);
         assert!(toml::from_str::<Settings>("modle = \"x\"").is_err());
         let looks: Settings =
             toml::from_str("theme = \"Ink\"\n[keys]\ncosts = \"ctrl+u\"").unwrap();

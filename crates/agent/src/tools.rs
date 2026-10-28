@@ -71,13 +71,20 @@ pub(crate) fn work() -> Vec<ToolSpec> {
                           what fetches packages and sources (npm install, cargo fetch, pip \
                           install, git fetch); ask for it for another command with `network`, \
                           which waits for the person unless they opened it to every command. \
-                          Its output comes back, errors included."
+                          What needs the machine itself, with the person's own services and \
+                          credentials (the container daemon, a cluster, the forge's command \
+                          line, a cloud's), is known and runs there once approved; for \
+                          another command that needs the machine, as a make target starting \
+                          containers, ask with `host`. Never get around a refusal by \
+                          downloading or building a replacement. Its output comes back, errors \
+                          included."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
                     "network": {"type": "boolean"},
+                    "host": {"type": "boolean"},
                 },
                 "required": ["command"],
             }),

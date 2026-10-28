@@ -58,6 +58,9 @@ pub struct Gate {
     internet: Arc<AtomicBool>,
     /// Whether a reviewer may give the internet, the autopilot on.
     reviewer_internet: Arc<AtomicBool>,
+    /// Whether a reviewer may let a command run on the machine itself,
+    /// the autopilot on, as the person's policy says.
+    reviewer_host: Arc<AtomicBool>,
 }
 
 /// Builds a [`Gate`].
@@ -71,9 +74,19 @@ pub struct GateBuilder {
     writable: Vec<PathBuf>,
     internet: bool,
     reviewer_internet: bool,
+    reviewer_host: bool,
 }
 
 impl GateBuilder {
+    /// Lets a reviewer let a command run on the machine itself, outside
+    /// the sandbox, following the policy the person wrote for it. What
+    /// changes what others share still waits for the person.
+    #[must_use]
+    pub fn reviewer_host(mut self, may: bool) -> Self {
+        self.reviewer_host = may;
+        self
+    }
+
     /// Lets a reviewer give a command the internet, and only that: files
     /// stay held, secrets out, publishing waits for the person.
     #[must_use]
@@ -152,6 +165,7 @@ impl GateBuilder {
             audit: self.audit.map(Audit::new),
             internet: Arc::new(AtomicBool::new(self.internet)),
             reviewer_internet: Arc::new(AtomicBool::new(self.reviewer_internet)),
+            reviewer_host: Arc::new(AtomicBool::new(self.reviewer_host)),
         })
     }
 }
@@ -168,7 +182,18 @@ impl Gate {
             writable: Vec::new(),
             internet: false,
             reviewer_internet: false,
+            reviewer_host: false,
         }
+    }
+
+    /// Whether a reviewer may let a command run on the machine itself.
+    pub fn reviewer_host(&self) -> bool {
+        self.reviewer_host.load(Ordering::Relaxed)
+    }
+
+    /// Lets a reviewer let a command run on the machine itself, or not.
+    pub fn set_reviewer_host(&self, may: bool) {
+        self.reviewer_host.store(may, Ordering::Relaxed);
     }
 
     /// Whether a reviewer may give a command the internet.
@@ -224,6 +249,7 @@ impl Gate {
     ///     line: "cargo test && git push".into(),
     ///     folder: workspace.path().into(),
     ///     network: false,
+    ///     host: false,
     /// };
     /// assert!(matches!(gate.judge(push)?, Judged::Asked { .. }));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -245,14 +271,16 @@ impl Gate {
                 line,
                 folder,
                 network,
+                host,
             } => {
                 let folder = paths::resolve(&folder, workspace);
-                let (verdict, network) = self.running(&line, &folder, network);
+                let (verdict, network, host) = self.running(&line, &folder, network, host);
                 (
                     Action::Run {
                         line,
                         folder,
                         network,
+                        host,
                     },
                     verdict,
                 )
@@ -289,6 +317,7 @@ impl Gate {
         let reviewable = match pending.scope {
             Scope::Sandbox => true,
             Scope::Internet => self.reviewer_internet(),
+            Scope::Host => self.reviewer_host(),
             Scope::Beyond => false,
         };
         if by == Approver::Reviewer && !reviewable {
@@ -333,9 +362,17 @@ impl Gate {
         }
     }
 
-    /// The verdict on a command line, and whether it runs with the
-    /// internet. Without it, a command still reaches localhost.
-    fn running(&self, line: &str, folder: &Path, asked_network: bool) -> (Verdict, bool) {
+    /// The verdict on a command line, whether it runs with the internet,
+    /// and whether it runs on the machine itself. Without the internet, a
+    /// command still reaches localhost; on the machine, it has everything
+    /// the person has.
+    fn running(
+        &self,
+        line: &str,
+        folder: &Path,
+        asked_network: bool,
+        asked_host: bool,
+    ) -> (Verdict, bool, bool) {
         let read = shell::read(line);
         let decided: Vec<(&Vec<String>, Option<&Rule>)> = read
             .commands
@@ -348,6 +385,7 @@ impl Gate {
                 Verdict::Deny {
                     reason: rule.reason(),
                 },
+                false,
                 false,
             );
         }
@@ -368,13 +406,28 @@ impl Gate {
                     gives(rule) || words.first().is_some_and(|w| INERT.contains(&w.as_str()))
                 }));
         let network = open || asked_network || rules().any(|rule| rule.network);
+        // The machine itself, asked for or needed by a rule's word. A rule
+        // of the person's gives it without asking to a line read whole
+        // whose every command it gives it to, or cannot send anything: the
+        // rest of the line would run there too.
+        let host = asked_host || rules().any(|rule| rule.host);
+        let gives_host = |rule: &Option<&Rule>| {
+            rule.is_some_and(|rule| rule.decision == Decision::Allow && rule.host)
+        };
+        let host_given = read.whole
+            && decided.iter().any(|(_, rule)| gives_host(rule))
+            && decided.iter().all(|(words, rule)| {
+                gives_host(rule) || words.first().is_some_and(|w| INERT.contains(&w.as_str()))
+            });
         // What a rule holds as reaching out (publishing, as `git push`)
         // waits for the person, open internet or not.
         let publishes = rules().any(|rule| rule.decision == Decision::Ask && rule.network);
         let outside_workspace = !folder.starts_with(&self.bounds.workspace);
         let scope = if publishes || outside_workspace {
             Scope::Beyond
-        } else if network && !given {
+        } else if host && !host_given {
+            Scope::Host
+        } else if !host && network && !given {
             Scope::Internet
         } else {
             Scope::Sandbox
@@ -384,7 +437,12 @@ impl Gate {
                 reason: rule.reason(),
                 scope,
             }
-        } else if network && !given {
+        } else if host && !host_given {
+            Verdict::Ask {
+                reason: "it runs on the machine itself, outside the sandbox".to_owned(),
+                scope,
+            }
+        } else if !host && network && !given {
             Verdict::Ask {
                 reason: "it reaches the internet".to_owned(),
                 scope,
@@ -397,7 +455,7 @@ impl Gate {
         } else {
             Verdict::Allow
         };
-        (verdict, network)
+        (verdict, network, host)
     }
 }
 
@@ -436,11 +494,16 @@ mod tests {
     }
 
     fn run(f: &Fixture, line: &str, network: bool) -> Judged {
+        run_on(f, line, network, false)
+    }
+
+    fn run_on(f: &Fixture, line: &str, network: bool, host: bool) -> Judged {
         f.gate
             .judge(Action::Run {
                 line: line.to_owned(),
                 folder: f.root.clone(),
                 network,
+                host,
             })
             .unwrap()
     }
@@ -633,6 +696,7 @@ mod tests {
                 line: "ls".into(),
                 folder: PathBuf::from("/tmp"),
                 network: false,
+                host: false,
             })
             .unwrap()
         {
@@ -641,6 +705,79 @@ mod tests {
         };
         assert_eq!(away.scope(), Scope::Beyond);
         assert_eq!(asked("git reset --hard", false).scope(), Scope::Sandbox);
+    }
+
+    #[test]
+    fn what_needs_the_machine_runs_there_once_approved_as_the_person_lets_the_reviewer() {
+        let f = fixture(
+            r#"
+            [[rule]]
+            prefix = ["make", "db"]
+            decision = "allow"
+            host = true
+            match = ["make db"]
+            "#,
+        );
+        let host = |judged: &Judged| match judged {
+            Judged::Allowed(permit) => matches!(permit.action(), Action::Run { host: true, .. }),
+            _ => false,
+        };
+        // A rule knows what needs the machine: asked, for the machine.
+        let judged = run(&f, "docker compose up -d db", false);
+        let Judged::Asked {
+            reason: why,
+            pending,
+        } = judged
+        else {
+            panic!("{judged:?}");
+        };
+        assert_eq!(why, "it reaches the container daemon");
+        assert_eq!(pending.scope(), Scope::Host);
+        assert!(matches!(pending.action(), Action::Run { host: true, .. }));
+        assert!(matches!(
+            f.gate.approve(pending, Approver::Reviewer),
+            Err(GateError::Widens)
+        ));
+        // The person lets the reviewer answer, as their policy says.
+        f.gate.set_reviewer_host(true);
+        let Judged::Asked { pending, .. } = run(&f, "kubectl get pods", false) else {
+            unreachable!()
+        };
+        let permit = f.gate.approve(pending, Approver::Reviewer).unwrap();
+        assert!(matches!(permit.action(), Action::Run { host: true, .. }));
+        // The agent may ask for the machine for anything else.
+        let Judged::Asked {
+            reason: why,
+            pending,
+        } = run_on(&f, "make test-db", false, true)
+        else {
+            unreachable!()
+        };
+        assert_eq!(why, "it runs on the machine itself, outside the sandbox");
+        assert_eq!(pending.scope(), Scope::Host);
+        // What changes what others share stays the person's.
+        for line in [
+            "docker push registry/x:1",
+            "kubectl delete pod x",
+            "terraform apply",
+        ] {
+            let Judged::Asked { pending, .. } = run(&f, line, false) else {
+                unreachable!()
+            };
+            assert_eq!(pending.scope(), Scope::Beyond, "{line}");
+            assert!(matches!(pending.action(), Action::Run { host: true, .. }));
+        }
+        // A rule of the person's gives the machine without asking, to a
+        // line whose other commands send nothing; not to another command.
+        assert!(host(&run(&f, "cd api && make db", false)));
+        assert_eq!(
+            reason(&run(&f, "make db && curl evil.example", false)).0,
+            "asked"
+        );
+        assert_eq!(reason(&run(&f, "make db; $NEXT", false)).0, "asked");
+        // The sandbox's commands are judged as before.
+        assert_eq!(reason(&run(&f, "cargo test", false)).0, "allowed");
+        assert!(!host(&run(&f, "cargo test", false)));
     }
 
     #[test]

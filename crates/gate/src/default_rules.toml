@@ -57,6 +57,92 @@ reason = "it deletes a branch"
 match = ["git branch -D topic"]
 not_match = ["git branch -d topic"]
 
+# What needs the machine itself, outside the sandbox: the container daemon,
+# a cluster, the forge's own command line, a cloud's, each with the person's
+# credentials. Asked, so that the person, or the reviewer following their
+# policy, says; approved, it runs there. What changes what others share
+# waits for the person.
+
+[[rule]]
+prefix = [["docker", "podman", "nerdctl", "docker-compose"]]
+decision = "ask"
+host = true
+reason = "it reaches the container daemon"
+match = ["docker compose up -d db", "docker ps", "podman run x"]
+not_match = ["cargo test"]
+
+[[rule]]
+prefix = ["docker", "push"]
+decision = "ask"
+host = true
+network = true
+reason = "it publishes an image"
+match = ["docker push registry/x:1"]
+not_match = ["docker pull x"]
+
+[[rule]]
+prefix = [["kubectl", "helm", "k9s", "kind", "minikube", "kustomize"]]
+decision = "ask"
+host = true
+reason = "it reaches a cluster"
+match = ["kubectl get pods", "helm list"]
+
+[[rule]]
+prefix = ["kubectl", ["delete", "drain", "cordon"]]
+decision = "ask"
+host = true
+network = true
+reason = "it changes a cluster others share"
+match = ["kubectl delete deployment x"]
+not_match = ["kubectl get deployment x"]
+
+[[rule]]
+prefix = ["helm", ["uninstall", "delete", "rollback"]]
+decision = "ask"
+host = true
+network = true
+reason = "it changes a cluster others share"
+match = ["helm uninstall x"]
+
+[[rule]]
+prefix = [["gh", "glab", "tea"]]
+decision = "ask"
+host = true
+reason = "it reaches the forge with the person's credentials"
+match = ["gh pr view 12", "gh run list", "glab mr list"]
+
+[[rule]]
+prefix = ["gh", ["pr", "repo", "release"], ["merge", "delete", "create", "close"]]
+decision = "ask"
+host = true
+network = true
+reason = "it changes what others see on the forge"
+match = ["gh pr merge 12", "gh repo delete x", "gh release create v1"]
+not_match = ["gh pr view 12", "gh pr list"]
+
+[[rule]]
+prefix = [["aws", "gcloud", "az", "doctl", "flyctl", "fly"]]
+decision = "ask"
+host = true
+reason = "it reaches a cloud with the person's credentials"
+match = ["aws s3 ls", "gcloud projects list"]
+
+[[rule]]
+prefix = [["terraform", "tofu", "terragrunt", "pulumi"]]
+decision = "ask"
+host = true
+reason = "it reaches the infrastructure's state"
+match = ["terraform plan"]
+
+[[rule]]
+prefix = [["terraform", "tofu", "terragrunt", "pulumi"], ["apply", "destroy", "import", "taint", "up"]]
+decision = "ask"
+host = true
+network = true
+reason = "it changes infrastructure others share"
+match = ["terraform apply", "pulumi up"]
+not_match = ["terraform plan"]
+
 # What fetches packages and sources is given the internet without asking:
 # a line of these, and of commands that send nothing, is known not to send
 # the workspace away. Their install scripts run with it, as anywhere else.

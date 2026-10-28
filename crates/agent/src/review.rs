@@ -1,9 +1,10 @@
 //! The reviewer: a model that answers for the person, the autopilot being
-//! on, what the gate asks. It sees only what stays within the sandbox, and
-//! what only reaches the internet when the person lets it (the gate
-//! refuses it the rest), so the worst it lets through is work of the
-//! project's own lost, or sent away; never a secret, never code run
-//! outside, never a commit published.
+//! on, what the gate asks. It sees what stays within the sandbox, what only
+//! reaches the internet when the person lets it, and what runs on the
+//! machine itself when the person lets it, following the policy they
+//! wrote for it (the gate refuses it the rest), so that what it lets
+//! through is what the person would: never a secret, never a commit
+//! published, never what changes what others share.
 
 /// The reviewer's standing instructions.
 pub(crate) const INSTRUCTIONS: &str = "You review one action that an AI coding agent wants to \
@@ -16,15 +17,36 @@ you cannot tell. Some actions reach the internet from the sandbox: the person's 
 secrets stay out of their reach, but what they send goes. Approve those that fetch: installing \
 packages, cloning or fetching sources, reading documentation or an API. Refuse those that send \
 the project's files or data away (an upload, a POST of a file, scp, rsync to a remote), and those \
-that run code they download (curl ... | sh). Answer with APPROVE or REFUSE as the first word, \
-then one short sentence why.";
+that run code they download (curl ... | sh). Some actions run on the machine itself, outside \
+the sandbox, with the person's own services and credentials, as if they typed them: the \
+container daemon, a cluster, the forge's command line, a cloud's. Approve those that serve the \
+task as the person's policy, when they wrote one, says: the project's own services started, \
+its database, migrations and tests run against them, what reads a cluster or the forge. Refuse \
+what the policy does not cover and you cannot tell, what destroys or changes what others share, \
+what mounts or reads folders outside the project, privileged containers, images the project \
+does not name, and anything that sends data away. Answer with APPROVE or REFUSE as the first \
+word, then one short sentence why.";
 
-/// What the reviewer is asked about one action.
-pub(crate) fn prompt(task: &str, action: &str, reason: &str) -> String {
+/// What the reviewer is asked about one action: the task, the action,
+/// where it runs (`place`) and why it was held.
+pub(crate) fn prompt(task: &str, action: &str, place: &str, reason: &str) -> String {
     format!(
-        "The agent's task:\n{task}\n\nThe action it wants to take:\n{action}\n\nWhy it was held: \
-         {reason}.\n\nAPPROVE or REFUSE?"
+        "The agent's task:\n{task}\n\nThe action it wants to take:\n{action}\n\nWhere it runs: \
+         {place}.\n\nWhy it was held: {reason}.\n\nAPPROVE or REFUSE?"
     )
+}
+
+/// Where an action of `scope` runs, for the reviewer.
+pub(crate) fn place(scope: iq_gate::Scope) -> &'static str {
+    match scope {
+        iq_gate::Scope::Sandbox => "in the sandbox, which holds it to the project's folder",
+        iq_gate::Scope::Internet => "in the sandbox, with the internet",
+        iq_gate::Scope::Host => {
+            "on the machine itself, outside the sandbox, with the person's own services and \
+             credentials"
+        }
+        iq_gate::Scope::Beyond => "beyond the sandbox, which only the person may allow",
+    }
 }
 
 /// The reviewer's answer: approved or not, and why. Anything but a clear

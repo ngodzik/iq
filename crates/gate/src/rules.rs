@@ -14,7 +14,11 @@
 //!
 //! A word of the prefix may be a list of words, any of which matches. The
 //! examples are checked as the rules are read, so that a rule that does not
-//! do what it says is refused rather than trusted.
+//! do what it says is refused rather than trusted. A rule with `host`
+//! names a command that needs the machine itself, outside the sandbox: the
+//! container daemon, a cluster, the forge's own command line, a cloud's,
+//! which keep the person's credentials. Asked, it runs there once
+//! approved; allowed, it runs there as it is.
 
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +65,10 @@ pub(crate) struct Rule {
     /// Whether the command needs the network: allowed, it gets it.
     #[serde(default)]
     pub(crate) network: bool,
+    /// Whether the command needs the machine itself, outside the sandbox:
+    /// allowed or approved, it runs there.
+    #[serde(default)]
+    pub(crate) host: bool,
     #[serde(default, rename = "match")]
     matching: Vec<String>,
     #[serde(default)]
@@ -165,12 +173,13 @@ impl Rules {
         self
     }
 
-    /// The most restrictive rule a command matches, if any.
+    /// The most restrictive rule a command matches, if any; of two as
+    /// restrictive, the one naming more of the command.
     pub(crate) fn decide(&self, words: &[String]) -> Option<&Rule> {
         self.0
             .iter()
             .filter(|rule| rule.matches(words))
-            .max_by_key(|rule| rule.decision)
+            .max_by_key(|rule| (rule.decision, rule.prefix.len()))
     }
 }
 
@@ -214,6 +223,12 @@ mod tests {
         assert_eq!(decided("sudo ls"), Some(Decision::Deny));
         assert_eq!(decided("cargo test"), None);
         assert!(rules.decide(&words("git push")).unwrap().network);
+        // Of two rules asking, the one naming more of the command decides:
+        // `docker push` publishes, where `docker` only needs the machine.
+        let push = rules.decide(&words("docker push x")).unwrap();
+        assert!(push.network && push.host);
+        let ps = rules.decide(&words("docker ps")).unwrap();
+        assert!(!ps.network && ps.host);
     }
 
     #[test]

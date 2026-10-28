@@ -31,6 +31,11 @@ pub enum Action {
         /// Whether it asks to reach the network, which the sandbox withholds
         /// otherwise.
         network: bool,
+        /// Whether it runs on the machine itself, outside the sandbox, with
+        /// the person's own services and credentials: what the rules say
+        /// needs them (the container daemon, a cluster, the forge's own
+        /// command line, a cloud's), or what the agent asks for.
+        host: bool,
     },
     /// Reaching the network outside a command: fetching a page, searching
     /// the web. Always asked of the person: what leaves cannot be taken
@@ -92,6 +97,11 @@ pub enum Scope {
     /// The internet, and nothing else: files stay held, secrets out. A
     /// reviewer may give it when the person lets it.
     Internet,
+    /// The machine itself: the command runs outside the sandbox, with the
+    /// person's own services and credentials, as if they typed it. A
+    /// reviewer may give it when the person lets it, following the policy
+    /// they wrote for it.
+    Host,
     /// More: publishing, a file outside the workspace, where code runs
     /// later, secrets. Only the person may give it.
     Beyond,

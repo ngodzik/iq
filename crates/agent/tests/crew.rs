@@ -460,6 +460,88 @@ async fn the_reviewer_answers_within_the_sandbox_when_the_autopilot_is_on() {
 }
 
 #[tokio::test]
+async fn what_runs_on_the_machine_waits_for_the_person_unless_they_let_the_reviewer() {
+    let scripts = |answer: &str| {
+        [
+            (
+                "lead",
+                vec![
+                    calls(
+                        "run",
+                        serde_json::json!({"command": "echo on-the-machine", "host": true}),
+                    ),
+                    say("Ran."),
+                ],
+            ),
+            ("reviewer", vec![say(answer)]),
+        ]
+    };
+    let settings = || Settings {
+        reviewer: Some(model("cheap/reviewer")),
+        ..Settings::default()
+    };
+    // Not let: the person is asked, the reviewer never.
+    let f = fixture(&scripts("APPROVE: fine."), settings());
+    f.crew.set_autopilot(true);
+    f.crew
+        .start("lead", &model("cheap/model"), "start the db".into(), PERSON);
+    let id = f.question().await;
+    f.crew.answer(id, false);
+    f.settled().await;
+    assert!(f.model.seen_by("reviewer").is_empty());
+    assert!(f.model.seen_by("lead").contains("the person refused it"));
+    // Let, as their policy says: the reviewer answers, the command runs on
+    // the machine, and its output comes back.
+    let f = fixture(
+        &scripts("APPROVE: the policy lets the project's services start."),
+        settings(),
+    );
+    f.crew.set_autopilot(true);
+    f.crew.set_autopilot_host(true);
+    f.crew
+        .start("lead", &model("cheap/model"), "start the db".into(), PERSON);
+    f.settled().await;
+    assert!(!f.events().iter().any(|e| matches!(e, Event::Asked { .. })));
+    let asked = f.model.seen_by("reviewer");
+    assert!(
+        asked.contains("on the machine itself, outside the sandbox"),
+        "{asked}"
+    );
+    let seen = f.model.seen_by("lead");
+    assert!(seen.contains("on-the-machine"), "{seen}");
+}
+
+#[tokio::test]
+async fn after_refusals_in_a_row_the_person_is_asked() {
+    let reset = || calls("run", serde_json::json!({"command": "git reset --hard"}));
+    let f = fixture(
+        &[
+            ("lead", vec![reset(), reset(), reset(), say("Stuck.")]),
+            (
+                "reviewer",
+                vec![say("REFUSE: it loses work."), say("REFUSE: still.")],
+            ),
+        ],
+        Settings {
+            reviewer: Some(model("cheap/reviewer")),
+            refusals: 2,
+            ..Settings::default()
+        },
+    );
+    f.crew.set_autopilot(true);
+    f.crew
+        .start("lead", &model("cheap/model"), "tidy up".into(), PERSON);
+    let id = f.question().await;
+    f.crew.answer(id, false);
+    f.settled().await;
+    assert_eq!(f.model.models_of("reviewer").len(), 2);
+    assert!(f.events().iter().any(|e| matches!(
+        e,
+        Event::Notice { text, .. } if text.contains("refused 2 actions of lead in a row")
+    )));
+}
+
+#[tokio::test]
 async fn agents_hand_work_to_each_other_on_the_board() {
     let f = fixture(
         &[
