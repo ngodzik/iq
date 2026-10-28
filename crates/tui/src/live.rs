@@ -271,17 +271,10 @@ impl Live<'_> {
         let ask = self.board.sync_ask()?;
         let inner = width.saturating_sub(4);
         let pad = [Span::raw(" ")];
-        const NAMED: usize = 3;
-        let mut files = ask
-            .files
-            .iter()
-            .take(NAMED)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        if ask.files.len() > NAMED {
-            files.push_str(&format!(" and {} more", ask.files.len() - NAMED));
-        }
+        let files = match ask.files.len() {
+            1 => ask.said.clone(),
+            n => format!("{n} files: {}", ask.said),
+        };
         let mut lines = wrap(
             &[Span::styled(
                 format!("send what changed to {}?", ask.remote),

@@ -88,8 +88,9 @@ enum Command {
     /// The provider's models, with what they charge per million tokens.
     Models,
     /// Syncs iq's folder of data now with the repository the settings'
-    /// [sync] names: what changed here sent, what changed elsewhere taken;
-    /// a new machine takes everything first. iq does it on its own as it runs.
+    /// [sync] names: what changed elsewhere taken, what changed here sent
+    /// once the person says so, unless [sync] auto; a new machine takes
+    /// everything first. iq does it as it runs too.
     Sync,
     /// Runs a command line in the sandbox, as a model's would be: judged by
     /// the gate, asked when it must be, written to the audit log.
@@ -249,7 +250,19 @@ fn machine_sync() -> Result<Option<Arc<iq_sync::Sync>>> {
 /// that the settings it took keep are put back too, what it had kept
 /// beside.
 async fn sync_now(sync: &iq_sync::Sync) -> Result<iq_sync::Outcome, iq_sync::SyncError> {
-    let outcome = sync.run().await?;
+    put_back_taken(sync.run().await?)
+}
+
+/// Takes what the repository holds, on a machine new to it, and sends
+/// nothing: what the machine has is asked about after. The files of the
+/// home the settings it took keep are put back, as [`sync_now`] does.
+async fn take_first(sync: &iq_sync::Sync) -> Result<iq_sync::Outcome, iq_sync::SyncError> {
+    put_back_taken(sync.take_first().await?)
+}
+
+/// `outcome`, the files of the home put back first when a machine new to
+/// the repository took settings that keep some.
+fn put_back_taken(outcome: iq_sync::Outcome) -> Result<iq_sync::Outcome, iq_sync::SyncError> {
     if outcome.fresh
         && outcome.taken.iter().any(|f| f.starts_with("config/"))
         && let Some(taken) = machine_sync().ok().flatten()
@@ -386,7 +399,9 @@ async fn work(
 ) -> Result<()> {
     let folder = home_folder()?;
     let (settings, lead) = chosen(cli, &folder)?;
-    retired(&settings);
+    for note in retired(&settings).into_iter().chain(left_over(&settings)) {
+        eprintln!("iq: {note}");
+    }
     let ledger = Arc::new(Ledger::open(&folder));
     let journal = Arc::new(Journal::open(&folder, &project()));
     let (send, mut events) = tokio::sync::mpsc::unbounded_channel();
@@ -453,12 +468,29 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         Settings::load(&folder).is_ok_and(|settings| settings.sync_auto()),
     ));
     let first = sync.as_ref().and_then(|sync| {
+        if sync.fresh() {
+            // New to the repository: it takes what is there, and what it
+            // has is asked about once iq is open.
+            eprintln!(
+                "iq: this machine is new to {}: it takes what is there first…",
+                sync.remote()
+            );
+            let result = runtime
+                .block_on(async { tokio::time::timeout(sync::OPENING, take_first(sync)).await })
+                .unwrap_or_else(|_| {
+                    Err(iq_sync::SyncError::Refused(
+                        "it took too long; iq opened without it".into(),
+                    ))
+                });
+            match &result {
+                Ok(outcome) => eprintln!("iq: synced, {}", outcome.said()),
+                Err(error) => eprintln!("iq: the sync failed, iq opens without it: {error}"),
+            }
+            return Some(synced(&result));
+        }
         let waiting = runtime.block_on(sync.changes());
         if !waiting.is_empty() && !auto.load(Ordering::Relaxed) {
-            eprintln!(
-                "iq: changed since the last sync: {}. iq asks before it sends.",
-                iq_sync::named(&waiting)
-            );
+            // Asked once iq is open.
             return None;
         }
         eprintln!("iq: syncing with {}…", sync.remote());
@@ -476,9 +508,12 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         Some(synced(&result))
     });
     let (settings, lead) = chosen(cli, &folder)?;
-    retired(&settings);
+    // Said in the conversation, under its header: what is printed before
+    // the terminal is taken is cleared with it.
+    let mut notes = retired(&settings);
+    notes.extend(left_over(&settings));
     if cli.api_key.is_none() {
-        eprintln!("iq: REQUESTY_API_KEY is not set: no model will answer.");
+        notes.push("REQUESTY_API_KEY is not set: no model will answer.".to_owned());
     }
     let keyed = cli.api_key.is_some();
     let ledger = Arc::new(Ledger::open(&folder));
@@ -498,6 +533,9 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         autopilot: settings.autopilot,
         internet: settings.internet,
     });
+    for note in notes {
+        let _ = send.send(Update::Said(note));
+    }
     let _ = send.send(Update::Kept(
         ledger.billed(iq_ui::now().saturating_sub(ledger::BILLED_KEEP_SECS)),
     ));
@@ -515,7 +553,16 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
             let mut asked: Vec<String> = Vec::new();
             loop {
                 let changes = sync.changes().await;
-                let update = if changes.is_empty() {
+                let update = if sync.fresh() {
+                    // Its first sync failed as iq opened: it takes first
+                    // again, now and then, and sends nothing.
+                    if last.elapsed() < sync::TAKE_EVERY {
+                        None
+                    } else {
+                        last = std::time::Instant::now();
+                        Some(Update::Synced(synced(&take_first(&sync).await)))
+                    }
+                } else if changes.is_empty() {
                     asked.clear();
                     if last.elapsed() < sync::TAKE_EVERY {
                         None
@@ -532,6 +579,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     asked = changes.clone();
                     Some(Update::SyncAsk(iq_ui::SyncAsk {
                         remote: sync.remote().to_owned(),
+                        said: iq_sync::named(&changes),
                         files: changes,
                     }))
                 } else {
@@ -714,11 +762,13 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         crew.end().await;
         // What changed since the last sync leaves with iq, as the person
         // says.
+        let changes = match &sync {
+            Some(sync) => sync.changes().await,
+            None => Vec::new(),
+        };
         if let Some(sync) = &sync
-            && sync.pending().await
-            && (sync.fresh()
-                || auto.load(Ordering::Relaxed)
-                || send_changes(sync.remote(), &sync.changes().await))
+            && !changes.is_empty()
+            && (auto.load(Ordering::Relaxed) || send_changes(sync.remote(), &changes))
         {
             match tokio::time::timeout(sync::CLOSING, sync.run()).await {
                 Ok(Ok(outcome)) => eprintln!("iq: synced, {}", outcome.said()),
@@ -843,22 +893,52 @@ fn gate_in(workspace: &Path, internet: bool, reviewer_internet: bool) -> Result<
     Ok(gate.build()?)
 }
 
-/// Says at start what the settings hold that iq reads no more, and the
-/// models they name that it runs no more, for the person to change them.
-fn retired(settings: &Settings) {
+/// What iq says at start of what it left behind that the person may want
+/// gone, and of where the rules the lead follows come from when they are
+/// Claude Code's.
+fn left_over(settings: &Settings) -> Vec<String> {
+    let Ok(home) = home_dir() else {
+        return Vec::new();
+    };
+    let mut said = Vec::new();
+    let assay = settings::data_folder(&home).join("assay");
+    if assay.is_dir() {
+        said.push(format!(
+            "{} is the store of the assay iq no longer has: it is synced no more, and the next \
+             sync takes it out of the repository, whose history keeps it. Move it out of iq's \
+             folder, or remove it.",
+            assay.display()
+        ));
+    }
+    if settings.claude_rules_by_default(&home) {
+        said.push(
+            "the lead follows ~/.claude/CLAUDE.md, Claude Code's rules, which iq does not sync: \
+             rules of iq's own go in ~/.iq/AGENTS.md, read instead once written."
+                .to_owned(),
+        );
+    }
+    said
+}
+
+/// What iq says at start of what the settings hold that it reads no more,
+/// and of the models they name that it runs no more, for the person to
+/// change them.
+fn retired(settings: &Settings) -> Vec<String> {
+    let mut said = Vec::new();
     let retired = settings.retired();
     if !retired.is_empty() {
-        eprintln!(
-            "iq: ~/.iq/settings.toml holds {}, which iq reads no more: it may go.",
+        said.push(format!(
+            "~/.iq/settings.toml holds {}, which iq reads no more: it may go.",
             retired.join(", ")
-        );
+        ));
     }
     for (key, model) in settings.agents_named() {
-        eprintln!(
-            "iq: ~/.iq/settings.toml names {model} for {key}, which was Claude Code's or Codex's: \
-             iq runs the provider's models only, such as anthropic/claude-opus-5-5."
-        );
+        said.push(format!(
+            "~/.iq/settings.toml names {model} for {key}, which was Claude Code's or Codex's: iq \
+             runs the provider's models only."
+        ));
     }
+    said
 }
 
 /// Asks the person on the terminal whether what changed, `files`, goes to
@@ -921,17 +1001,25 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
             for why in sync.refused() {
                 println!("Not kept: {why}.");
             }
+            if sync.fresh() {
+                println!(
+                    "This machine is new to {}: it takes what is there first…",
+                    sync.remote()
+                );
+                let outcome = take_first(&sync).await?;
+                println!("Taken: {}.", outcome.said());
+            }
+            let changes = sync.changes().await;
+            let auto = Settings::load(&home_folder()?).is_ok_and(|s| s.sync_auto());
+            if !changes.is_empty() && !auto && !send_changes(sync.remote(), &changes) {
+                println!("Nothing sent.");
+                return Ok(());
+            }
             println!("Syncing {} with {}…", sync.root().display(), sync.remote());
             let outcome = sync_now(&sync).await?;
-            if outcome.fresh && !outcome.taken.is_empty() {
-                println!("This machine was new to it: it took what was there first.");
-            }
             println!("Synced: {}.", outcome.said());
-            for file in &outcome.taken {
-                println!("  taken: {file}");
-            }
-            for file in &outcome.sent {
-                println!("  sent: {file}");
+            if !outcome.taken.is_empty() {
+                println!("  taken: {}", iq_sync::named(&outcome.taken));
             }
             let kept = sync.kept();
             if !kept.is_empty() {

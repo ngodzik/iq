@@ -92,6 +92,9 @@ pub struct SyncAsk {
     pub remote: String,
     /// The files that changed, as the repository names them.
     pub files: Vec<String>,
+    /// Those files, said for the person to decide on: the person's own by
+    /// name, the rest counted by folder.
+    pub said: String,
 }
 
 /// How far back the costs are summed, in seconds, as the costs' page
@@ -1208,6 +1211,7 @@ mod tests {
             Update::SyncAsk(SyncAsk {
                 remote: "https://example.com/notes.git".into(),
                 files: vec!["config/skills/teams/SKILL.md".into()],
+                said: "config/skills/teams/SKILL.md".into(),
             })
         };
         board.update(ask());

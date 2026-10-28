@@ -64,7 +64,7 @@ fn read(root: &Path, path: &str) -> Option<String> {
 async fn a_new_machine_takes_what_is_there_before_it_sends_anything() {
     let w = world();
     let a = w.machine("a");
-    write(a.root(), "assay/README.md", "the assay\n");
+    write(a.root(), "memory/README.md", "the memory\n");
     write(a.root(), "memory/notes.md", "kept on a\n");
     write(&w.root, "a/home/settings.toml", "theme = \"ink\"\n");
     let first = a.run().await.unwrap();
@@ -76,14 +76,14 @@ async fn a_new_machine_takes_what_is_there_before_it_sends_anything() {
 
     // b had a README of its own, a note a never saw, and its own settings.
     let b = w.machine("b");
-    write(b.root(), "assay/README.md", "made fresh on b\n");
+    write(b.root(), "memory/README.md", "made fresh on b\n");
     write(b.root(), "memory/only-b.md", "b's\n");
     write(&w.root, "b/home/settings.toml", "theme = \"porcelain\"\n");
     let second = b.run().await.unwrap();
     assert!(second.fresh);
     assert_eq!(
-        read(b.root(), "assay/README.md").as_deref(),
-        Some("the assay\n")
+        read(b.root(), "memory/README.md").as_deref(),
+        Some("the memory\n")
     );
     assert_eq!(
         read(b.root(), "memory/notes.md").as_deref(),
@@ -155,40 +155,53 @@ async fn changes_on_each_side_meet_and_this_machine_wins_where_they_overlap() {
     );
 }
 
+/// Runs git in `folder` as an older iq or the person would, out of any
+/// repository's hook it may run in.
+fn git(folder: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(folder)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
 #[tokio::test]
 async fn what_only_this_machine_needs_stays_here() {
     let w = world();
     let a = w.machine("a");
-    write(a.root(), "assay/runs/add/20261024-1/A/run.json", "{}\n");
-    write(
-        a.root(),
-        "assay/runs/add/20261024-1/A/work/node_modules/x.js",
-        "big\n",
-    );
-    write(a.root(), "assay/judging/add-1/A.diff", "+x\n");
+    write(a.root(), "assay/runs/add/1/A/run.json", "{}\n");
+    write(a.root(), "memory/notes.md", "kept\n");
+    write(a.root(), "memory/notes.md.before-sync", "old\n");
     let outcome = a.run().await.unwrap();
-    assert!(
-        outcome
-            .sent
-            .contains(&"assay/runs/add/20261024-1/A/run.json".to_owned())
-    );
+    assert!(outcome.sent.contains(&"memory/notes.md".to_owned()));
     assert!(
         outcome
             .sent
             .iter()
-            .all(|f| !f.contains("/work/") && !f.contains("judging")),
+            .all(|f| !f.starts_with("assay/") && !f.ends_with(".before-sync")),
         "{outcome:?}"
     );
+
+    // What an older iq sent of the assay's store goes from the repository,
+    // and stays here.
+    git(a.root(), &["add", "-f", "assay/runs/add/1/A/run.json"]);
+    git(a.root(), &["commit", "-q", "-m", "an older iq"]);
+    git(a.root(), &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    assert_eq!(a.changes().await, ["assay/runs/add/1/A/run.json"]);
+    a.run().await.unwrap();
+    assert!(a.changes().await.is_empty());
+    assert!(read(a.root(), "assay/runs/add/1/A/run.json").is_some());
     let b = w.machine("b");
     b.run().await.unwrap();
-    assert!(read(b.root(), "assay/runs/add/20261024-1/A/run.json").is_some());
-    assert!(
-        read(
-            b.root(),
-            "assay/runs/add/20261024-1/A/work/node_modules/x.js"
-        )
-        .is_none()
-    );
+    assert!(read(b.root(), "assay/runs/add/1/A/run.json").is_none());
+    assert!(read(b.root(), "memory/notes.md").is_some());
+
     // Nothing changed: nothing is committed or sent.
     assert!(!a.pending().await);
     assert!(a.run().await.unwrap().sent.is_empty());
@@ -199,6 +212,40 @@ async fn what_only_this_machine_needs_stays_here() {
     assert!(!a.pending().await);
     write(&w.root, "a/home/settings.toml", "changed again\n");
     assert!(a.pending().await);
+}
+
+#[tokio::test]
+async fn a_new_machine_asked_first_takes_what_is_there_and_sends_nothing() {
+    let w = world();
+    let a = w.machine("a");
+    write(a.root(), "memory/notes.md", "kept on a\n");
+    a.run().await.unwrap();
+    let b = w.machine("b");
+    write(b.root(), "memory/only-b.md", "b's\n");
+    write(&w.root, "b/home/settings.toml", "theme = \"porcelain\"\n");
+    // Never synced: nothing to ask yet, it takes first.
+    assert!(b.fresh() && b.changes().await.is_empty());
+    let taken = b.take_first().await.unwrap();
+    assert!(taken.fresh && taken.sent.is_empty());
+    assert!(taken.taken.contains(&"memory/notes.md".to_owned()));
+    assert_eq!(
+        read(b.root(), "memory/notes.md").as_deref(),
+        Some("kept on a\n")
+    );
+    // What it has of its own is asked about, and was not sent.
+    assert!(!b.fresh());
+    assert_eq!(
+        b.changes().await,
+        ["config/settings.toml", "memory/only-b.md"]
+    );
+    assert!(a.run().await.unwrap().taken.is_empty());
+    // A repository that holds nothing yet: the first machine sends nothing
+    // either, until asked.
+    let empty = world();
+    let first = empty.machine("first");
+    write(first.root(), "memory/x.md", "x\n");
+    first.take_first().await.unwrap();
+    assert_eq!(first.changes().await, [".gitignore", "memory/x.md"]);
 }
 
 #[tokio::test]

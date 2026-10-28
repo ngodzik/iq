@@ -24,7 +24,10 @@
 //! removed stays in the history.
 //!
 //! What a sync would send is listed before, for the person to say whether
-//! it goes.
+//! it goes; a machine new to the repository takes what is there first, and
+//! then is asked as any other. What the folder's `.gitignore` leaves out is
+//! not kept, nor what was sent of it before: the store of the assay iq
+//! once had, among it.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -41,12 +44,16 @@ use tokio::sync::Mutex;
 pub const BRANCH: &str = "main";
 
 /// What a sync leaves out: what only this machine needs, or what is built
-/// again from the rest, such as the work folders of the assay iq once had.
+/// again from the rest; and the store of the assay iq once had, which it
+/// reads no more.
 const IGNORED: &str = "# What only this machine needs, or what is built again from the rest.
-assay/runs/*/*/*/work/
-assay/judging/
 *.before-sync
+# The assay iq once had, which it reads no more.
+assay/
 ";
+
+/// What the `.gitignore` once said, which the store's own line now covers.
+const IGNORED_ONCE: [&str; 2] = ["assay/runs/*/*/*/work/", "assay/judging/"];
 
 /// Where they are kept in the folder.
 const KEPT: &str = "home";
@@ -157,20 +164,74 @@ impl Outcome {
     }
 }
 
-/// The first few of `files`, and how many more.
+/// `files`, as the repository names them, said for the person to decide
+/// on: a few by name; more, the person's own by name (what is kept from
+/// the home, iq's settings, rules and skills) and the rest counted by
+/// folder.
+///
+/// # Examples
+///
+/// ```
+/// let files: Vec<String> = ["home/.claude/CLAUDE.md", "memory/a.md", "memory/b.md", "assay/x", "assay/y", "assay/z"]
+///     .map(str::to_owned)
+///     .to_vec();
+/// assert_eq!(iq_sync::named(&files[..2]), "home/.claude/CLAUDE.md, memory/a.md");
+/// assert_eq!(iq_sync::named(&files), "home/.claude/CLAUDE.md; assay/ 3, memory/ 2");
+/// ```
 #[must_use]
 pub fn named(files: &[String]) -> String {
+    /// So many files are named whole.
     const NAMED: usize = 3;
-    let mut said = files
-        .iter()
-        .take(NAMED)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if files.len() > NAMED {
-        said.push_str(&format!(" and {} more", files.len() - NAMED));
+    /// So many of the person's own are named among more.
+    const OWN: usize = 6;
+    /// So many folders are counted.
+    const FOLDERS: usize = 4;
+    if files.len() <= NAMED {
+        return files.join(", ");
     }
-    said
+    let own: Vec<&String> = files
+        .iter()
+        .filter(|f| f.starts_with(&format!("{KEPT}/")) || f.starts_with("config/"))
+        .collect();
+    let mut folders: Vec<(String, usize)> = Vec::new();
+    for file in files.iter().filter(|f| !own.contains(f)) {
+        let folder = match file.split_once('/') {
+            Some((folder, _)) => format!("{folder}/"),
+            None => file.clone(),
+        };
+        match folders.iter_mut().find(|(f, _)| *f == folder) {
+            Some((_, count)) => *count += 1,
+            None => folders.push((folder, 1)),
+        }
+    }
+    folders.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut parts = Vec::new();
+    if !own.is_empty() {
+        let mut said = own
+            .iter()
+            .take(OWN)
+            .map(|f| f.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if own.len() > OWN {
+            said.push_str(&format!(" and {} more of yours", own.len() - OWN));
+        }
+        parts.push(said);
+    }
+    if !folders.is_empty() {
+        let mut said = folders
+            .iter()
+            .take(FOLDERS)
+            .map(|(folder, count)| format!("{folder} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let others: usize = folders.iter().skip(FOLDERS).map(|(_, count)| count).sum();
+        if others > 0 {
+            said.push_str(&format!(" and {others} elsewhere"));
+        }
+        parts.push(said);
+    }
+    parts.join("; ")
 }
 
 fn count(files: usize) -> String {
@@ -466,10 +527,43 @@ impl Sync {
         !self.root.join(".git").exists()
     }
 
+    /// Takes what the repository holds, on a machine that never synced,
+    /// and sends nothing: what this machine has is then asked about as any
+    /// change is. Where the repository holds nothing yet, the folder is
+    /// only made one of it.
+    ///
+    /// # Errors
+    ///
+    /// Git could not be run, or said no, as when the repository cannot be
+    /// reached; or a file could not be read or written.
+    pub async fn take_first(&self) -> Result<Outcome, SyncError> {
+        let _one = self.running.lock().await;
+        let git = Git::new(&self.root, &self.remote, &self.machine).await;
+        self.prepare(&git).await?;
+        let mut outcome = Outcome {
+            fresh: true,
+            ..Outcome::default()
+        };
+        git.run(&["fetch", "-q", "origin"]).await?;
+        let theirs = format!("refs/remotes/origin/{}", self.branch);
+        if !git.ok(&["rev-parse", "--verify", "-q", "HEAD"]).await
+            && git.ok(&["rev-parse", "--verify", "-q", &theirs]).await
+        {
+            git.run(&["reset", "-q", &theirs]).await?;
+            git.run(&["checkout", "-q", &theirs, "--", "."]).await?;
+            outcome.taken = git.lines(&["ls-tree", "-r", "--name-only", "HEAD"]).await?;
+            self.copy_out(true)?;
+            self.keep_out(true)?;
+        }
+        Ok(outcome)
+    }
+
     /// What a sync would send, as the repository names it: the files of
-    /// the folder changed, and those mirrored or kept that changed where
-    /// they live. Reads only, and reaches no repository; nothing on a
-    /// machine that never synced, which takes first.
+    /// the folder changed, those mirrored or kept that changed where they
+    /// live, and what was sent before that the folder's `.gitignore` now
+    /// leaves out, which goes from the repository. Reads only, and
+    /// reaches no repository; nothing on a machine that never synced,
+    /// which takes first.
     pub async fn changes(&self) -> Vec<String> {
         if self.fresh() {
             return Vec::new();
@@ -515,6 +609,9 @@ impl Sync {
                     .filter_map(|line| line.get(3..))
                     .map(|name| name.trim_matches('"').to_owned()),
             );
+        }
+        if let Ok(left_out) = git.lines(&["ls-files", "-ci", "--exclude-standard"]).await {
+            changed.extend(left_out);
         }
         changed.sort();
         changed.dedup();
@@ -634,8 +731,21 @@ impl Sync {
             git.run(&["init", "-q", "-b", &self.branch]).await?;
         }
         let ignored = self.root.join(".gitignore");
-        if !ignored.exists() {
-            std::fs::write(&ignored, IGNORED).map_err(io(&ignored))?;
+        let before = std::fs::read_to_string(&ignored).unwrap_or_default();
+        let now = ignore_lines(&before);
+        if now != before {
+            std::fs::write(&ignored, now).map_err(io(&ignored))?;
+        }
+        // What it now leaves out goes from the repository, as the assay's
+        // store did once iq read it no more; its history keeps it.
+        let left_out = git
+            .lines(&["ls-files", "-ci", "--exclude-standard"])
+            .await
+            .unwrap_or_default();
+        for some in left_out.chunks(200) {
+            let mut args = vec!["rm", "-q", "--cached", "--ignore-unmatch", "--"];
+            args.extend(some.iter().map(String::as_str));
+            git.run(&args).await?;
         }
         match git.run(&["remote", "get-url", "origin"]).await {
             Ok(url) if url.trim() == self.remote => Ok(()),
@@ -692,6 +802,31 @@ impl Sync {
         }
         Ok(())
     }
+}
+
+/// The folder's `.gitignore` as it should be, from what it says now: the
+/// person's own lines kept, those iq wrote once and no longer needs
+/// dropped, iq's own added where missing.
+fn ignore_lines(now: &str) -> String {
+    if now.trim().is_empty() {
+        return IGNORED.to_owned();
+    }
+    let mut lines: Vec<&str> = now
+        .lines()
+        .filter(|line| !IGNORED_ONCE.contains(&line.trim()))
+        .collect();
+    let missing: Vec<&str> = IGNORED
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .filter(|line| !lines.iter().any(|kept| kept.trim() == line.trim()))
+        .collect();
+    if !missing.is_empty() {
+        lines.push("# The assay iq once had, which it reads no more.");
+        lines.extend(missing);
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
 }
 
 /// Whether the file at `path` may be kept: not one whose name says it
@@ -892,6 +1027,31 @@ mod tests {
             "1 file sent (a), 2 files taken, 1 file changed on both sides and merged, this machine's lines kept where they met"
         );
         let many: Vec<String> = ["a", "b", "c", "d", "e"].map(str::to_owned).to_vec();
-        assert_eq!(named(&many), "a, b, c and 2 more");
+        assert_eq!(named(&many), "a 1, b 1, c 1, d 1 and 1 elsewhere");
+        let mut first: Vec<String> = (0..1500).map(|n| format!("assay/runs/{n}")).collect();
+        first.extend((0..20).map(|n| format!("memory/{n}.md")));
+        first.extend(
+            [
+                "config/settings.toml",
+                "config/skills/teams/SKILL.md",
+                ".gitignore",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            named(&first),
+            "config/settings.toml, config/skills/teams/SKILL.md; assay/ 1500, memory/ 20, .gitignore 1"
+        );
+    }
+
+    #[test]
+    fn the_gitignore_keeps_the_persons_lines_and_drops_what_iq_wrote_once() {
+        assert_eq!(ignore_lines(""), IGNORED);
+        assert_eq!(ignore_lines(IGNORED), IGNORED);
+        let once = "# What only this machine needs, or what is built again from the rest.\nassay/runs/*/*/*/work/\nassay/judging/\n*.before-sync\nnotes/drafts/\n";
+        assert_eq!(
+            ignore_lines(once),
+            "# What only this machine needs, or what is built again from the rest.\n*.before-sync\nnotes/drafts/\n# The assay iq once had, which it reads no more.\nassay/\n"
+        );
     }
 }

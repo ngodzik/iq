@@ -11,7 +11,7 @@
 //! autopilot_internet = true              # the reviewer also answers what only reaches the internet
 //! internet = false                       # true: every command reaches the internet
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
-//! rules = ["~/.claude/CLAUDE.md"]        # your rules for every project, given to the agents you start; this one unless set
+//! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else Claude Code's ~/.claude/CLAUDE.md
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set
 //! claude_memory = true                   # Claude Code's notes of the project read beside iq's own
 //!
@@ -32,7 +32,7 @@
 //! [sync]                                 # iq's data kept in a private repository of yours, any name
 //! remote = "https://github.com/someone/any-name.git"
 //! branch = "main"                        # another when main must go through pull requests
-//! keep = ["~/notes", "~/.zshrc"]         # files and folders of the home kept too, put back on a new machine; your rules and skills are
+//! keep = ["~/notes", "~/.zshrc"]         # files and folders of the home kept too, put back on a new machine; your rules and skills in ~/.iq are
 //! auto = false                           # true: what changes is sent without asking, and said; else iq asks first
 //! ```
 
@@ -51,9 +51,14 @@ const LEAD: &str = "anthropic/claude-opus-5-5";
 /// observer's too.
 const REVIEWER: &str = "anthropic/claude-haiku-5-5";
 
-/// The person's rules unless the settings list others: Claude Code's, which
-/// many already keep.
-const RULES: [&str; 1] = ["~/.claude/CLAUDE.md"];
+/// The person's rules for iq, unless the settings list others: read, and
+/// synced with iq's own files.
+const IQ_RULES: &str = "~/.iq/AGENTS.md";
+
+/// Claude Code's, which many already keep: read when iq's are not there.
+/// They are not synced: they may name what the person keeps out of their
+/// repository, and hold Claude Code's own habits.
+const CLAUDE_RULES: &str = "~/.claude/CLAUDE.md";
 
 /// The folders of the person's skills unless the settings list others.
 const SKILLS: [&str; 1] = ["~/.iq/skills"];
@@ -221,12 +226,13 @@ impl Settings {
     }
 
     /// The files of the person's rules, as the settings write them and
-    /// where they are: `~/` in `home`.
+    /// where they are: `~/` in `home`. Unless set, iq's own, else Claude
+    /// Code's.
     pub(crate) fn rules_files(&self, home: &Path) -> Vec<(String, PathBuf)> {
-        let listed = self
-            .rules
-            .clone()
-            .unwrap_or_else(|| RULES.map(str::to_owned).to_vec());
+        let listed = self.rules.clone().unwrap_or_else(|| {
+            let own = placed(IQ_RULES, home, home);
+            vec![if own.exists() { IQ_RULES } else { CLAUDE_RULES }.to_owned()]
+        });
         listed
             .into_iter()
             .filter(|file| !file.trim().is_empty())
@@ -247,6 +253,14 @@ impl Settings {
             .filter(|folder| !folder.trim().is_empty())
             .map(|folder| placed(folder.trim(), home, workspace))
             .collect()
+    }
+
+    /// Whether the rules read are Claude Code's, by default: there are no
+    /// rules of iq's own yet.
+    pub(crate) fn claude_rules_by_default(&self, home: &Path) -> bool {
+        self.rules.is_none()
+            && !placed(IQ_RULES, home, home).exists()
+            && placed(CLAUDE_RULES, home, home).exists()
     }
 
     /// Whether Claude Code's notes of the project are read beside iq's.
@@ -297,9 +311,10 @@ impl Settings {
     }
 
     /// The machine's sync of iq's folder of data `data`, with the settings
-    /// and rules of iq's `folder` mirrored in it and the files of `home`
-    /// they list kept, the person's rules and skills among them, as those
-    /// in iq's folder are mirrored; none without a repository.
+    /// and rules of iq's `folder` mirrored in it, the person's rules and
+    /// skills kept there too, and the files of `home` they list kept; none
+    /// without a repository. Rules or skills elsewhere are synced only as
+    /// listed: Claude Code's may hold what is not for the repository.
     pub(crate) fn sync(&self, folder: &Path, data: &Path, home: &Path) -> Option<iq_sync::Sync> {
         let remote = self.sync.remote.as_deref()?.trim();
         if remote.is_empty() {
@@ -308,11 +323,10 @@ impl Settings {
         let mut sync = iq_sync::Sync::new(data, remote, crate::sync::machine())
             .mirror(folder.join("settings.toml"), "config/settings.toml")
             .mirror(folder.join("rules.toml"), "config/rules.toml");
-        let mut keep = self.sync.keep.clone();
         let rules = self
             .rules
             .clone()
-            .unwrap_or_else(|| RULES.map(str::to_owned).to_vec());
+            .unwrap_or_else(|| vec![IQ_RULES.to_owned()]);
         let skills = self
             .skills
             .clone()
@@ -323,17 +337,11 @@ impl Settings {
                 continue;
             };
             let place = home.join(relative);
-            match place.strip_prefix(folder) {
-                Ok(inside) => {
-                    sync = sync.mirror(&place, format!("config/{}", inside.display()));
-                }
-                Err(_) if !keep.iter().any(|k| k.trim() == written) => {
-                    keep.push(written.to_owned());
-                }
-                Err(_) => {}
+            if let Ok(inside) = place.strip_prefix(folder) {
+                sync = sync.mirror(&place, format!("config/{}", inside.display()));
             }
         }
-        let mut sync = sync.keeping(home, keep);
+        let mut sync = sync.keeping(home, self.sync.keep.clone());
         if let Some(branch) = self.sync.branch.as_deref().filter(|b| !b.trim().is_empty()) {
             sync = sync.on_branch(branch.trim());
         }
@@ -427,6 +435,15 @@ mod tests {
                 PathBuf::from("/h/.claude/CLAUDE.md")
             )]
         );
+        // Rules of iq's own, once written, are read instead.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/CLAUDE.md"), "Claude's\n").unwrap();
+        assert!(none.claude_rules_by_default(dir.path()));
+        std::fs::create_dir_all(dir.path().join(".iq")).unwrap();
+        std::fs::write(dir.path().join(".iq/AGENTS.md"), "iq's\n").unwrap();
+        assert_eq!(none.rules_files(dir.path())[0].0, "~/.iq/AGENTS.md");
+        assert!(!none.claude_rules_by_default(dir.path()));
         assert_eq!(
             none.skill_folders(home, work),
             [PathBuf::from("/h/.iq/skills")]
@@ -483,8 +500,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sync.remote(), "https://github.com/someone/any-name.git");
-        // The person's rules are kept with what they list.
-        assert_eq!(sync.kept(), ["~/notes", "~/.claude/CLAUDE.md"]);
+        // Claude Code's rules are not kept unless listed.
+        assert_eq!(sync.kept(), ["~/notes"]);
         assert_eq!(sync.refused().len(), 1);
         assert!(!set.sync_auto());
         let auto: Settings =
