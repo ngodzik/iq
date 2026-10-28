@@ -18,6 +18,8 @@ use crate::error::UiError;
 pub enum Action {
     /// Writes to the next agent, or to a new chat after the last.
     NextAgent,
+    /// Writes to the agent before the one written to.
+    PrevAgent,
     /// The crew's page: each agent, what it does and spends.
     Team,
     /// The costs' page.
@@ -44,8 +46,9 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order the list of shortcuts gives them.
-    pub const ALL: [Action; 12] = [
+    pub const ALL: [Action; 13] = [
         Action::NextAgent,
+        Action::PrevAgent,
         Action::Team,
         Action::Costs,
         Action::Observations,
@@ -64,6 +67,7 @@ impl Action {
     pub fn name(self) -> &'static str {
         match self {
             Action::NextAgent => "next_agent",
+            Action::PrevAgent => "prev_agent",
             Action::Team => "team",
             Action::Costs => "costs",
             Action::Observations => "observations",
@@ -83,6 +87,7 @@ impl Action {
     pub fn what(self) -> &'static str {
         match self {
             Action::NextAgent => "write to the next agent, or start a new chat",
+            Action::PrevAgent => "write to the agent before",
             Action::Team => "the crew: each agent, what it does and spends",
             Action::Costs => "the costs: by model, by kind of task, over time",
             Action::Observations => "what the work went to, over time",
@@ -101,6 +106,7 @@ impl Action {
     fn default_chord(self) -> &'static str {
         match self {
             Action::NextAgent => "ctrl+n",
+            Action::PrevAgent => "ctrl+p",
             Action::Team => "ctrl+t",
             Action::Costs => "ctrl+o",
             Action::Observations => "ctrl+j",

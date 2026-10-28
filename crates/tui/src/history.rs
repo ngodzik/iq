@@ -102,6 +102,9 @@ pub(crate) struct History {
     /// What to say after the person's next message to an agent: the models
     /// they named in it.
     after: HashMap<String, String>,
+    /// The files each agent read since its last line: written as one line
+    /// before its next, so that what it does is not lost among them.
+    reads: HashMap<String, Vec<String>>,
 }
 
 impl History {
@@ -205,6 +208,13 @@ impl History {
                 output,
                 ok,
             } => {
+                if name == "read_file" && *ok {
+                    self.reads
+                        .entry(agent.clone())
+                        .or_default()
+                        .push(short(input).replace('\n', " "));
+                    return;
+                }
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
                 let (mark, tint) = if *ok {
@@ -430,8 +440,33 @@ impl History {
         }
     }
 
-    /// `agent`'s name and model, when another spoke last.
+    /// `agent`'s name and model, when another spoke last; then the files
+    /// it read since its last line, in one line.
     fn header(&mut self, agent: &str, board: &Board, p: &Palette) {
+        self.named(agent, board, p);
+        let Some(read) = self.reads.remove(agent).filter(|read| !read.is_empty()) else {
+            return;
+        };
+        let names = read.join(", ");
+        self.paras.push(Para {
+            first: vec![Span::raw("  "), Span::styled("▸ ", p.fg(p.faint))],
+            rest: vec![Span::raw("    ")],
+            body: vec![
+                Span::styled(
+                    if read.len() == 1 {
+                        "read ".to_owned()
+                    } else {
+                        format!("read {} files ", read.len())
+                    },
+                    p.fg(p.text),
+                ),
+                Span::styled(cut(&names, INPUT_CHARS), p.fg(p.dim)),
+            ],
+        });
+    }
+
+    /// `agent`'s name and model, when another spoke last.
+    fn named(&mut self, agent: &str, board: &Board, p: &Palette) {
         if self.speaker.as_deref() == Some(agent) {
             return;
         }
@@ -687,6 +722,74 @@ mod tests {
             ]
         );
         assert!(!history.waiting());
+    }
+
+    #[test]
+    fn the_files_read_are_written_in_one_line_before_the_next_step() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        let run = |board: &mut Board, history: &mut History, event| crew(board, history, event, &p);
+        run(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: "lead".into(),
+                model: "m".into(),
+                by: PERSON.into(),
+            },
+        );
+        run(
+            &mut board,
+            &mut history,
+            Event::Working {
+                agent: "lead".into(),
+                prompt: "look".into(),
+            },
+        );
+        let read = |path: &str| Event::Tool {
+            agent: "lead".into(),
+            name: "read_file".into(),
+            input: path.into(),
+            output: "1\tfn main() {}".into(),
+            ok: true,
+        };
+        run(&mut board, &mut history, read("src/a.rs"));
+        run(&mut board, &mut history, read("src/b.rs"));
+        run(
+            &mut board,
+            &mut history,
+            Event::Tool {
+                agent: "lead".into(),
+                name: "run".into(),
+                input: "cargo test".into(),
+                output: "ok".into(),
+                ok: true,
+            },
+        );
+        run(&mut board, &mut history, read("src/c.rs"));
+        run(
+            &mut board,
+            &mut history,
+            Event::Done {
+                agent: "lead".into(),
+                outcome: Ok("done".into()),
+            },
+        );
+        let lines: Vec<String> = history.take(80).iter().map(ToString::to_string).collect();
+        assert_eq!(
+            lines,
+            [
+                "",
+                "› look",
+                "",
+                "● lead  m",
+                "  ▸ read 2 files src/a.rs, src/b.rs",
+                "  ▸ run cargo test",
+                "  ▸ read src/c.rs",
+                "  ✔ 0s",
+            ]
+        );
     }
 
     #[test]

@@ -88,6 +88,15 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
             ));
         }
         lines.push(Line::from(spans));
+        if let Some(place) = &agent.place {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "       in {}",
+                    cut(&place.display().to_string(), seen.width.saturating_sub(12))
+                ),
+                p.fg(p.faint),
+            )));
+        }
     }
     if let Some(agent) = agents.get(chosen) {
         seen.heading(

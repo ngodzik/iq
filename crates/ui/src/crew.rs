@@ -148,6 +148,8 @@ pub struct AgentView {
     pub reads: Vec<TokenCount>,
     /// How hard it thinks; `None` leaves it to its model.
     pub effort: Option<Effort>,
+    /// Where it works, when it was given a place of its own.
+    pub place: Option<std::path::PathBuf>,
 }
 
 impl AgentView {
@@ -295,6 +297,7 @@ impl CrewView {
                     billed: Usd(0.0),
                     reads: Vec::new(),
                     effort: None,
+                    place: None,
                 });
             }
             Event::Working { agent, prompt } => {
@@ -433,14 +436,16 @@ impl CrewView {
             }
             Event::Placed {
                 agent,
-                said: Some(said),
-                ..
+                folder,
+                said,
             } => {
                 if let Some(view) = self.agent_mut(&agent) {
-                    view.thread.push(Entry::Notice(format!("{agent} {said}")));
+                    view.place = Some(folder);
+                    if let Some(said) = said {
+                        view.thread.push(Entry::Notice(format!("{agent} {said}")));
+                    }
                 }
             }
-            Event::Placed { said: None, .. } => {}
             Event::Effort { agent, effort } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.effort = effort;

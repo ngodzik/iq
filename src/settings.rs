@@ -16,6 +16,9 @@
 //! command_timeout = 600                  # seconds a command may run before it is stopped
 //! command_quiet = 180                    # seconds a command may write nothing before it is stopped: one waiting for a login, or an answer at a terminal
 //! worktree = false                       # true: each chat you start works in a worktree of its own, on a branch iq/<chat>; your checkout is left as it is
+//! worktree_from = "HEAD"                 # what a worktree starts from: your checkout's commit, or a branch such as "origin/main"
+//! worktree_setup = ["uv sync"]           # commands run in a worktree as it is made, on your machine, to give it the project's environment
+//! worktree_keep = 30                     # days a worktree may go untouched before iq removes it as it starts, when nothing in it is uncommitted; 0 never
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
@@ -70,6 +73,10 @@ const CLAUDE_RULES: &str = "~/.claude/CLAUDE.md";
 /// The folders of the person's skills unless the settings list others.
 const SKILLS: [&str; 1] = ["~/.iq/skills"];
 
+/// How many days a worktree may go untouched before iq removes it, unless
+/// the settings say.
+const WORKTREE_KEEP_DAYS: u64 = 30;
+
 /// What the settings once held and iq reads no more, since it works with
 /// the provider's models alone and lets the lead decide.
 const RETIRED: [&str; 6] = [
@@ -114,6 +121,13 @@ pub(crate) struct Settings {
     /// branch of its own, rather than in their checkout.
     #[serde(default)]
     pub(crate) worktree: bool,
+    /// What a worktree starts from; `HEAD` unless set.
+    worktree_from: Option<String>,
+    /// The commands run in a worktree as it is made.
+    #[serde(default)]
+    worktree_setup: Vec<String>,
+    /// Days a worktree may go untouched before it is removed; 0 never.
+    worktree_keep: Option<u64>,
     /// The theme.
     theme: Option<String>,
     /// The person's rules for every project, files of their home.
@@ -286,6 +300,28 @@ impl Settings {
         Ok(iq_ui::look::Look::new(theme))
     }
 
+    /// What a worktree starts from: as set, else `HEAD`.
+    pub(crate) fn worktree_from(&self) -> &str {
+        self.worktree_from.as_deref().map_or("HEAD", str::trim)
+    }
+
+    /// The commands run in a worktree as it is made, those that say
+    /// something.
+    pub(crate) fn worktree_setup(&self) -> Vec<String> {
+        self.worktree_setup
+            .iter()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// How long a worktree may go untouched before it is removed; `None`
+    /// never.
+    pub(crate) fn worktree_keep(&self) -> Option<std::time::Duration> {
+        let days = self.worktree_keep.unwrap_or(WORKTREE_KEEP_DAYS);
+        (days > 0).then(|| std::time::Duration::from_secs(days * 24 * 3600))
+    }
+
     /// Whether the autopilot's reviewer answers what only reaches the
     /// internet.
     pub(crate) fn autopilot_internet(&self) -> bool {
@@ -417,8 +453,16 @@ mod tests {
         assert_eq!(quiet.crew().unwrap().context_every, 0);
         assert!(set.autopilot && set.internet);
         assert!(!set.worktree);
-        let apart: Settings = toml::from_str("worktree = true").unwrap();
+        assert_eq!(set.worktree_from(), "HEAD");
+        assert_eq!(set.worktree_keep().unwrap().as_secs(), 30 * 24 * 3600);
+        let apart: Settings = toml::from_str(
+            "worktree = true\nworktree_from = \" origin/main \"\nworktree_setup = [\"uv sync\", \" \"]\nworktree_keep = 0",
+        )
+        .unwrap();
         assert!(apart.worktree);
+        assert_eq!(apart.worktree_from(), "origin/main");
+        assert_eq!(apart.worktree_setup(), ["uv sync"]);
+        assert!(apart.worktree_keep().is_none());
         assert!(set.autopilot_skill.is_none());
         let local: Settings = toml::from_str("autopilot_skill = \"local-review\"").unwrap();
         assert_eq!(local.autopilot_skill.as_deref(), Some("local-review"));

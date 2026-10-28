@@ -199,9 +199,7 @@ fn crew(cli: &Cli, settings: &Settings, report: Report) -> Result<Crew<OpenAiCom
     );
     crew.set_autopilot(settings.autopilot);
     if settings.worktree {
-        let worktrees = settings::data_folder(&home).join("worktrees");
-        let placer = worktree::Worktrees::open(&workspace, &worktrees)
-            .map_err(|why| anyhow::anyhow!("no worktree for the chats: {why}"))?;
+        let placer = worktrees(settings, &home, &workspace)?;
         crew.set_placer(Some(Arc::new(placer)));
     }
     // What the agents the person starts remember of this project, kept
@@ -220,6 +218,38 @@ fn crew(cli: &Cli, settings: &Settings, report: Report) -> Result<Crew<OpenAiCom
     }
     crew.extend(Arc::new(skills));
     Ok(crew)
+}
+
+/// The worktrees of the repository `workspace` is in, as the settings say
+/// they are made.
+fn worktrees(settings: &Settings, home: &Path, workspace: &Path) -> Result<worktree::Worktrees> {
+    let folder = settings::data_folder(home).join("worktrees");
+    worktree::Worktrees::open(
+        workspace,
+        &folder,
+        settings.worktree_from(),
+        settings.worktree_setup(),
+    )
+    .map_err(|why| anyhow::anyhow!("no worktree for the chats: {why}"))
+}
+
+/// What iq says at start of the worktrees it removed, untouched for as
+/// long as the settings say, and of those it left; nothing when the chats
+/// do not work in worktrees, or outside a repository.
+fn pruned_worktrees(settings: &Settings) -> Vec<String> {
+    let Some(keep) = settings.worktree_keep() else {
+        return Vec::new();
+    };
+    let (Ok(home), Ok(workspace)) = (home_dir(), std::env::current_dir()) else {
+        return Vec::new();
+    };
+    if !settings.worktree {
+        return Vec::new();
+    }
+    match worktrees(settings, &home, &workspace) {
+        Ok(worktrees) => worktrees.prune(keep),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// The person's rules, from the files the settings list, as written and
@@ -422,7 +452,11 @@ async fn work(
 ) -> Result<()> {
     let folder = home_folder()?;
     let (settings, lead) = chosen(cli, &folder)?;
-    for note in retired(&settings).into_iter().chain(left_over(&settings)) {
+    for note in retired(&settings)
+        .into_iter()
+        .chain(left_over(&settings))
+        .chain(pruned_worktrees(&settings))
+    {
         eprintln!("iq: {note}");
     }
     let ledger = Arc::new(Ledger::open(&folder));
@@ -539,6 +573,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     // the terminal is taken is cleared with it.
     let mut notes = retired(&settings);
     notes.extend(left_over(&settings));
+    notes.extend(pruned_worktrees(&settings));
     if cli.api_key.is_none() {
         notes.push("REQUESTY_API_KEY is not set: no model will answer.".to_owned());
     }

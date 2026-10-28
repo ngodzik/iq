@@ -465,6 +465,7 @@ impl Board {
     pub fn act(&mut self, action: Action) -> Option<Request> {
         match action {
             Action::NextAgent => self.next_agent(),
+            Action::PrevAgent => self.prev_agent(),
             Action::Team => self.screen.toggle(Page::Team),
             Action::Costs => self.screen.toggle(Page::Costs),
             Action::Observations => self.screen.toggle(Page::Observations),
@@ -506,6 +507,22 @@ impl Board {
         match next {
             Some(agent) => self.screen.talk_to(agent),
             None => self.screen.new_chat(self.crew.lead()),
+        }
+    }
+
+    /// Writes to the agent before the one written to, in the order they
+    /// joined; from a new chat, or the first, to the last.
+    fn prev_agent(&mut self) {
+        let names: Vec<String> = self.crew.agents().iter().map(|a| a.name.clone()).collect();
+        let before = match self.screen.talking_to() {
+            None => names.last(),
+            Some(agent) => match names.iter().position(|name| name == agent) {
+                Some(0) | None => names.last(),
+                Some(at) => names.get(at - 1),
+            },
+        };
+        if let Some(agent) = before {
+            self.screen.talk_to(agent);
         }
     }
 
@@ -1010,6 +1027,13 @@ mod tests {
         assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "lab/second"));
         key(&mut board, "ctrl+n");
         assert_eq!(board.screen().talking_to(), Some("lead"));
+        // Ctrl-P goes the other way, from the first to the last.
+        key(&mut board, "ctrl+p");
+        assert_eq!(board.screen().talking_to(), Some("helper"));
+        key(&mut board, "ctrl+p");
+        assert_eq!(board.screen().talking_to(), Some("lead"));
+        key(&mut board, "ctrl+p");
+        assert_eq!(board.screen().talking_to(), Some("helper"));
     }
 
     #[test]
