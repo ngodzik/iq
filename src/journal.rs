@@ -277,7 +277,10 @@ impl Snapshot {
                         "--",
                     ],
                 ),
-                (None, Some(end)) => git(workspace, &["ls-tree", "-r", "--name-only", "-z", end]),
+                (None, Some(end)) => git(
+                    workspace,
+                    &["ls-tree", "-r", "--full-tree", "--name-only", "-z", end],
+                ),
                 _ => None,
             };
             if let Some(diff) = diff {
@@ -309,6 +312,24 @@ mod tests {
         run_git(dir, &["config", "user.name", "Test"]);
         run_git(dir, &["config", "user.email", "test@example.invalid"]);
         run_git(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn a_first_commit_in_a_subdirectory_keeps_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        repository(dir.path());
+        let workspace = dir.path().join("sub");
+        std::fs::create_dir(&workspace).unwrap();
+        let start = Snapshot::take(&workspace).unwrap();
+        std::fs::write(workspace.join("new"), "new").unwrap();
+        std::fs::write(dir.path().join("outside"), "outside").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-qm", "Initial files"]);
+        let end = Snapshot::take(&workspace).unwrap();
+        assert_eq!(
+            start.changed(&end, &workspace),
+            ["new".to_owned()].into_iter().collect()
+        );
     }
 
     #[test]
