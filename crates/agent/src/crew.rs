@@ -1302,7 +1302,7 @@ where
     pub(crate) async fn act(&self, agent: &str, action: Action) -> Result<Permit, String> {
         match self.inner.gate.judge(action).map_err(|e| chain(&e))? {
             Judged::Allowed(permit) => Ok(permit),
-            Judged::Denied { reason } => Err(format!("refused, {reason}")),
+            Judged::Denied { reason } => Err(refusal("the gate", &reason)),
             Judged::Asked { reason, pending } => self.ask(agent, reason, pending).await,
         }
     }
@@ -1334,7 +1334,7 @@ where
                             .approve(pending, Approver::Reviewer)
                             .map_err(|e| chain(&e))
                     } else {
-                        Err(format!("the reviewer refused it: {why}"))
+                        Err(refusal("the reviewer", &why))
                     };
                 }
                 Err(error) => self.report(Event::Notice {
@@ -1363,8 +1363,11 @@ where
                 .gate
                 .approve(pending, Approver::Person)
                 .map_err(|e| chain(&e)),
-            Ok(Ok(false)) => Err(format!("the person refused it ({reason})")),
-            _ => Err(format!("nobody answered in time ({reason})")),
+            Ok(Ok(false)) => Err(refusal("the person", &reason)),
+            _ => Err(refusal(
+                "the gate",
+                &format!("nobody answered in time ({reason})"),
+            )),
         }
     }
 
@@ -1737,6 +1740,16 @@ fn role_line(role: Option<&str>) -> String {
         )
     })
     .unwrap_or_default()
+}
+
+fn refusal(who: &str, reason: &str) -> String {
+    format!(
+        "{who} refused it: {reason}. Do not work around this refusal by downloading or building \
+         a replacement tool, or changing the project to avoid the restriction. Take another \
+         approach only if the task permits it and it respects this refusal. Otherwise, tell \
+         the person what is blocked and ask for the access or approved way you need. If the \
+         command needs the internet, request it explicitly with network: true."
+    )
 }
 
 /// What a command prints when it needed the internet and had none.

@@ -255,7 +255,11 @@ async fn an_agent_writes_and_reads_through_the_gate_and_says_what_it_spent() {
     let seen = f.model.seen_by("lead");
     assert!(seen.contains("1\\thi"), "{seen}");
     assert!(!seen.contains("secret-value"), "{seen}");
-    assert!(seen.contains("refused, it holds secrets"), "{seen}");
+    assert!(
+        seen.contains("the gate refused it: it holds secrets"),
+        "{seen}"
+    );
+    assert_refusal_guidance(&seen);
     let events = f.events();
     assert!(events.contains(&Event::Done {
         agent: "lead".into(),
@@ -298,11 +302,53 @@ async fn what_the_gate_asks_waits_for_the_person() {
     f.settled().await;
     assert!(!f.root.join(".git/hooks/pre-commit").exists());
     assert!(f.model.seen_by("lead").contains("the person refused it"));
+    assert_refusal_guidance(&f.model.seen_by("lead"));
     assert!(f.events().contains(&Event::Answered {
         id,
         approved: false
     }));
     assert!(f.model.seen_by("reviewer").is_empty(), "no reviewer");
+}
+
+fn assert_refusal_guidance(seen: &str) {
+    assert!(seen.contains("Do not work around this refusal"), "{seen}");
+    assert!(seen.contains("replacement tool"), "{seen}");
+    assert!(seen.contains("tell the person what is blocked"), "{seen}");
+    assert!(seen.contains("network: true"), "{seen}");
+}
+
+#[tokio::test]
+async fn a_reviewer_refusal_explains_the_reason_and_next_steps() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls("run", serde_json::json!({"command": "git reset --hard"})),
+                    say("Blocked."),
+                ],
+            ),
+            ("reviewer", vec![say("REFUSE: it would discard work.")]),
+        ],
+        Settings {
+            reviewer: Some(model("cheap/reviewer")),
+            ..Settings::default()
+        },
+    );
+    f.crew.set_autopilot(true);
+    f.crew.start(
+        "lead",
+        &model("cheap/model"),
+        "Inspect the project".into(),
+        PERSON,
+    );
+    f.settled().await;
+    let seen = f.model.seen_by("lead");
+    assert!(
+        seen.contains("the reviewer refused it: it would discard work."),
+        "{seen}"
+    );
+    assert_refusal_guidance(&seen);
 }
 
 #[tokio::test]
