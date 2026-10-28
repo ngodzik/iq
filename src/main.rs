@@ -144,7 +144,11 @@ fn main() -> Result<()> {
                 .open(folder.join("iq.log"))
                 .ok()
         });
-    let logging = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
+    // In its file, the warnings too: what went wrong is read there after;
+    // on the terminal, the errors alone, unless RUST_LOG says.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(if log.is_some() { "warn" } else { "error" }));
+    let logging = tracing_subscriber::fmt().with_env_filter(filter);
     match log {
         Some(file) => logging
             .with_ansi(false)

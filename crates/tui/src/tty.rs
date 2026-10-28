@@ -69,21 +69,45 @@ impl Tty {
         Ok(Tty { tty })
     }
 
-    /// Waits up to `wait` for something to read from the terminal.
+    /// Waits up to `wait` for something to read from the terminal. A
+    /// hang up or an error it reports is taken for its window closed only
+    /// once the terminal no longer answers: some come from what another
+    /// program did to it, such as one iq ran, and pass. What it said goes
+    /// to iq's log either way.
     pub(crate) fn wait(&self, wait: Duration) -> Wait {
         let millis = u16::try_from(wait.as_millis()).unwrap_or(u16::MAX);
         let mut watched = [PollFd::new(self.tty.as_fd(), PollFlags::POLLIN)];
-        match poll(&mut watched, PollTimeout::from(millis)) {
-            Ok(0) | Err(nix::errno::Errno::EINTR) => Wait::Nothing,
+        let said = match poll(&mut watched, PollTimeout::from(millis)) {
+            Ok(0) | Err(nix::errno::Errno::EINTR) => return Wait::Nothing,
             Ok(_) => {
                 let seen = watched[0].revents().unwrap_or(PollFlags::empty());
-                if seen.intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL) {
-                    Wait::Gone
-                } else {
+                let trouble = PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL;
+                if !seen.intersects(trouble) {
+                    return Wait::Ready;
+                }
+                format!("{seen:?}")
+            }
+            Err(error) => format!("poll failed: {error}"),
+        };
+        match nix::sys::termios::tcgetattr(self.tty.as_fd()) {
+            Ok(_) => {
+                tracing::warn!("the terminal said {said}, yet still answers: iq goes on");
+                // So that a word that stays is not read again at once,
+                // over and over.
+                std::thread::sleep(wait);
+                if watched[0]
+                    .revents()
+                    .is_some_and(|seen| seen.contains(PollFlags::POLLIN))
+                {
                     Wait::Ready
+                } else {
+                    Wait::Nothing
                 }
             }
-            Err(_) => Wait::Gone,
+            Err(error) => {
+                tracing::warn!("the terminal said {said} and answers no more ({error}): iq ends");
+                Wait::Gone
+            }
         }
     }
 

@@ -1090,6 +1090,7 @@ dependencies = [
  "iq-ui",
  "nix",
  "ratatui",
+ "tracing",
  "unicode-width",
  "vt100",
 ]

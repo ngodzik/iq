@@ -12,8 +12,11 @@ iq-agent.workspace = true
 iq-ui.workspace    = true
 ratatui.workspace  = true
 unicode-width.workspace = true
-# Watching the terminal for keys, which tells when its window is closed.
-nix = { workspace = true, features = ["poll"] }
+# Watching the terminal for keys, which tells when its window is closed,
+# and asking it whether it is still there.
+nix = { workspace = true, features = ["poll", "term"] }
+# What the terminal said when iq took it for gone, in iq's log.
+tracing.workspace = true
 
 [dev-dependencies]
 vt100.workspace = true
