@@ -403,7 +403,11 @@ async fn work(
         eprintln!("iq: {note}");
     }
     let ledger = Arc::new(Ledger::open(&folder));
-    let journal = Arc::new(Journal::open(&folder, &project()));
+    let journal = Arc::new(Journal::open(
+        &folder,
+        &project(),
+        &std::env::current_dir()?,
+    ));
     let (send, mut events) = tokio::sync::mpsc::unbounded_channel();
     let kept = Arc::clone(&ledger);
     let noted = Arc::clone(&journal);
@@ -518,7 +522,11 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let keyed = cli.api_key.is_some();
     let ledger = Arc::new(Ledger::open(&folder));
     ledger.trim();
-    let journal = Arc::new(Journal::open(&folder, &project()));
+    let journal = Arc::new(Journal::open(
+        &folder,
+        &project(),
+        &std::env::current_dir()?,
+    ));
     journal.trim();
     let (send, feed) = std::sync::mpsc::channel();
     let quit = send.clone();
