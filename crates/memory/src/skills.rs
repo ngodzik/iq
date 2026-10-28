@@ -71,7 +71,7 @@ impl Skills {
             return Ok(None);
         };
         let skill = self
-            .list()
+            .all()
             .into_iter()
             .find(|skill| slug(&skill.name) == slug(name))
             .ok_or_else(|| format!("the review skill {name:?} is missing"))?;
@@ -98,9 +98,19 @@ impl Skills {
         .map(Some)
     }
 
-    /// The skills, by name.
+    /// The skills the agents are given, by name: all but the reviewer's,
+    /// which an agent knowing would write its requests to.
     #[must_use]
     pub fn list(&self) -> Vec<Skill> {
+        let mut skills = self.all();
+        if let Some((name, _)) = &self.reviewer {
+            skills.retain(|skill| slug(&skill.name) != slug(name));
+        }
+        skills
+    }
+
+    /// Every skill of the folders, by name, the reviewer's among them.
+    fn all(&self) -> Vec<Skill> {
         let mut skills: Vec<Skill> = Vec::new();
         for folder in &self.folders {
             for skill in skills_in(folder) {
@@ -270,6 +280,11 @@ mod tests {
             Skills::new(vec![home.path().into()]).with_reviewer("local-review", work.path());
         assert!(skills.review_policy().is_err());
         std::fs::write(&file, "Approve local test setup.").unwrap();
+        std::fs::write(home.path().join("teams.md"), "For code, a writer.").unwrap();
+        // The agents are given the other skills, never the reviewer's.
+        assert_eq!(skills.list().len(), 1);
+        assert!(!skills.told().unwrap().contains("local-review"));
+        assert!(skills.read("local-review").is_err());
         assert!(
             skills
                 .review_policy()

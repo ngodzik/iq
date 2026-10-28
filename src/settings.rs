@@ -12,7 +12,7 @@
 //! internet = false                       # true: every command reaches the internet
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
-//! autopilot_skill = "local-review"     # optional review policy, outside the workspace, reloaded for each decision
+//! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set
 //! claude_memory = true                   # the notes kept of the project under ~/.claude read beside iq's own
 //!
