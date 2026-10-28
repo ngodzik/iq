@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 
 use crate::event::{Event, PERSON};
 use crate::extension::Extension;
+use crate::place::Placer;
 use crate::review;
 use crate::rules::{self, RulesFile};
 use crate::team::{self, Pattern, Phase, Seat, Team};
@@ -121,8 +122,14 @@ impl<M> Clone for Crew<M> {
 
 struct Inner<M> {
     provider: M,
-    gate: Gate,
-    sandbox: Sandbox,
+    /// The crew's own place: its workspace, where agents work unless given
+    /// a place of their own.
+    place: Arc<Place>,
+    /// What starts the sandbox of every place.
+    helper: Helper,
+    /// What gives the agents the person starts a place of their own, when
+    /// they want one.
+    placer: Mutex<Option<Arc<dyn Placer>>>,
     settings: Settings,
     report: Report,
     autopilot: AtomicBool,
@@ -145,6 +152,21 @@ struct Inner<M> {
     extensions: Mutex<Vec<Arc<dyn Extension<M>>>>,
     /// The project's rules for some of its files, as last read, and when.
     scoped: Mutex<Option<(Instant, Vec<rules::Scoped>)>>,
+}
+
+/// Where agents work: the gate that judges their actions there, and the
+/// sandbox their commands run in.
+struct Place {
+    gate: Gate,
+    sandbox: Sandbox,
+}
+
+/// Where an agent joining works: a place given, the one of the agent that
+/// starts it; or, for the person's, one of its own when they set a placer,
+/// else the crew's.
+enum Placing {
+    Given(Arc<Place>),
+    Own,
 }
 
 #[derive(Default)]
@@ -188,6 +210,8 @@ struct Member {
     compacted: Option<String>,
     /// The project's rules for some files it was given, by their files.
     rules_given: Vec<String>,
+    /// Where it works.
+    place: Arc<Place>,
 }
 
 /// An agent of the crew, as listed.
@@ -219,12 +243,13 @@ where
         settings: Settings,
         report: Report,
     ) -> Self {
-        let sandbox = gate.sandbox(helper);
+        let sandbox = gate.sandbox(helper.clone());
         Self {
             inner: Arc::new(Inner {
                 provider,
-                gate,
-                sandbox,
+                place: Arc::new(Place { gate, sandbox }),
+                helper,
+                placer: Mutex::new(None),
                 settings,
                 report,
                 autopilot: AtomicBool::new(false),
@@ -292,9 +317,42 @@ where
             .collect()
     }
 
-    /// The gate the crew acts through.
+    /// The gate the crew acts through, in its own workspace.
     pub fn gate(&self) -> &Gate {
-        &self.inner.gate
+        &self.inner.place.gate
+    }
+
+    /// Gives each agent the person starts from now on a place of its own,
+    /// made by `placer`; or none, and they work in the crew's workspace.
+    /// The agents one starts work where it does.
+    pub fn set_placer(&self, placer: Option<Arc<dyn Placer>>) {
+        *lock(&self.inner.placer) = placer;
+    }
+
+    /// Where `agent` works: its place, or the crew's own for one unknown.
+    fn place_of(&self, agent: &str) -> Arc<Place> {
+        lock(&self.inner.board)
+            .members
+            .get(agent)
+            .map_or_else(|| Arc::clone(&self.inner.place), |m| Arc::clone(&m.place))
+    }
+
+    /// A place of its own for `name`, from the placer when the person set
+    /// one: its gate as the crew's, in its folder, and its sandbox; and
+    /// what the person is told of it.
+    fn own_place(&self, name: &str) -> Result<Option<(Arc<Place>, String)>, String> {
+        let Some(placer) = lock(&self.inner.placer).clone() else {
+            return Ok(None);
+        };
+        let placed = placer.place(name)?;
+        let gate = self
+            .inner
+            .place
+            .gate
+            .within(&placed.folder, placed.writable.clone())
+            .map_err(|e| chain(&e))?;
+        let sandbox = gate.sandbox(self.inner.helper.clone());
+        Ok(Some((Arc::new(Place { gate, sandbox }), placed.said)))
     }
 
     /// Whether the reviewer answers for the person.
@@ -310,13 +368,13 @@ where
 
     /// Whether every command has the internet.
     pub fn internet(&self) -> bool {
-        self.inner.gate.internet()
+        self.inner.place.gate.internet()
     }
 
     /// Gives every command the internet, or only what a rule gives it to
-    /// and what the person allows.
+    /// and what the person allows: in every place at once.
     pub fn set_internet(&self, open: bool) {
-        self.inner.gate.set_internet(open);
+        self.inner.place.gate.set_internet(open);
     }
 
     /// What the provider's key was billed so far.
@@ -552,14 +610,25 @@ where
         role: Option<String>,
         effort: Option<Effort>,
     ) -> String {
-        let name = self.join(name, model, task.clone(), by, role, effort, true);
-        self.wake(&name, task);
+        // The person's agent works in a place of its own when they want
+        // one; an agent's works where it does.
+        let placing = if by == PERSON {
+            Placing::Own
+        } else {
+            Placing::Given(self.place_of(by))
+        };
+        let (name, joined) = self.join(name, model, task.clone(), by, role, effort, true, placing);
+        if joined {
+            self.wake(&name, task);
+        }
         name
     }
 
     /// Puts an agent on the board, its name `name` made unique, and gives
-    /// it. One that `works` is about to be woken on `task`; another holds
-    /// its task and waits until it is written to.
+    /// it, in the place `placing` says. One that `works` is about to be
+    /// woken on `task`; another holds its task and waits until it is
+    /// written to. Whether it joined: one that could not be given a place
+    /// of its own is not on the board, and the person is told why.
     #[allow(clippy::too_many_arguments)]
     fn join(
         &self,
@@ -570,18 +639,46 @@ where
         role: Option<String>,
         effort: Option<Effort>,
         works: bool,
-    ) -> String {
+        placing: Placing,
+    ) -> (String, bool) {
         let mut board = lock(&self.inner.board);
         let name = free_name(&board.members, &base_name(name), &[]);
+        let (place, said) = match placing {
+            Placing::Given(place) => (place, None),
+            Placing::Own => match self.own_place(&name) {
+                Ok(Some((place, said))) => (place, Some(said)),
+                Ok(None) => (Arc::clone(&self.inner.place), None),
+                Err(why) => {
+                    drop(board);
+                    self.report(Event::Joined {
+                        agent: name.clone(),
+                        model: model.to_string(),
+                        by: by.to_owned(),
+                    });
+                    self.report(Event::Notice {
+                        agent: name.clone(),
+                        text: format!("{name} is not started: no place of its own for it, {why}"),
+                    });
+                    self.report(Event::Done {
+                        agent: name.clone(),
+                        outcome: Err("it has no place to work in".into()),
+                    });
+                    return (name, false);
+                }
+            },
+        };
+        let workspace = place.gate.workspace().to_path_buf();
         let mut messages = vec![Message::system(self.instructions(
             &name,
             by,
             role.as_deref(),
+            &workspace,
         ))];
         if !works {
             messages.push(Message::user(task.clone()));
         }
         let read = board.messages.len();
+        let own = !Arc::ptr_eq(&place, &self.inner.place);
         board.members.insert(
             name.clone(),
             Member {
@@ -597,6 +694,7 @@ where
                 told: 0,
                 compacted: None,
                 rules_given: Vec::new(),
+                place,
             },
         );
         drop(board);
@@ -605,11 +703,18 @@ where
             model: model.to_string(),
             by: by.to_owned(),
         });
+        if own {
+            self.report(Event::Placed {
+                agent: name.clone(),
+                folder: workspace,
+                said,
+            });
+        }
         self.report(Event::Effort {
             agent: name.clone(),
             effort: effort.or(self.inner.settings.effort),
         });
-        name
+        (name, true)
     }
 
     /// Starts a team, named `team`, on `task` for `by`: one agent for each
@@ -629,7 +734,8 @@ where
         let brief = |at: usize| format!("{task}\n\n{}", team::roster(&names, seats, at, by));
         let role = |seat: &Seat| Some(format!("{} in the team {team}: {}", seat.role, seat.does));
         // Those who wait join first, so that the first finds them when it
-        // writes to them.
+        // writes to them; all work where the agent that asked does.
+        let place = self.place_of(by);
         for (at, seat) in seats.iter().enumerate().skip(1) {
             self.join(
                 &names[at],
@@ -639,6 +745,7 @@ where
                 role(seat),
                 seat.effort,
                 false,
+                Placing::Given(Arc::clone(&place)),
             );
         }
         let first = &seats[0];
@@ -719,10 +826,18 @@ where
     }
 
     /// Ends the crew: every agent stopped, and what their commands left
-    /// running stopped with the sandbox.
+    /// running stopped with the sandboxes, in every place.
     pub async fn end(&self) {
         self.stop_all();
-        self.inner.sandbox.end().await;
+        let mut places = vec![Arc::clone(&self.inner.place)];
+        for member in lock(&self.inner.board).members.values() {
+            if !places.iter().any(|place| Arc::ptr_eq(place, &member.place)) {
+                places.push(Arc::clone(&member.place));
+            }
+        }
+        for place in places {
+            place.sandbox.end().await;
+        }
     }
 
     /// Waits until no agent works, nor any answer is on its way to wake
@@ -1113,7 +1228,7 @@ where
     }
 
     async fn tool(&self, agent: &str, name: &str, args: &Args) -> Result<String, String> {
-        let workspace = self.inner.gate.workspace().to_path_buf();
+        let workspace = self.place_of(agent).gate.workspace().to_path_buf();
         match name {
             "read_file" => {
                 let path: std::path::PathBuf = args.text("path")?.into();
@@ -1162,7 +1277,7 @@ where
                     host: args.flag("host"),
                 };
                 let permit = self.act(agent, action).await?;
-                self.run(permit, OWN_ASK).await.map(|(text, _)| text)
+                self.run(agent, permit, OWN_ASK).await.map(|(text, _)| text)
             }
             _ => self.board_tool(agent, name, args).await,
         }
@@ -1268,10 +1383,16 @@ where
         }
     }
 
-    /// Runs the command `permit` allows, and says how it went, and whether
-    /// it succeeded. A command that failed without the internet, as one
-    /// that needs it does, is told how to ask for it: `ask`.
-    pub(crate) async fn run(&self, permit: Permit, ask: &str) -> Result<(String, bool), String> {
+    /// Runs the command `permit` allows for `agent`, in its place, and says
+    /// how it went, and whether it succeeded. A command that failed without
+    /// the internet, as one that needs it does, is told how to ask for it:
+    /// `ask`.
+    pub(crate) async fn run(
+        &self,
+        agent: &str,
+        permit: Permit,
+        ask: &str,
+    ) -> Result<(String, bool), String> {
         let offline = matches!(
             permit.action(),
             Action::Run {
@@ -1281,7 +1402,7 @@ where
             }
         );
         let ran = self
-            .inner
+            .place_of(agent)
             .sandbox
             .run(permit)
             .await
@@ -1319,7 +1440,12 @@ where
     /// Judges `action` for `agent`, asking whoever answers for the person
     /// when the gate asks.
     pub(crate) async fn act(&self, agent: &str, action: Action) -> Result<Permit, String> {
-        match self.inner.gate.judge(action).map_err(|e| chain(&e))? {
+        let judged = self
+            .place_of(agent)
+            .gate
+            .judge(action)
+            .map_err(|e| chain(&e))?;
+        match judged {
             Judged::Allowed(permit) => Ok(permit),
             Judged::Denied { reason } => Err(refusal("the gate", &reason, false)),
             Judged::Asked { reason, pending } => self.ask(agent, reason, pending).await,
@@ -1335,10 +1461,11 @@ where
         // The reviewer answers what stays within the sandbox, what only
         // reaches the internet and what runs on the machine when the
         // person lets it; never more.
+        let gate = self.place_of(agent).gate.clone();
         let reviewable = match pending.scope() {
             Scope::Sandbox => true,
-            Scope::Internet => self.inner.gate.reviewer_internet(),
-            Scope::Host => self.inner.gate.reviewer_host(),
+            Scope::Internet => gate.reviewer_internet(),
+            Scope::Host => gate.reviewer_host(),
             Scope::Beyond => false,
         };
         let most = self.inner.settings.refusals;
@@ -1369,9 +1496,7 @@ where
                     }
                     drop(refused);
                     return if approved {
-                        self.inner
-                            .gate
-                            .approve(pending, Approver::Reviewer)
+                        gate.approve(pending, Approver::Reviewer)
                             .map_err(|e| chain(&e))
                     } else {
                         Err(refusal("the reviewer", &why, true))
@@ -1400,9 +1525,7 @@ where
         // The person's answer, whichever it is, starts the count over.
         lock(&self.inner.refused).remove(agent);
         match answer {
-            Ok(Ok(true)) => self
-                .inner
-                .gate
+            Ok(Ok(true)) => gate
                 .approve(pending, Approver::Person)
                 .map_err(|e| chain(&e)),
             Ok(Ok(false)) => Err(refusal("the person", &reason, true)),
@@ -1472,7 +1595,7 @@ where
     /// leaves that to the person. Publishing and what leaves the workspace
     /// are always the person's.
     pub fn set_autopilot_internet(&self, may: bool) {
-        self.inner.gate.set_reviewer_internet(may);
+        self.inner.place.gate.set_reviewer_internet(may);
     }
 
     /// Lets the reviewer let a command run on the machine itself, the
@@ -1480,7 +1603,7 @@ where
     /// leaves that to the person. What changes what others share is always
     /// the person's.
     pub fn set_autopilot_host(&self, may: bool) {
-        self.inner.gate.set_reviewer_host(may);
+        self.inner.place.gate.set_reviewer_host(may);
     }
 
     fn spent(&self, agent: &str, model: &str, usage: iq_core::Usage, cost: Option<Usd>) {
@@ -1499,9 +1622,16 @@ where
         (self.inner.report)(event);
     }
 
-    /// The standing instructions of one of iq's agents.
-    fn instructions(&self, name: &str, by: &str, role: Option<&str>) -> String {
-        let workspace = self.inner.gate.workspace().display();
+    /// The standing instructions of one of iq's agents, working in
+    /// `workspace`.
+    fn instructions(
+        &self,
+        name: &str,
+        by: &str,
+        role: Option<&str>,
+        workspace: &std::path::Path,
+    ) -> String {
+        let workspace = workspace.display();
         let started = if by == PERSON {
             "The person gave you your task.".to_owned()
         } else {
@@ -1572,11 +1702,11 @@ where
         out
     }
 
-    /// Reads `path` in the workspace through the gate, as an agent's reads
-    /// are, never asking the person: what the gate does not allow at once
-    /// is not read.
+    /// Reads `path` in the crew's workspace through the gate, as an agent's
+    /// reads are, never asking the person: what the gate does not allow at
+    /// once is not read.
     fn read_quietly(&self, path: std::path::PathBuf) -> Option<String> {
-        match self.inner.gate.judge(Action::Read { path }).ok()? {
+        match self.inner.place.gate.judge(Action::Read { path }).ok()? {
             Judged::Allowed(permit) => String::from_utf8(permit.read().ok()?).ok(),
             Judged::Asked { .. } | Judged::Denied { .. } => None,
         }
@@ -1585,9 +1715,10 @@ where
     /// The project's rules for agents, each with the file it came from: its
     /// `AGENTS.md`, then its `CLAUDE.md`, whose `@file` lines are the
     /// files they import, a file given already left out; then those of its
-    /// `.claude/rules` for the whole project.
+    /// `.claude/rules` for the whole project. Read in the crew's workspace,
+    /// the person's checkout: a place made for an agent holds the same.
     fn project_rules(&self) -> Vec<(String, String)> {
-        let workspace = self.inner.gate.workspace().to_path_buf();
+        let workspace = self.inner.place.gate.workspace().to_path_buf();
         let mut given: Vec<(String, String)> = Vec::new();
         for file in RULES_FILES {
             let path = workspace.join(file);
@@ -1628,7 +1759,7 @@ where
     /// The files of the project's `.claude/rules`, each with what it says,
     /// in the order of their names.
     fn rules_folder(&self) -> Vec<(String, String)> {
-        let workspace = self.inner.gate.workspace().to_path_buf();
+        let workspace = self.inner.place.gate.workspace().to_path_buf();
         let mut found = Vec::new();
         let mut folders = vec![workspace.join(RULES_FOLDER)];
         while let Some(folder) = folders.pop() {
@@ -1682,9 +1813,9 @@ where
     /// The project's rules for `path` that `agent` was not given yet, as
     /// it reads or writes it, to follow on the tool's answer; marked given.
     fn scoped_for(&self, agent: &str, path: &std::path::Path) -> String {
-        let workspace = self.inner.gate.workspace();
+        let place = self.place_of(agent);
         let relative = if path.is_absolute() {
-            match path.strip_prefix(workspace) {
+            match path.strip_prefix(place.gate.workspace()) {
                 Ok(relative) => relative,
                 Err(_) => return String::new(),
             }

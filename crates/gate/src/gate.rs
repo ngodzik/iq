@@ -186,6 +186,45 @@ impl Gate {
         }
     }
 
+    /// A gate for `workspace`, another folder, as this one is: the same
+    /// rules, the same audit log, and the internet and the reviewer's reach
+    /// shared, so that what the person opens or shuts, they open or shut
+    /// for every place at once. `writable` are folders beside it commands
+    /// may write too, as the repository's own folder is for a worktree of
+    /// it, which keeps its index there and takes its commits to it.
+    ///
+    /// # Errors
+    ///
+    /// `workspace` cannot be resolved.
+    pub fn within(
+        &self,
+        workspace: impl Into<PathBuf>,
+        writable: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Gate, GateError> {
+        let workspace: PathBuf = workspace.into();
+        let resolved = workspace
+            .canonicalize()
+            .map_err(|source| GateError::Workspace {
+                path: workspace,
+                source,
+            })?;
+        let mut bounds = self.bounds.clone();
+        bounds.workspace = resolved;
+        bounds.writable.extend(
+            writable
+                .into_iter()
+                .map(|folder| folder.canonicalize().unwrap_or(folder)),
+        );
+        Ok(Gate {
+            bounds,
+            rules: self.rules.clone(),
+            audit: self.audit.clone(),
+            internet: Arc::clone(&self.internet),
+            reviewer_internet: Arc::clone(&self.reviewer_internet),
+            reviewer_host: Arc::clone(&self.reviewer_host),
+        })
+    }
+
     /// Whether a reviewer may let a command run on the machine itself.
     pub fn reviewer_host(&self) -> bool {
         self.reviewer_host.load(Ordering::Relaxed)

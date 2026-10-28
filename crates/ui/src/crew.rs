@@ -431,6 +431,16 @@ impl CrewView {
                     view.thread.push(Entry::Notice(text));
                 }
             }
+            Event::Placed {
+                agent,
+                said: Some(said),
+                ..
+            } => {
+                if let Some(view) = self.agent_mut(&agent) {
+                    view.thread.push(Entry::Notice(format!("{agent} {said}")));
+                }
+            }
+            Event::Placed { said: None, .. } => {}
             Event::Effort { agent, effort } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.effort = effort;

@@ -48,6 +48,8 @@ pub const BRANCH: &str = "main";
 /// reads no more.
 const IGNORED: &str = "# What only this machine needs, or what is built again from the rest.
 *.before-sync
+# The worktrees the agents work in, which their repositories keep.
+worktrees/
 # The assay iq once had, which it reads no more.
 assay/
 ";
@@ -815,14 +817,20 @@ fn ignore_lines(now: &str) -> String {
         .lines()
         .filter(|line| !IGNORED_ONCE.contains(&line.trim()))
         .collect();
-    let missing: Vec<&str> = IGNORED
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-        .filter(|line| !lines.iter().any(|kept| kept.trim() == line.trim()))
-        .collect();
-    if !missing.is_empty() {
-        lines.push("# The assay iq once had, which it reads no more.");
-        lines.extend(missing);
+    // What is missing is added under the comment that says why, once.
+    let mut comment = None;
+    for line in IGNORED.lines() {
+        if line.starts_with('#') {
+            comment = Some(line);
+            continue;
+        }
+        if line.trim().is_empty() || lines.iter().any(|kept| kept.trim() == line.trim()) {
+            continue;
+        }
+        if let Some(comment) = comment.take() {
+            lines.push(comment);
+        }
+        lines.push(line);
     }
     let mut text = lines.join("\n");
     text.push('\n');
@@ -1051,7 +1059,7 @@ mod tests {
         let once = "# What only this machine needs, or what is built again from the rest.\nassay/runs/*/*/*/work/\nassay/judging/\n*.before-sync\nnotes/drafts/\n";
         assert_eq!(
             ignore_lines(once),
-            "# What only this machine needs, or what is built again from the rest.\n*.before-sync\nnotes/drafts/\n# The assay iq once had, which it reads no more.\nassay/\n"
+            "# What only this machine needs, or what is built again from the rest.\n*.before-sync\nnotes/drafts/\n# The worktrees the agents work in, which their repositories keep.\nworktrees/\n# The assay iq once had, which it reads no more.\nassay/\n"
         );
     }
 }

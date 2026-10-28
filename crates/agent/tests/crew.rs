@@ -1289,3 +1289,103 @@ async fn an_agent_is_given_the_rules_for_the_files_it_touches_once() {
     assert!(helper.contains("No inline styles."));
     assert!(!helper.contains("Short functions."));
 }
+
+/// Gives each agent a folder of its own under one, as a worktree would be.
+struct Apart(PathBuf);
+
+impl iq_agent::Placer for Apart {
+    fn place(&self, name: &str) -> Result<iq_agent::Placed, String> {
+        if name.starts_with("nowhere") {
+            return Err("no room".into());
+        }
+        let folder = self.0.join(name);
+        std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+        Ok(iq_agent::Placed {
+            folder: folder.clone(),
+            writable: Vec::new(),
+            said: format!("works apart in {}", folder.display()),
+        })
+    }
+}
+
+#[tokio::test]
+async fn the_persons_agents_work_in_places_of_their_own_with_those_they_start() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "write_file",
+                        serde_json::json!({"path": "note.txt", "content": "mine\n"}),
+                    ),
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"name": "Helper", "model": "cheap/model", "task": "write"}),
+                    ),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 5})),
+                    say("Both written."),
+                ],
+            ),
+            (
+                "helper",
+                vec![
+                    calls(
+                        "write_file",
+                        serde_json::json!({"path": "helped.txt", "content": "theirs\n"}),
+                    ),
+                    say("written"),
+                ],
+            ),
+        ],
+        Settings::default(),
+    );
+    let places = tempfile::tempdir().unwrap();
+    let apart = places.path().canonicalize().unwrap();
+    f.crew.set_placer(Some(Arc::new(Apart(apart.clone()))));
+    f.crew
+        .start("lead", &model("cheap/model"), "write notes".into(), PERSON);
+    f.settled().await;
+    // Both wrote in the lead's place, nothing in the crew's workspace.
+    assert_eq!(
+        std::fs::read_to_string(apart.join("lead/note.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(apart.join("lead/helped.txt")).unwrap(),
+        "theirs\n"
+    );
+    assert!(!f.root.join("note.txt").exists());
+    assert!(!f.root.join("helped.txt").exists());
+    assert!(
+        f.model
+            .instructions_of("lead")
+            .contains(&format!("working in {}", apart.join("lead").display()))
+    );
+    let events = f.events();
+    assert!(events.contains(&Event::Placed {
+        agent: "lead".into(),
+        folder: apart.join("lead"),
+        said: Some(format!("works apart in {}", apart.join("lead").display())),
+    }));
+    assert!(events.contains(&Event::Placed {
+        agent: "helper".into(),
+        folder: apart.join("lead"),
+        said: None,
+    }));
+    // Without a place of its own, an agent of the person's is not started.
+    f.crew
+        .start("nowhere", &model("cheap/model"), "go".into(), PERSON);
+    f.settled().await;
+    let events = f.events();
+    assert!(events.contains(&Event::Done {
+        agent: "nowhere".into(),
+        outcome: Err("it has no place to work in".into()),
+    }));
+    assert!(events.iter().any(|event| matches!(event, Event::Notice { agent, text } if agent == "nowhere" && text.contains("no room"))));
+    assert!(f.crew.list().iter().all(|agent| agent.name != "nowhere"));
+    assert!(events.contains(&Event::Done {
+        agent: "lead".into(),
+        outcome: Ok("Both written.".into()),
+    }));
+}

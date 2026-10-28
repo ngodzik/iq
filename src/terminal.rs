@@ -110,7 +110,12 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
             Err(error) => writeln!(out, "\n✘ {agent} stopped: {error}"),
         },
         Event::Notice { agent, text } => writeln!(out, "\n! {agent}: {text}"),
-        Event::Effort { .. } => Ok(()),
+        Event::Placed {
+            agent,
+            said: Some(said),
+            ..
+        } => writeln!(out, "\n! {agent} {said}"),
+        Event::Effort { .. } | Event::Placed { said: None, .. } => Ok(()),
     };
     let _ = out.flush();
     None

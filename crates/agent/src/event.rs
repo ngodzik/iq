@@ -19,6 +19,17 @@ pub enum Event {
         /// Who started it: the person or another agent.
         by: String,
     },
+    /// Where an agent works, when it is not the crew's workspace: a place
+    /// of its own, as a worktree of the project is, or the place of the
+    /// agent that started it.
+    Placed {
+        /// The agent.
+        agent: String,
+        /// Its folder.
+        folder: std::path::PathBuf,
+        /// What the person is told of it, when the place was made for it.
+        said: Option<String>,
+    },
     /// How hard an agent thinks, as it joined or as it was changed.
     Effort {
         /// The agent.

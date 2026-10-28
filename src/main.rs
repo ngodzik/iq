@@ -8,6 +8,7 @@ mod lock;
 mod settings;
 mod sync;
 mod terminal;
+mod worktree;
 
 use std::io::{BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -64,6 +65,11 @@ struct Cli {
     /// and what the person allows. Files stay held, secrets out.
     #[arg(long, global = true)]
     internet: bool,
+
+    /// Each chat works in a worktree of its own, on a branch `iq/<chat>` from
+    /// what is checked out: the checkout is left as it is.
+    #[arg(long, global = true)]
+    worktree: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -192,6 +198,12 @@ fn crew(cli: &Cli, settings: &Settings, report: Report) -> Result<Crew<OpenAiCom
         report,
     );
     crew.set_autopilot(settings.autopilot);
+    if settings.worktree {
+        let worktrees = settings::data_folder(&home).join("worktrees");
+        let placer = worktree::Worktrees::open(&workspace, &worktrees)
+            .map_err(|why| anyhow::anyhow!("no worktree for the chats: {why}"))?;
+        crew.set_placer(Some(Arc::new(placer)));
+    }
     // What the agents the person starts remember of this project, kept
     // with iq's data, and the notes kept of it under ~/.claude.
     let claude = settings
@@ -392,6 +404,7 @@ fn chosen(cli: &Cli, folder: &std::path::Path) -> Result<(Settings, ModelId)> {
     let mut settings = Settings::load(folder)?;
     settings.autopilot |= cli.autopilot;
     settings.internet |= cli.internet;
+    settings.worktree |= cli.worktree;
     let lead = match &cli.model {
         Some(model) => ModelId::new(model.as_str())?,
         None => settings.lead()?,

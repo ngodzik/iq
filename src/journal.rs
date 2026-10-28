@@ -5,7 +5,8 @@
 //! the start of their task. In a repository, a task's files are also what
 //! git saw change while it worked, so that the journal shows what the
 //! person will find, whatever wrote it: a tool, a command, a commit, another
-//! branch checked out.
+//! branch checked out; in the place the agent works in, when it was given
+//! one of its own.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -42,6 +43,8 @@ pub(crate) struct Journal {
     /// The tasks under way, by agent, and each agent's model.
     open: Mutex<(HashMap<String, OpenTask>, HashMap<String, String>)>,
     workspace: PathBuf,
+    /// Where each agent works, when not in the workspace.
+    places: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl Journal {
@@ -52,7 +55,17 @@ impl Journal {
             project: project.to_owned(),
             workspace: workspace.to_owned(),
             open: Mutex::new((HashMap::new(), HashMap::new())),
+            places: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Where `agent` works: its own place, else the workspace.
+    fn place_of(&self, agent: &str) -> PathBuf {
+        self.places
+            .lock()
+            .ok()
+            .and_then(|places| places.get(agent).cloned())
+            .unwrap_or_else(|| self.workspace.clone())
     }
 
     /// Where it is kept.
@@ -68,10 +81,11 @@ impl Journal {
             // agents' events do not wait for it.
             let open = self.open.lock().ok()?.0.remove(agent)?;
             let mut task = open.task;
+            let place = self.place_of(agent);
             if let Ok(Some(start)) = open.snapshot.join()
-                && let Some(end) = Snapshot::take(&self.workspace)
+                && let Some(end) = Snapshot::take(&place)
             {
-                for path in start.changed(&end, &self.workspace) {
+                for path in start.changed(&end, &place) {
                     if task.files.len() < MOST_KEPT && !task.files.contains(&path) {
                         task.files.push(path);
                     }
@@ -90,11 +104,16 @@ impl Journal {
             Event::Joined { agent, model, .. } => {
                 models.insert(agent.clone(), model.clone());
             }
+            Event::Placed { agent, folder, .. } => {
+                if let Ok(mut places) = self.places.lock() {
+                    places.insert(agent.clone(), folder.clone());
+                }
+            }
             Event::Working { agent, prompt } => {
                 tasks.entry(agent.clone()).or_insert_with(|| OpenTask {
                     snapshot: {
-                        let workspace = self.workspace.clone();
-                        std::thread::spawn(move || Snapshot::take(&workspace))
+                        let place = self.place_of(agent);
+                        std::thread::spawn(move || Snapshot::take(&place))
                     },
                     task: Task {
                         at: iq_ui::now(),
@@ -201,7 +220,7 @@ struct Snapshot {
 /// A git command in `folder`, as git itself runs hooks: none of the
 /// variables a hook is given, which would point it at another repository's
 /// index, and no lock taken that the person's own git would wait for.
-fn git_command(folder: &Path) -> Command {
+pub(crate) fn git_command(folder: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .current_dir(folder)
@@ -485,6 +504,49 @@ mod tests {
             })
             .unwrap();
         assert_eq!(task.files, ["tool-file", "file"]);
+    }
+
+    #[test]
+    fn an_agent_given_a_place_of_its_own_has_its_changes_read_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        repository(dir.path());
+        std::fs::write(dir.path().join("file"), "before").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-qm", "Initial files"]);
+        let place = tempfile::tempdir().unwrap();
+        let worktree = place.path().join("lead");
+        run_git(
+            dir.path(),
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+        );
+        let journal = Journal::open(logs.path(), "project", dir.path());
+        journal.event(&Event::Placed {
+            agent: "lead".into(),
+            folder: worktree.clone(),
+            said: Some("works apart".into()),
+        });
+        journal.event(&Event::Working {
+            agent: "lead".into(),
+            prompt: "Work".into(),
+        });
+        while !journal.open.lock().unwrap().0["lead"]
+            .snapshot
+            .is_finished()
+        {
+            std::thread::yield_now();
+        }
+        std::fs::write(worktree.join("file"), "after").unwrap();
+        std::fs::write(worktree.join("new"), "new").unwrap();
+        // The person's own checkout changes too, which is not the task's.
+        std::fs::write(dir.path().join("theirs"), "theirs").unwrap();
+        let task = journal
+            .event(&Event::Done {
+                agent: "lead".into(),
+                outcome: Ok("done".into()),
+            })
+            .unwrap();
+        assert_eq!(task.files, ["file", "new"]);
     }
 
     #[test]

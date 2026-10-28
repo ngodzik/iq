@@ -12,6 +12,7 @@
 //! autopilot_host = true                  # the reviewer also answers what runs on the machine itself (containers, clusters, the forge), as your skill says; true once a skill is set
 //! autopilot_refusals = 3                 # refusals of the reviewer in a row before an agent's next action is asked of you; 0 never
 //! internet = false                       # true: every command reaches the internet
+//! worktree = false                       # true: each chat you start works in a worktree of its own, on a branch iq/<chat>; your checkout is left as it is
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
@@ -100,6 +101,10 @@ pub(crate) struct Settings {
     /// it to and what the person allows.
     #[serde(default)]
     pub(crate) internet: bool,
+    /// Each chat the person starts works in a worktree of its own, on a
+    /// branch of its own, rather than in their checkout.
+    #[serde(default)]
+    pub(crate) worktree: bool,
     /// The theme.
     theme: Option<String>,
     /// The person's rules for every project, files of their home.
@@ -395,6 +400,9 @@ mod tests {
         let quiet: Settings = toml::from_str("context_every = 0").unwrap();
         assert_eq!(quiet.crew().unwrap().context_every, 0);
         assert!(set.autopilot && set.internet);
+        assert!(!set.worktree);
+        let apart: Settings = toml::from_str("worktree = true").unwrap();
+        assert!(apart.worktree);
         assert!(set.autopilot_skill.is_none());
         let local: Settings = toml::from_str("autopilot_skill = \"local-review\"").unwrap();
         assert_eq!(local.autopilot_skill.as_deref(), Some("local-review"));

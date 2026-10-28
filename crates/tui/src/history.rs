@@ -354,6 +354,20 @@ impl History {
                     body: vec![Span::styled(short(text), p.fg(p.dim))],
                 });
             }
+            Event::Placed {
+                agent,
+                said: Some(said),
+                ..
+            } => {
+                self.finish(agent, board, p);
+                self.header(agent, board, p);
+                self.paras.push(Para {
+                    first: vec![Span::raw("  "), Span::styled("! ", p.fg(p.warn))],
+                    rest: vec![Span::raw("    ")],
+                    body: vec![Span::styled(short(&format!("{agent} {said}")), p.fg(p.dim))],
+                });
+            }
+            Event::Placed { said: None, .. } => {}
         }
     }
 
