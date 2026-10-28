@@ -118,18 +118,25 @@ impl Journal {
         let Ok(line) = serde_json::to_string(task) else {
             return;
         };
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&self.file);
-        if let Ok(mut file) = file {
-            let _ = writeln!(file, "{line}");
-        }
+        crate::lock::holding(&self.file, || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&self.file);
+            if let Ok(mut file) = file {
+                let _ = writeln!(file, "{line}");
+            }
+        });
     }
 
-    /// Drops the tasks older than they are kept.
+    /// Drops the tasks older than they are kept. Another iq keeping a task
+    /// meanwhile waits for it.
     pub(crate) fn trim(&self) {
+        crate::lock::holding(&self.file, || self.trim_held());
+    }
+
+    fn trim_held(&self) {
         let since = iq_ui::now().saturating_sub(KEEP_SECS);
         let Ok(text) = std::fs::read_to_string(&self.file) else {
             return;

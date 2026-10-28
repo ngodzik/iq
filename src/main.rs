@@ -4,6 +4,7 @@
 
 mod journal;
 mod ledger;
+mod lock;
 mod settings;
 mod sync;
 mod terminal;

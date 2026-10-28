@@ -70,12 +70,14 @@ impl Ledger {
         };
         text.push('\n');
         let _writing = self.writing.lock();
-        let written = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&self.calls)
-            .and_then(|mut file| file.write_all(text.as_bytes()));
+        let written = crate::lock::holding(&self.calls, || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&self.calls)
+                .and_then(|mut file| file.write_all(text.as_bytes()))
+        });
         if let Err(error) = written {
             tracing::warn!(
                 "could not keep a billed call in {}: {error}",
@@ -85,8 +87,13 @@ impl Ledger {
     }
 
     /// Drops calls older than the history kept, so that the file does not
-    /// grow without end.
+    /// grow without end. Another iq adding a call meanwhile waits for it.
     pub(crate) fn trim(&self) {
+        let _writing = self.writing.lock();
+        crate::lock::holding(&self.calls, || self.trim_held());
+    }
+
+    fn trim_held(&self) {
         let since = iq_ui::now().saturating_sub(BILLED_KEEP_SECS);
         let Ok(text) = std::fs::read_to_string(&self.calls) else {
             return;
@@ -123,5 +130,46 @@ mod tests {
         assert!(again.billed(iq_ui::now() + 10).is_empty());
         again.trim();
         assert_eq!(again.billed(0).len(), 2);
+    }
+
+    #[test]
+    fn two_iq_billing_and_trimming_at_once_lose_no_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().to_path_buf();
+        let billing = {
+            let folder = folder.clone();
+            std::thread::spawn(move || {
+                let ledger = Ledger::open(&folder);
+                for _ in 0..300 {
+                    ledger.bill("lead", "lab/model", Some(Usd(0.01)));
+                }
+            })
+        };
+        // Another process's ledger: a call too old to keep, then a trim
+        // that writes the file again, over and over.
+        let other = Ledger::open(&folder);
+        let old = format!(
+            "{}\n",
+            serde_json::to_string(&Line {
+                at: 0,
+                agent: "lead".into(),
+                model: "lab/old".into(),
+                cost: None,
+            })
+            .unwrap()
+        );
+        while !billing.is_finished() {
+            crate::lock::holding(&other.calls, || {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&other.calls)
+                    .and_then(|mut file| file.write_all(old.as_bytes()))
+                    .unwrap();
+            });
+            other.trim();
+        }
+        billing.join().unwrap();
+        assert_eq!(Ledger::open(&folder).billed(1).len(), 300);
     }
 }
