@@ -8,6 +8,7 @@
 //! stays within the sandbox.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -69,6 +70,16 @@ pub const CONTEXT_EVERY: u64 = 25_000;
 /// next is asked of the person, unless the settings say.
 pub const REFUSALS: u32 = 3;
 
+/// How long a command may run before it is stopped, unless the settings
+/// say.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long a command may write nothing before it is stopped, unless the
+/// settings say: one waiting for a login in a browser, or for an answer at
+/// a terminal it does not have, would hold its agent until its time ran
+/// out.
+pub const COMMAND_QUIET: Duration = Duration::from_secs(180);
+
 /// What the crew starts with.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -90,6 +101,13 @@ pub struct Settings {
     /// How many actions of one agent the reviewer refuses in a row before
     /// the next is asked of the person instead; 0 never.
     pub refusals: u32,
+    /// How hard the reviewer thinks; low unless the person says.
+    pub reviewer_effort: Effort,
+    /// How long a command may run before it is stopped.
+    pub command_timeout: Duration,
+    /// How long a command may write nothing before it is stopped: one
+    /// waiting for an answer nobody can give it.
+    pub command_quiet: Duration,
 }
 
 impl Default for Settings {
@@ -102,6 +120,9 @@ impl Default for Settings {
             rules: Vec::new(),
             context_every: CONTEXT_EVERY,
             refusals: REFUSALS,
+            reviewer_effort: Effort::Low,
+            command_timeout: COMMAND_TIMEOUT,
+            command_quiet: COMMAND_QUIET,
         }
     }
 }
@@ -150,8 +171,9 @@ struct Inner<M> {
     teams: Mutex<Vec<Team>>,
     /// The tools other parts of iq offer some agents.
     extensions: Mutex<Vec<Arc<dyn Extension<M>>>>,
-    /// The project's rules for some of its files, as last read, and when.
-    scoped: Mutex<Option<(Instant, Vec<rules::Scoped>)>>,
+    /// The project's rules for some of its files, as last read in each
+    /// place, and when.
+    scoped: Mutex<HashMap<PathBuf, (Instant, Vec<rules::Scoped>)>>,
 }
 
 /// Where agents work: the gate that judges their actions there, and the
@@ -243,7 +265,10 @@ where
         settings: Settings,
         report: Report,
     ) -> Self {
-        let sandbox = gate.sandbox(helper.clone());
+        let sandbox = gate
+            .sandbox(helper.clone())
+            .with_timeout(settings.command_timeout)
+            .with_quiet(settings.command_quiet);
         Self {
             inner: Arc::new(Inner {
                 provider,
@@ -263,7 +288,7 @@ where
                 peer_wakes: Mutex::new(Vec::new()),
                 teams: Mutex::new(Vec::new()),
                 extensions: Mutex::new(Vec::new()),
-                scoped: Mutex::new(None),
+                scoped: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -351,7 +376,10 @@ where
             .gate
             .within(&placed.folder, placed.writable.clone())
             .map_err(|e| chain(&e))?;
-        let sandbox = gate.sandbox(self.inner.helper.clone());
+        let sandbox = gate
+            .sandbox(self.inner.helper.clone())
+            .with_timeout(self.inner.settings.command_timeout)
+            .with_quiet(self.inner.settings.command_quiet);
         Ok(Some((Arc::new(Place { gate, sandbox }), placed.said)))
     }
 
@@ -672,7 +700,7 @@ where
             &name,
             by,
             role.as_deref(),
-            &workspace,
+            &place,
         ))];
         if !works {
             messages.push(Message::user(task.clone()));
@@ -1479,7 +1507,15 @@ where
                 ),
             });
         } else if self.autopilot() && reviewable {
-            match self.review(agent, &action, pending.scope(), &reason).await {
+            // A make target is judged by its recipe, not by its name.
+            let does = match pending.action() {
+                Action::Run { line, .. } => self.make_recipes(agent, line),
+                _ => None,
+            };
+            match self
+                .review(agent, &action, pending.scope(), &reason, does.as_deref())
+                .await
+            {
                 Ok((approved, why)) => {
                     self.report(Event::Reviewed {
                         agent: agent.to_owned(),
@@ -1499,6 +1535,7 @@ where
                         gate.approve(pending, Approver::Reviewer)
                             .map_err(|e| chain(&e))
                     } else {
+                        self.refused(agent, &gate, pending, Approver::Reviewer, &why);
                         Err(refusal("the reviewer", &why, true))
                     };
                 }
@@ -1528,29 +1565,63 @@ where
             Ok(Ok(true)) => gate
                 .approve(pending, Approver::Person)
                 .map_err(|e| chain(&e)),
-            Ok(Ok(false)) => Err(refusal("the person", &reason, true)),
-            _ => Err(refusal(
-                "the gate",
-                &format!("nobody answered in time ({reason})"),
-                true,
-            )),
+            Ok(Ok(false)) => {
+                self.refused(agent, &gate, pending, Approver::Person, &reason);
+                Err(refusal("the person", &reason, true))
+            }
+            _ => {
+                let why = format!("nobody answered in time ({reason})");
+                self.refused(agent, &gate, pending, Approver::Person, &why);
+                Err(refusal("the gate", &why, true))
+            }
         }
     }
 
-    /// The reviewer's verdict on an action of `agent`'s, of `scope`.
+    /// Writes a refusal of `agent`'s action to the audit log; one that
+    /// cannot be written is said, as nothing is done either way.
+    fn refused(&self, agent: &str, gate: &Gate, pending: Pending, by: Approver, why: &str) {
+        if let Err(error) = gate.refuse(pending, by, why) {
+            self.report(Event::Notice {
+                agent: agent.to_owned(),
+                text: format!("the audit log misses a refusal: {}", chain(&error)),
+            });
+        }
+    }
+
+    /// What the make targets of `line` do, from the Makefile of the place
+    /// `agent` works in, when `line` is a `make` command and the Makefile
+    /// has them.
+    fn make_recipes(&self, agent: &str, line: &str) -> Option<String> {
+        let targets = crate::make::targets(line);
+        if targets.is_empty() {
+            return None;
+        }
+        let place = self.place_of(agent);
+        let workspace = place.gate.workspace();
+        ["GNUmakefile", "makefile", "Makefile"]
+            .iter()
+            .map(|name| workspace.join(name))
+            .find(|path| path.is_file())
+            .and_then(|path| self.read_quietly(&place.gate, path))
+            .and_then(|text| crate::make::recipes(&text, &targets))
+    }
+
+    /// The reviewer's verdict on an action of `agent`'s, of `scope`, told
+    /// what the action does when its name alone does not say (`does`).
     async fn review(
         &self,
         agent: &str,
         action: &str,
         scope: Scope,
         reason: &str,
+        does: Option<&str>,
     ) -> Result<(bool, String), String> {
         let task = lock(&self.inner.board)
             .members
             .get(agent)
             .map(|member| member.task.clone())
             .unwrap_or_default();
-        let prompt = review::prompt(&task, action, review::place(scope), reason);
+        let prompt = review::prompt(&task, action, review::place(scope), reason, does);
         let model = self
             .inner
             .settings
@@ -1569,7 +1640,7 @@ where
             model: model.clone(),
             messages: vec![Message::system(instructions), Message::user(prompt)],
             tools: Vec::new(),
-            effort: Some(Effort::Low),
+            effort: Some(self.inner.settings.reviewer_effort),
         };
         let response = self
             .inner
@@ -1624,14 +1695,8 @@ where
 
     /// The standing instructions of one of iq's agents, working in
     /// `workspace`.
-    fn instructions(
-        &self,
-        name: &str,
-        by: &str,
-        role: Option<&str>,
-        workspace: &std::path::Path,
-    ) -> String {
-        let workspace = workspace.display();
+    fn instructions(&self, name: &str, by: &str, role: Option<&str>, place: &Place) -> String {
+        let workspace = place.gate.workspace().display();
         let started = if by == PERSON {
             "The person gave you your task.".to_owned()
         } else {
@@ -1655,7 +1720,7 @@ where
              tests, linters), and be brief. When the task is done, answer with what you did and \
              call no tool.{}{}",
             if by == PERSON {
-                self.known()
+                self.known(place)
             } else {
                 String::new()
             },
@@ -1666,7 +1731,7 @@ where
     /// What an agent the person started is told beyond its task: the
     /// person's rules and the project's, and that the agents it starts
     /// know none of what it knows but what it gives them.
-    fn known(&self) -> String {
+    fn known(&self, place: &Place) -> String {
         let mut out = String::new();
         for file in &self.inner.settings.rules {
             if let Some(text) = rules::kept(&file.text) {
@@ -1676,12 +1741,12 @@ where
                 ));
             }
         }
-        for (file, text) in self.project_rules() {
+        for (file, text) in self.project_rules(place) {
             out.push_str(&format!(
                 "\n\nThe project's rules for agents, from its {file}, which you follow:\n\n{text}"
             ));
         }
-        let scoped = self.scoped_rules();
+        let scoped = self.scoped_rules(place);
         if !scoped.is_empty() {
             out.push_str(
                 "\n\nThe project's rules for some of its files, which an agent is given as it \
@@ -1702,11 +1767,10 @@ where
         out
     }
 
-    /// Reads `path` in the crew's workspace through the gate, as an agent's
-    /// reads are, never asking the person: what the gate does not allow at
-    /// once is not read.
-    fn read_quietly(&self, path: std::path::PathBuf) -> Option<String> {
-        match self.inner.place.gate.judge(Action::Read { path }).ok()? {
+    /// Reads `path` through `gate`, as an agent's reads are, never asking
+    /// the person: what the gate does not allow at once is not read.
+    fn read_quietly(&self, gate: &Gate, path: std::path::PathBuf) -> Option<String> {
+        match gate.judge(Action::Read { path }).ok()? {
             Judged::Allowed(permit) => String::from_utf8(permit.read().ok()?).ok(),
             Judged::Asked { .. } | Judged::Denied { .. } => None,
         }
@@ -1715,17 +1779,18 @@ where
     /// The project's rules for agents, each with the file it came from: its
     /// `AGENTS.md`, then its `CLAUDE.md`, whose `@file` lines are the
     /// files they import, a file given already left out; then those of its
-    /// `.claude/rules` for the whole project. Read in the crew's workspace,
-    /// the person's checkout: a place made for an agent holds the same.
-    fn project_rules(&self) -> Vec<(String, String)> {
-        let workspace = self.inner.place.gate.workspace().to_path_buf();
+    /// `.claude/rules` for the whole project. Read where the agent works:
+    /// a place of its own may hold other rules than the person's checkout.
+    fn project_rules(&self, place: &Place) -> Vec<(String, String)> {
+        let gate = &place.gate;
+        let workspace = gate.workspace().to_path_buf();
         let mut given: Vec<(String, String)> = Vec::new();
         for file in RULES_FILES {
             let path = workspace.join(file);
             if !path.is_file() {
                 continue;
             }
-            let Some(text) = self.read_quietly(path) else {
+            let Some(text) = self.read_quietly(gate, path) else {
                 continue;
             };
             let text: String = text
@@ -1734,7 +1799,7 @@ where
                     // As `AGENTS.md` is, imported by `CLAUDE.md`.
                     Some(name) if given.iter().any(|(file, _)| file == name) => "\n".to_owned(),
                     Some(name) => {
-                        self.read_quietly(workspace.join(name))
+                        self.read_quietly(gate, workspace.join(name))
                             .unwrap_or_else(|| line.to_owned())
                             + "\n"
                     }
@@ -1745,7 +1810,7 @@ where
                 given.push((file.to_owned(), text));
             }
         }
-        for (file, text) in self.rules_folder() {
+        for (file, text) in self.rules_folder(place) {
             let (paths, body) = rules::scope(&text);
             if paths.is_empty()
                 && let Some(body) = rules::kept(body)
@@ -1756,10 +1821,10 @@ where
         given
     }
 
-    /// The files of the project's `.claude/rules`, each with what it says,
-    /// in the order of their names.
-    fn rules_folder(&self) -> Vec<(String, String)> {
-        let workspace = self.inner.place.gate.workspace().to_path_buf();
+    /// The files of the project's `.claude/rules` in `place`, each with
+    /// what it says, in the order of their names.
+    fn rules_folder(&self, place: &Place) -> Vec<(String, String)> {
+        let workspace = place.gate.workspace().to_path_buf();
         let mut found = Vec::new();
         let mut folders = vec![workspace.join(RULES_FOLDER)];
         while let Some(folder) = folders.pop() {
@@ -1784,21 +1849,22 @@ where
                     .ok()?
                     .to_string_lossy()
                     .into_owned();
-                Some((file, self.read_quietly(path)?))
+                Some((file, self.read_quietly(&place.gate, path)?))
             })
             .collect()
     }
 
-    /// The project's rules for some of its files, read again once they are
-    /// older than [`SCOPED_FRESH`].
-    fn scoped_rules(&self) -> Vec<rules::Scoped> {
-        if let Some((read, rules)) = lock(&self.inner.scoped).as_ref()
+    /// The project's rules for some of its files, in `place`, read again
+    /// once they are older than [`SCOPED_FRESH`].
+    fn scoped_rules(&self, place: &Place) -> Vec<rules::Scoped> {
+        let workspace = place.gate.workspace().to_path_buf();
+        if let Some((read, rules)) = lock(&self.inner.scoped).get(&workspace)
             && read.elapsed() < SCOPED_FRESH
         {
             return rules.clone();
         }
         let rules: Vec<rules::Scoped> = self
-            .rules_folder()
+            .rules_folder(place)
             .into_iter()
             .filter_map(|(file, text)| {
                 let (paths, body) = rules::scope(&text);
@@ -1806,7 +1872,7 @@ where
                 (!paths.is_empty()).then_some(rules::Scoped { file, paths, text })
             })
             .collect();
-        *lock(&self.inner.scoped) = Some((Instant::now(), rules.clone()));
+        lock(&self.inner.scoped).insert(workspace, (Instant::now(), rules.clone()));
         rules
     }
 
@@ -1824,7 +1890,7 @@ where
         };
         let relative = relative.to_string_lossy();
         let matching: Vec<rules::Scoped> = self
-            .scoped_rules()
+            .scoped_rules(&place)
             .into_iter()
             .filter(|rule| {
                 rule.paths

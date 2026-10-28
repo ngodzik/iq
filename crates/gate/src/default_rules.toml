@@ -228,3 +228,30 @@ decision = "allow"
 network = true
 reason = "it fetches submodules"
 match = ["git submodule update --init"]
+
+# What waits for the person to log in, at a terminal or in a browser, which
+# nobody can give a command of an agent's: it would wait until it is
+# stopped. The person logs in themselves.
+[[rule]]
+prefix = ["aws", ["sso", "configure"], ["login", "sso"]]
+decision = "deny"
+host = true
+reason = "it waits for a login in a browser, which nobody can give it: ask the person to log in"
+match = ["aws sso login", "aws sso login --profile dev", "aws configure sso"]
+not_match = ["aws sso logout", "aws s3 ls"]
+
+[[rule]]
+prefix = [["gcloud", "gh", "glab", "doctl", "flyctl", "fly", "firebase"], "auth", ["login", "init", "activate-service-account"]]
+decision = "deny"
+host = true
+reason = "it waits for a login at a terminal or in a browser, which nobody can give it: ask the person to log in"
+match = ["gcloud auth login", "gh auth login", "doctl auth init", "glab auth login"]
+not_match = ["gh auth status", "gcloud auth list", "gh pr list"]
+
+[[rule]]
+prefix = [["az", "docker", "podman", "nerdctl", "npm", "cargo", "heroku", "vercel", "netlify", "wrangler", "huggingface-cli"], "login"]
+decision = "deny"
+host = true
+reason = "it waits for a login at a terminal or in a browser, which nobody can give it: ask the person to log in"
+match = ["docker login registry.example", "npm login", "az login", "cargo login"]
+not_match = ["docker logout", "docker ps", "npm install"]

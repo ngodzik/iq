@@ -227,6 +227,82 @@ async fn a_command_out_of_time_is_stopped_with_its_children() {
 }
 
 #[tokio::test]
+async fn a_command_that_writes_nothing_for_too_long_is_stopped_and_told_why() {
+    let f = fixture();
+    let sandbox = f
+        .sandbox
+        .clone()
+        .with_quiet(std::time::Duration::from_millis(1500));
+    // One that writes now and then goes on; one that waits is stopped.
+    let ran = run_with(&f, &sandbox, "echo a; sleep 1; echo b").await;
+    assert_eq!(ran.status, Some(0), "{}", ran.output);
+    assert!(ran.output.contains("a\nb"), "{}", ran.output);
+    let ran = run_with(&f, &sandbox, "echo waiting; sleep 30").await;
+    assert!(ran.timed_out);
+    assert!(
+        ran.output
+            .contains("waiting\nstopped after 1 seconds without output"),
+        "{}",
+        ran.output
+    );
+}
+
+#[tokio::test]
+async fn a_command_whose_wait_is_dropped_is_stopped_with_its_group() {
+    let f = fixture();
+    let action = Action::Run {
+        line: "sh -c 'echo $$ > pid; sleep 30' & echo $! > shell; wait".to_owned(),
+        folder: f.root.clone(),
+        network: false,
+        host: false,
+    };
+    let Judged::Allowed(permit) = f.gate.judge(action).unwrap() else {
+        panic!("not allowed")
+    };
+    let sandbox = f.sandbox.clone();
+    let running = tokio::spawn(async move { sandbox.run(permit).await });
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(f.root.join("pid"))
+            && let Ok(pid) = pid.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    // The person stops the agent: its turn is dropped, the wait with it.
+    running.abort();
+    let _ = running.await;
+    let gone = |pid: u32| {
+        std::process::Command::new("kill")
+            .args(["-s", "0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| !status.success())
+    };
+    for _ in 0..40 {
+        if gone(pid) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the command's child {pid} still runs");
+}
+
+async fn run_with(f: &Fixture, sandbox: &Sandbox, line: &str) -> Ran {
+    let action = Action::Run {
+        line: line.to_owned(),
+        folder: f.root.clone(),
+        network: false,
+        host: false,
+    };
+    let Judged::Allowed(permit) = f.gate.judge(action).unwrap() else {
+        panic!("{line}: not allowed")
+    };
+    sandbox.run(permit).await.unwrap()
+}
+
+#[tokio::test]
 async fn what_the_person_lets_on_the_machine_runs_outside_the_sandbox() {
     let workspace = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();

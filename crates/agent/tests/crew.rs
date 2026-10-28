@@ -452,11 +452,94 @@ async fn the_reviewer_answers_within_the_sandbox_when_the_autopilot_is_on() {
         .expect("the reviewer answered");
     assert_eq!(reviewed, (true, "it is what the task asks.".to_owned()));
     assert_eq!(f.model.models_of("reviewer"), ["cheap/reviewer"]);
+    assert_eq!(f.model.efforts_of("reviewer"), [Some(iq_core::Effort::Low)]);
     let asked = f.model.seen_by("reviewer");
     assert!(asked.contains("git reset --hard"), "{asked}");
     assert!(asked.contains("start over"), "{asked}");
     // No question went to the person.
     assert!(!f.events().iter().any(|e| matches!(e, Event::Asked { .. })));
+}
+
+#[tokio::test]
+async fn the_reviewer_reads_what_a_make_target_does_and_thinks_as_hard_as_set() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "run",
+                        serde_json::json!({"command": "make down && make up-db"}),
+                    ),
+                    say("Done."),
+                ],
+            ),
+            (
+                "reviewer",
+                vec![say("REFUSE: it deletes the database's data.")],
+            ),
+        ],
+        Settings {
+            reviewer: Some(model("cheap/reviewer")),
+            reviewer_effort: iq_core::Effort::High,
+            rules: Vec::new(),
+            ..Settings::default()
+        },
+    );
+    std::fs::write(
+        f.root.join("Makefile"),
+        "down:\n\tdocker compose down --volumes\n\nup-db: down\n\tdocker compose up -d db\n",
+    )
+    .unwrap();
+    // A rule of the person's holds the target for the reviewer.
+    let gate = Gate::builder(&f.root)
+        .rules(
+            iq_gate::Rules::parse(
+                "[[rule]]\nprefix = [\"make\", \"down\"]\ndecision = \"ask\"\nreason = \"it stops services\"\n",
+            )
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let crew = Crew::new(
+        Model(Arc::clone(&f.model)),
+        gate,
+        Helper::new("/nonexistent", Vec::<String>::new()),
+        Settings {
+            reviewer: Some(model("cheap/reviewer")),
+            reviewer_effort: iq_core::Effort::High,
+            ..Settings::default()
+        },
+        Arc::new(|_| {}),
+    );
+    crew.set_autopilot(true);
+    crew.start(
+        "lead",
+        &model("cheap/model"),
+        "restart the db".into(),
+        PERSON,
+    );
+    tokio::time::timeout(Duration::from_secs(10), crew.settled())
+        .await
+        .unwrap();
+    let asked = f.model.seen_by("reviewer");
+    // Seen as the request is printed, its newlines escaped.
+    assert!(
+        asked.contains("down:\\n    docker compose down --volumes\\n"),
+        "{asked}"
+    );
+    assert!(asked.contains("judge the action by this"), "{asked}");
+    assert_eq!(
+        f.model.efforts_of("reviewer"),
+        [Some(iq_core::Effort::High)]
+    );
+    assert!(
+        f.model
+            .seen_by("lead")
+            .contains("the reviewer refused it: it deletes the database's data"),
+        "{}",
+        f.model.seen_by("lead")
+    );
 }
 
 #[tokio::test]

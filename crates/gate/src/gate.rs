@@ -36,6 +36,11 @@ enum Event<'a> {
         action: &'a Action,
         by: Approver,
     },
+    Refused {
+        action: &'a Action,
+        by: Approver,
+        reason: &'a str,
+    },
 }
 
 /// Programs that cannot send anything over a network, whatever they are
@@ -369,6 +374,24 @@ impl Gate {
             })?;
         }
         Ok(pending.permit)
+    }
+
+    /// Writes to the audit log that `pending` was refused `by` whoever
+    /// answers for the person, and why: the log tells what was asked and
+    /// not done as it tells what was.
+    ///
+    /// # Errors
+    ///
+    /// The audit log cannot be written.
+    pub fn refuse(&self, pending: Pending, by: Approver, reason: &str) -> Result<(), GateError> {
+        if let Some(audit) = &self.audit {
+            audit.write(&Event::Refused {
+                action: &pending.permit.action,
+                by,
+                reason,
+            })?;
+        }
+        Ok(())
     }
 
     fn reading(&self, path: &Path) -> Verdict {
@@ -837,16 +860,31 @@ mod tests {
             unreachable!()
         };
         assert!(f.gate.approve(pending, Approver::Person).is_ok());
+        // A refusal is written as an approval is, with its reason.
+        let Judged::Asked { pending, .. } = run(&f, "git reset --hard", false) else {
+            unreachable!()
+        };
+        f.gate
+            .refuse(
+                pending,
+                Approver::Reviewer,
+                "the task does not ask to lose work",
+            )
+            .unwrap();
         let log = std::fs::read_to_string(f.root.join("audit.log")).unwrap();
         let events: Vec<serde_json::Value> = log
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 7);
         assert_eq!(events[0]["event"], "judged");
         assert_eq!(events[0]["verdict"], "ask");
         assert_eq!(events[4]["event"], "approved");
         assert_eq!(events[4]["by"], "person");
         assert_eq!(events[4]["action"]["line"], "git push");
+        assert_eq!(events[6]["event"], "refused");
+        assert_eq!(events[6]["by"], "reviewer");
+        assert_eq!(events[6]["reason"], "the task does not ask to lose work");
+        assert_eq!(events[6]["action"]["line"], "git reset --hard");
     }
 }

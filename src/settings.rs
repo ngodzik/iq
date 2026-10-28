@@ -5,6 +5,7 @@
 //! base_url = "https://router.requesty.ai/v1"  # the provider: another region's router, any OpenAI compatible endpoint
 //! model = "anthropic/claude-opus-5-5"    # the lead, which decides who does what
 //! reviewer = "anthropic/claude-haiku-5-5"  # answers for the person when the autopilot is on
+//! reviewer_effort = "low"                # how hard it thinks
 //! effort = "high"                        # how hard the models think; /effort changes an agent's
 //! context_every = 25000                  # tokens an agent's conversation grows between two words to it of its size; 0 never
 //! autopilot = false
@@ -12,6 +13,8 @@
 //! autopilot_host = true                  # the reviewer also answers what runs on the machine itself (containers, clusters, the forge), as your skill says; true once a skill is set
 //! autopilot_refusals = 3                 # refusals of the reviewer in a row before an agent's next action is asked of you; 0 never
 //! internet = false                       # true: every command reaches the internet
+//! command_timeout = 600                  # seconds a command may run before it is stopped
+//! command_quiet = 180                    # seconds a command may write nothing before it is stopped: one waiting for a login, or an answer at a terminal
 //! worktree = false                       # true: each chat you start works in a worktree of its own, on a branch iq/<chat>; your checkout is left as it is
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
@@ -80,7 +83,13 @@ pub(crate) struct Settings {
     base_url: Option<String>,
     model: Option<String>,
     reviewer: Option<String>,
+    /// How hard the reviewer thinks; low unless set.
+    reviewer_effort: Option<Effort>,
     effort: Option<Effort>,
+    /// Seconds a command may run before it is stopped.
+    command_timeout: Option<u64>,
+    /// Seconds a command may write nothing before it is stopped.
+    command_quiet: Option<u64>,
     /// How many tokens an agent's conversation grows between two words to
     /// it of its size.
     context_every: Option<u64>,
@@ -362,6 +371,13 @@ impl Settings {
             effort: self.effort,
             context_every: self.context_every.unwrap_or(iq_agent::CONTEXT_EVERY),
             refusals: self.autopilot_refusals.unwrap_or(iq_agent::REFUSALS),
+            reviewer_effort: self.reviewer_effort.unwrap_or(Effort::Low),
+            command_timeout: self
+                .command_timeout
+                .map_or(iq_agent::COMMAND_TIMEOUT, std::time::Duration::from_secs),
+            command_quiet: self
+                .command_quiet
+                .map_or(iq_agent::COMMAND_QUIET, std::time::Duration::from_secs),
             ..iq_agent::Settings::default()
         })
     }
@@ -416,6 +432,16 @@ mod tests {
         .unwrap();
         assert!(!kept.autopilot_host());
         assert_eq!(kept.crew().unwrap().refusals, 5);
+        let limits: Settings = toml::from_str(
+            "reviewer_effort = \"high\"\ncommand_timeout = 1200\ncommand_quiet = 30",
+        )
+        .unwrap();
+        let crew = limits.crew().unwrap();
+        assert_eq!(crew.reviewer_effort, Effort::High);
+        assert_eq!(crew.command_timeout.as_secs(), 1200);
+        assert_eq!(crew.command_quiet.as_secs(), 30);
+        assert_eq!(set.crew().unwrap().reviewer_effort, Effort::Low);
+        assert_eq!(set.crew().unwrap().command_quiet, iq_agent::COMMAND_QUIET);
         assert_eq!(set.crew().unwrap().refusals, iq_agent::REFUSALS);
         assert!(toml::from_str::<Settings>("modle = \"x\"").is_err());
         let looks: Settings =

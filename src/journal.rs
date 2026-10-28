@@ -93,6 +93,10 @@ impl Journal {
             }
             task.seconds = iq_ui::now().saturating_sub(task.at);
             task.ok = outcome.is_ok();
+            task.why = outcome
+                .as_ref()
+                .err()
+                .map(|why| why.chars().take(PROMPT_CHARS).collect());
             self.keep(&task);
             return Some(task);
         }
@@ -609,8 +613,25 @@ mod tests {
         assert_eq!(task.tokens, 1_000);
         assert_eq!(task.project, "github.com/org/repo");
         assert!(task.ok);
+        assert!(task.why.is_none());
         assert!((task.billed - 0.01).abs() < 1e-12);
         journal.trim();
         assert_eq!(iq_observe::read(journal.file(), 0).len(), 1);
+        // A turn that ends without an answer keeps why.
+        journal.event(&Event::Working {
+            agent: "lead".into(),
+            prompt: "again".into(),
+        });
+        journal.event(&Event::Done {
+            agent: "lead".into(),
+            outcome: Err("the provider answered HTTP 500".into()),
+        });
+        let tasks = iq_observe::read(journal.file(), 0);
+        assert_eq!(tasks.len(), 2);
+        assert!(!tasks[1].ok);
+        assert_eq!(
+            tasks[1].why.as_deref(),
+            Some("the provider answered HTTP 500")
+        );
     }
 }

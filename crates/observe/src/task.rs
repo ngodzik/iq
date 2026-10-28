@@ -37,6 +37,9 @@ pub struct Task {
     /// Whether it ended with an answer, rather than an error.
     #[serde(default = "answered")]
     pub ok: bool,
+    /// Why it ended without an answer, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 fn answered() -> bool {
@@ -57,6 +60,7 @@ impl Default for Task {
             tokens: 0,
             seconds: 0,
             ok: true,
+            why: None,
         }
     }
 }

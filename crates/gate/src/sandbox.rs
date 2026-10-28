@@ -10,7 +10,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,16 @@ const OUTPUT_BYTES: usize = 30_000;
 
 /// The longest a command runs by default.
 const TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long a command may write nothing before it is stopped, unless the
+/// sandbox is told otherwise: one that waits for a login in a browser, or
+/// for an answer at a terminal it does not have, would wait until its time
+/// ran out, holding its agent.
+const QUIET: Duration = Duration::from_secs(180);
+
+/// How long a command's output is waited for once it ended: what it left
+/// running in the background holds its output open, and is not waited for.
+const DRAIN: Duration = Duration::from_secs(1);
 
 /// The system's folders a command reads and runs programs from, those of
 /// Linux and of macOS.
@@ -233,7 +243,8 @@ pub struct Ran {
     /// What it printed, errors with the rest in order, its secrets taken
     /// out, its end kept when it is long.
     pub output: String,
-    /// Whether it ran out of time and was stopped.
+    /// Whether it ran out of time, or wrote nothing for too long, and was
+    /// stopped.
     pub timed_out: bool,
     /// What it wrote where code runs later on its own and was put back:
     /// git's hooks, the settings that make git run a program.
@@ -250,6 +261,8 @@ pub struct Sandbox {
     bounds: Bounds,
     audit: Option<Audit>,
     timeout: Duration,
+    /// How long a command may write nothing before it is stopped.
+    quiet: Duration,
     /// The process holding the commands' own network, started with the
     /// first command without the internet, on Linux.
     holder: Arc<Mutex<Option<Holder>>>,
@@ -296,6 +309,7 @@ impl Sandbox {
             bounds,
             audit,
             timeout: TIMEOUT,
+            quiet: QUIET,
             holder: Arc::default(),
             leftovers: Arc::default(),
         }
@@ -356,6 +370,14 @@ impl Sandbox {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// The same sandbox, its commands stopped once they wrote nothing for
+    /// `quiet`: one waiting for an answer nobody can give it.
+    #[must_use]
+    pub fn with_quiet(mut self, quiet: Duration) -> Self {
+        self.quiet = quiet;
         self
     }
 
@@ -441,44 +463,48 @@ impl Sandbox {
             .process_group(0)
             .kill_on_drop(true);
         let watch = Watch::take(workspace);
-        let child = command.spawn().map_err(GateError::Spawn)?;
+        let mut child = command.spawn().map_err(GateError::Spawn)?;
         let group = child.id();
         // Kept from the start: a turn stopped while the command runs drops
-        // this wait, and only the sandbox's end is left to stop it.
+        // this wait, which stops the group, and the sandbox's end stops
+        // what it may have left.
         if let Some(group) = group
             && let Ok(mut leftovers) = self.leftovers.lock()
         {
             leftovers.push(group);
         }
-        let waited = tokio::time::timeout(self.timeout, child.wait_with_output()).await;
+        let mut stopping = Stopping(group);
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let ended = waited(&mut child, stdout, stderr, self.timeout, self.quiet).await;
+        stopping.0 = None;
         if let Some(group) = group {
-            if waited.is_err() {
+            if ended.stopped.is_some() {
                 stop_group(group).await;
+                let _ = child.wait().await;
             }
-            if (waited.is_err() || !alive(group).await)
+            if (ended.stopped.is_some() || !alive(group).await)
                 && let Ok(mut leftovers) = self.leftovers.lock()
             {
                 leftovers.retain(|kept| *kept != group);
             }
         }
         let settled = watch.settle();
-        let (status, output, timed_out) = match waited {
-            Ok(output) => {
-                let output = output.map_err(GateError::Spawn)?;
-                let helper = String::from_utf8_lossy(&output.stderr);
-                if let Some(failure) = helper.strip_prefix(HELPER_PREFIX) {
-                    return Err(GateError::Confine(failure.trim().to_owned()));
+        let helper = String::from_utf8_lossy(&ended.stderr);
+        if let Some(failure) = helper.strip_prefix(HELPER_PREFIX) {
+            return Err(GateError::Confine(failure.trim().to_owned()));
+        }
+        // What the shell says before its errors join the output, such as a
+        // line it cannot parse, comes after.
+        let mut output = format!("{}{helper}", String::from_utf8_lossy(&ended.stdout));
+        let (status, timed_out) = match ended.stopped {
+            None => (ended.status.and_then(|status| status.code()), false),
+            Some(why) => {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
                 }
-                // What the shell says before its errors join the output, such
-                // as a line it cannot parse, comes after.
-                let printed = format!("{}{helper}", String::from_utf8_lossy(&output.stdout));
-                (output.status.code(), printed, false)
+                output.push_str(&why);
+                (None, true)
             }
-            Err(_) => (
-                None,
-                format!("stopped after {} seconds", self.timeout.as_secs()),
-                true,
-            ),
         };
         let redactor = Redactor::new(std::env::vars_os(), workspace);
         let ran = Ran {
@@ -497,6 +523,115 @@ impl Sandbox {
             })?;
         }
         Ok(ran)
+    }
+}
+
+/// How a command ended: its status when it ended on its own, else why it
+/// was stopped; and what it wrote.
+struct Ended {
+    status: Option<std::process::ExitStatus>,
+    stopped: Option<String>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Waits for `child` to end, reading what it writes as it comes, and stops
+/// waiting after `timeout`, or once it wrote nothing for `quiet`. Its
+/// output is read for [`DRAIN`] more once it ended: what it left running
+/// holds its output open.
+async fn waited(
+    child: &mut tokio::process::Child,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    timeout: Duration,
+    quiet: Duration,
+) -> Ended {
+    let started = Instant::now();
+    let last = Arc::new(Mutex::new(Instant::now()));
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let err = Arc::new(Mutex::new(Vec::new()));
+    let readers = [
+        stdout.map(|pipe| tokio::spawn(reading(pipe, Arc::clone(&out), Arc::clone(&last)))),
+        stderr.map(|pipe| tokio::spawn(reading(pipe, Arc::clone(&err), Arc::clone(&last)))),
+    ];
+    let mut status = None;
+    let stopped = loop {
+        tokio::select! {
+            ended = child.wait() => {
+                status = ended.ok();
+                break None;
+            }
+            () = tokio::time::sleep(Duration::from_millis(250)) => {
+                if started.elapsed() >= timeout {
+                    break Some(format!("stopped after {} seconds", timeout.as_secs()));
+                }
+                let silent = last.lock().map(|last| last.elapsed()).unwrap_or_default();
+                if silent >= quiet {
+                    break Some(format!(
+                        "stopped after {} seconds without output: it was waiting for something \
+                         nobody can give it (an answer at a terminal, a login in a browser), or \
+                         it is slow; run it again with output, or in the background with its \
+                         output in a file",
+                        quiet.as_secs()
+                    ));
+                }
+            }
+        }
+    };
+    for reader in readers.into_iter().flatten() {
+        if tokio::time::timeout(DRAIN, reader).await.is_err() {
+            // What it left running holds the pipe: what was read is kept.
+        }
+    }
+    let taken = |buffer: &Arc<Mutex<Vec<u8>>>| buffer.lock().map(|b| b.clone()).unwrap_or_default();
+    Ended {
+        status,
+        stopped,
+        stdout: taken(&out),
+        stderr: taken(&err),
+    }
+}
+
+/// Reads `pipe` into `into` as it comes, noting in `last` when it last
+/// came, until it closes.
+async fn reading(
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+    into: Arc<Mutex<Vec<u8>>>,
+    last: Arc<Mutex<Instant>>,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if let Ok(mut into) = into.lock() {
+                    into.extend_from_slice(&chunk[..n]);
+                }
+                if let Ok(mut last) = last.lock() {
+                    *last = Instant::now();
+                }
+            }
+        }
+    }
+}
+
+/// Stops a command's group when the wait for it is dropped before it
+/// ended: a turn stopped by the person while its command runs. Once the
+/// command ended, there is nothing to stop.
+struct Stopping(Option<u32>);
+
+impl Drop for Stopping {
+    fn drop(&mut self) {
+        if let Some(group) = self.0.take()
+            && group >= 2
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-s", "KILL", "--", &format!("-{group}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 

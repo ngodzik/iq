@@ -28,11 +28,25 @@ does not name, and anything that sends data away. Answer with APPROVE or REFUSE 
 word, then one short sentence why.";
 
 /// What the reviewer is asked about one action: the task, the action,
-/// where it runs (`place`) and why it was held.
-pub(crate) fn prompt(task: &str, action: &str, place: &str, reason: &str) -> String {
+/// where it runs (`place`), why it was held, and what the action does when
+/// its name alone does not say (`does`): the recipes of a `make` target.
+pub(crate) fn prompt(
+    task: &str,
+    action: &str,
+    place: &str,
+    reason: &str,
+    does: Option<&str>,
+) -> String {
+    let does = match does {
+        Some(does) => format!(
+            "\n\nWhat the make targets do, from the project's Makefile, each with what it depends \
+             on; judge the action by this, not by the targets' names:\n{does}"
+        ),
+        None => String::new(),
+    };
     format!(
         "The agent's task:\n{task}\n\nThe action it wants to take:\n{action}\n\nWhere it runs: \
-         {place}.\n\nWhy it was held: {reason}.\n\nAPPROVE or REFUSE?"
+         {place}.\n\nWhy it was held: {reason}.{does}\n\nAPPROVE or REFUSE?"
     )
 }
 
