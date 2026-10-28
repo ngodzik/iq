@@ -1,8 +1,11 @@
 //! The journal of iq's tasks, kept in its folder: each turn of an agent's,
 //! the files it wrote, the commands it ran and what it cost, one line of
-//! JSON each, for the assay to say what each kind of task spends. Only
+//! JSON each, for the observations to say what each kind of task spends. Only
 //! what iq's agents did is kept, never what they read or were told beyond
-//! the start of their task.
+//! the start of their task. In a repository, a task's files are also what
+//! git saw change while it worked, so that the journal shows what the
+//! person will find, whatever wrote it: a tool, a command, a commit, another
+//! branch checked out.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -60,6 +63,25 @@ impl Journal {
     /// Notes what `event` says of a task, and keeps the task once its turn
     /// ends, which it gives.
     pub(crate) fn event(&self, event: &Event) -> Option<Task> {
+        if let Event::Done { agent, outcome } = event {
+            // Git reads the checkout with the journal let go: the other
+            // agents' events do not wait for it.
+            let open = self.open.lock().ok()?.0.remove(agent)?;
+            let mut task = open.task;
+            if let Ok(Some(start)) = open.snapshot.join()
+                && let Some(end) = Snapshot::take(&self.workspace)
+            {
+                for path in start.changed(&end, &self.workspace) {
+                    if task.files.len() < MOST_KEPT && !task.files.contains(&path) {
+                        task.files.push(path);
+                    }
+                }
+            }
+            task.seconds = iq_ui::now().saturating_sub(task.at);
+            task.ok = outcome.is_ok();
+            self.keep(&task);
+            return Some(task);
+        }
         let Ok(mut open) = self.open.lock() else {
             return None;
         };
@@ -113,24 +135,6 @@ impl Journal {
                     task.billed += cost.map_or(0.0, |c| c.0);
                 }
             }
-            Event::Done { agent, outcome } => {
-                if let Some(open) = tasks.remove(agent) {
-                    let mut task = open.task;
-                    if let Ok(Some(start)) = open.snapshot.join()
-                        && let Some(end) = Snapshot::take(&self.workspace)
-                    {
-                        for path in start.changed(&end, &self.workspace) {
-                            if task.files.len() < MOST_KEPT && !task.files.contains(&path) {
-                                task.files.push(path);
-                            }
-                        }
-                    }
-                    task.seconds = iq_ui::now().saturating_sub(task.at);
-                    task.ok = outcome.is_ok();
-                    self.keep(&task);
-                    return Some(task);
-                }
-            }
             _ => {}
         }
         None
@@ -178,22 +182,40 @@ impl Journal {
     }
 }
 
+/// A task under way: what it did so far, and the state of the checkout
+/// as it started, read on a thread of its own.
 struct OpenTask {
     task: Task,
     snapshot: JoinHandle<Option<Snapshot>>,
 }
 
+/// The state of a checkout: each file git lists as changed, with its
+/// status and what it holds, the commit checked out, and where the
+/// workspace is within the repository.
 struct Snapshot {
     entries: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
     head: Option<String>,
     prefix: String,
 }
 
-fn git(workspace: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
-        .current_dir(workspace)
-        .args(args)
+/// A git command in `folder`, as git itself runs hooks: none of the
+/// variables a hook is given, which would point it at another repository's
+/// index, and no lock taken that the person's own git would wait for.
+fn git_command(folder: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(folder)
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    command
+}
+
+/// What `git args` prints in `workspace`, when it succeeds.
+fn git(workspace: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = git_command(workspace)
+        .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -201,26 +223,68 @@ fn git(workspace: &Path, args: &[&str]) -> Option<Vec<u8>> {
     output.status.success().then_some(output.stdout)
 }
 
-fn hash_file(root: &Path, path: &str) -> Option<Vec<u8>> {
-    // Git's quoted input preserves spaces, newlines and non-ASCII path bytes.
-    let quoted: String = path.bytes().map(|byte| format!("\\{byte:03o}")).collect();
-    let mut child = Command::new("git")
-        .current_dir(root)
-        .args(["hash-object", "--no-filters", "--stdin-paths"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let written = child
-        .stdin
-        .take()?
-        .write_all(format!("\"{quoted}\"\n").as_bytes());
-    let output = child.wait_with_output().ok()?;
-    (written.is_ok() && output.status.success()).then_some(output.stdout)
+/// What each of `paths` holds, by git's hash, in one call however many
+/// there are: a large checkout lists thousands. Paths that are not a file
+/// are given an empty hash.
+fn hashes(root: &Path, paths: &[&String]) -> Vec<Vec<u8>> {
+    let files: Vec<&String> = paths
+        .iter()
+        .copied()
+        .filter(|path| root.join(path).is_file())
+        .collect();
+    let mut hashed: HashMap<&String, Vec<u8>> = HashMap::new();
+    if !files.is_empty() {
+        // Quoted as git reads them: spaces, line ends and any byte kept.
+        let input: String = files
+            .iter()
+            .map(|path| {
+                let quoted: String = path.bytes().map(|byte| format!("\\{byte:03o}")).collect();
+                format!("\"{quoted}\"\n")
+            })
+            .collect();
+        let child = git_command(root)
+            .args(["hash-object", "--no-filters", "--stdin-paths"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = child {
+            // Written on a thread of its own: git answers as it reads, and
+            // a pipe full both ways would hold them both.
+            let writer = child
+                .stdin
+                .take()
+                .map(|mut stdin| std::thread::spawn(move || stdin.write_all(input.as_bytes())));
+            let output = child.wait_with_output();
+            let written = writer.is_some_and(|writer| writer.join().is_ok_and(|w| w.is_ok()));
+            if let Ok(output) = output
+                && written
+                && output.status.success()
+            {
+                let lines: Vec<&[u8]> = output
+                    .stdout
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .collect();
+                if lines.len() == files.len() {
+                    hashed = files
+                        .into_iter()
+                        .zip(lines)
+                        .map(|(path, hash)| (path, hash.to_vec()))
+                        .collect();
+                }
+            }
+        }
+    }
+    paths
+        .iter()
+        .map(|path| hashed.get(path).cloned().unwrap_or_default())
+        .collect()
 }
 
 impl Snapshot {
+    /// The checkout `workspace` is in, as it is now; `None` outside a
+    /// repository.
     fn take(workspace: &Path) -> Option<Self> {
         let prefix = String::from_utf8(git(workspace, &["rev-parse", "--show-prefix"])?).ok()?;
         let prefix = prefix.trim_end_matches('\n').to_owned();
@@ -230,7 +294,8 @@ impl Snapshot {
             workspace,
             &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
         )?;
-        let mut entries = BTreeMap::new();
+        let mut listed = Vec::new();
+        let mut sources = Vec::new();
         let mut records = status
             .split(|byte| *byte == 0)
             .filter(|part| !part.is_empty());
@@ -239,12 +304,20 @@ impl Snapshot {
                 return None;
             }
             let path = String::from_utf8(record[3..].to_vec()).ok()?;
-            let hash = hash_file(root, &path).unwrap_or_default();
-            entries.insert(path, (record[..2].to_vec(), hash));
+            listed.push((path, record[..2].to_vec()));
             if record[..2].iter().any(|byte| matches!(byte, b'R' | b'C')) {
-                let source = String::from_utf8(records.next()?.to_vec()).ok()?;
-                entries.insert(source, (b"D ".to_vec(), Vec::new()));
+                sources.push(String::from_utf8(records.next()?.to_vec()).ok()?);
             }
+        }
+        let paths: Vec<&String> = listed.iter().map(|(path, _)| path).collect();
+        let hashed = hashes(root, &paths);
+        let mut entries: BTreeMap<String, (Vec<u8>, Vec<u8>)> = listed
+            .into_iter()
+            .zip(hashed)
+            .map(|((path, status), hash)| (path, (status, hash)))
+            .collect();
+        for source in sources {
+            entries.insert(source, (b"D ".to_vec(), Vec::new()));
         }
         let head = git(workspace, &["rev-parse", "--verify", "HEAD"])
             .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -256,6 +329,10 @@ impl Snapshot {
         })
     }
 
+    /// The files that changed from this state to `end`, relative to the
+    /// workspace: those whose status or content changed, and those the
+    /// commits between them changed. Files outside the workspace are left
+    /// out.
     fn changed(&self, end: &Self, workspace: &Path) -> BTreeSet<String> {
         let mut paths: BTreeSet<String> = self
             .entries
