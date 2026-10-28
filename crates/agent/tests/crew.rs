@@ -260,6 +260,7 @@ async fn an_agent_writes_and_reads_through_the_gate_and_says_what_it_spent() {
         "{seen}"
     );
     assert_refusal_guidance(&seen);
+    assert!(seen.contains("nobody can approve it"), "{seen}");
     let events = f.events();
     assert!(events.contains(&Event::Done {
         agent: "lead".into(),
@@ -380,10 +381,9 @@ async fn the_reviewer_receives_local_policy_and_errors_go_to_the_person() {
 }
 
 fn assert_refusal_guidance(seen: &str) {
-    assert!(seen.contains("Do not work around this refusal"), "{seen}");
+    assert!(seen.contains("Do not get around it"), "{seen}");
     assert!(seen.contains("replacement tool"), "{seen}");
     assert!(seen.contains("tell the person what is blocked"), "{seen}");
-    assert!(seen.contains("network: true"), "{seen}");
 }
 
 #[tokio::test]
@@ -414,7 +414,7 @@ async fn a_reviewer_refusal_explains_the_reason_and_next_steps() {
     f.settled().await;
     let seen = f.model.seen_by("lead");
     assert!(
-        seen.contains("the reviewer refused it: it would discard work."),
+        seen.contains("the reviewer refused it: it would discard work. Do not"),
         "{seen}"
     );
     assert_refusal_guidance(&seen);

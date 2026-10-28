@@ -1302,7 +1302,7 @@ where
     pub(crate) async fn act(&self, agent: &str, action: Action) -> Result<Permit, String> {
         match self.inner.gate.judge(action).map_err(|e| chain(&e))? {
             Judged::Allowed(permit) => Ok(permit),
-            Judged::Denied { reason } => Err(refusal("the gate", &reason)),
+            Judged::Denied { reason } => Err(refusal("the gate", &reason, false)),
             Judged::Asked { reason, pending } => self.ask(agent, reason, pending).await,
         }
     }
@@ -1334,7 +1334,7 @@ where
                             .approve(pending, Approver::Reviewer)
                             .map_err(|e| chain(&e))
                     } else {
-                        Err(refusal("the reviewer", &why))
+                        Err(refusal("the reviewer", &why, true))
                     };
                 }
                 Err(error) => self.report(Event::Notice {
@@ -1363,10 +1363,11 @@ where
                 .gate
                 .approve(pending, Approver::Person)
                 .map_err(|e| chain(&e)),
-            Ok(Ok(false)) => Err(refusal("the person", &reason)),
+            Ok(Ok(false)) => Err(refusal("the person", &reason, true)),
             _ => Err(refusal(
                 "the gate",
                 &format!("nobody answered in time ({reason})"),
+                true,
             )),
         }
     }
@@ -1750,13 +1751,21 @@ fn role_line(role: Option<&str>) -> String {
     .unwrap_or_default()
 }
 
-fn refusal(who: &str, reason: &str) -> String {
+/// What an agent is told of an action refused: who refused it and why, and
+/// what it may do now, so that it asks or takes another way rather than
+/// getting around what was refused. What was asked may be asked of the
+/// person; what the gate denies, nobody approves.
+fn refusal(who: &str, reason: &str, asked: bool) -> String {
+    let reason = reason.trim().trim_end_matches('.');
+    let then = if asked {
+        "tell the person what is blocked and what you need, and wait for their answer"
+    } else {
+        "tell the person what is blocked: nobody can approve it"
+    };
     format!(
-        "{who} refused it: {reason}. Do not work around this refusal by downloading or building \
-         a replacement tool, or changing the project to avoid the restriction. Take another \
-         approach only if the task permits it and it respects this refusal. Otherwise, tell \
-         the person what is blocked and ask for the access or approved way you need. If the \
-         command needs the internet, request it explicitly with network: true."
+        "{who} refused it: {reason}. Do not get around it: no downloading or building a \
+         replacement tool, no changing the project to avoid it. Take another way only if the \
+         task allows it and it keeps to this refusal; otherwise {then}."
     )
 }
 
