@@ -57,6 +57,8 @@ pub enum Update {
     SyncAsk(SyncAsk),
     /// The provider's models, as it lists them: what the person may name.
     Models(Vec<String>),
+    /// Something iq says to the person in passing, in the conversation.
+    Said(String),
     /// How the crew starts: the lead's model, the reviewer's, whether
     /// the reviewer answers for the person, and whether every command has
     /// the internet.
@@ -830,6 +832,8 @@ impl Board {
             }
             Update::SyncAsk(ask) => self.sync_ask = Some(ask),
             Update::Models(models) => self.models = models,
+            // The conversation is the terminal's: the board keeps nothing.
+            Update::Said(_) => {}
             Update::Started {
                 lead,
                 reviewer,

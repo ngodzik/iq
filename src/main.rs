@@ -313,6 +313,36 @@ async fn listed(provider: &OpenAiCompatible, keyed: bool) -> Vec<String> {
     }
 }
 
+/// What iq says of each model in use, `in_use` as the setting that names
+/// it and the model, that the provider at `endpoint` does not list among
+/// `listed`; nothing when the list could not be had.
+fn unlisted(endpoint: &str, in_use: &[(&str, String)], listed: &[String]) -> Vec<String> {
+    if listed.is_empty() {
+        return Vec::new();
+    }
+    in_use
+        .iter()
+        .filter(|(_, model)| !listed.contains(model))
+        .map(|(key, model)| {
+            format!(
+                "{endpoint} lists no {model}, which iq uses for `{key}`: set it in \
+                 ~/.iq/settings.toml to a model it lists (iq models)"
+            )
+        })
+        .collect()
+}
+
+/// The models the settings put to use, each with the setting that names
+/// it: the lead's, the reviewer's and the observer's.
+fn in_use(settings: &Settings, lead: &ModelId) -> Result<Vec<(&'static str, String)>> {
+    let mut models = vec![("model", lead.to_string())];
+    if let Some(reviewer) = settings.crew()?.reviewer {
+        models.push(("reviewer", reviewer.to_string()));
+    }
+    models.push(("[observe] model", settings.observing()?.model.to_string()));
+    Ok(models)
+}
+
 /// What the crew does, kept in iq's folder as it happens: the calls billed
 /// to the provider, each task's files, commands and costs. Gives the task
 /// that `event` ended, if it ended one.
@@ -370,6 +400,10 @@ async fn work(
             let _ = send.send(event);
         }),
     )?;
+    let listed = listed(&provider(cli), cli.api_key.is_some()).await;
+    for said in unlisted(cli.endpoint(), &in_use(&settings, &lead)?, &listed) {
+        eprintln!("iq: {said}");
+    }
     let mut models = vec![lead];
     if let Some(partner) = partner {
         models.push(ModelId::new(partner)?);
@@ -562,9 +596,16 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     {
         let provider = provider(cli);
         let send = send.clone();
+        let endpoint = cli.endpoint().to_owned();
+        let in_use = in_use(&settings, &lead)?;
         runtime.spawn(async move {
-            // The models the person may name in what they write.
-            let _ = send.send(Update::Models(listed(&provider, keyed).await));
+            // The models the person may name in what they write; and those
+            // in use the provider does not have, said before a call fails.
+            let models = listed(&provider, keyed).await;
+            for said in unlisted(&endpoint, &in_use, &models) {
+                let _ = send.send(Update::Said(said));
+            }
+            let _ = send.send(Update::Models(models));
         });
     }
 
@@ -930,4 +971,24 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_model_in_use_the_provider_does_not_list_is_named_with_its_setting() {
+        let in_use = [
+            ("model", "lab/lead".to_owned()),
+            ("reviewer", "lab/gone".to_owned()),
+        ];
+        let listed = ["lab/lead".to_owned(), "lab/other".to_owned()];
+        let said = unlisted("https://router.example/v1", &in_use, &listed);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].starts_with("https://router.example/v1 lists no lab/gone"));
+        assert!(said[0].contains("`reviewer`"));
+        // No list, nothing said: the provider may simply not answer.
+        assert!(unlisted("x", &in_use, &[]).is_empty());
+    }
 }

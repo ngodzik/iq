@@ -213,6 +213,7 @@ impl Iq {
                     internet,
                 });
             }
+            Update::Said(text) => self.history.say(&text, &self.p),
             Update::Synced(synced) => {
                 // What moved is said in the conversation; a sync that moved
                 // nothing only in the status line.
