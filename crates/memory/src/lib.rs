@@ -4,8 +4,8 @@
 //! The memory is notes, each a Markdown file with its name and a line
 //! saying what it holds, kept in a folder of the project's own, named
 //! after its repository's address so that the same project on another
-//! machine finds them, wherever it was cloned. Claude Code's notes of the
-//! project are read beside them, never changed. An agent the person
+//! machine finds them, wherever it was cloned. The notes kept of the
+//! project under `~/.claude` are read beside them, never changed. An agent the person
 //! started is told which notes there are, reads one with `recall`, and
 //! keeps what it learnt with `remember`; the agents it starts are given
 //! what they need of them.
@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 
 pub use skills::{Skill, Skills};
 
-/// The file of Claude Code's memory that lists its notes, which is not one.
+/// The file of the notes under `~/.claude` that lists them, which is not one.
 const CLAUDE_INDEX: &str = "MEMORY.md";
 
 /// The longest note kept, in bytes.
@@ -63,7 +63,8 @@ const SECRET_SIGNS: &[&str] = &[
 pub struct Memory {
     folder: PathBuf,
     project: String,
-    /// Claude Code's notes of the project, read and never changed.
+    /// The notes kept of the project under `~/.claude`, read and never
+    /// changed.
     claude: Option<PathBuf>,
 }
 
@@ -90,7 +91,8 @@ impl Memory {
         }
     }
 
-    /// Reads Claude Code's notes of the project too, kept in `folder`, as
+    /// Reads the notes kept of the project under `~/.claude` too, in
+    /// `folder`, as
     /// [`claude_folder`] finds it.
     #[must_use]
     pub fn with_claude(mut self, folder: Option<PathBuf>) -> Self {
@@ -111,7 +113,7 @@ impl Memory {
         notes_in(&self.folder)
     }
 
-    /// Claude Code's notes of the project, by name.
+    /// The notes kept of the project under `~/.claude`, by name.
     #[must_use]
     pub fn claude_notes(&self) -> Vec<Note> {
         self.claude.as_deref().map(notes_in).unwrap_or_default()
@@ -160,7 +162,7 @@ impl Memory {
     }
 
     /// A note's text, by its name: one of the memory's, else one of
-    /// Claude Code's.
+    /// those under `~/.claude`.
     ///
     /// # Errors
     ///
@@ -172,7 +174,7 @@ impl Memory {
                 if claude.is_empty() {
                     why
                 } else {
-                    format!("{why}; Claude Code's are {}", names(&claude))
+                    format!("{why}; those under ~/.claude are {}", names(&claude))
                 }
             })
         })?;
@@ -241,8 +243,8 @@ impl Memory {
         let claude = self.claude_notes();
         if !claude.is_empty() {
             out.push_str(
-                "Claude Code's notes of this project, which recall reads too and which you do \
-                 not change:\n",
+                "The notes kept of this project under ~/.claude, which recall reads too and \
+                 which you do not change:\n",
             );
             listed(&mut out, &claude);
         }
@@ -285,7 +287,8 @@ fn names(notes: &[Note]) -> String {
 }
 
 /// The notes in `folder`, by name: its Markdown files, each named as its
-/// head says, else as its file is; Claude Code's list of them left out.
+/// head says, else as its file is; the list of them under `~/.claude` left
+/// out.
 fn notes_in(folder: &Path) -> Vec<Note> {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return Vec::new();
@@ -310,7 +313,7 @@ fn notes_in(folder: &Path) -> Vec<Note> {
     notes
 }
 
-/// Where Claude Code keeps its notes of the project in `workspace`, under
+/// Where the notes of the project in `workspace` are kept under
 /// its folder of projects `projects` (`~/.claude/projects`): named after
 /// the project's path, every sign but letters and digits a dash, the
 /// workspace's own or its repository's top; `None` when it has none.
@@ -616,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_codes_notes_are_read_beside_and_never_changed() {
+    fn the_notes_under_dot_claude_are_read_beside_and_never_changed() {
         let dir = tempfile::tempdir().unwrap();
         let claude = dir.path().join("claude");
         std::fs::create_dir_all(&claude).unwrap();
@@ -637,7 +640,7 @@ mod tests {
         };
         let told = memory.told();
         assert!(told.contains("There is no note yet."));
-        assert!(told.contains("Claude Code's notes") && told.contains("- deploy: how it ships"));
+        assert!(told.contains("under ~/.claude") && told.contains("- deploy: how it ships"));
         assert!(!told.contains("MEMORY"));
         assert!(
             memory
@@ -648,7 +651,7 @@ mod tests {
         assert!(memory.forget("deploy").is_err());
         assert!(claude.join("deploy.md").exists());
         let missing = memory.recall("nothing").unwrap_err();
-        assert!(missing.contains("Claude Code's are deploy"));
+        assert!(missing.contains("under ~/.claude are deploy"));
         // Kept in the memory's own folder, a note of the same name comes first.
         memory
             .remember("deploy", "ours", "Run make release.")

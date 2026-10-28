@@ -476,7 +476,7 @@ async fn the_lead_follows_the_rules_and_gives_its_agents_what_they_need_of_them(
     assert!(!helper.contains("Answer in French.") && !helper.contains("Tests first."));
     assert!(!helper.contains("rules for agents"));
 
-    // Claude Code's file alone, importing another.
+    // A `CLAUDE.md` alone, importing another.
     let g = fixture(&[], Settings::default());
     std::fs::write(g.root.join("CLAUDE.md"), "Read these:\n@docs/rules.md\n").unwrap();
     std::fs::create_dir_all(g.root.join("docs")).unwrap();

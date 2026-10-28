@@ -1,5 +1,5 @@
 //! The rules agents follow: the person's own, kept in files of their home
-//! such as Claude Code's `~/.claude/CLAUDE.md`, and the project's, in its
+//! such as `~/.claude/CLAUDE.md`, and the project's, in its
 //! `AGENTS.md`, its `CLAUDE.md` and the files of its `.claude/rules`. Only
 //! the agents the person starts read them: they give the agents they start
 //! what their part needs. A rule of `.claude/rules` whose head names
@@ -19,7 +19,7 @@ pub struct RulesFile {
 }
 
 /// `text` with each line that is `@` and a file name replaced by that
-/// file, as `read` gives it, the way Claude Code's files import others;
+/// file, as `read` gives it, the way `CLAUDE.md` files import others;
 /// a line `read` gives nothing for stays as it is.
 ///
 /// # Examples

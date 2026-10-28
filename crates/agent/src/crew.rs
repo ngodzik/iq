@@ -49,7 +49,7 @@ const PEER_SPAN: Duration = Duration::from_secs(10 * 60);
 static CREWS: AtomicU64 = AtomicU64::new(0);
 
 /// The files a project's rules for agents are read from, each found: the
-/// shared format, then Claude Code's, which often imports the other.
+/// shared format, then the other one many keep, which often imports it.
 const RULES_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 
 /// The folder of the project's rules, each a Markdown file, for the whole

@@ -18,7 +18,7 @@
 //! home there, as their settings list them: a new machine, taking the
 //! settings with the rest, puts each file back in its place. What holds
 //! secrets is never kept, as the gate tells it; in a folder of credentials
-//! of the home, such as Claude Code's, only the Markdown files are: the
+//! of the home, such as `~/.claude`, only the Markdown files are: the
 //! rules and notes written there. Nor what is too large, nor what is
 //! rebuilt. A sync never removes a file of the home: what another machine
 //! removed stays in the history.

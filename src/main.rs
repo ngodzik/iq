@@ -185,7 +185,7 @@ fn crew(cli: &Cli, settings: &Settings, report: Report) -> Result<Crew<OpenAiCom
     );
     crew.set_autopilot(settings.autopilot);
     // What the agents the person starts remember of this project, kept
-    // with iq's data, and what Claude Code noted of it.
+    // with iq's data, and the notes kept of it under ~/.claude.
     let claude = settings
         .claude_memory()
         .then(|| iq_memory::claude_folder(&home.join(".claude/projects"), &workspace))
@@ -204,7 +204,7 @@ fn crew(cli: &Cli, settings: &Settings, report: Report) -> Result<Crew<OpenAiCom
 /// where they are: each with the files it imports, `~/` in `home`, others
 /// beside it. A file that is not there, or that its name says holds
 /// secrets, is left out; its folder may be one of credentials, as
-/// Claude Code's is, which holds its rules beside them.
+/// `~/.claude` is, which holds its rules beside them.
 fn person_rules(files: &[(String, PathBuf)], home: &Path) -> Vec<iq_agent::RulesFile> {
     files
         .iter()
@@ -895,7 +895,7 @@ fn gate_in(workspace: &Path, internet: bool, reviewer_internet: bool) -> Result<
 
 /// What iq says at start of what it left behind that the person may want
 /// gone, and of where the rules the lead follows come from when they are
-/// Claude Code's.
+/// those of `~/.claude`.
 fn left_over(settings: &Settings) -> Vec<String> {
     let Ok(home) = home_dir() else {
         return Vec::new();
@@ -912,7 +912,7 @@ fn left_over(settings: &Settings) -> Vec<String> {
     }
     if settings.claude_rules_by_default(&home) {
         said.push(
-            "the lead follows ~/.claude/CLAUDE.md, Claude Code's rules, which iq does not sync: \
+            "the lead follows ~/.claude/CLAUDE.md, which iq does not sync: \
              rules of iq's own go in ~/.iq/AGENTS.md, read instead once written."
                 .to_owned(),
         );
@@ -921,8 +921,7 @@ fn left_over(settings: &Settings) -> Vec<String> {
 }
 
 /// What iq says at start of what the settings hold that it reads no more,
-/// and of the models they name that it runs no more, for the person to
-/// change them.
+/// for the person to change it.
 fn retired(settings: &Settings) -> Vec<String> {
     let mut said = Vec::new();
     let retired = settings.retired();
@@ -930,12 +929,6 @@ fn retired(settings: &Settings) -> Vec<String> {
         said.push(format!(
             "~/.iq/settings.toml holds {}, which iq reads no more: it may go.",
             retired.join(", ")
-        ));
-    }
-    for (key, model) in settings.agents_named() {
-        said.push(format!(
-            "~/.iq/settings.toml names {model} for {key}, which was Claude Code's or Codex's: iq \
-             runs the provider's models only."
         ));
     }
     said

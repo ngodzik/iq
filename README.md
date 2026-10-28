@@ -2,7 +2,7 @@
 
 **An experimental coding agent. It is not stable, it comes with no guarantee of any kind, and it changes all the time.**
 
-This is a personal experiment, not a product. Commands, settings and file formats change without notice, and whatever is described here may be changed or removed at any time. If you want a coding agent to rely on, use [Claude Code](https://code.claude.com/docs/en/overview) or [Codex](https://developers.openai.com/codex) instead.
+This is a personal experiment, not a product. Commands, settings and file formats change without notice, and whatever is described here may be changed or removed at any time. If you want a coding agent to rely on, use an established one instead.
 
 ## The idea
 

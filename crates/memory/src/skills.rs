@@ -1,7 +1,7 @@
 //! The person's skills: what they wrote for the agents they start to
 //! follow in a kind of work, such as which team to start for code and how
 //! it works, each a Markdown file with its name and a line on when it
-//! serves, as Claude Code's are: a folder with its `SKILL.md`, or a file of
+//! serves, as `.claude/skills` holds them: a folder with its `SKILL.md`, or a file of
 //! its own. An agent the person started is told which there are, reads one
 //! whole with `skill` before the work it is for, and gives the agents it
 //! starts what they need of it. The person changes a skill, and the next
@@ -199,7 +199,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skills_are_read_from_their_folders_as_claude_code_keeps_them() {
+    fn skills_are_read_from_their_folders_or_files() {
         let mine = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let skills = Skills::new(vec![mine.path().into(), other.path().into()]);
