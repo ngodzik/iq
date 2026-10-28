@@ -307,7 +307,9 @@ fn parse_known(body: &str) -> HashMap<String, Known> {
                     let pricing = priced(&m).ok().flatten();
                     let known = Known {
                         window: m.context_window,
-                        output: m.max_output_tokens,
+                        // Listed as 0 by some, which means unknown: asked
+                        // for at most none, they refuse or say nothing.
+                        output: m.max_output_tokens.filter(|&most| most > 0),
                         pricing,
                         reasoning: m.supports_reasoning,
                     };
@@ -938,10 +940,11 @@ mod tests {
     #[test]
     fn the_most_a_model_writes_comes_from_the_model_list() {
         let known = parse_known(
-            r#"{"data": [{"id": "a/thinker", "max_output_tokens": 128000}, {"id": "a/plain"}]}"#,
+            r#"{"data": [{"id": "a/thinker", "max_output_tokens": 128000}, {"id": "a/plain"}, {"id": "a/zero", "max_output_tokens": 0}]}"#,
         );
         assert_eq!(known["a/thinker"].output, Some(128_000));
         assert_eq!(known["a/plain"].output, None);
+        assert_eq!(known["a/zero"].output, None);
     }
 
     #[test]
