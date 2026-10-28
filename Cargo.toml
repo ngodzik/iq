@@ -60,6 +60,9 @@ libc        = "0.2.180"
 # a user and a network namespace, and the loopback device brought up over
 # netlink, through safe interfaces.
 nix         = { version = "0.31.3", default-features = false, features = ["sched", "user", "socket"] }
+# How much a terminal holds to read, through a safe interface: what tells
+# a key waiting from a window closed.
+rustix      = { version = "1.1.5", default-features = false, features = ["std"] }
 # Local time for the observations' days, weeks and months, the system's
 # time zone read as the platform keeps it.
 jiff       = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }

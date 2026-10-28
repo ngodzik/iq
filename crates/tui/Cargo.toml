@@ -12,11 +12,15 @@ iq-agent.workspace = true
 iq-ui.workspace    = true
 ratatui.workspace  = true
 unicode-width.workspace = true
-# Watching the terminal for keys, which tells when its window is closed,
-# and asking it whether it is still there.
-nix = { workspace = true, features = ["poll", "term"] }
-# What the terminal said when iq took it for gone, in iq's log.
+# Watching the terminal for keys with select(2), which macOS answers on a
+# terminal where it answers poll(2) with an error, and asking how much it
+# holds, which tells when its window is closed.
+nix = { workspace = true, features = ["poll"] }
+rustix.workspace = true
+# Why iq took its terminal for gone, in iq's log.
 tracing.workspace = true
 
 [dev-dependencies]
 vt100.workspace = true
+# A pseudo-terminal, to wait for its keys.
+nix = { workspace = true, features = ["poll", "term"] }

@@ -4,15 +4,17 @@
 //! where the terminal can (Shift-Enter from Enter); the mouse taken only on
 //! a page, so that the conversation is selected and scrolled as the
 //! terminal's own output. iq watches the terminal itself for its keys: once
-//! its window is closed, crossterm would read nothing from it forever.
+//! its window is closed, crossterm would read it forever and find nothing.
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::errno::Errno;
+use nix::sys::select::{FD_SETSIZE, FdSet, select};
+use nix::sys::time::{TimeVal, TimeValLike};
 
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -49,6 +51,11 @@ impl Tty {
     /// Takes the terminal.
     pub(crate) fn take() -> io::Result<Tty> {
         let tty = File::open("/dev/tty")?;
+        if !watchable(tty.as_fd()) {
+            return Err(io::Error::other(
+                "iq holds too many files to watch its terminal",
+            ));
+        }
         terminal::enable_raw_mode()?;
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -69,46 +76,9 @@ impl Tty {
         Ok(Tty { tty })
     }
 
-    /// Waits up to `wait` for something to read from the terminal. A
-    /// hang up or an error it reports is taken for its window closed only
-    /// once the terminal no longer answers: some come from what another
-    /// program did to it, such as one iq ran, and pass. What it said goes
-    /// to iq's log either way.
+    /// Waits up to `wait` for something to read from the terminal.
     pub(crate) fn wait(&self, wait: Duration) -> Wait {
-        let millis = u16::try_from(wait.as_millis()).unwrap_or(u16::MAX);
-        let mut watched = [PollFd::new(self.tty.as_fd(), PollFlags::POLLIN)];
-        let said = match poll(&mut watched, PollTimeout::from(millis)) {
-            Ok(0) | Err(nix::errno::Errno::EINTR) => return Wait::Nothing,
-            Ok(_) => {
-                let seen = watched[0].revents().unwrap_or(PollFlags::empty());
-                let trouble = PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL;
-                if !seen.intersects(trouble) {
-                    return Wait::Ready;
-                }
-                format!("{seen:?}")
-            }
-            Err(error) => format!("poll failed: {error}"),
-        };
-        match nix::sys::termios::tcgetattr(self.tty.as_fd()) {
-            Ok(_) => {
-                tracing::warn!("the terminal said {said}, yet still answers: iq goes on");
-                // So that a word that stays is not read again at once,
-                // over and over.
-                std::thread::sleep(wait);
-                if watched[0]
-                    .revents()
-                    .is_some_and(|seen| seen.contains(PollFlags::POLLIN))
-                {
-                    Wait::Ready
-                } else {
-                    Wait::Nothing
-                }
-            }
-            Err(error) => {
-                tracing::warn!("the terminal said {said} and answers no more ({error}): iq ends");
-                Wait::Gone
-            }
-        }
+        wait_for(self.tty.as_fd(), wait)
     }
 
     /// Shows a page on the terminal's other screen, the mouse taken for
@@ -131,6 +101,40 @@ impl Drop for Tty {
     }
 }
 
+/// Waits up to `wait` for something to read from `tty`, with select(2):
+/// macOS answers poll(2) on a terminal with `POLLNVAL` at once, every
+/// time, where every system answers select(2). A terminal ready with
+/// nothing to read has hung up, its window closed: a key read leaves it
+/// ready no more. Why iq takes it for gone goes to iq's log.
+fn wait_for(tty: BorrowedFd<'_>, wait: Duration) -> Wait {
+    if !watchable(tty) {
+        tracing::warn!("the terminal cannot be watched: iq ends");
+        return Wait::Gone;
+    }
+    let mut ready = FdSet::new();
+    ready.insert(tty);
+    // iq waits a fraction of a second at a time: a minute is only a bound.
+    let micros = wait.min(Duration::from_secs(60)).as_micros();
+    let mut timeout = TimeVal::microseconds(i64::try_from(micros).unwrap_or(0));
+    let said = match select(None, &mut ready, None, None, &mut timeout) {
+        Ok(0) | Err(Errno::EINTR) => return Wait::Nothing,
+        Ok(_) => match rustix::io::ioctl_fionread(tty) {
+            Ok(0) => "it is ready with nothing to read".to_owned(),
+            Ok(_) => return Wait::Ready,
+            Err(error) => format!("it is ready, yet cannot tell what it holds ({error})"),
+        },
+        Err(error) => format!("waiting for it failed ({error})"),
+    };
+    tracing::warn!("the terminal is taken for closed, as {said}: iq ends");
+    Wait::Gone
+}
+
+/// Whether select(2) can watch `fd`: below `FD_SETSIZE`, as the terminal
+/// iq opens as it starts is.
+fn watchable(fd: BorrowedFd<'_>) -> bool {
+    usize::try_from(fd.as_raw_fd()).is_ok_and(|fd| fd < FD_SETSIZE)
+}
+
 /// Gives the terminal back as iq found it.
 fn give_back() {
     let mut out = io::stdout();
@@ -146,4 +150,36 @@ fn give_back() {
     let _ = queue!(out, DisableBracketedPaste, cursor::Show);
     let _ = out.flush();
     let _ = terminal::disable_raw_mode();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use nix::pty::openpty;
+    use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
+
+    use super::*;
+
+    #[test]
+    fn a_key_is_seen_at_once_and_a_closed_window_for_what_it_is() {
+        let pty = openpty(None, None).unwrap();
+        // Raw, as iq takes its terminal: a key is there to read at once.
+        let mut raw = tcgetattr(&pty.slave).unwrap();
+        cfmakeraw(&mut raw);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &raw).unwrap();
+        let (mut window, tty) = (File::from(pty.master), File::from(pty.slave));
+        let (short, long) = (Duration::from_millis(20), Duration::from_secs(5));
+        assert_eq!(wait_for(tty.as_fd(), short), Wait::Nothing);
+        window.write_all(b"y").unwrap();
+        assert_eq!(wait_for(tty.as_fd(), long), Wait::Ready);
+        // Until it is read, the key is still there.
+        assert_eq!(wait_for(tty.as_fd(), long), Wait::Ready);
+        let mut key = [0; 1];
+        (&tty).read_exact(&mut key).unwrap();
+        assert_eq!(&key, b"y");
+        assert_eq!(wait_for(tty.as_fd(), short), Wait::Nothing);
+        drop(window);
+        assert_eq!(wait_for(tty.as_fd(), long), Wait::Gone);
+    }
 }
