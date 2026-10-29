@@ -83,6 +83,11 @@ const HOME_READ: &[&str] = &[
     ".local/share/pnpm",
     ".local/share/mise",
     ".local/share/fnm",
+    // The Pythons uv installs, which the environments it makes run on, and
+    // the tools it installs, linked from `~/.local/bin`; never all of its
+    // folder, which keeps the credentials it logs in with.
+    ".local/share/uv/python",
+    ".local/share/uv/tools",
     ".linuxbrew",
     ".npm",
     ".nvm",
