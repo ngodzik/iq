@@ -3,6 +3,7 @@
 //! question when one waits, the page's lines scrolled as the person reads
 //! them, and the keys it takes at its foot.
 
+mod changes;
 mod costs;
 mod keys;
 mod observations;
@@ -64,8 +65,8 @@ impl Seen<'_> {
 }
 
 /// The page's lines, and the keys it takes.
-fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, &'static str) {
-    match page {
+fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String) {
+    let (lines, foot) = match page {
         Page::Team => (
             team::lines(seen),
             "↑↓ choose · Enter write to it · v its thread · n a new chat",
@@ -77,7 +78,9 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, &'static str) {
             "← → earlier, later · s the span · b by · n now · ↑↓ scroll",
         ),
         Page::Keys => (keys::lines(seen), "↑↓ scroll"),
-    }
+        Page::Changes => return (changes::lines(seen), changes::foot(seen)),
+    };
+    (lines, foot.to_owned())
 }
 
 /// Draws the page open over the whole screen, and keeps its scroll

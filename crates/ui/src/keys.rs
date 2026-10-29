@@ -38,6 +38,9 @@ pub enum Action {
     Allow,
     /// Refuses it.
     Refuse,
+    /// What a sync would send, line by line, before the person says
+    /// whether it goes.
+    Changes,
     /// Stops the agent the person writes to.
     Stop,
     /// Quits.
@@ -46,7 +49,7 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order the list of shortcuts gives them.
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 14] = [
         Action::NextAgent,
         Action::PrevAgent,
         Action::Team,
@@ -58,6 +61,7 @@ impl Action {
         Action::Internet,
         Action::Allow,
         Action::Refuse,
+        Action::Changes,
         Action::Stop,
         Action::Quit,
     ];
@@ -77,6 +81,7 @@ impl Action {
             Action::Internet => "internet",
             Action::Allow => "allow",
             Action::Refuse => "refuse",
+            Action::Changes => "changes",
             Action::Stop => "stop",
             Action::Quit => "quit",
         }
@@ -97,6 +102,7 @@ impl Action {
             Action::Internet => "the internet open to every command",
             Action::Allow => "allow what an agent asks",
             Action::Refuse => "refuse it",
+            Action::Changes => "what a sync would send, line by line",
             Action::Stop => "stop the agent you write to",
             Action::Quit => "quit",
         }
@@ -116,6 +122,7 @@ impl Action {
             Action::Autopilot => "shift+tab",
             Action::Allow => "ctrl+y",
             Action::Refuse => "ctrl+r",
+            Action::Changes => "ctrl+g",
             Action::Stop => "escape",
             // A terminal never hands Cmd-Q to the program in it.
             Action::Quit => "ctrl+q",

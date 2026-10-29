@@ -340,6 +340,9 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
+/// What a sync says where the settings name no repository.
+const NO_REPOSITORY: &str = "no repository is set: [sync] remote in ~/.iq/settings.toml";
+
 /// This machine's sync, when its settings name a repository.
 fn machine_sync() -> Result<Option<Arc<iq_sync::Sync>>> {
     let folder = home_folder()?;
@@ -862,9 +865,21 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                             let _ = told.send(Update::Synced(iq_ui::Synced {
                                 at: iq_ui::now(),
                                 ok: false,
-                                said: "no repository is set: [sync] remote in ~/.iq/settings.toml"
-                                    .into(),
+                                said: NO_REPOSITORY.into(),
                             }));
+                        }
+                    }
+                }
+                Request::Changes => {
+                    let told = told.clone();
+                    match syncing.clone() {
+                        Some(sync) => {
+                            tokio::spawn(async move {
+                                let _ = told.send(Update::Changes(sync.diff().await));
+                            });
+                        }
+                        None => {
+                            let _ = told.send(Update::Changes(NO_REPOSITORY.into()));
                         }
                     }
                 }

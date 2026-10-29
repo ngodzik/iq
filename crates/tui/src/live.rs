@@ -302,7 +302,9 @@ impl Live<'_> {
             Span::styled(key(Action::Allow), p.bold(p.ok)),
             Span::styled(" send  ", p.fg(p.dim)),
             Span::styled(key(Action::Refuse), p.bold(p.bad)),
-            Span::styled(" not now", p.fg(p.dim)),
+            Span::styled(" not now  ", p.fg(p.dim)),
+            Span::styled(key(Action::Changes), p.bold(p.info)),
+            Span::styled(" the diff", p.fg(p.dim)),
             Span::styled("  · /sync auto never asks", p.fg(p.faint)),
         ]));
         Some(Part::Boxed {

@@ -79,6 +79,95 @@ const LEFT_OUT: &[&str] = &[
 /// when another machine sent between its fetch and its push.
 const ATTEMPTS: usize = 3;
 
+/// The most lines of what a sync would send that are shown.
+pub const DIFF_LINES: usize = 4000;
+
+/// One change a sync would send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Change {
+    /// A file copied in from where it lives, which differs from its copy:
+    /// changed there, new there, or gone from there.
+    Copied {
+        /// Its name, as the repository names it.
+        name: String,
+        /// Where it lives.
+        outside: PathBuf,
+        /// Its copy in the folder.
+        inside: PathBuf,
+    },
+    /// A file of the folder the repository holds, changed or removed.
+    Own {
+        /// Its name.
+        name: String,
+    },
+    /// A file of the folder the repository does not hold yet.
+    New {
+        /// Its name.
+        name: String,
+    },
+    /// A file sent before that the folder's `.gitignore` now leaves out,
+    /// which goes from the repository.
+    LeftOut {
+        /// Its name.
+        name: String,
+    },
+}
+
+impl Change {
+    /// Its name, as the repository names it.
+    fn name(&self) -> &str {
+        match self {
+            Change::Copied { name, .. }
+            | Change::Own { name }
+            | Change::New { name }
+            | Change::LeftOut { name } => name,
+        }
+    }
+}
+
+/// A diff of two files made with `--no-index`, which names them by their
+/// paths, named `name` as the repository does: its header lines rewritten,
+/// as far as its first hunk, `/dev/null` where a side is not there.
+fn headed(text: &str, name: &str, from_there: bool, to_there: bool) -> String {
+    let mut out = String::new();
+    let mut header = false;
+    for line in text.lines() {
+        if line.starts_with("diff --git ") {
+            header = true;
+            out.push_str(&format!("diff --git a/{name} b/{name}\n"));
+            continue;
+        }
+        if header && (line.starts_with("@@") || line.starts_with("Binary files ")) {
+            header = false;
+            if line.starts_with("Binary files ") {
+                out.push_str(&format!("Binary files a/{name} and b/{name} differ\n"));
+                continue;
+            }
+        }
+        if header && line.starts_with("--- ") {
+            let from = if from_there {
+                format!("a/{name}")
+            } else {
+                "/dev/null".to_owned()
+            };
+            out.push_str(&format!("--- {from}\n"));
+            continue;
+        }
+        if header && line.starts_with("+++ ") {
+            let to = if to_there {
+                format!("b/{name}")
+            } else {
+                "/dev/null".to_owned()
+            };
+            out.push_str(&format!("+++ {to}\n"));
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// What can go wrong with a sync.
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -567,11 +656,74 @@ impl Sync {
     /// reaches no repository; nothing on a machine that never synced,
     /// which takes first.
     pub async fn changes(&self) -> Vec<String> {
+        self.changed()
+            .await
+            .into_iter()
+            .map(|change| change.name().to_owned())
+            .collect()
+    }
+
+    /// What a sync would send, line by line: the diff git makes of each
+    /// change of [`Self::changes`], a file copied in against what it is
+    /// where it lives, a file of the folder against what was sent of it,
+    /// each named as the repository names it, as far as [`DIFF_LINES`]
+    /// lines. Reads only, and reaches no repository; empty where nothing
+    /// would be sent.
+    pub async fn diff(&self) -> String {
+        let git = Git::new(&self.root, &self.remote, &self.machine).await;
+        let mut out = String::new();
+        for change in self.changed().await {
+            let text = match &change {
+                Change::Copied {
+                    name,
+                    outside,
+                    inside,
+                } => git
+                    .diff_no_index(inside, outside)
+                    .await
+                    .map(|text| headed(&text, name, inside.is_file(), outside.is_file())),
+                Change::Own { name } => git.diffed(&["diff", "HEAD", "--", name]).await,
+                Change::New { name } => {
+                    let file = self.root.join(name);
+                    git.diff_no_index(Path::new("/dev/null"), &file)
+                        .await
+                        .map(|text| headed(&text, name, false, true))
+                }
+                Change::LeftOut { name } => {
+                    let file = self.root.join(name);
+                    git.diff_no_index(&file, Path::new("/dev/null"))
+                        .await
+                        .map(|text| headed(&text, name, true, false))
+                }
+            };
+            match text {
+                Ok(text) => out.push_str(&text),
+                Err(error) => out.push_str(&format!("{}: {error}\n", change.name())),
+            }
+        }
+        let lines = out.lines().count();
+        if lines > DIFF_LINES {
+            let kept: Vec<&str> = out.lines().take(DIFF_LINES).collect();
+            let mut cut = kept.join("\n");
+            cut.push_str(&format!("\n[{} more lines]\n", lines - DIFF_LINES));
+            return cut;
+        }
+        out
+    }
+
+    /// Each change a sync would send, by name, once each; nothing on a
+    /// machine that never synced, which takes first.
+    async fn changed(&self) -> Vec<Change> {
         if self.fresh() {
             return Vec::new();
         }
         let differs = |from: &Path, to: &Path| std::fs::read(from).ok() != std::fs::read(to).ok();
-        let mut changed: Vec<String> = Vec::new();
+        let mut changed: Vec<Change> = Vec::new();
+        let copied = |outside: &Path, inside: &Path| Change::Copied {
+            name: self.named_inside(inside),
+            outside: outside.to_path_buf(),
+            inside: inside.to_path_buf(),
+        };
         for (outside, inside) in self.mirrored_files() {
             let sent = if outside.exists() {
                 differs(&outside, &inside)
@@ -579,12 +731,12 @@ impl Sync {
                 self.removed_here(&outside)
             };
             if sent {
-                changed.push(self.named_inside(&inside));
+                changed.push(copied(&outside, &inside));
             }
         }
         for (_, outside, inside) in self.kept_places() {
             let here = files_kept(&outside, self.home.as_deref());
-            let copied = files_kept(&inside, None);
+            let there = files_kept(&inside, None);
             let at = |place: &Path, relative: &PathBuf| {
                 if relative.as_os_str().is_empty() {
                     place.to_path_buf()
@@ -594,29 +746,31 @@ impl Sync {
             };
             for relative in &here {
                 if differs(&at(&outside, relative), &at(&inside, relative)) {
-                    changed.push(self.named_inside(&at(&inside, relative)));
+                    changed.push(copied(&at(&outside, relative), &at(&inside, relative)));
                 }
             }
             if outside.is_dir() {
-                for relative in copied.iter().filter(|r| !here.contains(r)) {
-                    changed.push(self.named_inside(&at(&inside, relative)));
+                for relative in there.iter().filter(|r| !here.contains(r)) {
+                    changed.push(copied(&at(&outside, relative), &at(&inside, relative)));
                 }
             }
         }
         let git = Git::new(&self.root, &self.remote, &self.machine).await;
         if let Ok(status) = git.run(&["status", "--porcelain", "-uall"]).await {
-            changed.extend(
-                status
-                    .lines()
-                    .filter_map(|line| line.get(3..))
-                    .map(|name| name.trim_matches('"').to_owned()),
-            );
+            changed.extend(status.lines().filter_map(|line| {
+                let name = line.get(3..)?.trim_matches('"').to_owned();
+                Some(if line.starts_with("??") {
+                    Change::New { name }
+                } else {
+                    Change::Own { name }
+                })
+            }));
         }
         if let Ok(left_out) = git.lines(&["ls-files", "-ci", "--exclude-standard"]).await {
-            changed.extend(left_out);
+            changed.extend(left_out.into_iter().map(|name| Change::LeftOut { name }));
         }
-        changed.sort();
-        changed.dedup();
+        changed.sort_by(|a, b| a.name().cmp(b.name()));
+        changed.dedup_by(|a, b| a.name() == b.name());
         changed
     }
 
@@ -957,6 +1111,36 @@ impl Git {
 
     /// What git printed, once it succeeded.
     async fn run(&self, args: &[&str]) -> Result<String, SyncError> {
+        self.done(args, |status| status.success()).await
+    }
+
+    /// What `git diff` printed: it ends with 1 where the sides differ,
+    /// which is no failure.
+    async fn diffed(&self, args: &[&str]) -> Result<String, SyncError> {
+        self.done(args, |status| matches!(status.code(), Some(0 | 1)))
+            .await
+    }
+
+    /// The diff of `from` to `to`, files anywhere, `/dev/null` for one not
+    /// there.
+    async fn diff_no_index(&self, from: &Path, to: &Path) -> Result<String, SyncError> {
+        let side = |file: &Path| {
+            if file.is_file() {
+                file.to_string_lossy().into_owned()
+            } else {
+                "/dev/null".to_owned()
+            }
+        };
+        self.diffed(&["diff", "--no-index", "--", &side(from), &side(to)])
+            .await
+    }
+
+    /// What git printed, once it ended as `ok` says.
+    async fn done(
+        &self,
+        args: &[&str],
+        ok: impl Fn(std::process::ExitStatus) -> bool,
+    ) -> Result<String, SyncError> {
         let mut command = Command::new("git");
         command.arg("-C").arg(&self.root);
         for setting in &self.settings {
@@ -980,7 +1164,7 @@ impl Git {
                 command: args.join(" "),
                 said: format!("git could not be run: {error}"),
             })?;
-        if output.status.success() {
+        if ok(output.status) {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         } else {
             Err(SyncError::Git {

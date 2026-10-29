@@ -71,6 +71,9 @@ pub enum Request {
         /// Whether what changes is sent from now on without asking.
         always: bool,
     },
+    /// Read what a sync would send, line by line, for the page that shows
+    /// it.
+    Changes,
 }
 
 /// One thing in an agent's thread.

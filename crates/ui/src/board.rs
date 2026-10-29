@@ -55,6 +55,9 @@ pub enum Update {
     /// What changed waits to be sent to the sync's repository, for the
     /// person to say whether it goes.
     SyncAsk(SyncAsk),
+    /// What a sync would send, line by line, as the page that shows it
+    /// asked; empty where nothing would be sent.
+    Changes(String),
     /// The provider's models, as it lists them: what the person may name.
     Models(Vec<String>),
     /// Something iq says to the person in passing, in the conversation.
@@ -119,6 +122,8 @@ pub struct Board {
     synced: Option<Synced>,
     /// What waits to be sent, asked of the person.
     sync_ask: Option<SyncAsk>,
+    /// What a sync would send, line by line, once read for its page.
+    changes: Option<String>,
     /// How the work is looked at.
     lens: crate::observations::Lens,
     /// The provider's models, as it lists them.
@@ -147,6 +152,7 @@ impl Board {
             quitting: false,
             synced: None,
             sync_ask: None,
+            changes: None,
             lens: crate::observations::Lens::default(),
             models: Vec::new(),
         }
@@ -455,9 +461,17 @@ impl Board {
                 }
             }
             Page::Thread(_) if key == "Left" => self.screen.close(),
-            Page::Thread(_) | Page::Keys => {}
+            Page::Thread(_) | Page::Keys | Page::Changes => {}
         }
         Vec::new()
+    }
+
+    /// The page of what a sync would send closes once the person said
+    /// whether it goes.
+    fn sync_answered(&mut self) {
+        if self.screen.page() == Some(&Page::Changes) {
+            self.screen.close();
+        }
     }
 
     /// Does what `action` says. Returns what it asks of the crew, if it
@@ -479,10 +493,22 @@ impl Board {
                     return Some(self.crew.answer(id, action == Action::Allow));
                 }
                 self.sync_ask.take()?;
+                self.sync_answered();
                 return Some(Request::Sync {
                     send: action == Action::Allow,
                     always: false,
                 });
+            }
+            Action::Changes => {
+                // Shown as it stands when the page opens: the same key
+                // closes it.
+                if self.screen.page() == Some(&Page::Changes) {
+                    self.screen.close();
+                    return None;
+                }
+                self.screen.open(Page::Changes);
+                self.changes = None;
+                return Some(Request::Changes);
             }
             Action::Stop => {
                 let agent = self.screen.talking_to()?.to_owned();
@@ -661,6 +687,7 @@ impl Board {
             Command::Effort(effort) => return self.effort(effort, now),
             Command::Sync(always) => {
                 self.sync_ask = None;
+                self.sync_answered();
                 return vec![Request::Sync { send: true, always }];
             }
             Command::Stop(None) => return self.act(Action::Stop).into_iter().collect(),
@@ -795,6 +822,13 @@ impl Board {
         self.sync_ask.as_ref()
     }
 
+    /// What a sync would send, line by line, once read for its page;
+    /// empty where nothing would be sent.
+    #[must_use]
+    pub fn changes(&self) -> Option<&str> {
+        self.changes.as_deref()
+    }
+
     /// The costs.
     #[must_use]
     pub fn costs(&self) -> &Costs {
@@ -849,8 +883,10 @@ impl Board {
             Update::Synced(synced) => {
                 self.synced = Some(synced);
                 self.sync_ask = None;
+                self.changes = None;
             }
             Update::SyncAsk(ask) => self.sync_ask = Some(ask),
+            Update::Changes(changes) => self.changes = Some(changes),
             Update::Models(models) => self.models = models,
             // The conversation is the terminal's: the board keeps nothing.
             Update::Said(_) => {}
@@ -1265,6 +1301,45 @@ mod tests {
             }]
         );
         assert!(board.sync_ask().is_none());
+    }
+
+    #[test]
+    fn what_a_sync_would_send_is_read_on_its_page_and_answered_from_there() {
+        let mut board = Board::default();
+        board.update(Update::SyncAsk(SyncAsk {
+            remote: "https://example.com/notes.git".into(),
+            files: vec!["config/settings.toml".into()],
+            said: "config/settings.toml".into(),
+        }));
+        assert_eq!(board.act(Action::Changes), Some(Request::Changes));
+        assert_eq!(board.screen().page(), Some(&Page::Changes));
+        assert_eq!(board.changes(), None);
+        board.update(Update::Changes("diff --git a/x b/x\n+one\n".into()));
+        assert_eq!(board.changes(), Some("diff --git a/x b/x\n+one\n"));
+        // The same key closes it, and nothing is read again.
+        assert_eq!(board.act(Action::Changes), None);
+        assert_eq!(board.screen().page(), None);
+        assert_eq!(board.changes(), Some("diff --git a/x b/x\n+one\n"));
+        // Opened again, it is read afresh; answered there, it closes.
+        assert_eq!(key(&mut board, "ctrl+g"), [Request::Changes]);
+        assert_eq!(board.changes(), None);
+        assert_eq!(
+            key(&mut board, "ctrl+y"),
+            [Request::Sync {
+                send: true,
+                always: false
+            }]
+        );
+        assert_eq!(board.screen().page(), None);
+        assert!(board.sync_ask().is_none());
+        // Once synced, what was read is stale, and goes.
+        board.update(Update::Changes(String::new()));
+        board.update(Update::Synced(Synced {
+            at: 100,
+            ok: true,
+            said: "sent 1 file".into(),
+        }));
+        assert_eq!(board.changes(), None);
     }
 
     #[test]

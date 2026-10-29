@@ -48,6 +48,8 @@ pub enum Page {
     Observations,
     /// The shortcuts and the commands.
     Keys,
+    /// What a sync would send, line by line.
+    Changes,
 }
 
 impl Page {
@@ -60,6 +62,7 @@ impl Page {
             Page::Costs => "Costs".to_owned(),
             Page::Observations => "Observations".to_owned(),
             Page::Keys => "Keys and commands".to_owned(),
+            Page::Changes => "What a sync would send".to_owned(),
         }
     }
 }

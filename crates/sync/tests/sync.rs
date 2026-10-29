@@ -399,3 +399,43 @@ async fn rules_and_notes_are_kept_from_a_folder_of_credentials_and_a_folder_mirr
         Some("Answer in English.\n")
     );
 }
+
+#[tokio::test]
+async fn what_a_sync_would_send_is_shown_line_by_line_before_it_goes() {
+    let w = world();
+    let a = w.machine("a");
+    write(a.root(), "shared.md", "one\ntwo\nthree\n");
+    write(&w.home("a"), "settings.toml", "model = \"x\"\n");
+    a.run().await.unwrap();
+    assert_eq!(a.diff().await, "");
+
+    write(a.root(), "shared.md", "one\nTWO\nthree\n");
+    write(a.root(), "new.md", "new\n");
+    write(&w.home("a"), "settings.toml", "model = \"y\"\n");
+    let diff = a.diff().await;
+    // A file mirrored is named as the repository names it, never by where
+    // it lives.
+    assert!(
+        diff.contains("diff --git a/config/settings.toml b/config/settings.toml\n"),
+        "{diff}"
+    );
+    assert!(diff.contains("--- a/config/settings.toml\n+++ b/config/settings.toml\n"));
+    assert!(diff.contains("-model = \"x\"\n+model = \"y\"\n"));
+    assert!(!diff.contains(w.root.to_str().unwrap()), "{diff}");
+    assert!(diff.contains("--- /dev/null\n+++ b/new.md\n"), "{diff}");
+    assert!(diff.contains("+new\n"));
+    assert!(
+        diff.contains("--- a/shared.md\n+++ b/shared.md\n"),
+        "{diff}"
+    );
+    assert!(diff.contains("-two\n+TWO\n"));
+    let sent = a.run().await.unwrap().sent;
+    assert_eq!(sent, ["config/settings.toml", "new.md", "shared.md"]);
+    assert_eq!(a.diff().await, "");
+
+    // A file removed goes from the repository, and the diff says so.
+    std::fs::remove_file(a.root().join("new.md")).unwrap();
+    let diff = a.diff().await;
+    assert!(diff.contains("--- a/new.md\n+++ /dev/null\n"), "{diff}");
+    assert!(diff.contains("-new\n"));
+}
