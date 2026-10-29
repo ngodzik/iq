@@ -75,6 +75,18 @@ pub const REFUSALS: u32 = 3;
 /// say.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How many times a call is sent again while its provider is out of
+/// capacity, unless the settings say: with the waits doubling, some ten
+/// minutes, past what a quota for the minute or an overload lasts.
+pub const BUSY_TRIES: u32 = 6;
+
+/// How long the first wait for a provider out of capacity lasts, at
+/// least, doubled at each try.
+pub const BUSY_WAIT: Duration = Duration::from_secs(10);
+
+/// The longest one wait lasts, whatever the provider asks.
+pub const BUSY_MOST: Duration = Duration::from_secs(300);
+
 /// How long a command may write nothing before it is stopped, unless the
 /// settings say: one waiting for a login in a browser, or for an answer at
 /// a terminal it does not have, would hold its agent until its time ran
@@ -109,6 +121,14 @@ pub struct Settings {
     /// How long a command may write nothing before it is stopped: one
     /// waiting for an answer nobody can give it.
     pub command_quiet: Duration,
+    /// How many times a call is sent again while its provider is out of
+    /// capacity, before the turn ends saying so; 0 never.
+    pub busy_tries: u32,
+    /// How long the first wait for a provider out of capacity lasts, at
+    /// least, doubled at each try.
+    pub busy_wait: Duration,
+    /// The longest one wait lasts, whatever the provider asks.
+    pub busy_most: Duration,
 }
 
 impl Default for Settings {
@@ -124,6 +144,9 @@ impl Default for Settings {
             reviewer_effort: Effort::Low,
             command_timeout: COMMAND_TIMEOUT,
             command_quiet: COMMAND_QUIET,
+            busy_tries: BUSY_TRIES,
+            busy_wait: BUSY_WAIT,
+            busy_most: BUSY_MOST,
         }
     }
 }
@@ -1237,6 +1260,68 @@ where
         Some(context_said(TokenCount(context), rises))
     }
 
+    /// Sends `request` for `agent`, again while its provider is out of
+    /// capacity, as many times as the settings say: after as long as the
+    /// provider asks, and at least a wait that doubles at each try, each
+    /// wait said. Then the call fails saying what the person may do: the
+    /// conversation is kept, to go on with later or on another model.
+    async fn ask_model(
+        &self,
+        agent: &str,
+        request: &ChatRequest,
+    ) -> Result<iq_core::ChatResponse, String> {
+        let settings = &self.inner.settings;
+        let started = Instant::now();
+        let mut wait = settings.busy_wait;
+        let mut tries = 0;
+        loop {
+            let error = match self.inner.provider.complete(request).await {
+                Ok(response) => {
+                    if tries > 0 {
+                        self.report(Event::Notice {
+                            agent: agent.to_owned(),
+                            text: format!("the provider of {} answers again", request.model),
+                        });
+                    }
+                    return Ok(response);
+                }
+                Err(error) => error,
+            };
+            let Some(busy) = self.inner.provider.busy(&error) else {
+                return Err(chain(&error));
+            };
+            let said = cut_to(&chain(&error), BUSY_SAID);
+            if tries >= settings.busy_tries {
+                return Err(format!(
+                    "the provider of {} stayed out of capacity for {}, through {} tries ({said}). \
+                     The conversation is kept: write to the agent to try again later, or give \
+                     the task to an agent on another model",
+                    request.model,
+                    lasted(started.elapsed()),
+                    tries + 1,
+                ));
+            }
+            tries += 1;
+            let delay = busy
+                .after
+                .unwrap_or_default()
+                .max(wait)
+                .min(settings.busy_most);
+            wait = (wait * 2).min(settings.busy_most);
+            self.report(Event::Notice {
+                agent: agent.to_owned(),
+                text: format!(
+                    "the provider of {} is out of capacity ({said}): it is asked again in {}, \
+                     try {tries} of {}",
+                    request.model,
+                    lasted(delay),
+                    settings.busy_tries,
+                ),
+            });
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     /// Whether the person wrote to `agent` since it last read the board.
     fn person_waits(&self, agent: &str) -> bool {
         let board = lock(&self.inner.board);
@@ -1279,9 +1364,9 @@ where
                 tools: tools.clone(),
                 effort,
             };
-            let response = match self.inner.provider.complete(&request).await {
+            let response = match self.ask_model(name, &request).await {
                 Ok(response) => response,
-                Err(error) => return (messages, Err(chain(&error))),
+                Err(error) => return (messages, Err(error)),
             };
             let cost = match response.cost {
                 Some(cost) => Some(cost),
@@ -1761,12 +1846,7 @@ where
             tools: Vec::new(),
             effort: Some(self.inner.settings.reviewer_effort),
         };
-        let response = self
-            .inner
-            .provider
-            .complete(&request)
-            .await
-            .map_err(|e| chain(&e))?;
+        let response = self.ask_model(agent, &request).await?;
         let cost = match response.cost {
             Some(cost) => Some(cost),
             None => self
@@ -2193,6 +2273,31 @@ fn describe(action: &Action) -> String {
 }
 
 /// An error with its causes, as one line.
+/// The most characters of a provider's error said while it is waited for.
+const BUSY_SAID: usize = 200;
+
+/// `text` within `most` characters, an ellipsis where it was cut.
+fn cut_to(text: &str, most: usize) -> String {
+    if text.chars().count() <= most {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(most.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// A length of time as said to the person: `350ms`, `20s`, `4m 05s`.
+fn lasted(time: Duration) -> String {
+    let seconds = time.as_secs();
+    if seconds == 0 {
+        format!("{}ms", time.as_millis())
+    } else if seconds < 120 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
 pub(crate) fn chain(error: &dyn std::error::Error) -> String {
     let mut text = error.to_string();
     let mut source = error.source();

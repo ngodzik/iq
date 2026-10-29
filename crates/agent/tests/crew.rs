@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use iq_agent::{Called, Crew, Event, Extension, PERSON, Pattern, RulesFile, Settings};
 use iq_core::{
-    ChatModel, ChatRequest, ChatResponse, CoreError, Message, ModelId, TokenCount, ToolCall, Usage,
-    Usd,
+    Busy, ChatModel, ChatRequest, ChatResponse, Message, ModelId, TokenCount, ToolCall, Usage, Usd,
 };
 use iq_gate::{Gate, Helper};
 
@@ -18,7 +17,27 @@ use iq_gate::{Gate, Helper};
 struct Scripted {
     scripts: Mutex<HashMap<String, VecDeque<ChatResponse>>>,
     requests: Mutex<Vec<(String, ChatRequest)>>,
+    /// How many of each agent's next calls its provider is out of
+    /// capacity for.
+    busy: Mutex<HashMap<String, usize>>,
 }
+
+/// What the scripted provider fails with.
+#[derive(Debug)]
+enum Failed {
+    /// Out of capacity for now.
+    Busy,
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failed::Busy => f.write_str("HTTP 429: TPM quota exhausted, please try again later"),
+        }
+    }
+}
+
+impl std::error::Error for Failed {}
 
 impl Scripted {
     fn new(scripts: &[(&str, Vec<ChatResponse>)]) -> Arc<Self> {
@@ -30,7 +49,13 @@ impl Scripted {
                     .collect(),
             ),
             requests: Mutex::default(),
+            busy: Mutex::default(),
         })
+    }
+
+    /// The provider is out of capacity for `agent`'s next `calls`.
+    fn busy_for(&self, agent: &str, calls: usize) {
+        self.busy.lock().unwrap().insert(agent.to_owned(), calls);
     }
 
     /// The models `agent`'s calls asked for.
@@ -116,14 +141,20 @@ impl std::ops::Deref for Model {
 }
 
 impl ChatModel for Model {
-    type Error = CoreError;
+    type Error = Failed;
 
-    async fn complete(&self, request: &ChatRequest) -> Result<ChatResponse, CoreError> {
+    async fn complete(&self, request: &ChatRequest) -> Result<ChatResponse, Failed> {
         let name = speaker(request);
         self.requests
             .lock()
             .unwrap()
             .push((name.clone(), request.clone()));
+        if let Some(left) = self.busy.lock().unwrap().get_mut(&name)
+            && *left > 0
+        {
+            *left -= 1;
+            return Err(Failed::Busy);
+        }
         let next = self
             .scripts
             .lock()
@@ -131,6 +162,14 @@ impl ChatModel for Model {
             .get_mut(&name)
             .and_then(VecDeque::pop_front);
         Ok(next.unwrap_or_else(|| say(&format!("{name} has nothing more to say"))))
+    }
+
+    fn busy(&self, error: &Failed) -> Option<Busy> {
+        match error {
+            Failed::Busy => Some(Busy {
+                after: Some(Duration::from_millis(1)),
+            }),
+        }
     }
 }
 
@@ -1546,5 +1585,92 @@ async fn a_chat_is_kept_at_each_turn_and_resumed_where_it_stopped() {
             .model
             .instructions_of("lead")
             .contains(&format!("working in {}", again.root.display()))
+    );
+}
+
+#[tokio::test]
+async fn a_provider_out_of_capacity_is_asked_again_and_the_turn_goes_on() {
+    let settings = Settings {
+        busy_wait: Duration::from_millis(1),
+        ..Settings::default()
+    };
+    let f = fixture(&[("lead", vec![say("Done, after the wait.")])], settings);
+    f.model.busy_for("lead", 2);
+    f.crew
+        .start("lead", &model("busy/model"), "fix it".into(), PERSON);
+    f.settled().await;
+    let events = f.events();
+    assert!(
+        events.contains(&Event::Done {
+            agent: "lead".into(),
+            outcome: Ok("Done, after the wait.".into())
+        }),
+        "{events:#?}"
+    );
+    let said: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Notice { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said.len(), 3, "{said:#?}");
+    assert!(
+        said[0].starts_with("the provider of busy/model is out of capacity (HTTP 429"),
+        "{}",
+        said[0]
+    );
+    assert!(said[0].ends_with("try 1 of 6"), "{}", said[0]);
+    assert!(said[1].ends_with("try 2 of 6"), "{}", said[1]);
+    assert_eq!(said[2], "the provider of busy/model answers again");
+    assert_eq!(f.model.requests_of("lead").len(), 3);
+}
+
+#[tokio::test]
+async fn a_provider_still_out_of_capacity_ends_the_turn_saying_what_to_do_and_keeps_the_chat() {
+    let settings = Settings {
+        busy_tries: 2,
+        busy_wait: Duration::from_millis(1),
+        ..Settings::default()
+    };
+    let f = fixture(&[("lead", vec![say("Done at last.")])], settings);
+    f.model.busy_for("lead", 3);
+    f.crew
+        .start("lead", &model("busy/model"), "fix it".into(), PERSON);
+    f.settled().await;
+    let failed = f
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            Event::Done {
+                outcome: Err(why), ..
+            } => Some(why.clone()),
+            _ => None,
+        })
+        .expect("the turn should end");
+    assert!(
+        failed.starts_with("the provider of busy/model stayed out of capacity for"),
+        "{failed}"
+    );
+    assert!(failed.contains("through 3 tries (HTTP 429"), "{failed}");
+    assert!(
+        failed.ends_with(
+            "The conversation is kept: write to the agent to try again later, or give the task \
+             to an agent on another model"
+        ),
+        "{failed}"
+    );
+    // Written to again, it goes on from its conversation.
+    f.crew.tell("lead", "try again".into()).unwrap();
+    f.settled().await;
+    assert!(f.events().contains(&Event::Done {
+        agent: "lead".into(),
+        outcome: Ok("Done at last.".into())
+    }));
+    let last = f.model.requests_of("lead").pop().unwrap();
+    let seen = format!("{:?}", last.messages);
+    assert!(
+        seen.contains("fix it") && seen.contains("try again"),
+        "{seen}"
     );
 }

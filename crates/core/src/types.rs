@@ -1,5 +1,6 @@
 use std::fmt;
 use std::ops::{Add, AddAssign};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -141,6 +142,14 @@ impl fmt::Display for Usd {
         let decimals = decimals.trim_end_matches('0');
         write!(f, "${units}.{decimals:0<2}")
     }
+}
+
+/// A provider out of capacity for now: a quota spent for the minute, an
+/// overload. The call is worth sending again, unlike one it refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Busy {
+    /// How long it asked to be left before the next call, when it said.
+    pub after: Option<Duration>,
 }
 
 /// What a model charges, per token, for what it reads and what it writes;

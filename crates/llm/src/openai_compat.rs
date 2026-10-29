@@ -220,6 +220,10 @@ impl ChatModel for OpenAiCompatible {
     async fn pricing(&self, model: &ModelId) -> Option<Pricing> {
         self.known(model).await?.pricing
     }
+
+    fn busy(&self, error: &LlmError) -> Option<iq_core::Busy> {
+        error.busy()
+    }
 }
 
 /// What the model list says of one model.
@@ -336,18 +340,64 @@ pub(crate) fn transport(url: &str, source: reqwest::Error) -> LlmError {
 
 pub(crate) async fn read_body(url: &str, response: reqwest::Response) -> Result<String, LlmError> {
     let status = response.status();
+    let asked = retry_after(response.headers());
     let body = response
         .text()
         .await
         .map_err(|source| transport(url, source))?;
     if !status.is_success() {
+        let after = asked.or_else(|| try_again_in(&body));
         return Err(LlmError::Status {
             url: url.to_owned(),
             status: status.as_u16(),
             body,
+            after,
         });
     }
     Ok(body)
+}
+
+/// How long a provider asks to be left, as its headers say: in
+/// milliseconds where it says them, else in seconds. A date is left out:
+/// the caller then waits as it would without being told.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let number = |name: &str| -> Option<f64> {
+        let value = headers
+            .get(name)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse::<f64>()
+            .ok()?;
+        (value.is_finite() && value >= 0.0).then_some(value)
+    };
+    number("retry-after-ms")
+        .map(|ms| std::time::Duration::from_secs_f64(ms / 1000.0))
+        .or_else(|| number("retry-after").map(std::time::Duration::from_secs_f64))
+}
+
+/// How long a provider asks to be left, in the words of its answer:
+/// `Please try again in 20s`, `in 1.5 seconds`, `in 350ms`.
+fn try_again_in(body: &str) -> Option<std::time::Duration> {
+    let lower = body.to_ascii_lowercase();
+    let at = lower.find("try again in ")? + "try again in ".len();
+    let rest = &lower[at..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    let value: f64 = rest[..end].parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let unit = rest[end..].trim_start();
+    let seconds = if unit.starts_with("ms") || unit.starts_with("millisecond") {
+        value / 1000.0
+    } else if unit.starts_with('m') && !unit.starts_with("mo") {
+        value * 60.0
+    } else {
+        value
+    };
+    Some(std::time::Duration::from_secs_f64(seconds))
 }
 
 /// Whether `model` is one of Anthropic's, whatever route serves it, such
@@ -635,6 +685,53 @@ fn priced(model: &WireModel) -> Result<Option<Pricing>, iq_core::CoreError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn how_long_a_busy_provider_asks_to_be_left_is_read_from_its_headers_or_words() {
+        use std::time::Duration;
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after(&headers), None);
+        headers.insert("retry-after", "20".parse().unwrap());
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(20)));
+        headers.insert("retry-after-ms", "1500".parse().unwrap());
+        assert_eq!(retry_after(&headers), Some(Duration::from_millis(1500)));
+        let mut dated = reqwest::header::HeaderMap::new();
+        dated.insert(
+            "retry-after",
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after(&dated), None);
+        let quota = r#"{"error":{"message":"TPM quota exhausted for this model. Please try again in 17.5s."}}"#;
+        assert_eq!(try_again_in(quota), Some(Duration::from_millis(17_500)));
+        assert_eq!(
+            try_again_in("Please try again in 350ms"),
+            Some(Duration::from_millis(350))
+        );
+        assert_eq!(
+            try_again_in("Try again in 2 minutes"),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(try_again_in("Please try again later"), None);
+        let busy = LlmError::Status {
+            url: "https://router.example/v1/chat/completions".into(),
+            status: 429,
+            body: quota.into(),
+            after: try_again_in(quota),
+        };
+        assert_eq!(
+            busy.busy(),
+            Some(iq_core::Busy {
+                after: Some(Duration::from_millis(17_500))
+            })
+        );
+        let refused = LlmError::Status {
+            url: "https://router.example/v1/chat/completions".into(),
+            status: 400,
+            body: "bad request".into(),
+            after: None,
+        };
+        assert_eq!(refused.busy(), None);
+    }
+
     #[test]
     fn an_image_goes_as_a_user_message_with_a_data_url() {
         let message = Message::Image {

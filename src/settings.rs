@@ -15,6 +15,7 @@
 //! internet = false                       # true: every command reaches the internet
 //! command_timeout = 600                  # seconds a command may run before it is stopped
 //! command_quiet = 180                    # seconds a command may write nothing before it is stopped: one waiting for a login, or an answer at a terminal
+//! provider_retries = 6                   # times a call is sent again while its provider is out of capacity (a quota, an overload), waiting as it asks, longer each time; 0 never
 //! worktree = false                       # true: each chat you start works in a worktree of its own, on a branch iq/<chat>; your checkout is left as it is
 //! worktree_from = "HEAD"                 # what a worktree starts from: your checkout's commit, or a branch such as "origin/main"
 //! worktree_setup = ["uv sync"]           # commands run in a worktree as it is made, on your machine, to give it the project's environment
@@ -98,6 +99,8 @@ pub(crate) struct Settings {
     command_timeout: Option<u64>,
     /// Seconds a command may write nothing before it is stopped.
     command_quiet: Option<u64>,
+    /// Times a call is sent again while its provider is out of capacity.
+    provider_retries: Option<u32>,
     /// How many tokens an agent's conversation grows between two words to
     /// it of its size.
     context_every: Option<u64>,
@@ -417,6 +420,7 @@ impl Settings {
             command_quiet: self
                 .command_quiet
                 .map_or(iq_agent::COMMAND_QUIET, std::time::Duration::from_secs),
+            busy_tries: self.provider_retries.unwrap_or(iq_agent::BUSY_TRIES),
             ..iq_agent::Settings::default()
         })
     }
@@ -480,13 +484,15 @@ mod tests {
         assert!(!kept.autopilot_host());
         assert_eq!(kept.crew().unwrap().refusals, 5);
         let limits: Settings = toml::from_str(
-            "reviewer_effort = \"high\"\ncommand_timeout = 1200\ncommand_quiet = 30",
+            "reviewer_effort = \"high\"\ncommand_timeout = 1200\ncommand_quiet = 30\nprovider_retries = 2",
         )
         .unwrap();
         let crew = limits.crew().unwrap();
         assert_eq!(crew.reviewer_effort, Effort::High);
         assert_eq!(crew.command_timeout.as_secs(), 1200);
         assert_eq!(crew.command_quiet.as_secs(), 30);
+        assert_eq!(crew.busy_tries, 2);
+        assert_eq!(set.crew().unwrap().busy_tries, iq_agent::BUSY_TRIES);
         assert_eq!(set.crew().unwrap().reviewer_effort, Effort::Low);
         assert_eq!(set.crew().unwrap().command_quiet, iq_agent::COMMAND_QUIET);
         assert_eq!(set.crew().unwrap().refusals, iq_agent::REFUSALS);

@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use crate::types::{ChatRequest, ChatResponse, ModelId, Pricing};
+use crate::types::{Busy, ChatRequest, ChatResponse, ModelId, Pricing};
 
 /// Something that can answer a chat request.
 ///
@@ -29,5 +29,13 @@ pub trait ChatModel: Send + Sync {
     fn pricing(&self, model: &ModelId) -> impl Future<Output = Option<Pricing>> + Send {
         let _ = model;
         std::future::ready(None)
+    }
+
+    /// Whether `error` says the provider is out of capacity for now
+    /// rather than refusing the call, which is then worth sending again;
+    /// `None`, the default, for an error that would come again.
+    fn busy(&self, error: &Self::Error) -> Option<Busy> {
+        let _ = error;
+        None
     }
 }

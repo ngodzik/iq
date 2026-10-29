@@ -30,8 +30,8 @@ mod team;
 mod tools;
 
 pub use crew::{
-    ALL, COMMAND_QUIET, COMMAND_TIMEOUT, CONTEXT_EVERY, Crew, Listed, Posted, REFUSALS, Report,
-    Settings,
+    ALL, BUSY_MOST, BUSY_TRIES, BUSY_WAIT, COMMAND_QUIET, COMMAND_TIMEOUT, CONTEXT_EVERY, Crew,
+    Listed, Posted, REFUSALS, Report, Settings,
 };
 pub use event::{Event, PERSON};
 pub use extension::{Called, Extension};
