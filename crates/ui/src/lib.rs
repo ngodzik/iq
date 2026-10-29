@@ -15,6 +15,7 @@ pub mod look;
 pub mod named;
 pub mod observations;
 pub mod screen;
+pub mod steps;
 
 pub use board::{Board, PERIODS, Post, SyncAsk, Synced, Update};
 pub use error::UiError;

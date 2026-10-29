@@ -50,6 +50,8 @@ pub enum Page {
     Keys,
     /// What a sync would send, line by line.
     Changes,
+    /// Every step the agents took, fold by fold, the latest last.
+    Steps,
 }
 
 impl Page {
@@ -63,6 +65,7 @@ impl Page {
             Page::Observations => "Observations".to_owned(),
             Page::Keys => "Keys and commands".to_owned(),
             Page::Changes => "What a sync would send".to_owned(),
+            Page::Steps => "Steps".to_owned(),
         }
     }
 }

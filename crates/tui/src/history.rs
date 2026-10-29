@@ -2,8 +2,10 @@
 //! once into the terminal's own scrollback as it happens, where the person
 //! scrolls, selects and copies it as any output. Each agent's text is
 //! written a line at a time as it comes, under the agent's name when
-//! another spoke last; its tools, its questions answered, its messages and
-//! the end of its turns each take a line.
+//! another spoke last; its messages and the end of its turns each take a
+//! line. What it does between two lines of text (its tools, what was
+//! allowed or refused it) shows in the live part as it comes; once it goes
+//! on, only their count is written, the steps unfolded on their page.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
@@ -11,6 +13,8 @@ use std::time::Instant;
 use iq_agent::{Event, PERSON};
 use iq_core::{TokenCount, Usd};
 use iq_ui::Board;
+use iq_ui::keys::Action;
+use iq_ui::steps::{Fold, Step};
 use ratatui::text::{Line, Span};
 
 use crate::markdown::{Markdown, Styled, inline};
@@ -24,7 +28,10 @@ const MESSAGE_LINES: usize = 4;
 const FAILED_LINES: usize = 3;
 
 /// The longest tool input written, in characters.
-const INPUT_CHARS: usize = 160;
+pub(crate) const INPUT_CHARS: usize = 160;
+
+/// How many kinds of step a fold's count names.
+const KINDS: usize = 4;
 
 /// How many paragraphs written are kept, to write the end of the
 /// conversation again when the terminal is made narrower.
@@ -97,14 +104,11 @@ pub(crate) struct History {
     turns: HashMap<String, Turn>,
     /// The agents whose task was written.
     tasked: HashSet<String>,
-    /// What each question waiting asks, to say it once answered.
-    asked: HashMap<u64, (String, String)>,
     /// What to say after the person's next message to an agent: the models
     /// they named in it.
     after: HashMap<String, String>,
-    /// The files each agent read since its last line: written as one line
-    /// before its next, so that what it does is not lost among them.
-    reads: HashMap<String, Vec<String>>,
+    /// The number of each agent's last fold of steps written.
+    told: HashMap<String, usize>,
 }
 
 impl History {
@@ -201,97 +205,13 @@ impl History {
                     turn.tokens += usage.input.0 + usage.output.0;
                 }
             }
-            Event::Tool {
-                agent,
-                name,
-                input,
-                output,
-                ok,
-            } => {
-                if name == "read_file" && *ok {
-                    self.reads
-                        .entry(agent.clone())
-                        .or_default()
-                        .push(short(input).replace('\n', " "));
-                    return;
-                }
+            // A step: the board keeps it in the agent's fold, which the live
+            // part shows as it grows. What the agent wrote so far comes
+            // before it.
+            Event::Tool { agent, .. } | Event::Reviewed { agent, .. } => {
                 self.finish(agent, board, p);
-                self.header(agent, board, p);
-                let (mark, tint) = if *ok {
-                    ("▸ ", p.faint)
-                } else {
-                    ("✗ ", p.bad)
-                };
-                self.paras.push(Para {
-                    first: vec![Span::raw("  "), Span::styled(mark, p.fg(tint))],
-                    rest: vec![Span::raw("    ")],
-                    body: vec![
-                        Span::styled(name.clone(), p.fg(p.text)),
-                        Span::raw(" "),
-                        Span::styled(
-                            cut(&short(input).replace('\n', " "), INPUT_CHARS),
-                            p.fg(p.dim),
-                        ),
-                    ],
-                });
-                if !ok {
-                    for line in output
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .take(FAILED_LINES)
-                    {
-                        self.paras.push(Para::indented(
-                            "    ",
-                            vec![Span::styled(short(line), p.fg(p.faint))],
-                        ));
-                    }
-                }
             }
-            Event::Asked {
-                id, agent, action, ..
-            } => {
-                self.asked.insert(*id, (agent.clone(), action.clone()));
-            }
-            Event::Answered { id, approved } => {
-                if let Some((agent, action)) = self.asked.remove(id) {
-                    self.finish(&agent, board, p);
-                    self.header(&agent, board, p);
-                    let (said, tint) = if *approved {
-                        ("✓ you allowed ", p.ok)
-                    } else {
-                        ("✗ refused ", p.bad)
-                    };
-                    self.paras.push(Para::indented(
-                        "  ",
-                        vec![
-                            Span::styled(said, p.fg(tint)),
-                            Span::styled(short(&action), p.fg(p.dim)),
-                        ],
-                    ));
-                }
-            }
-            Event::Reviewed {
-                agent,
-                action,
-                approved,
-                why,
-                ..
-            } => {
-                self.finish(agent, board, p);
-                self.header(agent, board, p);
-                let (said, tint) = if *approved {
-                    ("⏵⏵ the reviewer allowed ", p.ok)
-                } else {
-                    ("⏵⏵ the reviewer refused ", p.bad)
-                };
-                self.paras.push(Para::indented(
-                    "  ",
-                    vec![
-                        Span::styled(said, p.fg(tint)),
-                        Span::styled(format!("{}: {why}", short(action)), p.fg(p.dim)),
-                    ],
-                ));
-            }
+            Event::Asked { .. } | Event::Answered { .. } => {}
             Event::Posted { from, to, text } => {
                 if from == PERSON {
                     self.person(text, to, board, p);
@@ -310,6 +230,7 @@ impl History {
                     }
                 } else {
                     self.finish(from, board, p);
+                    self.folds(from, board, p);
                     self.speaker = None;
                     self.paras.push(Para::indented(
                         "  ",
@@ -395,8 +316,9 @@ impl History {
         self.after.insert(agent.to_owned(), text);
     }
 
-    /// What the person wrote, to `agent`.
+    /// What the person wrote, to `agent`, after what it did before.
     fn person(&mut self, text: &str, agent: &str, board: &Board, p: &Palette) {
+        self.folds(agent, board, p);
         self.paras.push(Para::blank());
         let mut body = Vec::new();
         if board.crew().agents().len() > 1 {
@@ -440,29 +362,73 @@ impl History {
         }
     }
 
-    /// `agent`'s name and model, when another spoke last; then the files
-    /// it read since its last line, in one line.
+    /// `agent`'s name and model, when another spoke last; then what it
+    /// did since its last line.
     fn header(&mut self, agent: &str, board: &Board, p: &Palette) {
         self.named(agent, board, p);
-        let Some(read) = self.reads.remove(agent).filter(|read| !read.is_empty()) else {
+        self.folds(agent, board, p);
+    }
+
+    /// `agent`'s folds of steps closed since the last written, under its
+    /// name: a fold of one step as that step, a larger one as its count.
+    fn folds(&mut self, agent: &str, board: &Board, p: &Palette) {
+        self.folds_of(agent, board, p, false);
+    }
+
+    /// The same, the fold being made with them when `all`, as iq ends.
+    fn folds_of(&mut self, agent: &str, board: &Board, p: &Palette, all: bool) {
+        let told = self.told.get(agent).copied().unwrap_or(0);
+        let mut new: Vec<&Fold> = board
+            .steps()
+            .folds()
+            .rev()
+            .take_while(|fold| fold.id > told)
+            .filter(|fold| fold.agent == agent && (fold.closed || all))
+            .collect();
+        if new.is_empty() {
             return;
-        };
-        let names = read.join(", ");
-        self.paras.push(Para {
-            first: vec![Span::raw("  "), Span::styled("▸ ", p.fg(p.faint))],
-            rest: vec![Span::raw("    ")],
-            body: vec![
-                Span::styled(
-                    if read.len() == 1 {
-                        "read ".to_owned()
-                    } else {
-                        format!("read {} files ", read.len())
-                    },
-                    p.fg(p.text),
-                ),
-                Span::styled(cut(&names, INPUT_CHARS), p.fg(p.dim)),
-            ],
-        });
+        }
+        new.reverse();
+        self.told
+            .insert(agent.to_owned(), new.last().map_or(told, |fold| fold.id));
+        self.named(agent, board, p);
+        let unfold = board
+            .keys()
+            .chord(Action::Steps)
+            .map(|chord| chord.to_string());
+        for fold in new {
+            match fold.steps.as_slice() {
+                [] => {}
+                [step] => {
+                    let (first, body) = step_line(step, p);
+                    self.paras.push(Para {
+                        first,
+                        rest: vec![Span::raw("    ")],
+                        body,
+                    });
+                    if let Step::Tool {
+                        output, ok: false, ..
+                    } = step
+                    {
+                        for line in output
+                            .lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .take(FAILED_LINES)
+                        {
+                            self.paras.push(Para::indented(
+                                "    ",
+                                vec![Span::styled(short(line), p.fg(p.faint))],
+                            ));
+                        }
+                    }
+                }
+                _ => self.paras.push(Para {
+                    first: vec![Span::raw("  "), Span::styled("▸ ", p.fg(p.faint))],
+                    rest: vec![Span::raw("    ")],
+                    body: counted(fold, unfold.as_deref(), p),
+                }),
+            }
+        }
     }
 
     /// `agent`'s name and model, when another spoke last.
@@ -508,6 +474,15 @@ impl History {
         let agents: Vec<String> = self.streams.keys().cloned().collect();
         for agent in agents {
             self.finish(&agent, board, p);
+        }
+        let agents: Vec<String> = board
+            .crew()
+            .agents()
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        for agent in agents {
+            self.folds_of(&agent, board, p, true);
         }
     }
 
@@ -571,6 +546,88 @@ impl History {
         let extra = lines.len().saturating_sub(rows);
         lines.split_off(extra)
     }
+}
+
+/// A step in a line: its mark, then what it did.
+pub(crate) fn step_line(step: &Step, p: &Palette) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let one = |text: &str| cut(&short(text).replace('\n', " "), INPUT_CHARS);
+    match step {
+        Step::Tool {
+            name, input, ok, ..
+        } => {
+            let (mark, tint) = if *ok {
+                ("▸ ", p.faint)
+            } else {
+                ("✗ ", p.bad)
+            };
+            (
+                vec![Span::raw("  "), Span::styled(mark, p.fg(tint))],
+                vec![
+                    Span::styled(name.clone(), p.fg(p.text)),
+                    Span::raw(" "),
+                    Span::styled(one(input), p.fg(p.dim)),
+                ],
+            )
+        }
+        Step::Answered { action, approved } => {
+            let (said, tint) = if *approved {
+                ("✓ you allowed ", p.ok)
+            } else {
+                ("✗ refused ", p.bad)
+            };
+            (
+                vec![Span::raw("  "), Span::styled(said, p.fg(tint))],
+                vec![Span::styled(one(action), p.fg(p.dim))],
+            )
+        }
+        Step::Reviewed {
+            action,
+            approved,
+            why,
+        } => {
+            let (said, tint) = if *approved {
+                ("⏵⏵ the reviewer allowed ", p.ok)
+            } else {
+                ("⏵⏵ the reviewer refused ", p.bad)
+            };
+            (
+                vec![Span::raw("  "), Span::styled(said, p.fg(tint))],
+                vec![Span::styled(
+                    format!("{}: {}", one(action), short(why)),
+                    p.fg(p.dim),
+                )],
+            )
+        }
+    }
+}
+
+/// A fold's count: how many steps, of which kinds, how many went wrong,
+/// and the key that unfolds them.
+fn counted(fold: &Fold, unfold: Option<&str>, p: &Palette) -> Vec<Span<'static>> {
+    let kinds = fold.kinds();
+    let mut named: Vec<String> = kinds
+        .iter()
+        .take(KINDS)
+        .map(|(kind, count)| format!("{kind} {count}"))
+        .collect();
+    if kinds.len() > KINDS {
+        named.push("…".to_owned());
+    }
+    let mut spans = vec![
+        Span::styled(format!("{} steps", fold.steps.len()), p.fg(p.text)),
+        Span::styled(format!(" · {}", named.join(", ")), p.fg(p.dim)),
+    ];
+    let failed = fold.failed();
+    if failed > 0 {
+        spans.push(Span::styled(format!(" · {failed} went wrong"), p.fg(p.bad)));
+    }
+    if let Some(key) = unfold {
+        spans.push(Span::styled(
+            format!("  {key} unfolds #{}", fold.id),
+            p.fg(p.faint),
+        ));
+    }
+    spans
 }
 
 /// The colour of `agent`, by the order it joined; the person's is the
@@ -725,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn the_files_read_are_written_in_one_line_before_the_next_step() {
+    fn the_steps_between_two_lines_are_written_as_their_count_once_the_agent_goes_on() {
         let p = Palette::new(Theme::Graphite, Depth::True);
         let mut board = Board::default();
         let mut history = History::default();
@@ -767,6 +824,45 @@ mod tests {
                 ok: true,
             },
         );
+        run(
+            &mut board,
+            &mut history,
+            Event::Asked {
+                id: 1,
+                agent: "lead".into(),
+                action: "git push".into(),
+                reason: "it leaves the machine".into(),
+                widens: true,
+            },
+        );
+        run(
+            &mut board,
+            &mut history,
+            Event::Answered {
+                id: 1,
+                approved: false,
+            },
+        );
+        // While it works, its steps are the live part's, not the
+        // conversation's.
+        let lines: Vec<String> = history.take(80).iter().map(ToString::to_string).collect();
+        assert_eq!(lines, ["", "› look"]);
+        assert_eq!(board.steps().open("lead").unwrap().steps.len(), 4);
+        run(
+            &mut board,
+            &mut history,
+            Event::TextStart {
+                agent: "lead".into(),
+            },
+        );
+        run(
+            &mut board,
+            &mut history,
+            Event::Text {
+                agent: "lead".into(),
+                text: "I add the test.\n".into(),
+            },
+        );
         run(&mut board, &mut history, read("src/c.rs"));
         run(
             &mut board,
@@ -776,20 +872,20 @@ mod tests {
                 outcome: Ok("done".into()),
             },
         );
-        let lines: Vec<String> = history.take(80).iter().map(ToString::to_string).collect();
+        let lines: Vec<String> = history.take(120).iter().map(ToString::to_string).collect();
         assert_eq!(
             lines,
             [
                 "",
-                "› look",
-                "",
                 "● lead  m",
-                "  ▸ read 2 files src/a.rs, src/b.rs",
-                "  ▸ run cargo test",
-                "  ▸ read src/c.rs",
+                "  ▸ 4 steps · read_file 2, run 1, asked you 1 · 1 went wrong  Ctrl-X unfolds #1",
+                "  I add the test.",
+                // One step is written as it is: nothing to unfold.
+                "  ▸ read_file src/c.rs",
                 "  ✔ 0s",
             ]
         );
+        assert!(board.steps().folds().all(|fold| fold.closed));
     }
 
     #[test]

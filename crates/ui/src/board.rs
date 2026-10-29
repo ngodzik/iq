@@ -124,6 +124,8 @@ pub struct Board {
     sync_ask: Option<SyncAsk>,
     /// What a sync would send, line by line, once read for its page.
     changes: Option<String>,
+    /// What the agents did between their lines of text.
+    steps: crate::steps::Steps,
     /// How the work is looked at.
     lens: crate::observations::Lens,
     /// The provider's models, as it lists them.
@@ -153,6 +155,7 @@ impl Board {
             synced: None,
             sync_ask: None,
             changes: None,
+            steps: crate::steps::Steps::default(),
             lens: crate::observations::Lens::default(),
             models: Vec::new(),
         }
@@ -461,7 +464,7 @@ impl Board {
                 }
             }
             Page::Thread(_) if key == "Left" => self.screen.close(),
-            Page::Thread(_) | Page::Keys | Page::Changes => {}
+            Page::Thread(_) | Page::Keys | Page::Changes | Page::Steps => {}
         }
         Vec::new()
     }
@@ -484,6 +487,13 @@ impl Board {
             Action::Costs => self.screen.toggle(Page::Costs),
             Action::Observations => self.screen.toggle(Page::Observations),
             Action::Keys => self.screen.toggle(Page::Keys),
+            Action::Steps => {
+                // The latest last, where the page opens.
+                self.screen.toggle(Page::Steps);
+                if self.screen.page() == Some(&Page::Steps) {
+                    self.screen.scroll_to(usize::MAX);
+                }
+            }
             Action::Theme => self.look.next_theme(),
             Action::Autopilot => return Some(self.crew.toggle_autopilot()),
             Action::Internet => return Some(self.crew.toggle_internet()),
@@ -829,6 +839,12 @@ impl Board {
         self.changes.as_deref()
     }
 
+    /// What the agents did between their lines of text, fold by fold.
+    #[must_use]
+    pub fn steps(&self) -> &crate::steps::Steps {
+        &self.steps
+    }
+
     /// The costs.
     #[must_use]
     pub fn costs(&self) -> &Costs {
@@ -850,6 +866,9 @@ impl Board {
     pub fn update(&mut self, update: Update) {
         match update {
             Update::Crew(event) => {
+                // Before the crew takes it: an answer's question is still
+                // there.
+                self.steps.event(&event);
                 match &event {
                     Event::Spent {
                         model, cost, usage, ..
@@ -1301,6 +1320,17 @@ mod tests {
             }]
         );
         assert!(board.sync_ask().is_none());
+    }
+
+    #[test]
+    fn the_steps_unfold_on_their_page_the_latest_last() {
+        let mut board = Board::default();
+        assert_eq!(key(&mut board, "ctrl+x"), vec![]);
+        assert_eq!(board.screen().page(), Some(&Page::Steps));
+        // Opened at its end, which drawing brings back within its lines.
+        assert_eq!(board.screen().scroll(), usize::MAX);
+        key(&mut board, "ctrl+x");
+        assert_eq!(board.screen().page(), None);
     }
 
     #[test]

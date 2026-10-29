@@ -20,6 +20,7 @@
 //! worktree_setup = ["uv sync"]           # commands run in a worktree as it is made, on your machine, to give it the project's environment
 //! chat_keep = 30                         # days a chat may go untouched before iq forgets it as it starts, its worktree with it when nothing there is uncommitted; 0 never
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
+//! steps = 5                              # an agent's latest steps (tools, what was allowed) shown as it works; once it writes again only their count, Ctrl-X unfolds them; 0 none
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set
@@ -130,6 +131,8 @@ pub(crate) struct Settings {
     chat_keep: Option<u64>,
     /// The theme.
     theme: Option<String>,
+    /// How many of an agent's latest steps show as it works.
+    steps: Option<usize>,
     /// The person's rules for every project, files of their home.
     rules: Option<Vec<String>>,
     /// The folders of the person's skills.
@@ -297,7 +300,7 @@ impl Settings {
             Some(name) => name.parse()?,
             None => iq_ui::look::Theme::default(),
         };
-        Ok(iq_ui::look::Look::new(theme))
+        Ok(iq_ui::look::Look::new(theme).showing(self.steps.unwrap_or(iq_ui::steps::SHOWN)))
     }
 
     /// What a worktree starts from: as set, else `HEAD`.

@@ -1,5 +1,6 @@
 //! The live part, below the conversation: the agents at work and what
-//! they do, the oldest question waiting for the person, a word to them,
+//! they do, each with its latest steps since its last line of text, the
+//! oldest question waiting for the person, a word to them,
 //! the commands that complete what they write, where they write, and the
 //! status line, along which messages run between the agents.
 
@@ -16,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
-use crate::history::{History, agent_tint, seconds, short};
+use crate::history::{History, agent_tint, seconds, short, step_line};
 use crate::motion::{Motion, YOU};
 use crate::theme::Palette;
 use crate::wrap::{cut, spans_width, width as text_width, wrap};
@@ -148,7 +149,8 @@ impl Live<'_> {
     }
 
     /// A line for each agent at work: what it does, for how long, and
-    /// what it is writing.
+    /// what it is writing; under it, its latest steps since its last line
+    /// of text, as many as the settings say, the earlier counted.
     fn working(&self, motion: &Motion, width: usize) -> Vec<Line<'static>> {
         let p = self.p;
         let talking = self.board.screen().talking_to();
@@ -184,12 +186,15 @@ impl Live<'_> {
                 after.push_str(&format!(" · {} to stop", hint(&stop.to_string())));
             }
             spans.push(Span::styled(after, p.fg(p.faint)));
+            let shown = self.board.look().steps();
+            let fold = self.board.steps().open(&agent.name).filter(|_| shown > 0);
             let doing = self
                 .history
                 .partial(&agent.name)
                 .map(|text| format!("  {}", text.replace('\n', " ")))
                 .or_else(|| match agent.thread.last() {
-                    Some(Entry::Tool { name, input, .. }) => {
+                    // Its steps show under it, unless the settings show none.
+                    Some(Entry::Tool { name, input, .. }) if fold.is_none() => {
                         Some(format!("  ▸ {name} {}", short(input).replace('\n', " ")))
                     }
                     _ => None,
@@ -201,6 +206,25 @@ impl Live<'_> {
                 }
             }
             lines.push(Line::from(spans));
+            if let Some(fold) = fold {
+                let earlier = fold.steps.len().saturating_sub(shown);
+                if earlier > 0 {
+                    let mut said = format!(
+                        "    ⋯ {earlier} step{} before",
+                        if earlier == 1 { "" } else { "s" }
+                    );
+                    if let Some(unfold) = self.board.keys().chord(Action::Steps) {
+                        said.push_str(&format!(" · {} unfolds", hint(&unfold.to_string())));
+                    }
+                    lines.push(Line::from(Span::styled(said, p.fg(p.faint))));
+                }
+                for step in &fold.steps[earlier..] {
+                    let (mut first, body) = step_line(step, p);
+                    first.insert(0, Span::raw("  "));
+                    first.extend(body);
+                    lines.push(fit(first, width));
+                }
+            }
         }
         if agents.len() > WORKING {
             lines.push(Line::from(Span::styled(
@@ -739,6 +763,99 @@ mod tests {
         let status = rows.last().unwrap();
         assert!(status.contains("1 waiting for you"));
         assert!(status.ends_with("you ● lead"));
+    }
+
+    #[test]
+    fn an_agent_at_work_shows_its_latest_steps_and_counts_the_earlier() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::new(
+            iq_ui::keys::Keymap::default(),
+            iq_ui::look::Look::new(Theme::Graphite).showing(2),
+        );
+        let mut history = History::default();
+        crew(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: "lead".into(),
+                model: "m".into(),
+                by: PERSON.into(),
+            },
+            &p,
+        );
+        crew(
+            &mut board,
+            &mut history,
+            Event::Working {
+                agent: "lead".into(),
+                prompt: "look".into(),
+            },
+            &p,
+        );
+        for file in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            crew(
+                &mut board,
+                &mut history,
+                Event::Tool {
+                    agent: "lead".into(),
+                    name: "read_file".into(),
+                    input: file.into(),
+                    output: String::new(),
+                    ok: true,
+                },
+                &p,
+            );
+        }
+        let rows = drawn(&board, &history, 80);
+        let at = rows.iter().position(|r| r.contains("lead · m")).unwrap();
+        assert_eq!(
+            rows[at + 1..at + 4],
+            [
+                "    ⋯ 2 steps before · Ctrl-X unfolds",
+                "    ▸ read_file c.rs",
+                "    ▸ read_file d.rs",
+            ]
+        );
+        // Its text closes them: they go, counted in the conversation.
+        crew(
+            &mut board,
+            &mut history,
+            Event::TextStart {
+                agent: "lead".into(),
+            },
+            &p,
+        );
+        let rows = drawn(&board, &history, 80);
+        assert!(!rows.iter().any(|r| r.contains("read_file")), "{rows:#?}");
+        // None shown, as the settings may say: the latest in its line.
+        let mut quiet = Board::new(
+            iq_ui::keys::Keymap::default(),
+            iq_ui::look::Look::new(Theme::Graphite).showing(0),
+        );
+        for event in [
+            Event::Joined {
+                agent: "lead".into(),
+                model: "m".into(),
+                by: PERSON.into(),
+            },
+            Event::Working {
+                agent: "lead".into(),
+                prompt: "look".into(),
+            },
+            Event::Tool {
+                agent: "lead".into(),
+                name: "read_file".into(),
+                input: "a.rs".into(),
+                output: String::new(),
+                ok: true,
+            },
+        ] {
+            crew(&mut quiet, &mut history, event, &p);
+        }
+        let rows = drawn(&quiet, &history, 120);
+        let line = rows.iter().find(|r| r.contains("lead · m")).unwrap();
+        assert!(line.ends_with("▸ read_file a.rs"), "{line}");
+        assert!(!rows.iter().any(|r| r.starts_with("    ▸")));
     }
 
     #[test]

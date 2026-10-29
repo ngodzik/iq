@@ -7,6 +7,7 @@ mod changes;
 mod costs;
 mod keys;
 mod observations;
+mod steps;
 mod team;
 
 use iq_ui::Board;
@@ -79,6 +80,7 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String) {
         ),
         Page::Keys => (keys::lines(seen), "↑↓ scroll"),
         Page::Changes => return (changes::lines(seen), changes::foot(seen)),
+        Page::Steps => (steps::lines(seen), "↑↓ scroll · the latest last"),
     };
     (lines, foot.to_owned())
 }

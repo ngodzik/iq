@@ -63,16 +63,42 @@ impl FromStr for Theme {
 }
 
 /// How iq looks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Look {
     theme: Theme,
+    /// How many of an agent's latest steps show while it works.
+    steps: usize,
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Self::new(Theme::default())
+    }
 }
 
 impl Look {
-    /// In `theme`.
+    /// In `theme`, the latest [`crate::steps::SHOWN`] steps of an agent
+    /// shown while it works.
     #[must_use]
     pub fn new(theme: Theme) -> Self {
-        Self { theme }
+        Self {
+            theme,
+            steps: crate::steps::SHOWN,
+        }
+    }
+
+    /// With the latest `steps` of an agent shown while it works; none
+    /// for 0.
+    #[must_use]
+    pub fn showing(mut self, steps: usize) -> Self {
+        self.steps = steps;
+        self
+    }
+
+    /// How many of an agent's latest steps show while it works.
+    #[must_use]
+    pub fn steps(&self) -> usize {
+        self.steps
     }
 
     /// The theme.
