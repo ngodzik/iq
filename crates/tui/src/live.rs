@@ -470,7 +470,7 @@ impl Live<'_> {
     }
 
     /// The status line: the autopilot, the internet when open, what the
-    /// session spent, the sync, the questions waiting; on its right the person
+    /// session spent and what was spent since midnight, the sync, the questions waiting; on its right the person
     /// and the agents. Returns where each mark is drawn, for the sparks.
     fn status(&self, frame: &mut Frame<'_>, row: Rect, motion: &Motion) -> HashMap<String, u16> {
         let p = self.p;
@@ -493,6 +493,13 @@ impl Live<'_> {
         if spent.0 > 0.0 {
             left.push(sep());
             left.push(Span::styled(format!("{spent} spent"), p.fg(p.dim)));
+        }
+        // Since midnight, earlier sessions with this one: said when it is
+        // more than this one.
+        let today = self.board.billed_today(self.now);
+        if today.0 > 0.0 && today.to_string() != spent.to_string() {
+            left.push(sep());
+            left.push(Span::styled(format!("{today} today"), p.fg(p.faint)));
         }
         if let Some(synced) = self.board.synced() {
             left.push(sep());

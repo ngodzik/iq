@@ -6,7 +6,7 @@
 use iq_agent::{Event, PERSON};
 
 use crate::command::{self, Command, Completion};
-use crate::costs::{Costs, Spent};
+use crate::costs::{Costs, Period, Spent};
 use crate::crew::{CrewView, Question, Request};
 use crate::keys::{Action, Chord, Keymap};
 use crate::look::Look;
@@ -100,9 +100,14 @@ pub struct SyncAsk {
     pub said: String,
 }
 
-/// How far back the costs are summed, in seconds, as the costs' page
-/// offers it.
-pub const PERIODS: [u64; 4] = [3600, 6 * 3600, 24 * 3600, 7 * 24 * 3600];
+/// How far back the costs are summed, as the costs' page offers it.
+pub const PERIODS: [Period; 5] = [
+    Period::Last(3600),
+    Period::Last(6 * 3600),
+    Period::Today,
+    Period::Last(24 * 3600),
+    Period::Last(7 * 24 * 3600),
+];
 
 /// iq's state in the terminal.
 #[derive(Debug, Clone)]
@@ -112,7 +117,7 @@ pub struct Board {
     keys: Keymap,
     look: Look,
     /// How far back the costs are summed, one of [`PERIODS`].
-    period: u64,
+    period: Period,
     costs: Costs,
     /// The messages posted since the terminal last took them.
     posts: Vec<Post>,
@@ -148,7 +153,7 @@ impl Board {
             screen: Screen::default(),
             keys,
             look,
-            period: PERIODS[2],
+            period: Period::Last(24 * 3600),
             costs: Costs::default(),
             posts: Vec::new(),
             quitting: false,
@@ -172,14 +177,29 @@ impl Board {
         std::mem::take(&mut self.posts)
     }
 
-    /// How far back the costs are summed, in seconds.
+    /// How far back the costs are summed.
     #[must_use]
-    pub fn period(&self) -> u64 {
+    pub fn period(&self) -> Period {
         self.period
     }
 
+    /// When the period the costs are summed over starts, `now` being in
+    /// seconds since 1970, in the person's time zone.
+    #[must_use]
+    pub fn period_since(&self, now: u64) -> u64 {
+        self.period.since(now, &jiff::tz::TimeZone::system())
+    }
+
+    /// What the provider billed since midnight, in the person's time
+    /// zone: this session's calls and those iq kept of earlier ones.
+    #[must_use]
+    pub fn billed_today(&self, now: u64) -> iq_core::Usd {
+        self.costs
+            .billed(Period::Today.since(now, &jiff::tz::TimeZone::system()))
+    }
+
     /// Sums the costs over `period`, one of [`PERIODS`].
-    pub fn sum_over(&mut self, period: u64) {
+    pub fn sum_over(&mut self, period: Period) {
         if PERIODS.contains(&period) {
             self.period = period;
         }
@@ -964,15 +984,20 @@ mod tests {
     #[test]
     fn the_periods_go_round_and_are_those_offered() {
         let mut board = Board::default();
-        assert_eq!(board.period(), 24 * 3600);
-        board.next_period(true);
-        assert_eq!(board.period(), 7 * 24 * 3600);
-        board.next_period(true);
-        assert_eq!(board.period(), 3600);
+        assert_eq!(board.period(), Period::Last(24 * 3600));
         board.next_period(false);
-        assert_eq!(board.period(), 7 * 24 * 3600);
-        board.sum_over(5);
-        assert_eq!(board.period(), 7 * 24 * 3600);
+        assert_eq!(board.period(), Period::Today);
+        board.next_period(true);
+        board.next_period(true);
+        assert_eq!(board.period(), Period::Last(7 * 24 * 3600));
+        board.next_period(true);
+        assert_eq!(board.period(), Period::Last(3600));
+        board.next_period(false);
+        assert_eq!(board.period(), Period::Last(7 * 24 * 3600));
+        board.sum_over(Period::Last(5));
+        assert_eq!(board.period(), Period::Last(7 * 24 * 3600));
+        board.sum_over(Period::Today);
+        assert_eq!(board.period(), Period::Today);
     }
 
     #[test]
@@ -1141,7 +1166,7 @@ mod tests {
         assert!(board.screen().editor().is_empty());
         // On a page, letters choose and Escape closes; nothing is written.
         board.press(&Chord::plain("p"), Some('p'), 100);
-        assert_eq!(board.period(), 7 * 24 * 3600);
+        assert_eq!(board.period(), Period::Last(7 * 24 * 3600));
         key(&mut board, "escape");
         assert_eq!(board.screen().page(), None);
         assert!(board.screen().editor().is_empty());

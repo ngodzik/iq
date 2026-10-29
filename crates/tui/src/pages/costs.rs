@@ -11,27 +11,18 @@ use super::Seen;
 use crate::chart::{Curve, gauge, sparkline};
 use crate::wrap::cut;
 
-/// A period's name: `1h`, `24h`, `7d`.
-fn period_name(seconds: u64) -> String {
-    if seconds >= 2 * 24 * 3600 {
-        format!("{}d", seconds / (24 * 3600))
-    } else {
-        format!("{}h", seconds / 3600)
-    }
-}
-
 /// The page's lines.
 pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
     let p = seen.p;
     let board = seen.board;
     let now = seen.now;
-    let since = now.saturating_sub(board.period());
+    let since = board.period_since(now);
     let mut lines = Vec::new();
-    let mut periods = vec![Span::styled(" Over the last ", p.fg(p.dim))];
+    let mut periods = vec![Span::styled(" Over ", p.fg(p.dim))];
     for period in PERIODS {
         let on = board.period() == period;
         periods.push(Span::styled(
-            format!(" {} ", period_name(period)),
+            format!(" {} ", period.name()),
             if on { p.bold(p.accent) } else { p.fg(p.faint) },
         ));
     }
@@ -42,10 +33,7 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         lines.push(Line::default());
         seen.said(
             &mut lines,
-            &format!(
-                "iq made no call to a model in the last {}.",
-                period_name(board.period())
-            ),
+            &format!("iq made no call to a model {}.", board.period().said()),
             p.dim,
         );
     } else {
@@ -88,7 +76,7 @@ fn running(seen: &Seen<'_>, since: u64, lines: &mut Vec<Line<'static>>) {
         points.push((0.0, last));
     }
     let top = points.iter().map(|(_, v)| *v).fold(0.0, f64::max).max(0.01);
-    let hours = board.period() as f64 / 3600.0;
+    let hours = (now.saturating_sub(since) as f64 / 3600.0).max(1.0 / 60.0);
     seen.heading(lines, "The provider's bill", "as it grew over the period");
     let label = |v: f64| format!("${v:.2}");
     lines.extend(
@@ -100,10 +88,7 @@ fn running(seen: &Seen<'_>, since: u64, lines: &mut Vec<Line<'static>>) {
             height: 5,
             tint: p.ok,
             label: &label,
-            ends: (
-                format!("{} ago", period_name(board.period())),
-                "now".to_owned(),
-            ),
+            ends: (board.period().start(), "now".to_owned()),
         }
         .lines(p)
         .into_iter()

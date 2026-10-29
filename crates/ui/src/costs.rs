@@ -4,6 +4,66 @@
 use std::collections::BTreeMap;
 
 use iq_core::Usd;
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
+
+/// How far back the costs are summed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Period {
+    /// The last so many seconds.
+    Last(u64),
+    /// Since midnight, in the person's time zone.
+    Today,
+}
+
+impl Period {
+    /// When it starts, in seconds since 1970, `now` being one too and the
+    /// person's time zone `zone`.
+    #[must_use]
+    pub fn since(self, now: u64, zone: &TimeZone) -> u64 {
+        match self {
+            Period::Last(seconds) => now.saturating_sub(seconds),
+            Period::Today => midnight(now, zone).unwrap_or(now.saturating_sub(now % (24 * 3600))),
+        }
+    }
+
+    /// Its name, as the costs' page offers it: `1h`, `today`, `7d`.
+    #[must_use]
+    pub fn name(self) -> String {
+        match self {
+            Period::Last(seconds) if seconds >= 2 * 24 * 3600 => {
+                format!("{}d", seconds / (24 * 3600))
+            }
+            Period::Last(seconds) => format!("{}h", seconds / 3600),
+            Period::Today => "today".to_owned(),
+        }
+    }
+
+    /// When it starts, in words: `24h ago`, `midnight`.
+    #[must_use]
+    pub fn start(self) -> String {
+        match self {
+            Period::Last(_) => format!("{} ago", self.name()),
+            Period::Today => "midnight".to_owned(),
+        }
+    }
+
+    /// It, in a sentence: `in the last 24h`, `today`.
+    #[must_use]
+    pub fn said(self) -> String {
+        match self {
+            Period::Last(_) => format!("in the last {}", self.name()),
+            Period::Today => "today".to_owned(),
+        }
+    }
+}
+
+/// The last midnight before `now`, in `zone`.
+fn midnight(now: u64, zone: &TimeZone) -> Option<u64> {
+    let at = Timestamp::from_second(i64::try_from(now).ok()?).ok()?;
+    let start = at.to_zoned(zone.clone()).start_of_day().ok()?;
+    u64::try_from(start.timestamp().as_second()).ok()
+}
 
 /// One call to a model.
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +194,16 @@ impl Costs {
         self.spent.iter().filter(move |s| s.at >= since)
     }
 
+    /// What the calls of a known price cost since `since`.
+    #[must_use]
+    pub fn billed(&self, since: u64) -> Usd {
+        let mut sum = Usd(0.0);
+        for cost in self.since(since).filter_map(|s| s.cost) {
+            sum += cost;
+        }
+        sum
+    }
+
     /// What was spent since `since`, by model, the dearest first.
     #[must_use]
     pub fn totals(&self, since: u64) -> Vec<Total> {
@@ -176,6 +246,28 @@ impl Costs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn today_starts_at_midnight_where_the_person_is() {
+        // 2026-10-29 14:30 in UTC, 15:30 an hour east of it.
+        let now = 1_793_284_200;
+        assert_eq!(
+            Period::Today.since(now, &TimeZone::UTC),
+            1_793_232_000,
+            "midnight in UTC"
+        );
+        let east = TimeZone::fixed(jiff::tz::offset(1));
+        assert_eq!(Period::Today.since(now, &east), 1_793_228_400);
+        assert_eq!(Period::Last(3600).since(now, &east), now - 3600);
+        assert_eq!(Period::Last(7 * 24 * 3600).name(), "7d");
+        assert_eq!(Period::Last(6 * 3600).said(), "in the last 6h");
+        assert_eq!(Period::Today.start(), "midnight");
+        let mut costs = Costs::default();
+        costs.add(spent(1_793_220_000, "lab/a", Some(1.0)));
+        costs.add(spent(1_793_240_000, "lab/a", Some(0.25)));
+        costs.add(spent(1_793_250_000, "lab/b", None));
+        assert_eq!(costs.billed(Period::Today.since(now, &east)), Usd(0.25));
+    }
 
     fn spent(at: u64, model: &str, cost: Option<f64>) -> Spent {
         Spent {
