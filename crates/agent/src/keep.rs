@@ -21,6 +21,9 @@ pub struct Saved {
     pub role: Option<String>,
     /// Its task.
     pub task: String,
+    /// What the person asked of it since, the latest last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asked: Vec<String>,
     /// How hard it thinks, when the person chose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,

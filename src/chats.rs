@@ -150,6 +150,7 @@ mod tests {
             by: "person".to_owned(),
             role: None,
             task: "fix it".to_owned(),
+            asked: Vec::new(),
             effort: None,
             folder: Some(PathBuf::from("/place/lead")),
             context: 1200,

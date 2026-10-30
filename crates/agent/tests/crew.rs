@@ -500,6 +500,51 @@ async fn the_reviewer_answers_within_the_sandbox_when_the_autopilot_is_on() {
 }
 
 #[tokio::test]
+async fn the_reviewer_judges_by_the_person_s_latest_request_and_what_was_just_done() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    say("A new chat, with no context."),
+                    calls("run", serde_json::json!({"command": "echo checked"})),
+                    calls("run", serde_json::json!({"command": "git reset --hard"})),
+                    say("Coded."),
+                ],
+            ),
+            ("reviewer", vec![say("APPROVE: the check passed.")]),
+        ],
+        Settings {
+            reviewer: Some(model("cheap/reviewer")),
+            ..Settings::default()
+        },
+    );
+    f.crew.set_autopilot(true);
+    f.crew.start(
+        "lead",
+        &model("cheap/model"),
+        "is this a new chat?".into(),
+        PERSON,
+    );
+    f.settled().await;
+    f.crew.tell("lead", "code the first option".into()).unwrap();
+    f.settled().await;
+    let asked = f.model.seen_by("reviewer");
+    assert!(asked.contains("is this a new chat?"), "{asked}");
+    assert!(
+        asked.contains(
+            "What the person asked of it since, the latest last:\\n- code the first option"
+        ),
+        "{asked}"
+    );
+    // The fixture runs no command: it is said to have failed.
+    assert!(
+        asked.contains("- ran `echo checked`: failed: the command could not be run"),
+        "{asked}"
+    );
+}
+
+#[tokio::test]
 async fn the_reviewer_reads_what_a_make_target_does_and_thinks_as_hard_as_set() {
     let f = fixture(
         &[

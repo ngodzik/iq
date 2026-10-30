@@ -7,7 +7,7 @@
 //! or, the autopilot being on, to the reviewer, which may answer only what
 //! stays within the sandbox.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -50,6 +50,14 @@ const PEER_SPAN: Duration = Duration::from_secs(10 * 60);
 /// from the others', so that an answer reaches the crew that asked when
 /// one window shows several.
 static CREWS: AtomicU64 = AtomicU64::new(0);
+
+/// How many of the person's requests to an agent are kept, for the
+/// reviewer to judge its actions by what was asked last.
+const ASKED_KEPT: usize = 3;
+
+/// How many of an agent's last actions the reviewer is shown, with how
+/// they ended, so that a policy may rest on what was just done.
+const DONE_KEPT: usize = 8;
 
 /// The files a project's rules for agents are read from, each found: the
 /// shared format, then the other one many keep, which often imports it.
@@ -240,6 +248,12 @@ struct Member {
     /// What it does in the crew, when it was given a part.
     role: Option<String>,
     task: String,
+    /// What the person asked of it since, the latest last.
+    asked: Vec<String>,
+    /// What started its turn under way, or its last.
+    prompt: Option<String>,
+    /// Its last actions and how they ended, the latest last.
+    done: VecDeque<String>,
     /// The first message it has not read.
     read: usize,
     /// Its turn under way, when it works.
@@ -404,6 +418,7 @@ where
                 by: member.by.clone(),
                 role: member.role.clone(),
                 task: member.task.clone(),
+                asked: member.asked.clone(),
                 effort: member.effort,
                 folder: (!Arc::ptr_eq(&member.place, &self.inner.place))
                     .then(|| member.place.gate.workspace().to_path_buf()),
@@ -463,6 +478,9 @@ where
                 by: saved.by.clone(),
                 role: saved.role,
                 task: saved.task,
+                asked: saved.asked,
+                prompt: None,
+                done: VecDeque::new(),
                 read,
                 turn: None,
                 messages,
@@ -854,6 +872,9 @@ where
                 by: by.to_owned(),
                 role,
                 task: task.clone(),
+                asked: Vec::new(),
+                prompt: None,
+                done: VecDeque::new(),
                 read,
                 turn: None,
                 messages,
@@ -1057,6 +1078,15 @@ where
                 to: to.to_owned(),
                 text: text.clone(),
             });
+            if from == PERSON {
+                for (name, member) in &mut board.members {
+                    if name == to || to == ALL {
+                        member.asked.push(text.clone());
+                        let over = member.asked.len().saturating_sub(ASKED_KEPT);
+                        member.asked.drain(..over);
+                    }
+                }
+            }
             let started_it = board.members.get(from).is_some_and(|m| m.by == to);
             let resting = board
                 .members
@@ -1147,6 +1177,7 @@ where
         if member.turn.as_ref().is_some_and(|turn| !turn.is_finished()) {
             return;
         }
+        member.prompt = Some(prompt.clone());
         self.report(Event::Working {
             agent: name.clone(),
             prompt: prompt.clone(),
@@ -1449,6 +1480,14 @@ where
             Ok(output) => (output, true),
             Err(error) => (format!("Error: {error}"), false),
         };
+        if let Some(done) = review::done(&call.name, &input, &output, ok)
+            && let Some(member) = lock(&self.inner.board).members.get_mut(agent)
+        {
+            member.done.push_back(done);
+            while member.done.len() > DONE_KEPT {
+                member.done.pop_front();
+            }
+        }
         self.report(Event::Tool {
             agent: agent.to_owned(),
             name: call.name.clone(),
@@ -1820,12 +1859,17 @@ where
         reason: &str,
         does: Option<&str>,
     ) -> Result<(bool, String), String> {
-        let task = lock(&self.inner.board)
+        let work = lock(&self.inner.board)
             .members
             .get(agent)
-            .map(|member| member.task.clone())
+            .map(|member| review::Work {
+                task: member.task.clone(),
+                asked: member.asked.clone(),
+                prompt: member.prompt.clone(),
+                done: member.done.iter().cloned().collect(),
+            })
             .unwrap_or_default();
-        let prompt = review::prompt(&task, action, review::place(scope), reason, does);
+        let prompt = review::prompt(&work, action, review::place(scope), reason, does);
         let model = self
             .inner
             .settings
