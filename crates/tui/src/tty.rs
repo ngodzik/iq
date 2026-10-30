@@ -57,9 +57,14 @@ impl Tty {
             ));
         }
         terminal::enable_raw_mode()?;
+        // A panic of the thread that draws ends iq: the terminal is given
+        // back before it is said. Another ends a task, and iq draws on.
         let hook = std::panic::take_hook();
+        let drawing = std::thread::current().id();
         std::panic::set_hook(Box::new(move |info| {
-            give_back();
+            if std::thread::current().id() == drawing {
+                give_back();
+            }
             hook(info);
         }));
         let enhanced = matches!(terminal::supports_keyboard_enhancement(), Ok(true));

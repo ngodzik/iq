@@ -145,18 +145,19 @@ fn main() -> Result<()> {
     }
     // In the terminal, what is logged would write over what iq draws: it
     // goes to iq's folder instead.
-    let log = cli
+    let logged = cli
         .command
         .is_none()
         .then(|| home_folder().ok())
         .flatten()
-        .and_then(|folder| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(folder.join("iq.log"))
-                .ok()
-        });
+        .map(|folder| folder.join("iq.log"));
+    let log = logged.as_ref().and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    });
     // In its file, the warnings too: what went wrong is read there after;
     // on the terminal, the errors alone, unless RUST_LOG says.
     let filter = EnvFilter::try_from_default_env()
@@ -169,6 +170,9 @@ fn main() -> Result<()> {
             .init(),
         None => logging.with_writer(std::io::stderr).init(),
     }
+    if let Some(path) = logged {
+        log_panics(path);
+    }
     let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
     match &cli.command {
         Some(Command::Do {
@@ -179,6 +183,26 @@ fn main() -> Result<()> {
         Some(command) => runtime.block_on(run(command, &cli)),
         None => session(&runtime, &cli),
     }
+}
+
+/// Writes a panic to iq's log, `log`, with its backtrace: in the terminal,
+/// what is printed of it is drawn over by what iq draws. One of the thread
+/// that draws, which ends iq, is said too once the terminal is given back,
+/// with where it was written; another ends a task, and iq goes on.
+fn log_panics(log: PathBuf) {
+    let said = std::panic::take_hook();
+    let drawing = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!("iq panicked: {info}\n{backtrace}");
+        if std::thread::current().id() == drawing {
+            said(info);
+            eprintln!(
+                "iq: this is written in {}, with its backtrace",
+                log.display()
+            );
+        }
+    }));
 }
 
 /// The person's environment, as what iq runs on the machine for them gets
