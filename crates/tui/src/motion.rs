@@ -147,12 +147,14 @@ impl Motion {
             let head = f32::from(*from) + (f32::from(*to) - f32::from(*from)) * eased;
             let going = if to >= from { 1.0 } else { -1.0 };
             for back in 0..6 {
-                let x = head - going * back as f32;
+                // Rounded before it is bounded: a hair inside the edge
+                // rounds onto it.
+                let x = (head - going * back as f32).round();
                 if x < f32::from(row.left()) || x >= f32::from(row.right()) {
                     continue;
                 }
                 let lit = 1.0 - back as f32 / 6.0;
-                let cell = &mut buf[(x.round() as u16, row.top())];
+                let cell = &mut buf[(x as u16, row.top())];
                 let tint = p.faint.mix(p.accent, lit);
                 if back == 0 {
                     cell.set_symbol("●");
@@ -206,5 +208,26 @@ mod tests {
         motion.fly(&mut buf, row, &marks, &p);
         assert!(motion.glow("gone") > 0.9);
         assert_eq!(motion.glow("lead"), 0.0);
+    }
+
+    #[test]
+    fn a_spark_from_the_last_column_stays_within_its_row() {
+        let p = Palette::new(Theme::Ink, Depth::True);
+        let row = Rect::new(0, 0, 30, 1);
+        let marks: HashMap<String, u16> = [("lead".to_owned(), 29), (YOU.to_owned(), 4)]
+            .into_iter()
+            .collect();
+        // Its trail runs behind it, toward the edge it left, at every
+        // moment of its flight.
+        for ms in (0..FLIGHT.as_millis() as u64).step_by(5) {
+            let mut motion = Motion::default();
+            motion.flights.push(Flight {
+                from: "lead".into(),
+                to: YOU.into(),
+                since: Instant::now() - Duration::from_millis(ms),
+            });
+            let mut buf = Buffer::empty(row);
+            motion.fly(&mut buf, row, &marks, &p);
+        }
     }
 }
