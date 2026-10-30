@@ -175,7 +175,7 @@ pub(crate) fn verdict(answer: &str) -> (bool, String) {
         return (false, format!("its answer was not clear: {answer}"));
     }
     let why = rest[first.len()..]
-        .trim_start_matches([':', '.', ',', '-', ' ', '*', '\n'])
+        .trim_start_matches([':', '.', ',', '-', '\u{2013}', '\u{2014}', ' ', '*', '\n'])
         .lines()
         .next()
         .unwrap_or_default()
@@ -255,6 +255,13 @@ mod tests {
             (false, "it drops uncommitted work".to_owned())
         );
         assert_eq!(verdict("approve"), (true, "no reason given".to_owned()));
+        // The dashes models put after their verdict are not the reason's.
+        for dash in ['\u{2013}', '\u{2014}'] {
+            assert_eq!(
+                verdict(&format!("REFUSE {dash} its effects are unknown")),
+                (false, "its effects are unknown".to_owned())
+            );
+        }
         let (approved, why) = verdict("I think it is fine");
         assert!(!approved);
         assert!(why.contains("not clear"), "{why}");
