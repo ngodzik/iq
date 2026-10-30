@@ -449,15 +449,25 @@ done
             &gate,
             &tell,
         );
-        let said = updates(&feed, |u| {
-            matches!(
-                u,
-                Update::Plugin {
-                    told: Told::Commands(_),
-                    ..
-                }
-            )
-        });
+        // The two that did not start are said as they are tried, the
+        // commands as the one that did answers: in either order.
+        let mut said = Vec::new();
+        while said.iter().filter(|u| matches!(u, Update::Said(_))).count() < 2
+            || !said.iter().any(|u| {
+                matches!(
+                    u,
+                    Update::Plugin {
+                        told: Told::Commands(_),
+                        ..
+                    }
+                )
+            })
+        {
+            match feed.recv_timeout(Duration::from_secs(10)) {
+                Ok(update) => said.push(update),
+                Err(_) => panic!("{said:?}"),
+            }
+        }
         let texts: Vec<&str> = said
             .iter()
             .filter_map(|u| match u {
@@ -478,11 +488,13 @@ done
                 .any(|t| t.starts_with("the plugin ../x is not started")),
             "{texts:?}"
         );
-        let Some(Update::Plugin {
-            told: Told::Commands(commands),
-            ..
-        }) = said.last()
-        else {
+        let Some(commands) = said.iter().find_map(|u| match u {
+            Update::Plugin {
+                told: Told::Commands(commands),
+                ..
+            } => Some(commands),
+            _ => None,
+        }) else {
             panic!("{said:?}");
         };
         assert_eq!(commands[0].name, "ping");
