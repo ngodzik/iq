@@ -6,6 +6,7 @@ mod chats;
 mod journal;
 mod ledger;
 mod lock;
+mod plugins;
 mod settings;
 mod sync;
 mod terminal;
@@ -180,20 +181,40 @@ fn main() -> Result<()> {
     }
 }
 
-/// The crew of the current folder, what it does reported to `report`.
-/// Must run within the runtime.
-fn crew(cli: &Cli, settings: &Settings, report: Report) -> Result<Crew<OpenAiCompatible>> {
+/// The person's environment, as what iq runs on the machine for them gets
+/// it: their own variables, as they would run it, but iq's, which are of
+/// no use there, its provider's key among them.
+pub(crate) fn persons_env() -> impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os().filter(|(name, _)| {
+        name.to_str()
+            .is_none_or(|name| !name.starts_with("IQ_") && !name.starts_with("REQUESTY_"))
+    })
+}
+
+/// The gate of the current folder, as the settings open it.
+fn settings_gate(settings: &Settings) -> Result<Gate> {
+    gate(
+        settings.internet,
+        settings.autopilot_internet(),
+        settings.autopilot_host(),
+    )
+}
+
+/// The crew of the current folder, what it does reported to `report`,
+/// every action it takes judged by `gate`. Must run within the runtime.
+fn crew(
+    cli: &Cli,
+    settings: &Settings,
+    report: Report,
+    gate: Gate,
+) -> Result<Crew<OpenAiCompatible>> {
     let home = home_dir()?;
     let workspace = std::env::current_dir().context("reading the current folder")?;
     let mut crew_settings = settings.crew()?;
     crew_settings.rules = person_rules(&settings.rules_files(&home), &home);
     let crew = Crew::new(
         provider(cli),
-        gate(
-            settings.internet,
-            settings.autopilot_internet(),
-            settings.autopilot_host(),
-        )?,
+        gate,
         Helper::this_program()?,
         crew_settings,
         report,
@@ -525,6 +546,7 @@ async fn work(
             let _ = keep(&kept, &noted, &event);
             let _ = send.send(event);
         }),
+        settings_gate(&settings)?,
     )?;
     let listed = listed(&provider(cli), cli.api_key.is_some()).await;
     for said in unlisted(cli.endpoint(), &in_use(&settings, &lead)?, &listed) {
@@ -740,21 +762,38 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         let _inside = runtime.enter();
         observer.catch_up(iq_ui::now().saturating_sub(7 * 24 * 3600));
     }
+    // The person's plugins, before the crew: the chats put back as it
+    // starts are told to them as they come.
+    let gate = settings_gate(&settings)?;
+    let plugins = {
+        let _inside = runtime.enter();
+        Arc::new(plugins::Plugins::start(
+            &settings.plugins,
+            gate.workspace(),
+            std::env::var_os("PATH").as_deref(),
+            &gate,
+            &send,
+        ))
+    };
     let report: Report = {
         let send = send.clone();
         let ledger = Arc::clone(&ledger);
         let journal = Arc::clone(&journal);
         let observer = observer.clone();
+        let plugins = Arc::clone(&plugins);
         Arc::new(move |event: Event| {
             if let Some(task) = keep(&ledger, &journal, &event) {
                 observer.done(task);
+            }
+            if let Event::Placed { agent, folder, .. } = &event {
+                plugins.placed(agent, folder);
             }
             let _ = send.send(Update::Crew(event));
         })
     };
     let crew = {
         let _inside = runtime.enter();
-        crew(cli, &settings, report)?
+        crew(cli, &settings, report, gate)?
     };
     // The chats of earlier sessions come back before the person writes.
     for note in resume_chats(&settings, &crew, &send) {
@@ -814,6 +853,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let working = crew.clone();
     let syncing = sync.clone();
     let always = Arc::clone(&auto);
+    let asking = Arc::clone(&plugins);
     std::thread::spawn(move || {
         let _inside = handle.enter();
         for request in requests {
@@ -883,6 +923,13 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                         }
                     }
                 }
+                Request::Plugin {
+                    plugin,
+                    command,
+                    args,
+                    chat,
+                    folder,
+                } => asking.command(&plugin, command, args, chat, folder),
             }
         }
     });
@@ -891,6 +938,9 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let ran = iq_tui::run(feed, ask, board).context("running in the terminal");
     runtime.block_on(async {
         crew.end().await;
+        // The plugins after the crew, whose last commands may still need
+        // what they hold.
+        plugins.end().await;
         // What changed since the last sync leaves with iq, as the person
         // says.
         let changes = match &sync {

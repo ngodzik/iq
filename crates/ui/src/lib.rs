@@ -14,6 +14,7 @@ pub mod keys;
 pub mod look;
 pub mod named;
 pub mod observations;
+pub mod plugins;
 pub mod screen;
 pub mod steps;
 

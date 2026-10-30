@@ -53,21 +53,36 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         "Commands",
         "written after a /, completed with Tab",
     );
-    let name_width = COMMANDS
+    // iq's own, then the plugins', each said with its plugin.
+    let commands: Vec<(String, String)> = COMMANDS
         .iter()
-        .map(|c| c.name.len() + c.args.len() + 2)
+        .map(|c| (c.name.to_owned(), c.args.to_owned(), c.what.to_owned()))
+        .chain(seen.board.plugins().commands().map(|(plugin, c)| {
+            (
+                c.name.clone(),
+                c.args.clone(),
+                format!("{} ({plugin})", c.what),
+            )
+        }))
+        .map(|(name, args, what)| {
+            let named = if args.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{name} {args}")
+            };
+            (named, what)
+        })
+        .collect();
+    let name_width = commands
+        .iter()
+        .map(|(named, _)| named.len())
         .max()
         .unwrap_or(0)
         + 2;
-    for command in COMMANDS {
-        let named = if command.args.is_empty() {
-            format!("/{}", command.name)
-        } else {
-            format!("/{} {}", command.name, command.args)
-        };
+    for (named, what) in commands {
         lines.push(Line::from(vec![
             Span::styled(format!("  {named:<name_width$}"), p.fg(p.accent)),
-            Span::styled(command.what, p.fg(p.text)),
+            Span::styled(what, p.fg(p.text)),
         ]));
     }
     seen.heading(&mut lines, "Writing", "");

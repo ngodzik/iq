@@ -25,6 +25,7 @@ mod confine;
 mod error;
 mod files;
 mod gate;
+mod given;
 mod paths;
 mod redact;
 mod rules;

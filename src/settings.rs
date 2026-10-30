@@ -26,6 +26,7 @@
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set
 //! claude_memory = true                   # the notes kept of the project under ~/.claude read beside iq's own
+//! plugins = ["ports"]                    # programs of their own iq starts and speaks with: iq-ports for ports, found on the PATH, run on your machine as you; `cargo install --path plugins/ports` in iq's repository
 //!
 //! [keys]                                 # any shortcut moved, "" for none; Ctrl-S lists them
 //! costs = "ctrl+o"
@@ -143,6 +144,9 @@ pub(crate) struct Settings {
     /// Whether the notes kept of the project under `~/.claude` are read
     /// beside iq's.
     claude_memory: Option<bool>,
+    /// The plugins iq starts, by name: `iq-<name>` on the `PATH`.
+    #[serde(default)]
+    pub(crate) plugins: Vec<String>,
     /// The shortcuts moved: an action's name and its key.
     #[serde(default)]
     keys: BTreeMap<String, String>,
@@ -467,6 +471,9 @@ mod tests {
         )
         .unwrap();
         assert!(apart.worktree);
+        assert!(apart.plugins.is_empty());
+        let plugged: Settings = toml::from_str("plugins = [\"ports\"]").unwrap();
+        assert_eq!(plugged.plugins, ["ports"]);
         assert_eq!(apart.worktree_from(), "origin/main");
         assert_eq!(apart.worktree_setup(), ["uv sync"]);
         assert!(apart.chat_keep().is_none());

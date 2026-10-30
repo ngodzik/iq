@@ -155,19 +155,33 @@ impl Live<'_> {
     /// Where the agent the person writes to works, when it is a place of
     /// its own: the whole path, alone on its line for the person to select
     /// and paste in another terminal; written from `~` only when the whole
-    /// of it does not fit.
+    /// of it does not fit. When a plugin gave the place variables, the
+    /// line is the command that goes there and sets them, as its commands
+    /// get them.
     fn place(&self, width: usize) -> Option<Line<'static>> {
         let p = self.p;
         let agent = self.board.screen().talking_to()?;
         let place = self.board.crew().agent(agent)?.place.as_ref()?;
-        let lead = "  in ";
-        let mut path = place.display().to_string();
-        if text_width(lead) + text_width(&path) >= width {
-            path = short(&path);
+        let enter = self.board.plugins().enter(place);
+        let (lead, after) = match enter {
+            Some(line) => ("  cd ", format!(" && {line}")),
+            None => ("  in ", String::new()),
+        };
+        let full = place.display().to_string();
+        let mut path = if enter.is_some() {
+            shell_word(&full)
+        } else {
+            full.clone()
+        };
+        if text_width(lead) + text_width(&path) + text_width(&after) >= width
+            && shell_word(&full) == full
+        {
+            path = short(&full);
         }
         Some(Line::from(vec![
             Span::styled(lead, p.fg(p.faint)),
             Span::styled(path, p.fg(p.dim)),
+            Span::styled(after, p.fg(p.dim)),
         ]))
     }
 
@@ -538,6 +552,11 @@ impl Live<'_> {
                 left.push(Span::styled("sync failed", p.fg(p.warn)));
             }
         }
+        // What the person's plugins show: where localhost leads, say.
+        for status in self.board.plugins().statuses() {
+            left.push(sep());
+            left.push(Span::styled(status.to_owned(), p.fg(p.info)));
+        }
         let waiting = self.board.questions().len();
         if waiting > 0 {
             left.push(sep());
@@ -665,6 +684,20 @@ pub(crate) fn fold(text: &str, cursor: usize, width: usize) -> (Vec<String>, (us
         at = (used, rows.len() - 1);
     }
     (rows, at)
+}
+
+/// `text` as one word of a shell's line: as it is when nothing in it
+/// means more to the shell, else between single quotes.
+fn shell_word(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+=:@%".contains(c));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 #[cfg(test)]
@@ -831,6 +864,37 @@ mod tests {
         let others = drawn(&board, &history, 60);
         assert_eq!(others.len(), rows.len() - 1);
         assert!(others.iter().all(|row| !row.contains("worktrees")));
+        // A plugin that gave the place variables makes it the line that
+        // goes there and sets them; what it shows is on the status line.
+        for told in [
+            iq_ui::plugins::Told::Enter {
+                folder: "/data/iq/worktrees/lead".into(),
+                line: Some("eval \"$(iq-ports env)\"".into()),
+            },
+            iq_ui::plugins::Told::Status("localhost → lead".into()),
+        ] {
+            board.update(Update::Plugin {
+                plugin: "ports".into(),
+                told,
+            });
+        }
+        board.screen_mut().talk_to("lead");
+        let rows = drawn(&board, &history, 80);
+        assert_eq!(
+            rows[rows.len() - 2],
+            "  cd /data/iq/worktrees/lead && eval \"$(iq-ports env)\""
+        );
+        assert!(rows[rows.len() - 1].contains("· localhost → lead"));
+    }
+
+    #[test]
+    fn a_path_is_one_word_of_the_shell_quoted_only_when_it_must_be() {
+        assert_eq!(
+            shell_word("/data/iq/worktrees/lead-2"),
+            "/data/iq/worktrees/lead-2"
+        );
+        assert_eq!(shell_word("/Users/Jo Doe/w"), "'/Users/Jo Doe/w'");
+        assert_eq!(shell_word("/w/it's"), "'/w/it'\\''s'");
     }
 
     #[test]

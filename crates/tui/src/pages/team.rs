@@ -97,6 +97,13 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
                 p.fg(p.faint),
             )));
         }
+        // What the person's plugins say of it: its containers, say.
+        for said in seen.board.plugins().lines(&agent.name) {
+            lines.push(Line::from(Span::styled(
+                format!("       {}", cut(said, seen.width.saturating_sub(9))),
+                p.fg(p.dim),
+            )));
+        }
     }
     if let Some(agent) = agents.get(chosen) {
         seen.heading(

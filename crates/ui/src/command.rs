@@ -96,6 +96,24 @@ pub const COMMANDS: [Spec; 15] = [
     },
 ];
 
+/// The other names some commands answer to.
+const ALIASES: [&str; 5] = ["agents", "cost", "work", "help", "exit"];
+
+/// Whether `name` names one of iq's commands, by its name or another it
+/// answers to: a plugin's command never takes it.
+///
+/// # Examples
+///
+/// ```
+/// assert!(iq_ui::command::known("costs"));
+/// assert!(iq_ui::command::known("help"));
+/// assert!(!iq_ui::command::known("serve"));
+/// ```
+#[must_use]
+pub fn known(name: &str) -> bool {
+    COMMANDS.iter().any(|spec| spec.name == name) || ALIASES.contains(&name)
+}
+
 /// A command as read from its line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -330,6 +348,13 @@ mod tests {
             Command::Theme(Some(Theme::Ink))
         );
         assert_eq!(parse("/help").unwrap(), Command::Keys);
+        for name in COMMANDS.iter().map(|spec| spec.name).chain(ALIASES) {
+            let read = parse(&format!("/{name}"));
+            assert!(
+                !read.as_ref().is_err_and(|why| why.starts_with("iq has no")),
+                "{name}: {read:?}"
+            );
+        }
         assert_eq!(parse("/role ").unwrap(), Command::Role(String::new()));
         assert!(parse("/to").is_err());
         assert!(parse("/costs now").is_err());

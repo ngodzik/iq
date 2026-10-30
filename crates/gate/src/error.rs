@@ -89,4 +89,13 @@ pub enum GateError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A variable may not be given to the commands of a place.
+    #[error("{name} may not be given to commands: {reason}")]
+    Variable {
+        /// The variable's name.
+        name: String,
+        /// Why.
+        reason: &'static str,
+    },
 }

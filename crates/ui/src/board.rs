@@ -62,6 +62,13 @@ pub enum Update {
     Models(Vec<String>),
     /// Something iq says to the person in passing, in the conversation.
     Said(String),
+    /// What a plugin told iq to show.
+    Plugin {
+        /// The plugin.
+        plugin: String,
+        /// What it told.
+        told: crate::plugins::Told,
+    },
     /// How the crew starts: the lead's model, the reviewer's, whether
     /// the reviewer answers for the person, and whether every command has
     /// the internet.
@@ -135,6 +142,8 @@ pub struct Board {
     lens: crate::observations::Lens,
     /// The provider's models, as it lists them.
     models: Vec<String>,
+    /// What the person's plugins show.
+    plugins: crate::plugins::Plugins,
 }
 
 impl Default for Board {
@@ -163,7 +172,14 @@ impl Board {
             steps: crate::steps::Steps::default(),
             lens: crate::observations::Lens::default(),
             models: Vec::new(),
+            plugins: crate::plugins::Plugins::default(),
         }
+    }
+
+    /// What the person's plugins show.
+    #[must_use]
+    pub fn plugins(&self) -> &crate::plugins::Plugins {
+        &self.plugins
     }
 
     /// Whether iq was asked to stop, for the terminal to be given back.
@@ -280,7 +296,75 @@ impl Board {
         }
         let models = self.models_offered();
         let models: Vec<&str> = models.iter().map(String::as_str).collect();
-        command::complete(text, &agents, &models)
+        let mut completions = command::complete(text, &agents, &models);
+        completions.extend(self.plugin_completions(text, &agents));
+        completions
+    }
+
+    /// What completes `text` among the plugins' commands: their names, then
+    /// the chat one that takes something is for.
+    fn plugin_completions(&self, text: &str, agents: &[&str]) -> Vec<Completion> {
+        let Some(written) = text.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if written.contains('\n') {
+            return Vec::new();
+        }
+        match written.split_once(' ') {
+            None => self
+                .plugins
+                .commands()
+                .filter(|(_, spec)| spec.name.starts_with(written))
+                .map(|(plugin, spec)| Completion {
+                    line: if spec.args.is_empty() {
+                        format!("/{}", spec.name)
+                    } else {
+                        format!("/{} ", spec.name)
+                    },
+                    label: if spec.args.is_empty() {
+                        format!("/{}", spec.name)
+                    } else {
+                        format!("/{} {}", spec.name, spec.args)
+                    },
+                    what: format!("{} ({plugin})", spec.what),
+                })
+                .collect(),
+            Some((name, arg)) => match self.plugins.command(name) {
+                Some((_, spec)) if !spec.args.is_empty() && !arg.contains(' ') => agents
+                    .iter()
+                    .filter(|agent| agent.starts_with(arg) && **agent != arg)
+                    .map(|agent| Completion {
+                        line: format!("/{name} {agent}"),
+                        label: (*agent).to_owned(),
+                        what: "a chat".to_owned(),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
+        }
+    }
+
+    /// The request a plugin's command written as `text` makes, when it is
+    /// one: the chat written to and its place go with it.
+    fn plugin_request(&self, text: &str) -> Option<Request> {
+        let line = text.strip_prefix('/')?;
+        let (name, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        if command::known(name) {
+            return None;
+        }
+        let (plugin, spec) = self.plugins.command(name)?;
+        let chat = self.screen.talking_to().map(str::to_owned);
+        let folder = chat
+            .as_deref()
+            .and_then(|chat| self.crew.agent(chat))
+            .and_then(|view| view.place.clone());
+        Some(Request::Plugin {
+            plugin: plugin.to_owned(),
+            command: spec.name.clone(),
+            args: args.trim().to_owned(),
+            chat,
+            folder,
+        })
     }
 
     /// Takes a key the person pressed at `now`: `chord`, and the
@@ -589,6 +673,10 @@ impl Board {
         let text = self.screen.editor().text().trim().to_owned();
         if text.is_empty() {
             return Vec::new();
+        }
+        if let Some(request) = self.plugin_request(&text) {
+            self.screen.editor_mut().take();
+            return vec![request];
         }
         if text.starts_with('/') {
             return match command::parse(&text) {
@@ -929,6 +1017,7 @@ impl Board {
             Update::Models(models) => self.models = models,
             // The conversation is the terminal's: the board keeps nothing.
             Update::Said(_) => {}
+            Update::Plugin { plugin, told } => self.plugins.told(&plugin, told),
             Update::Started {
                 lead,
                 reviewer,
@@ -1345,6 +1434,55 @@ mod tests {
             }]
         );
         assert!(board.sync_ask().is_none());
+    }
+
+    #[test]
+    fn a_plugins_command_is_completed_and_sent_to_it_with_the_chat_written_to() {
+        use crate::plugins::{PluginCommand, Told};
+        let mut board = Board::default();
+        joined(&mut board, "lead", PERSON);
+        joined(&mut board, "fix", PERSON);
+        board.update(Update::Crew(Event::Placed {
+            agent: "lead".into(),
+            folder: "/w/lead".into(),
+            said: None,
+        }));
+        board.update(Update::Plugin {
+            plugin: "ports".into(),
+            told: Told::Commands(vec![PluginCommand {
+                name: "serve".into(),
+                args: "[chat]".into(),
+                what: "localhost to this chat".into(),
+            }]),
+        });
+        board.screen_mut().talk_to("lead");
+        board.screen_mut().editor_mut().set("/se");
+        let listed = board.completions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].line, "/serve ");
+        assert_eq!(listed[0].what, "localhost to this chat (ports)");
+        board.screen_mut().editor_mut().set("/serve f");
+        assert_eq!(board.completions()[0].line, "/serve fix");
+        board.screen_mut().editor_mut().set("/serve");
+        assert_eq!(
+            board.send(100),
+            [Request::Plugin {
+                plugin: "ports".into(),
+                command: "serve".into(),
+                args: String::new(),
+                chat: Some("lead".into()),
+                folder: Some("/w/lead".into()),
+            }]
+        );
+        assert!(board.screen().editor().is_empty());
+        // Gone, its command is iq's no more.
+        board.update(Update::Plugin {
+            plugin: "ports".into(),
+            told: Told::Gone,
+        });
+        board.screen_mut().editor_mut().set("/serve");
+        assert!(board.send(100).is_empty());
+        assert!(!board.screen().editor().is_empty());
     }
 
     #[test]

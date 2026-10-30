@@ -74,6 +74,19 @@ pub enum Request {
     /// Read what a sync would send, line by line, for the page that shows
     /// it.
     Changes,
+    /// Run a plugin's command.
+    Plugin {
+        /// The plugin.
+        plugin: String,
+        /// The command, as the plugin named it.
+        command: String,
+        /// What the person wrote after it, trimmed.
+        args: String,
+        /// The chat the person writes to, when they write to one.
+        chat: Option<String>,
+        /// Its place of its own, when it has one.
+        folder: Option<std::path::PathBuf>,
+    },
 }
 
 /// One thing in an agent's thread.

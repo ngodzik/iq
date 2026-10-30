@@ -220,11 +220,7 @@ impl Worktrees {
                 .args(["-c", &format!("exec 2>&1; {line}")])
                 .current_dir(folder)
                 .env_clear()
-                .envs(std::env::vars_os().filter(|(name, _)| {
-                    name.to_str().is_none_or(|name| {
-                        !name.starts_with("IQ_") && !name.starts_with("REQUESTY_")
-                    })
-                }))
+                .envs(crate::persons_env())
                 .stdin(std::process::Stdio::null())
                 .output();
             match output {

@@ -444,3 +444,87 @@ async fn in_a_worktree_a_command_commits_to_the_repository_whose_hooks_are_put_b
     );
     assert!(!top.join(".git/hooks/pre-push").exists());
 }
+
+#[tokio::test]
+async fn what_a_program_of_the_persons_gives_a_place_its_commands_get_and_no_others() {
+    let workspace = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let audit = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let log = audit.path().join("audit.log");
+    let rules = Rules::parse(
+        r#"
+        [[rule]]
+        prefix = ["docker"]
+        decision = "allow"
+        host = true
+        match = ["docker compose ps"]
+        "#,
+    )
+    .unwrap();
+    let gate = Gate::builder(&root)
+        .rules(rules)
+        .audit(&log)
+        .build()
+        .unwrap();
+    let elsewhere = gate.within(other.path(), Vec::new()).unwrap();
+    let vars = std::collections::BTreeMap::from([(
+        "COMPOSE_PROJECT_NAME".to_owned(),
+        "shop-lead".to_owned(),
+    )]);
+    // Given through any gate of the crew, by its folder as written.
+    elsewhere.give(workspace.path(), vars, "ports").unwrap();
+    let helper = || Helper::new(env!("CARGO_BIN_EXE_iq-sandbox"), Vec::<String>::new());
+    let said = "echo project=$COMPOSE_PROJECT_NAME";
+    let run_at = |gate: &Gate, line: &str| {
+        let action = Action::Run {
+            line: line.to_owned(),
+            folder: gate.workspace().to_path_buf(),
+            network: false,
+            host: false,
+        };
+        match gate.judge(action).unwrap() {
+            Judged::Allowed(permit) => permit,
+            Judged::Asked { pending, .. } => gate.approve(pending, Approver::Person).unwrap(),
+            Judged::Denied { reason } => panic!("{line}: {reason}"),
+        }
+    };
+    // In the sandbox, and on the machine, as a rule lets it.
+    let ran = gate
+        .sandbox(helper())
+        .run(run_at(&gate, said))
+        .await
+        .unwrap();
+    assert_eq!(ran.output.trim(), "project=shop-lead", "{}", ran.output);
+    let line = format!("docker compose ps 2>/dev/null; {said}");
+    let permit = run_at(&gate, &line);
+    assert!(matches!(permit.action(), Action::Run { host: true, .. }));
+    let ran = gate.sandbox(helper()).run(permit).await.unwrap();
+    assert!(
+        ran.output.trim().ends_with("project=shop-lead"),
+        "{}",
+        ran.output
+    );
+    // Another place's commands get nothing.
+    let ran = elsewhere
+        .sandbox(helper())
+        .run(run_at(&elsewhere, said))
+        .await
+        .unwrap();
+    assert_eq!(ran.output.trim(), "project=");
+    // What the sandbox rests on is not given, and the log says who gave
+    // what, by name.
+    let path = std::collections::BTreeMap::from([("PATH".to_owned(), "/x".to_owned())]);
+    assert!(gate.give(&root, path, "ports").is_err());
+    let written = std::fs::read_to_string(&log).unwrap();
+    let given = written
+        .lines()
+        .find(|line| line.contains(r#""event":"given""#))
+        .unwrap();
+    assert!(
+        given.contains(r#""names":["COMPOSE_PROJECT_NAME"]"#),
+        "{given}"
+    );
+    assert!(given.contains(r#""by":"ports""#), "{given}");
+    assert!(!written.contains("/x"));
+}

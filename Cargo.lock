@@ -985,6 +985,7 @@ dependencies = [
  "iq-llm",
  "iq-memory",
  "iq-observe",
+ "iq-plugin",
  "iq-sync",
  "iq-tui",
  "iq-ui",
@@ -1070,6 +1071,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "iq-plugin"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

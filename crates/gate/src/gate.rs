@@ -1,6 +1,7 @@
 //! The gate: every action judged in one place, by what it reaches and by
 //! the rules, written down before it is taken.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +11,7 @@ use serde::Serialize;
 use crate::action::{Action, Approver, Judged, Pending, Permit, Scope};
 use crate::audit::Audit;
 use crate::error::GateError;
+use crate::given::{Given, refused};
 use crate::paths;
 use crate::rules::{Decision, Rule, Rules};
 use crate::sandbox::{Bounds, Helper, Sandbox};
@@ -41,6 +43,19 @@ enum Event<'a> {
         by: Approver,
         reason: &'a str,
     },
+    /// Variables a program of the person's gave the commands of a place.
+    Given {
+        folder: &'a Path,
+        names: Vec<&'a str>,
+        by: &'a str,
+    },
+    /// What a program of the person's ran on the machine, outside the
+    /// gate, as it said.
+    Outside {
+        line: &'a str,
+        folder: &'a Path,
+        by: &'a str,
+    },
 }
 
 /// Programs that cannot send anything over a network, whatever they are
@@ -66,6 +81,8 @@ pub struct Gate {
     /// Whether a reviewer may let a command run on the machine itself,
     /// the autopilot on, as the person's policy says.
     reviewer_host: Arc<AtomicBool>,
+    /// The variables the person's programs gave each place's commands.
+    given: Given,
 }
 
 /// Builds a [`Gate`].
@@ -171,6 +188,7 @@ impl GateBuilder {
             internet: Arc::new(AtomicBool::new(self.internet)),
             reviewer_internet: Arc::new(AtomicBool::new(self.reviewer_internet)),
             reviewer_host: Arc::new(AtomicBool::new(self.reviewer_host)),
+            given: Given::default(),
         })
     }
 }
@@ -227,7 +245,83 @@ impl Gate {
             internet: Arc::clone(&self.internet),
             reviewer_internet: Arc::clone(&self.reviewer_internet),
             reviewer_host: Arc::clone(&self.reviewer_host),
+            given: self.given.clone(),
         })
+    }
+
+    /// Gives the commands run in `folder` (this gate's workspace, or that
+    /// of a gate made [`within`](Self::within) it or from the same one)
+    /// the variables `vars` from now on, in place of those given before;
+    /// none takes them back. `by` names the program of the person's that
+    /// gives them, as the audit log writes it. The commands are held as
+    /// before: the variables widen nothing.
+    ///
+    /// # Errors
+    ///
+    /// `folder` cannot be resolved; a variable names what the sandbox and
+    /// the shell rest on, or a secret; or the audit log cannot be written.
+    /// Nothing is given then.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::BTreeMap;
+    /// use iq_gate::Gate;
+    ///
+    /// let workspace = tempfile::tempdir()?;
+    /// let gate = Gate::builder(workspace.path()).build()?;
+    /// let vars = |name: &str| BTreeMap::from([(name.to_owned(), "x".to_owned())]);
+    /// gate.give(workspace.path(), vars("COMPOSE_PROJECT_NAME"), "ports")?;
+    /// assert!(gate.give(workspace.path(), vars("LD_PRELOAD"), "ports").is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn give(
+        &self,
+        folder: &Path,
+        vars: BTreeMap<String, String>,
+        by: &str,
+    ) -> Result<(), GateError> {
+        let resolved = folder
+            .canonicalize()
+            .map_err(|source| GateError::Workspace {
+                path: folder.to_path_buf(),
+                source,
+            })?;
+        if let Some((name, reason)) = vars
+            .keys()
+            .find_map(|name| refused(name).map(|reason| (name, reason)))
+        {
+            return Err(GateError::Variable {
+                name: name.clone(),
+                reason,
+            });
+        }
+        self.record(&Event::Given {
+            folder: &resolved,
+            names: vars.keys().map(String::as_str).collect(),
+            by,
+        })?;
+        self.given.set(resolved, vars);
+        Ok(())
+    }
+
+    /// Writes to the audit log that a program of the person's, `by`, runs
+    /// `line` in `folder` on the machine, outside the gate: a plugin they
+    /// set, as it says, or the plugin itself as iq starts it.
+    ///
+    /// # Errors
+    ///
+    /// The audit log cannot be written.
+    pub fn outside(&self, by: &str, line: &str, folder: &Path) -> Result<(), GateError> {
+        self.record(&Event::Outside { line, folder, by })
+    }
+
+    /// Writes `event` to the audit log, when there is one.
+    fn record(&self, event: &Event<'_>) -> Result<(), GateError> {
+        match &self.audit {
+            Some(audit) => audit.write(event),
+            None => Ok(()),
+        }
     }
 
     /// Whether a reviewer may let a command run on the machine itself.
@@ -274,7 +368,12 @@ impl Gate {
     /// The sandbox the commands this gate allows run in, started through
     /// `helper`.
     pub fn sandbox(&self, helper: Helper) -> Sandbox {
-        Sandbox::new(helper, self.bounds.clone(), self.audit.clone())
+        Sandbox::new(
+            helper,
+            self.bounds.clone(),
+            self.audit.clone(),
+            self.given.clone(),
+        )
     }
 
     /// Judges `action`. Its paths are resolved as the system reaches them,

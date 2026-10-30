@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::action::{Action, Permit};
 use crate::audit::Audit;
 use crate::error::GateError;
+use crate::given::Given;
 use crate::redact::{Redactor, secret_name};
 use crate::watch::Watch;
 
@@ -276,6 +277,8 @@ pub struct Sandbox {
     /// background: stopped when the sandbox ends, whether their turn ended
     /// or was cut short.
     leftovers: Arc<Mutex<Vec<u32>>>,
+    /// The variables the person's programs gave each place's commands.
+    given: Given,
 }
 
 /// The process holding a network of the sandbox's own: it lets it go when
@@ -308,7 +311,7 @@ enum Event<'a> {
 }
 
 impl Sandbox {
-    pub(crate) fn new(helper: Helper, bounds: Bounds, audit: Option<Audit>) -> Self {
+    pub(crate) fn new(helper: Helper, bounds: Bounds, audit: Option<Audit>, given: Given) -> Self {
         Self {
             helper,
             bounds,
@@ -317,6 +320,7 @@ impl Sandbox {
             quiet: QUIET,
             holder: Arc::default(),
             leftovers: Arc::default(),
+            given,
         }
     }
 
@@ -388,9 +392,12 @@ impl Sandbox {
 
     /// Runs the command `permit` allows: in the sandbox, or on the machine
     /// itself when the permit says so, as the person would run it, with
-    /// their environment but iq's own variables. Either way its output is
-    /// cleared of secrets, and what it wrote where code runs later is put
-    /// back.
+    /// their environment but iq's own variables. Either way it gets what
+    /// the person's programs gave its place (see [`Gate::give`]), its
+    /// output is cleared of secrets, and what it wrote where code runs
+    /// later is put back.
+    ///
+    /// [`Gate::give`]: crate::Gate::give
     pub async fn run(&self, permit: Permit) -> Result<Ran, GateError> {
         let Action::Run {
             line,
@@ -460,6 +467,9 @@ impl Sandbox {
             }
             command
         };
+        // What the person's programs gave this place, the plugin that keeps
+        // its containers apart among them, either way.
+        command.envs(self.given.of(workspace));
         command
             .current_dir(&folder)
             .stdin(Stdio::null())
