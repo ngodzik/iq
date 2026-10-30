@@ -16,7 +16,7 @@
 //! command_timeout = 600                  # seconds a command may run before it is stopped
 //! command_quiet = 180                    # seconds a command may write nothing before it is stopped: one waiting for a login, or an answer at a terminal
 //! provider_retries = 6                   # times a call is sent again while its provider is out of capacity (a quota, an overload), waiting as it asks, longer each time; 0 never
-//! worktree = false                       # true: each chat you start works in a worktree of its own, on a branch iq/<chat>; your checkout is left as it is
+//! worktree = false                       # true: each chat you start works in a worktree of its own, on a branch iq/<chat>, its path under where you write; your checkout is left as it is
 //! worktree_from = "HEAD"                 # what a worktree starts from: your checkout's commit, or a branch such as "origin/main"
 //! worktree_setup = ["uv sync"]           # commands run in a worktree as it is made, on your machine, to give it the project's environment
 //! chat_keep = 30                         # days a chat may go untouched before iq forgets it as it starts, its worktree with it when nothing there is uncommitted; 0 never

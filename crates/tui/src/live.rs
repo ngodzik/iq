@@ -1,8 +1,9 @@
 //! The live part, below the conversation: the agents at work and what
 //! they do, each with its latest steps since its last line of text, the
 //! oldest question waiting for the person, a word to them,
-//! the commands that complete what they write, where they write, and the
-//! status line, along which messages run between the agents.
+//! the commands that complete what they write, where they write, the
+//! folder of its own the agent they write to works in, and the status
+//! line, along which messages run between the agents.
 
 use std::collections::HashMap;
 
@@ -144,8 +145,30 @@ impl Live<'_> {
             parts.push(Part::Lines(listed));
         }
         parts.push(self.input(width));
+        if let Some(place) = self.place(width) {
+            parts.push(Part::Lines(vec![place]));
+        }
         parts.push(Part::Status);
         parts
+    }
+
+    /// Where the agent the person writes to works, when it is a place of
+    /// its own: the whole path, alone on its line for the person to select
+    /// and paste in another terminal; written from `~` only when the whole
+    /// of it does not fit.
+    fn place(&self, width: usize) -> Option<Line<'static>> {
+        let p = self.p;
+        let agent = self.board.screen().talking_to()?;
+        let place = self.board.crew().agent(agent)?.place.as_ref()?;
+        let lead = "  in ";
+        let mut path = place.display().to_string();
+        if text_width(lead) + text_width(&path) >= width {
+            path = short(&path);
+        }
+        Some(Line::from(vec![
+            Span::styled(lead, p.fg(p.faint)),
+            Span::styled(path, p.fg(p.dim)),
+        ]))
     }
 
     /// A line for each agent at work: what it does, for how long, and
@@ -770,6 +793,44 @@ mod tests {
         let status = rows.last().unwrap();
         assert!(status.contains("1 waiting for you"));
         assert!(status.ends_with("you ● lead"));
+    }
+
+    #[test]
+    fn the_folder_of_its_own_the_agent_written_to_works_in_stays_in_sight() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        for agent in ["lead", "other"] {
+            crew(
+                &mut board,
+                &mut history,
+                Event::Joined {
+                    agent: agent.into(),
+                    model: "m".into(),
+                    by: PERSON.into(),
+                },
+                &p,
+            );
+        }
+        crew(
+            &mut board,
+            &mut history,
+            Event::Placed {
+                agent: "lead".into(),
+                folder: "/data/iq/worktrees/lead".into(),
+                said: Some("works in a worktree of its own".into()),
+            },
+            &p,
+        );
+        // Written to, its folder shows whole, just over the status line.
+        board.screen_mut().talk_to("lead");
+        let rows = drawn(&board, &history, 60);
+        assert_eq!(rows[rows.len() - 2], "  in /data/iq/worktrees/lead");
+        // An agent in the crew's workspace, or a new chat, has no such line.
+        board.screen_mut().talk_to("other");
+        let others = drawn(&board, &history, 60);
+        assert_eq!(others.len(), rows.len() - 1);
+        assert!(others.iter().all(|row| !row.contains("worktrees")));
     }
 
     #[test]
