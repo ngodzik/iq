@@ -18,6 +18,7 @@
 //! provider_retries = 6                   # times a call is sent again while its provider is out of capacity (a quota, an overload), waiting as it asks, longer each time; 0 never
 //! worktree = false                       # true: each chat you start works in a worktree of its own, on a branch iq/<chat>, its path under where you write; your checkout is left as it is
 //! worktree_from = "HEAD"                 # what a worktree starts from: your checkout's commit, or a branch such as "origin/main"
+//! worktree_copy = [".env"]               # files of your checkout git does not keep, copied into a worktree as it is made, where it has their folder, never over one; a name alone is looked for in every folder
 //! worktree_setup = ["uv sync"]           # commands run in a worktree as it is made, on your machine, to give it the project's environment
 //! chat_keep = 30                         # days a chat may go untouched before iq forgets it as it starts, its worktree with it when nothing there is uncommitted; 0 never
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
@@ -128,6 +129,10 @@ pub(crate) struct Settings {
     pub(crate) worktree: bool,
     /// What a worktree starts from; `HEAD` unless set.
     worktree_from: Option<String>,
+    /// The files of the checkout git does not keep, copied into a
+    /// worktree as it is made.
+    #[serde(default)]
+    worktree_copy: Vec<String>,
     /// The commands run in a worktree as it is made.
     #[serde(default)]
     worktree_setup: Vec<String>,
@@ -318,11 +323,13 @@ impl Settings {
     /// The commands run in a worktree as it is made, those that say
     /// something.
     pub(crate) fn worktree_setup(&self) -> Vec<String> {
-        self.worktree_setup
-            .iter()
-            .map(|line| line.trim().to_owned())
-            .filter(|line| !line.is_empty())
-            .collect()
+        said(&self.worktree_setup)
+    }
+
+    /// The patterns of the files copied from the checkout into a worktree
+    /// as it is made, those that say something.
+    pub(crate) fn worktree_copy(&self) -> Vec<String> {
+        said(&self.worktree_copy)
     }
 
     /// How long a chat may go untouched before it is forgotten, its
@@ -430,6 +437,15 @@ impl Settings {
     }
 }
 
+/// The lines of `lines` that say something, trimmed.
+fn said(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| line.trim().to_owned())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
 /// Where `path` is: `~/` in `home`, a relative path in `base`.
 fn placed(path: &str, home: &Path, base: &Path) -> PathBuf {
     match path.strip_prefix("~/") {
@@ -467,7 +483,7 @@ mod tests {
         assert_eq!(set.worktree_from(), "HEAD");
         assert_eq!(set.chat_keep().unwrap().as_secs(), 30 * 24 * 3600);
         let apart: Settings = toml::from_str(
-            "worktree = true\nworktree_from = \" origin/main \"\nworktree_setup = [\"uv sync\", \" \"]\nchat_keep = 0",
+            "worktree = true\nworktree_from = \" origin/main \"\nworktree_setup = [\"uv sync\", \" \"]\nworktree_copy = [\" .env \", \"\"]\nchat_keep = 0",
         )
         .unwrap();
         assert!(apart.worktree);
@@ -476,6 +492,8 @@ mod tests {
         assert_eq!(plugged.plugins, ["ports"]);
         assert_eq!(apart.worktree_from(), "origin/main");
         assert_eq!(apart.worktree_setup(), ["uv sync"]);
+        assert_eq!(apart.worktree_copy(), [".env"]);
+        assert!(set.worktree_copy().is_empty());
         assert!(apart.chat_keep().is_none());
         assert!(set.autopilot_skill.is_none());
         let local: Settings = toml::from_str("autopilot_skill = \"local-review\"").unwrap();

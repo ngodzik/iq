@@ -255,6 +255,7 @@ fn worktrees(settings: &Settings, home: &Path, workspace: &Path) -> Result<workt
         workspace,
         &folder,
         settings.worktree_from(),
+        settings.worktree_copy(),
         settings.worktree_setup(),
     )
     .map_err(|why| anyhow::anyhow!("no worktree for the chats: {why}"))

@@ -2,9 +2,11 @@
 //! a worktree of the project's repository, on a branch of its own from
 //! what is checked out, or from the commit the settings name, kept in iq's
 //! folder of data. The person's checkout is left as it is while the agents
-//! work, and their work is a branch to merge, or to drop. The commands the
-//! settings list are run in the worktree as it is made, on the machine, to
-//! give it the project's environment. A worktree stays until the person
+//! work, and their work is a branch to merge, or to drop. The files the
+//! settings name that git does not keep (a project's local `.env`) are
+//! copied from the checkout into the worktree as it is made, then the
+//! commands they list are run there, on the machine, to give it the
+//! project's environment. A worktree stays until the person
 //! removes it, or until iq finds it untouched for as long as the settings
 //! say: it is then removed when nothing in it is uncommitted, and its
 //! branch with it when its work was merged.
@@ -40,6 +42,9 @@ pub(crate) struct Worktrees {
     from: String,
     /// The commands run in a worktree as it is made, on the machine.
     setup: Vec<String>,
+    /// The patterns of the files copied from the checkout as a worktree is
+    /// made, those git does not keep.
+    copy: Vec<String>,
 }
 
 /// A worktree iq made, as found again.
@@ -50,8 +55,8 @@ struct Found {
 
 impl Worktrees {
     /// Worktrees of the repository `workspace` is in, made under
-    /// `folder`, each from `from` (`HEAD` when empty) and set up with
-    /// `setup`.
+    /// `folder`, each from `from` (`HEAD` when empty), given the files of
+    /// the checkout `copy` names, and set up with `setup`.
     ///
     /// # Errors
     ///
@@ -60,6 +65,7 @@ impl Worktrees {
         workspace: &Path,
         folder: &Path,
         from: &str,
+        copy: Vec<String>,
         setup: Vec<String>,
     ) -> Result<Self, String> {
         let top = PathBuf::from(git(workspace, &["rev-parse", "--show-toplevel"])?);
@@ -86,6 +92,7 @@ impl Worktrees {
             folder,
             from: if from.is_empty() { "HEAD" } else { from }.to_owned(),
             setup,
+            copy,
         })
     }
 
@@ -210,6 +217,70 @@ impl Worktrees {
         latest
     }
 
+    /// Copies into the worktree `folder` the files of the checkout the
+    /// patterns name, which git does not keep: only into a folder the
+    /// worktree has, which spares the checkout's own (its packages, what it
+    /// built), and never over a file already there, so that what git keeps
+    /// is the commit's. A pattern naming no folder (`.env`) is looked for
+    /// in each, as `.gitignore` reads it. Says what was copied.
+    fn copy_untracked(&self, folder: &Path) -> String {
+        if self.copy.is_empty() {
+            return String::new();
+        }
+        let listed = git(
+            folder,
+            &["ls-tree", "-r", "-d", "-z", "--name-only", "HEAD"],
+        );
+        let folders = std::iter::once(String::new()).chain(
+            listed
+                .unwrap_or_default()
+                .split('\0')
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        );
+        let mut copied = Vec::new();
+        let mut failed = Vec::new();
+        for under in folders {
+            let Ok(entries) = std::fs::read_dir(self.top.join(&under)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = if under.is_empty() {
+                    name
+                } else {
+                    format!("{under}/{name}")
+                };
+                if !self
+                    .copy
+                    .iter()
+                    .any(|pattern| iq_core::glob_matches(pattern, &path))
+                {
+                    continue;
+                }
+                match copy_new(&entry.path(), &folder.join(&path)) {
+                    Ok(true) => copied.push(path),
+                    Ok(false) => {}
+                    Err(error) => failed.push(format!("{path} ({error})")),
+                }
+            }
+        }
+        copied.sort();
+        let mut said = String::new();
+        if !copied.is_empty() {
+            said.push_str(&format!(
+                " Copied from your checkout, as git does not keep them: {}.",
+                copied.join(", ")
+            ));
+        }
+        if !failed.is_empty() {
+            failed.sort();
+            said.push_str(&format!(" Not copied: {}.", failed.join(", ")));
+        }
+        said
+    }
+
     /// Runs the set-up commands in `folder`, on the machine, as the
     /// person would: with their environment, less iq's own variables.
     /// Says how each went.
@@ -307,6 +378,8 @@ impl Placer for Worktrees {
         } else {
             format!("{} ({base})", self.from)
         };
+        // The files first, which the commands may need.
+        let copied = self.copy_untracked(&folder);
         let set_up = self.set_up(&folder);
         Ok(Placed {
             folder: folder.clone(),
@@ -315,12 +388,35 @@ impl Placer for Worktrees {
                 "works in a worktree of its own, {}, on the branch {branch} from {from}: your \
                  checkout is left as it is, and what is not committed there is not in the \
                  worktree. `git merge {branch}` takes its work; `git worktree remove {}` removes \
-                 the worktree after.{set_up}",
+                 the worktree after.{copied}{set_up}",
                 folder.display(),
                 folder.display()
             ),
         })
     }
+}
+
+/// Copies the file `from` to `to`, a new file with the same rights, unless
+/// `to` is there already or `from` is no file; whether it did.
+fn copy_new(from: &Path, to: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let meta = std::fs::metadata(from)?;
+    if !meta.is_file() || std::fs::symlink_metadata(to).is_ok() {
+        return Ok(false);
+    }
+    let mut source = std::fs::File::open(from)?;
+    let mut target = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(meta.permissions().mode() & 0o777)
+        .open(to)
+    {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    std::io::copy(&mut source, &mut target)?;
+    Ok(true)
 }
 
 /// What `git args` prints in `folder`, trimmed; else what it said.
@@ -373,7 +469,7 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         // Not committed: the worktree starts from the commit.
         std::fs::write(dir.path().join("draft"), "draft\n").unwrap();
-        let placer = Worktrees::open(&sub, worktrees.path(), "", Vec::new()).unwrap();
+        let placer = Worktrees::open(&sub, worktrees.path(), "", Vec::new(), Vec::new()).unwrap();
         let first = placer.place("lead").unwrap();
         let second = placer.place("lead").unwrap();
         let top = dir.path().canonicalize().unwrap();
@@ -433,6 +529,7 @@ mod tests {
             dir.path(),
             worktrees.path(),
             "base",
+            Vec::new(),
             vec!["echo ready > made".to_owned(), "exit 3".to_owned()],
         )
         .unwrap();
@@ -453,15 +550,77 @@ mod tests {
             "{}",
             placed.said
         );
-        let nowhere = Worktrees::open(dir.path(), worktrees.path(), "no-such", Vec::new()).unwrap();
+        let nowhere = Worktrees::open(
+            dir.path(),
+            worktrees.path(),
+            "no-such",
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
         assert!(nowhere.place("lead").is_err());
+    }
+
+    #[test]
+    fn the_files_git_does_not_keep_are_copied_where_the_worktree_has_their_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = repository();
+        let top = dir.path();
+        std::fs::create_dir_all(top.join("api")).unwrap();
+        std::fs::write(top.join("api/main.py"), "app\n").unwrap();
+        std::fs::write(top.join(".gitignore"), ".env*\nnode_modules/\n").unwrap();
+        run_git(top, &["add", "."]);
+        run_git(top, &["commit", "-qm", "An api"]);
+        std::fs::write(top.join(".env"), "TOKEN=x\n").unwrap();
+        std::fs::set_permissions(top.join(".env"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(top.join("api/.env.local"), "DB=y\n").unwrap();
+        // A folder git does not keep is not looked into, nor is a file
+        // the patterns do not name copied, nor one git keeps changed.
+        std::fs::create_dir_all(top.join("node_modules/pkg")).unwrap();
+        std::fs::write(top.join("node_modules/pkg/.env"), "no\n").unwrap();
+        std::fs::write(top.join("notes"), "mine\n").unwrap();
+        std::fs::write(top.join("file"), "draft\n").unwrap();
+        let worktrees = tempfile::tempdir().unwrap();
+        let placer = Worktrees::open(
+            top,
+            worktrees.path(),
+            "",
+            vec![".env*".to_owned(), "file".to_owned()],
+            vec!["cat .env > seen".to_owned()],
+        )
+        .unwrap();
+        let placed = placer.place("lead").unwrap();
+        let at = |path: &str| placed.folder.join(path);
+        assert_eq!(std::fs::read_to_string(at(".env")).unwrap(), "TOKEN=x\n");
+        let mode = std::fs::metadata(at(".env")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(at("api/.env.local")).unwrap(),
+            "DB=y\n"
+        );
+        assert!(!at("node_modules").exists());
+        assert!(!at("notes").exists());
+        assert_eq!(std::fs::read_to_string(at("file")).unwrap(), "kept\n");
+        // Copied before the set-up, which reads them.
+        assert_eq!(std::fs::read_to_string(at("seen")).unwrap(), "TOKEN=x\n");
+        assert!(
+            placed.said.contains(
+                "Copied from your checkout, as git does not keep them: .env, api/.env.local. \
+                 `cat .env > seen` ran."
+            ),
+            "{}",
+            placed.said
+        );
+        // Their values are never said.
+        assert!(!placed.said.contains("TOKEN"), "{}", placed.said);
     }
 
     #[test]
     fn worktrees_untouched_for_long_are_removed_unless_they_hold_work() {
         let dir = repository();
         let worktrees = tempfile::tempdir().unwrap();
-        let placer = Worktrees::open(dir.path(), worktrees.path(), "", Vec::new()).unwrap();
+        let placer =
+            Worktrees::open(dir.path(), worktrees.path(), "", Vec::new(), Vec::new()).unwrap();
         let merged = placer.place("merged").unwrap();
         let dirty = placer.place("dirty").unwrap();
         let apart = placer.place("apart").unwrap();
@@ -515,6 +674,6 @@ mod tests {
     fn outside_a_repository_there_is_no_worktree() {
         let dir = tempfile::tempdir().unwrap();
         let worktrees = tempfile::tempdir().unwrap();
-        assert!(Worktrees::open(dir.path(), worktrees.path(), "", Vec::new()).is_err());
+        assert!(Worktrees::open(dir.path(), worktrees.path(), "", Vec::new(), Vec::new()).is_err());
     }
 }
