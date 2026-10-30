@@ -1,0 +1,12 @@
+[package]
+name    = "iq-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "What iq and its plugins say to each other: programs of their own, apart from iq's binary, that iq starts and speaks with over their standard input and output."
+
+[dependencies]
+thiserror.workspace  = true
+serde.workspace      = true
+serde_json.workspace = true
