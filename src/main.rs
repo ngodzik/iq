@@ -539,14 +539,35 @@ async fn work(
     let (send, mut events) = tokio::sync::mpsc::unbounded_channel();
     let kept = Arc::clone(&ledger);
     let noted = Arc::clone(&journal);
+    // The person's plugins, as in iq's terminal: the places the agents work
+    // in are told to them, and get the variables they give; what they say
+    // is printed.
+    let gate = settings_gate(&settings)?;
+    let (told, heard) = std::sync::mpsc::channel();
+    let plugins = Arc::new(plugins::Plugins::start(
+        &settings.plugins,
+        gate.workspace(),
+        std::env::var_os("PATH").as_deref(),
+        &gate,
+        &told,
+    ));
+    std::thread::spawn(move || {
+        for update in heard {
+            terminal::heard(&update);
+        }
+    });
+    let placing = Arc::clone(&plugins);
     let crew = crew(
         cli,
         &settings,
         Arc::new(move |event: Event| {
             let _ = keep(&kept, &noted, &event);
+            if let Event::Placed { agent, folder, .. } = &event {
+                placing.placed(agent, folder);
+            }
             let _ = send.send(event);
         }),
-        settings_gate(&settings)?,
+        gate,
     )?;
     let listed = listed(&provider(cli), cli.api_key.is_some()).await;
     for said in unlisted(cli.endpoint(), &in_use(&settings, &lead)?, &listed) {
@@ -582,6 +603,7 @@ async fn work(
         }
     }
     crew.end().await;
+    plugins.end().await;
     println!("\n{}", tally.summary());
     ledger.trim();
     Ok(())

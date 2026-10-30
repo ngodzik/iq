@@ -121,6 +121,31 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
     None
 }
 
+/// Prints what a plugin said that the person reads: its words, and the line
+/// that sets a place's variables in a terminal there. What it shows on the
+/// status line and the Team page is for iq's own terminal.
+pub(crate) fn heard(update: &iq_ui::Update) {
+    use iq_ui::plugins::Told;
+    let mut out = std::io::stdout().lock();
+    let _ = match update {
+        iq_ui::Update::Said(text) => writeln!(out, "\n! {text}"),
+        iq_ui::Update::Plugin {
+            told:
+                Told::Enter {
+                    folder,
+                    line: Some(line),
+                },
+            ..
+        } => writeln!(
+            out,
+            "\n! in a terminal there: cd {} && {line}",
+            folder.display()
+        ),
+        _ => Ok(()),
+    };
+    let _ = out.flush();
+}
+
 /// Asks the person on the terminal; no answer refuses.
 pub(crate) fn ask(question: &str) -> bool {
     print!("{question} Allow it? [y/N] ");
