@@ -281,6 +281,23 @@ pub(crate) fn replaced(text: &str, old: &str, new: &str, all: bool) -> Result<St
     }
 }
 
+/// A call's input in short, from the arguments the model wrote: the
+/// command, the path or the name it is given, on one line; nothing when
+/// they are not JSON.
+///
+/// # Examples
+///
+/// ```
+/// let written = r#"{"command": "cargo test\ncargo fmt"}"#;
+/// assert_eq!(iq_agent::tool_input(written), "cargo test…");
+/// ```
+#[must_use]
+pub fn tool_input(arguments: &str) -> String {
+    serde_json::from_str(arguments)
+        .map(|args| summary(&args))
+        .unwrap_or_default()
+}
+
 /// A call's input, in short, as the window shows it.
 pub(crate) fn summary(args: &Value) -> String {
     let short = |text: &str| -> String {

@@ -18,7 +18,7 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 15] = [
+pub const COMMANDS: [Spec; 16] = [
     Spec {
         name: "new",
         args: "[model]",
@@ -40,9 +40,14 @@ pub const COMMANDS: [Spec; 15] = [
         what: "write to this agent; @agent before a message writes it there once",
     },
     Spec {
+        name: "name",
+        args: "name",
+        what: "name the chat you write to, or the new chat",
+    },
+    Spec {
         name: "team",
         args: "",
-        what: "the crew: each agent, what it does and spends",
+        what: "your chats and the agents they started: pick one to write to (/chats)",
     },
     Spec {
         name: "costs",
@@ -97,7 +102,7 @@ pub const COMMANDS: [Spec; 15] = [
 ];
 
 /// The other names some commands answer to.
-const ALIASES: [&str; 5] = ["agents", "cost", "work", "help", "exit"];
+const ALIASES: [&str; 6] = ["agents", "chats", "cost", "work", "help", "exit"];
 
 /// Whether `name` names one of iq's commands, by its name or another it
 /// answers to: a plugin's command never takes it.
@@ -125,6 +130,8 @@ pub enum Command {
     Role(String),
     /// Write to this agent.
     To(String),
+    /// Name the chat written to, or the new chat.
+    Name(String),
     /// The crew's page.
     Team,
     /// The costs' page.
@@ -203,7 +210,11 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "to" => one("agent")?
             .map(|agent| Command::To(agent.trim_start_matches('@').to_owned()))
             .ok_or_else(|| "/to takes the agent to write to".to_owned()),
-        "team" | "agents" => bare(Command::Team),
+        "name" => match rest.trim_start_matches('@') {
+            "" => Err("/name takes the chat's name".to_owned()),
+            name => Ok(Command::Name(name.to_owned())),
+        },
+        "team" | "agents" | "chats" => bare(Command::Team),
         "costs" | "cost" => bare(Command::Costs),
         "observations" | "work" => bare(Command::Observations),
         "keys" | "help" => bare(Command::Keys),
@@ -356,6 +367,12 @@ mod tests {
             );
         }
         assert_eq!(parse("/role ").unwrap(), Command::Role(String::new()));
+        assert_eq!(
+            parse("/name login fix").unwrap(),
+            Command::Name("login fix".into())
+        );
+        assert_eq!(parse("/chats").unwrap(), Command::Team);
+        assert!(parse("/name").is_err());
         assert!(parse("/to").is_err());
         assert!(parse("/costs now").is_err());
         assert!(parse("/pattern solo a b").is_err());

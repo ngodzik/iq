@@ -24,6 +24,13 @@ use crate::wrap::{cut, wrap};
 /// How many lines of a message between agents are written.
 const MESSAGE_LINES: usize = 4;
 
+/// How many of a chat's last exchanges are written again as the person
+/// comes back to it.
+const RECALLED: usize = 3;
+
+/// How many lines of each answer recalled are written.
+const RECALLED_LINES: usize = 6;
+
 /// How many lines of a failed tool's output are written.
 const FAILED_LINES: usize = 3;
 
@@ -109,6 +116,9 @@ pub(crate) struct History {
     after: HashMap<String, String>,
     /// The number of each agent's last fold of steps written.
     told: HashMap<String, usize>,
+    /// Where the line saying an agent joined waits to be written: one that
+    /// comes back from an earlier session did not join now.
+    joins: HashMap<String, usize>,
 }
 
 impl History {
@@ -147,6 +157,7 @@ impl History {
         match event {
             Event::Joined { agent, model, by } if by != PERSON => {
                 self.speaker = None;
+                self.joins.insert(agent.clone(), self.paras.len());
                 let tint = agent_tint(board, agent, p);
                 self.paras.push(Para::indented(
                     "",
@@ -299,7 +310,132 @@ impl History {
                 });
             }
             Event::Placed { said: None, .. } => {}
+            Event::Renamed { from, to } => {
+                let renamed = |name: &mut String| {
+                    if name == from {
+                        name.clone_from(to);
+                    }
+                };
+                if let Some(speaker) = &mut self.speaker {
+                    renamed(speaker);
+                }
+                if let Some(stream) = self.streams.remove(from) {
+                    self.streams.insert(to.clone(), stream);
+                }
+                if let Some(turn) = self.turns.remove(from) {
+                    self.turns.insert(to.clone(), turn);
+                }
+                if self.tasked.remove(from) {
+                    self.tasked.insert(to.clone());
+                }
+                if let Some(after) = self.after.remove(from) {
+                    self.after.insert(to.clone(), after);
+                }
+                if let Some(told) = self.told.remove(from) {
+                    self.told.insert(to.clone(), told);
+                }
+                self.speaker = None;
+                self.paras.push(Para::indented(
+                    "  ",
+                    vec![
+                        Span::styled(from.clone(), p.fg(p.dim)),
+                        Span::styled(" is called ", p.fg(p.faint)),
+                        Span::styled(to.clone(), p.fg(agent_tint(board, to, p))),
+                        Span::styled(" now", p.fg(p.faint)),
+                    ],
+                ));
+            }
         }
+    }
+
+    /// A chat of an earlier session came back: what it was given then was
+    /// written then, and its next turn is woken by what the person writes.
+    pub(crate) fn back(&mut self, agent: &str) {
+        self.tasked.insert(agent.to_owned());
+        if let Some(at) = self.joins.remove(agent)
+            && at < self.paras.len()
+        {
+            self.paras.remove(at);
+            for later in self.joins.values_mut() {
+                if *later > at {
+                    *later -= 1;
+                }
+            }
+        }
+    }
+
+    /// Writes again the last exchanges of a chat of an earlier session the
+    /// person comes back to: what was asked of it and what it answered,
+    /// and where its whole thread is. As iq opens on it, says that it is
+    /// the chat written to last.
+    pub(crate) fn recall(&mut self, recall: &iq_ui::Recall, board: &Board, p: &Palette) {
+        let agent = recall.agent.as_str();
+        let Some(view) = board.crew().agent(agent) else {
+            return;
+        };
+        let mut exchanges: Vec<(&str, Option<&str>)> = Vec::new();
+        for entry in &view.thread {
+            match entry {
+                iq_ui::crew::Entry::Prompt(text) => exchanges.push((text, None)),
+                iq_ui::crew::Entry::Text(text) if !text.trim().is_empty() => {
+                    if let Some((_, answer)) = exchanges.last_mut() {
+                        *answer = Some(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.speaker = None;
+        self.named(agent, board, p);
+        let mut said = String::from("↺ back");
+        if let Some(worked) = view.worked {
+            said.push_str(&format!(", at work {}", iq_ui::ago(worked, iq_ui::now())));
+        }
+        let team = board
+            .keys()
+            .chord(Action::Team)
+            .map_or("/chats".to_owned(), |chord| chord.to_string());
+        said.push_str(&format!(" · its whole thread: {team}, then →"));
+        self.paras
+            .push(Para::indented("  ", vec![Span::styled(said, p.fg(p.info))]));
+        let skipped = exchanges.len().saturating_sub(RECALLED);
+        if skipped > 0 {
+            self.paras.push(Para::indented(
+                "  ",
+                vec![Span::styled(
+                    format!(
+                        "… {skipped} exchange{} before",
+                        if skipped == 1 { "" } else { "s" }
+                    ),
+                    p.fg(p.faint),
+                )],
+            ));
+        }
+        for (asked, answer) in exchanges.iter().skip(skipped) {
+            let asked = asked
+                .trim()
+                .strip_prefix("Message from person: ")
+                .unwrap_or(asked.trim());
+            self.lines_of(asked, "  › ", p, MESSAGE_LINES);
+            if let Some(answer) = answer {
+                self.lines_of(answer, "    ", p, RECALLED_LINES);
+            }
+        }
+        if recall.opening {
+            let others = board.crew().chats().count().saturating_sub(1);
+            let mut said = format!("you write to {agent}, the chat you wrote to last");
+            if others > 0 {
+                said.push_str(&format!(
+                    "; {team} or /chats lists the {others} other{}",
+                    if others == 1 { "" } else { "s" }
+                ));
+            }
+            self.paras.push(Para::indented(
+                "  ",
+                vec![Span::styled(said, p.fg(p.accent))],
+            ));
+        }
+        self.speaker = None;
     }
 
     /// Something said to the person by iq itself, in passing.
@@ -519,6 +655,7 @@ impl History {
 
     /// The lines waiting, folded within `width` columns.
     pub(crate) fn take(&mut self, width: usize) -> Vec<Line<'static>> {
+        self.joins.clear();
         let paras: Vec<Para> = std::mem::take(&mut self.paras);
         let lines = paras
             .iter()
@@ -694,6 +831,88 @@ mod tests {
     fn crew(board: &mut Board, history: &mut History, event: Event, p: &Palette) {
         board.update(Update::Crew(event.clone()));
         history.event(&event, board, p);
+    }
+
+    #[test]
+    fn a_chat_come_back_to_has_its_last_exchanges_written_again() {
+        use iq_ui::crew::{Back, Entry};
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        for agent in ["login", "build"] {
+            crew(
+                &mut board,
+                &mut history,
+                Event::Joined {
+                    agent: agent.into(),
+                    model: "lab/model".into(),
+                    by: PERSON.into(),
+                },
+                &p,
+            );
+        }
+        let mut thread = Vec::new();
+        for n in 1..=4 {
+            thread.push(Entry::Prompt(format!("Message from person: ask {n}")));
+            thread.push(Entry::Tool {
+                name: "run".into(),
+                input: "make test".into(),
+                output: "ok".into(),
+                ok: true,
+            });
+            thread.push(Entry::Text(format!("answer {n}")));
+        }
+        // An agent a chat started, back with it, did not join now.
+        crew(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: "review".into(),
+                model: "lab/model".into(),
+                by: "login".into(),
+            },
+            &p,
+        );
+        history.back("review");
+        history.back("login");
+        board.update(Update::Back(Back {
+            agent: "login".into(),
+            task: "ask 1".into(),
+            worked: iq_ui::now(),
+            written: Some(iq_ui::now()),
+            thread,
+        }));
+        let recall = board.take_recall().unwrap();
+        history.recall(&recall, &board, &p);
+        let lines: Vec<String> = history.take(100).iter().map(ToString::to_string).collect();
+        assert_eq!(
+            lines,
+            [
+                "",
+                "● login  lab/model",
+                "  ↺ back, at work just now · its whole thread: Ctrl-T, then →",
+                "  … 1 exchange before",
+                "  › ask 2",
+                "    answer 2",
+                "  › ask 3",
+                "    answer 3",
+                "  › ask 4",
+                "    answer 4",
+                "  you write to login, the chat you wrote to last; Ctrl-T or /chats lists the 1 other",
+            ]
+        );
+        // Its next turn, woken by the person's message, is not written as
+        // a task of its own.
+        crew(
+            &mut board,
+            &mut history,
+            Event::Working {
+                agent: "login".into(),
+                prompt: "Message from person: go on".into(),
+            },
+            &p,
+        );
+        assert!(history.take(100).is_empty());
     }
 
     #[test]

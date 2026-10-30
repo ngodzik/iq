@@ -23,6 +23,10 @@ use crate::motion::{Motion, YOU};
 use crate::theme::Palette;
 use crate::wrap::{cut, spans_width, width as text_width, wrap};
 
+/// How much of a chat's first request the box where the person writes
+/// shows, in characters.
+const HINT_TASK_CHARS: usize = 48;
+
 /// The most agents at work given a line each.
 const WORKING: usize = 3;
 
@@ -431,7 +435,20 @@ impl Live<'_> {
                         Span::styled(format!(" {model} "), p.fg(p.faint)),
                     ]),
                     Line::from(Span::styled(spent, p.fg(p.faint))),
-                    format!("Write to {agent}…"),
+                    // What it was first asked tells the chat from another.
+                    match view.map(|v| v.task.trim()).filter(|task| !task.is_empty()) {
+                        Some(task) => {
+                            let asked: String = task
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .chars()
+                                .take(HINT_TASK_CHARS)
+                                .collect();
+                            format!("Write to {agent}, first asked “{asked}”…")
+                        }
+                        None => format!("Write to {agent}…"),
+                    },
                 )
             }
             Talk::New(chat) => {

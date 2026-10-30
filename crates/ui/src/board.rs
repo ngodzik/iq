@@ -7,7 +7,7 @@ use iq_agent::{Event, PERSON};
 
 use crate::command::{self, Command, Completion};
 use crate::costs::{Costs, Period, Spent};
-use crate::crew::{CrewView, Question, Request};
+use crate::crew::{Back, CrewView, Question, Request};
 use crate::keys::{Action, Chord, Keymap};
 use crate::look::Look;
 use crate::observations::{By, Span};
@@ -38,11 +38,23 @@ impl Post {
     }
 }
 
+/// A chat of an earlier session whose last exchanges the conversation
+/// writes again, as the person comes back to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recall {
+    /// The chat.
+    pub agent: String,
+    /// Whether iq opened on it, as the chat the person wrote to last.
+    pub opening: bool,
+}
+
 /// What the program sends the terminal.
 #[derive(Debug, Clone)]
 pub enum Update {
     /// What the crew just did.
     Crew(Event),
+    /// A chat of an earlier session came back, as it was kept.
+    Back(Back),
     /// The calls iq kept of earlier sessions, oldest first.
     Kept(Vec<Spent>),
     /// iq is asked to stop: the terminal is given back, the agents
@@ -144,6 +156,15 @@ pub struct Board {
     models: Vec<String>,
     /// What the person's plugins show.
     plugins: crate::plugins::Plugins,
+    /// The chat whose last exchanges are to be written again.
+    recall: Option<Recall>,
+    /// The person's chats of earlier sessions not come back to yet.
+    unrecalled: std::collections::HashSet<String>,
+    /// Whether the person chose where they write, or wrote: the chats
+    /// coming back then leave it as it is.
+    chose: bool,
+    /// When the person wrote last to the chat iq opens on.
+    opening: Option<u64>,
 }
 
 impl Default for Board {
@@ -173,7 +194,40 @@ impl Board {
             lens: crate::observations::Lens::default(),
             models: Vec::new(),
             plugins: crate::plugins::Plugins::default(),
+            recall: None,
+            unrecalled: std::collections::HashSet::new(),
+            chose: false,
+            opening: None,
         }
+    }
+
+    /// The chat whose last exchanges the conversation writes again, once:
+    /// one of an earlier session the person comes back to.
+    pub fn take_recall(&mut self) -> Option<Recall> {
+        self.recall.take()
+    }
+
+    /// Writes to `agent` from now on; a chat of an earlier session is
+    /// recalled as the person comes back to it.
+    fn write_to(&mut self, agent: &str) {
+        self.screen.talk_to(agent);
+        if self.unrecalled.remove(agent) {
+            let recall = Recall {
+                agent: agent.to_owned(),
+                opening: false,
+            };
+            if let Some(before) = self.recall.replace(recall)
+                && before.agent != agent
+            {
+                self.unrecalled.insert(before.agent);
+            }
+        }
+    }
+
+    /// The person chose where they write: `agent`.
+    fn chose_to(&mut self, agent: &str) {
+        self.chose = true;
+        self.write_to(agent);
     }
 
     /// What the person's plugins show.
@@ -549,18 +603,19 @@ impl Board {
             Page::Team => {
                 let agent = self
                     .crew
-                    .agents()
+                    .listed()
                     .get(self.screen.chosen())
-                    .map(|a| a.name.clone());
+                    .map(|(_, a)| a.name.clone());
                 match (key, letter, agent) {
                     ("Enter", _, Some(agent)) | (_, Some('w'), Some(agent)) => {
-                        self.screen.talk_to(&agent);
+                        self.chose_to(&agent);
                         self.screen.close();
                     }
                     ("Right", _, Some(agent)) | (_, Some('v'), Some(agent)) => {
                         self.screen.open(Page::Thread(agent));
                     }
                     (_, Some('n'), _) => {
+                        self.chose = true;
                         self.screen.new_chat(self.crew.lead());
                         self.screen.close();
                     }
@@ -633,27 +688,30 @@ impl Board {
         None
     }
 
-    /// Writes to the agent after the one written to, in the order they
-    /// joined; after the last, to a new chat on the lead's model.
+    /// Writes to the person's chat after the one written to, in the order
+    /// they joined; after the last, to a new chat on the lead's model. The
+    /// agents a chat started are written to by their name.
     fn next_agent(&mut self) {
-        let names: Vec<String> = self.crew.agents().iter().map(|a| a.name.clone()).collect();
+        self.chose = true;
+        let names: Vec<String> = self.crew.chats().map(|a| a.name.clone()).collect();
         let next = match self.screen.talking_to() {
             None => names.first(),
-            Some(agent) => names
-                .iter()
-                .position(|name| name == agent)
-                .and_then(|at| names.get(at + 1)),
+            Some(agent) => match names.iter().position(|name| name == agent) {
+                Some(at) => names.get(at + 1),
+                None => names.first(),
+            },
         };
-        match next {
-            Some(agent) => self.screen.talk_to(agent),
+        match next.cloned() {
+            Some(agent) => self.write_to(&agent),
             None => self.screen.new_chat(self.crew.lead()),
         }
     }
 
-    /// Writes to the agent before the one written to, in the order they
-    /// joined; from a new chat, or the first, to the last.
+    /// Writes to the person's chat before the one written to, in the order
+    /// they joined; from a new chat, or the first, to the last.
     fn prev_agent(&mut self) {
-        let names: Vec<String> = self.crew.agents().iter().map(|a| a.name.clone()).collect();
+        self.chose = true;
+        let names: Vec<String> = self.crew.chats().map(|a| a.name.clone()).collect();
         let before = match self.screen.talking_to() {
             None => names.last(),
             Some(agent) => match names.iter().position(|name| name == agent) {
@@ -661,8 +719,8 @@ impl Board {
                 Some(at) => names.get(at - 1),
             },
         };
-        if let Some(agent) = before {
-            self.screen.talk_to(agent);
+        if let Some(agent) = before.cloned() {
+            self.write_to(&agent);
         }
     }
 
@@ -699,10 +757,11 @@ impl Board {
                 return Vec::new();
             }
             if message.trim().is_empty() {
-                self.screen.talk_to(name);
+                self.chose_to(name);
                 self.screen.editor_mut().take();
                 return Vec::new();
             }
+            self.chose = true;
             self.screen.editor_mut().take();
             let text = message.trim().to_owned();
             return vec![Request::Tell {
@@ -711,6 +770,7 @@ impl Board {
                 text,
             }];
         }
+        self.chose = true;
         let request = match self.screen.talk().clone() {
             Talk::To(agent) => {
                 if self.crew.agent(&agent).is_none() && !self.screen.starting().contains(&agent) {
@@ -738,10 +798,12 @@ impl Board {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| chat.model.trim().to_owned());
-                // A one-word role names the agent, else its model does.
+                // The name the person gave it, else a one-word role, else
+                // the first words of its task, else its model.
                 let base = match &role {
+                    _ if !chat.name.trim().is_empty() => chat.name.trim().to_owned(),
                     Some(role) if !role.contains(char::is_whitespace) => role.clone(),
-                    _ => model.clone(),
+                    _ => from_words(&text, &named).unwrap_or_else(|| model.clone()),
                 };
                 let name = self.name_for(&base);
                 let partner = Some(chat.partner.trim().to_owned())
@@ -770,8 +832,23 @@ impl Board {
         match command {
             Command::New(model) => {
                 let model = model.unwrap_or_else(|| self.crew.lead().to_owned());
+                self.chose = true;
                 self.screen.new_chat(&model);
             }
+            Command::Name(name) => match self.screen.talk().clone() {
+                Talk::To(agent) => {
+                    if self.crew.agent(&agent).is_none() {
+                        self.screen.notice(self.no_agent(&agent), now);
+                        return Vec::new();
+                    }
+                    return vec![Request::Rename { agent, name }];
+                }
+                Talk::New(_) => {
+                    if let Some(chat) = self.screen.new_chat_mut() {
+                        chat.name = name;
+                    }
+                }
+            },
             Command::Pattern(pattern, partner) => match self.screen.new_chat_mut() {
                 Some(chat) => {
                     chat.pattern = pattern;
@@ -789,7 +866,7 @@ impl Board {
             },
             Command::To(agent) => {
                 if self.crew.agent(&agent).is_some() {
-                    self.screen.talk_to(&agent);
+                    self.chose_to(&agent);
                 } else {
                     self.screen.notice(self.no_agent(&agent), now);
                 }
@@ -989,6 +1066,18 @@ impl Board {
                         });
                     }
                     Event::Joined { agent, .. } => self.screen.joined(agent),
+                    Event::Renamed { from, to } => {
+                        self.screen.renamed(from, to);
+                        self.plugins.rename(from, to);
+                        if self.unrecalled.remove(from) {
+                            self.unrecalled.insert(to.clone());
+                        }
+                        if let Some(recall) = &mut self.recall
+                            && recall.agent == *from
+                        {
+                            recall.agent.clone_from(to);
+                        }
+                    }
                     Event::Posted { from, to, text } => {
                         self.posts.push(Post {
                             from: from.clone(),
@@ -999,6 +1088,25 @@ impl Board {
                     _ => {}
                 }
                 self.crew.event(event);
+            }
+            Update::Back(back) => {
+                let agent = back.agent.clone();
+                let at = back.written.unwrap_or(back.worked);
+                let chat = self.crew.agent(&agent).is_some_and(|a| a.by == PERSON);
+                self.crew.back(back);
+                if !chat {
+                    return;
+                }
+                self.unrecalled.insert(agent.clone());
+                // iq opens on the chat the person wrote to last, unless
+                // they chose already.
+                if !self.chose && self.opening.is_none_or(|best| at >= best) {
+                    self.opening = Some(at);
+                    self.write_to(&agent);
+                    if let Some(recall) = &mut self.recall {
+                        recall.opening = true;
+                    }
+                }
             }
             Update::Kept(kept) => {
                 for spent in kept {
@@ -1029,6 +1137,54 @@ impl Board {
             }
         }
     }
+}
+
+/// The words that say little of a request, in English and French, left
+/// out of the name made from it.
+const SMALL_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "could", "do", "does", "for", "from",
+    "how", "i", "in", "is", "it", "its", "me", "my", "of", "on", "or", "our", "please", "should",
+    "so", "that", "the", "this", "to", "us", "we", "what", "when", "why", "will", "with", "would",
+    "you", "your", "au", "aux", "avec", "ce", "ces", "cette", "comment", "dans", "de", "des", "du",
+    "elle", "en", "est", "et", "il", "je", "la", "le", "les", "ma", "mes", "mon", "ne", "nous",
+    "on", "ou", "par", "pas", "plus", "pour", "pourquoi", "que", "quel", "quelle", "qui", "sa",
+    "se", "ses", "son", "stp", "sur", "svp", "ta", "tes", "ton", "tu", "un", "une", "vous",
+];
+
+/// How many words of a request name its chat.
+const NAME_WORDS: usize = 3;
+
+/// The longest name made from a request, in characters.
+const NAME_CHARS: usize = 24;
+
+/// A chat's name made from the first words of its first request that say
+/// something, lowercase, joined by hyphens: `fix-login-redirect` for "Fix
+/// the login redirect"; the words of the models it names left out, which
+/// say whom it goes to, not what for. None when no word is left.
+fn from_words(request: &str, named: &[String]) -> Option<String> {
+    let words_of = |text: &str| -> Vec<String> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let models: Vec<String> = named.iter().flat_map(|model| words_of(model)).collect();
+    let mut name = String::new();
+    let words = words_of(request)
+        .into_iter()
+        .filter(|word| !SMALL_WORDS.contains(&word.as_str()) && !models.contains(word))
+        .take(NAME_WORDS);
+    for word in words {
+        let more = usize::from(!name.is_empty()) + word.chars().count();
+        if name.chars().count() + more > NAME_CHARS {
+            break;
+        }
+        if !name.is_empty() {
+            name.push('-');
+        }
+        name.push_str(&word);
+    }
+    (!name.is_empty()).then_some(name)
 }
 
 #[cfg(test)]
@@ -1092,13 +1248,13 @@ mod tests {
     #[test]
     fn a_new_chat_starts_its_agent_then_is_written_to() {
         let mut board = Board::default();
-        started(&mut board, "anthropic/claude-opus-5-5");
+        started(&mut board, "lab/lead-5");
         write(&mut board, "  fix the build ");
         assert_eq!(
             key(&mut board, "enter"),
             vec![Request::Start {
-                name: "claude-opus-5-5".into(),
-                model: "anthropic/claude-opus-5-5".into(),
+                name: "fix-build".into(),
+                model: "lab/lead-5".into(),
                 task: "fix the build".into(),
                 role: None,
                 pattern: iq_agent::Pattern::Solo,
@@ -1107,21 +1263,43 @@ mod tests {
                 effort: None,
             }]
         );
-        assert_eq!(board.screen().talking_to(), Some("claude-opus-5-5"));
+        assert_eq!(board.screen().talking_to(), Some("fix-build"));
         // Written to before it joined, it is not gone: it starts.
         write(&mut board, "and the tests");
         assert!(matches!(
             &key(&mut board, "enter")[..],
-            [Request::Tell { to, .. }] if to == "claude-opus-5-5"
+            [Request::Tell { to, .. }] if to == "fix-build"
         ));
-        // A second chat on the same model is named apart, a one-word role
-        // names one.
+        // Another chat asked the same is named apart; one the person
+        // names, or with no word that says something, is named so.
         board.run(Command::New(None), 100);
-        write(&mut board, "review it");
+        write(&mut board, "Fix the build!");
         assert!(matches!(
             &key(&mut board, "enter")[..],
-            [Request::Start { name, .. }] if name == "claude-opus-5-5-2"
+            [Request::Start { name, .. }] if name == "fix-build-2"
         ));
+        board.run(Command::New(None), 100);
+        board.run(Command::Name("Login redirect".into()), 100);
+        write(&mut board, "it loops");
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Start { name, .. }] if name == "login-redirect"
+        ));
+        board.run(Command::New(None), 100);
+        write(&mut board, "is it?");
+        assert!(matches!(
+            &key(&mut board, "enter")[..],
+            [Request::Start { name, .. }] if name == "lead-5"
+        ));
+        // A chat written to is renamed by the crew, once it joined.
+        joined(&mut board, "lead-5", PERSON);
+        assert_eq!(
+            board.run(Command::Name("build".into()), 100),
+            vec![Request::Rename {
+                agent: "lead-5".into(),
+                name: "build".into()
+            }]
+        );
         board.run(Command::New(Some("lab/second".into())), 100);
         board.run(Command::Role("review".into()), 100);
         board.run(
@@ -1135,14 +1313,8 @@ mod tests {
                 if name == "review" && model == "lab/second" && role == "review"
                     && partner == "z-ai/glm-5"
         ));
-        joined(&mut board, "claude-opus-5-5", PERSON);
-        assert!(
-            board
-                .screen()
-                .starting()
-                .iter()
-                .all(|n| n != "claude-opus-5-5")
-        );
+        joined(&mut board, "fix-build", PERSON);
+        assert!(board.screen().starting().iter().all(|n| n != "fix-build"));
         assert_eq!(key(&mut board, "enter"), vec![]);
     }
 
@@ -1152,6 +1324,7 @@ mod tests {
         started(&mut board, "lab/second");
         joined(&mut board, "lead", PERSON);
         joined(&mut board, "helper", "lead");
+        joined(&mut board, "fix", PERSON);
         board.screen_mut().talk_to("lead");
         write(&mut board, "@helper read the tests");
         assert_eq!(
@@ -1188,21 +1361,115 @@ mod tests {
                 .contains("lead, helper")
         );
         assert_eq!(board.screen().editor().text(), "@nobody hi");
-        // Ctrl-N goes round the agents, then to a new chat.
+        // Ctrl-N goes round the person's chats, then to a new chat: the
+        // agents a chat started are written to by their name.
         key(&mut board, "ctrl+c");
         key(&mut board, "ctrl+n");
-        assert_eq!(board.screen().talking_to(), Some("helper"));
+        assert_eq!(board.screen().talking_to(), Some("fix"));
         key(&mut board, "ctrl+n");
         assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "lab/second"));
         key(&mut board, "ctrl+n");
         assert_eq!(board.screen().talking_to(), Some("lead"));
         // Ctrl-P goes the other way, from the first to the last.
         key(&mut board, "ctrl+p");
-        assert_eq!(board.screen().talking_to(), Some("helper"));
+        assert_eq!(board.screen().talking_to(), Some("fix"));
         key(&mut board, "ctrl+p");
         assert_eq!(board.screen().talking_to(), Some("lead"));
         key(&mut board, "ctrl+p");
-        assert_eq!(board.screen().talking_to(), Some("helper"));
+        assert_eq!(board.screen().talking_to(), Some("fix"));
+    }
+
+    fn back(board: &mut Board, agent: &str, worked: u64, written: Option<u64>) {
+        board.update(Update::Back(Back {
+            agent: agent.into(),
+            task: format!("the task of {agent}"),
+            worked,
+            written,
+            thread: vec![crate::crew::Entry::Prompt(format!("the task of {agent}"))],
+        }));
+    }
+
+    #[test]
+    fn iq_opens_on_the_chat_written_to_last_and_recalls_a_chat_come_back_to() {
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        for (agent, by) in [
+            ("today", PERSON),
+            ("yesterday", PERSON),
+            ("review", "today"),
+        ] {
+            joined(&mut board, agent, by);
+        }
+        // Written to last, though another worked since; an agent a chat
+        // started is not one to open on.
+        back(&mut board, "yesterday", 100, Some(90));
+        back(&mut board, "today", 200, Some(150));
+        back(&mut board, "review", 300, None);
+        assert_eq!(board.screen().talking_to(), Some("today"));
+        assert_eq!(
+            board.take_recall(),
+            Some(Recall {
+                agent: "today".into(),
+                opening: true
+            })
+        );
+        assert_eq!(board.take_recall(), None);
+        // Come back to, a chat is recalled once.
+        key(&mut board, "ctrl+n");
+        assert_eq!(board.screen().talking_to(), Some("yesterday"));
+        assert_eq!(
+            board.take_recall(),
+            Some(Recall {
+                agent: "yesterday".into(),
+                opening: false
+            })
+        );
+        key(&mut board, "ctrl+p");
+        key(&mut board, "ctrl+n");
+        assert_eq!(board.take_recall(), None);
+        // Renamed, it is written to under its new name.
+        board.update(Update::Crew(Event::Renamed {
+            from: "yesterday".into(),
+            to: "login".into(),
+        }));
+        assert_eq!(board.screen().talking_to(), Some("login"));
+        assert_eq!(
+            board.crew().agent("login").unwrap().task,
+            "the task of yesterday"
+        );
+    }
+
+    #[test]
+    fn a_chat_coming_back_leaves_where_the_person_chose_to_write() {
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        joined(&mut board, "old", PERSON);
+        joined(&mut board, "new", PERSON);
+        board.run(Command::To("new".into()), 100);
+        back(&mut board, "old", 100, Some(100));
+        assert_eq!(board.screen().talking_to(), Some("new"));
+        assert_eq!(board.take_recall(), None);
+    }
+
+    #[test]
+    fn a_chat_is_named_after_the_words_of_its_request_that_say_something() {
+        assert_eq!(
+            from_words("Fix the login redirect, please", &[]).as_deref(),
+            Some("fix-login-redirect")
+        );
+        assert_eq!(
+            from_words("corrige le test de la page de connexion", &[]).as_deref(),
+            Some("corrige-test-page")
+        );
+        assert_eq!(
+            from_words("with swift, translate the docs", &["lab/swift-5".into()]).as_deref(),
+            Some("translate-docs")
+        );
+        assert_eq!(
+            from_words("internationalisation configuration everywhere", &[]).as_deref(),
+            Some("internationalisation")
+        );
+        assert_eq!(from_words("is it?", &[]), None);
     }
 
     #[test]
@@ -1220,8 +1487,8 @@ mod tests {
             [Request::Start { model, named, .. }]
                 if model == "anthropic/claude-haiku-5" && named == &["anthropic/claude-haiku-5"]
         ));
-        assert_eq!(board.screen().talking_to(), Some("claude-haiku-5"));
-        joined(&mut board, "claude-haiku-5", PERSON);
+        assert_eq!(board.screen().talking_to(), Some("corrige-test"));
+        joined(&mut board, "corrige-test", PERSON);
         write(
             &mut board,
             "fais la conception avec opus et le code avec glm-5.3-flash",

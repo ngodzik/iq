@@ -171,6 +171,10 @@ impl Iq {
             for post in self.board.take_posts() {
                 self.motion.posted(&post);
             }
+            if let Some(recall) = self.board.take_recall() {
+                self.history.recall(&recall, &self.board, &self.p);
+                changed = true;
+            }
             if self.board.quitting() {
                 return Ok(());
             }
@@ -214,6 +218,10 @@ impl Iq {
                 });
             }
             Update::Said(text) => self.history.say(&text, &self.p),
+            Update::Back(back) => {
+                self.history.back(&back.agent);
+                self.board.update(Update::Back(back));
+            }
             Update::Synced(synced) => {
                 // What moved is said in the conversation; a sync that moved
                 // nothing only in the status line.

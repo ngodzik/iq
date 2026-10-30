@@ -24,6 +24,9 @@ pub struct Saved {
     /// What the person asked of it since, the latest last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub asked: Vec<String>,
+    /// When the person last wrote to it, in seconds since 1970.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<u64>,
     /// How hard it thinks, when the person chose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
@@ -41,4 +44,7 @@ pub struct Saved {
 pub trait Keeper: Send + Sync {
     /// Keeps `chat` as it stands now, in place of what was kept of it.
     fn keep(&self, chat: &Saved);
+
+    /// Forgets what was kept of the chat `name`: it goes on under another.
+    fn forget(&self, _name: &str) {}
 }

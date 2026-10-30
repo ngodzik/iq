@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use iq_agent::{Crew, Event, Report};
+use iq_agent::{Crew, Event, Keeper, PERSON, Report};
 use iq_core::ModelId;
 use iq_gate::{Action, Approver, Gate, HELPER_FLAG, HOLD_FLAG, Helper, Judged, Rules};
 use iq_llm::OpenAiCompatible;
@@ -262,9 +262,11 @@ fn worktrees(settings: &Settings, home: &Path, workspace: &Path) -> Result<workt
 }
 
 /// Puts the project's chats kept from earlier sessions back on the board,
-/// resting, each in its worktree when it still has one; the chats and the
-/// worktrees untouched for as long as the settings say forgotten first.
-/// What was forgotten is said; what came back is said to each chat.
+/// resting, each in its worktree when it still has one: the person's
+/// first, then the agents each started, under it; an agent whose starter
+/// is gone is let go with it. The chats and the worktrees untouched for as
+/// long as the settings say are forgotten first. What was forgotten is
+/// said; each chat that came back is told to the board, with its thread.
 fn resume_chats(
     settings: &Settings,
     crew: &Crew<OpenAiCompatible>,
@@ -284,45 +286,109 @@ fn resume_chats(
         .worktree
         .then(|| worktrees(settings, &home, &workspace).ok())
         .flatten();
-    let now = iq_ui::now();
-    for found in chats.list() {
-        let name = found.chat.name.clone();
-        let place = match (&found.chat.folder, &worktrees) {
-            (Some(folder), Some(worktrees)) if folder.is_dir() => Some(iq_agent::Placed {
-                folder: folder.clone(),
-                writable: vec![worktrees.common().to_path_buf()],
-                said: String::new(),
-            }),
-            (Some(folder), _) => {
-                said.push(format!(
-                    "the chat {name} worked in {}, which is gone: it goes on in this folder",
-                    folder.display()
-                ));
-                None
-            }
-            (None, _) => None,
-        };
-        let task: String = found.chat.task.chars().take(80).collect();
-        match crew.resume(found.chat, place) {
-            Ok(name) => {
-                let days = now.saturating_sub(found.at) / (24 * 3600);
-                let ago = match days {
-                    0 => "today".to_owned(),
-                    1 => "yesterday".to_owned(),
-                    days => format!("{days} days ago"),
-                };
-                let _ = tell.send(Update::Crew(Event::Notice {
-                    agent: name,
-                    text: format!("resumed from {ago}: its task was \"{task}\""),
-                }));
-            }
-            Err(why) => said.push(format!("the chat {name} could not be resumed: {why}")),
+    // The person's chats first, then, round by round, the agents started
+    // by one that came back, its name as it came back.
+    let mut waiting = chats.list();
+    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut back: Vec<(String, String, u64)> = Vec::new();
+    loop {
+        let (now, later): (Vec<_>, Vec<_>) = waiting
+            .into_iter()
+            .partition(|found| found.chat.by == PERSON || names.contains_key(&found.chat.by));
+        waiting = later;
+        if now.is_empty() {
+            break;
         }
+        for mut found in now {
+            if let Some(by) = names.get(&found.chat.by) {
+                found.chat.by.clone_from(by);
+            }
+            let kept = found.chat.name.clone();
+            if let Some(name) = resume_one(found, crew, worktrees.as_ref(), tell, &mut said) {
+                names.insert(kept, name.0.clone());
+                back.push(name);
+            }
+        }
+    }
+    for found in waiting {
+        chats.forget(&found.chat.name);
+        said.push(format!(
+            "the agent {} is let go: {}, which started it, did not come back",
+            found.chat.name, found.chat.by
+        ));
+    }
+    if !back.is_empty() {
+        let now = iq_ui::now();
+        let listed: Vec<String> = back
+            .iter()
+            .filter(|(_, by, _)| by == PERSON)
+            .map(|(name, _, at)| format!("{name} ({})", iq_ui::ago(*at, now)))
+            .collect();
+        let agents = back.len() - listed.len();
+        let mut line = format!("back from earlier sessions: {}", listed.join(", "));
+        if agents > 0 {
+            line.push_str(&format!(
+                ", with {agents} agent{} they started",
+                if agents == 1 { "" } else { "s" }
+            ));
+        }
+        line.push_str("; /chats lists them");
+        said.push(line);
     }
     if let (Some(keep), Some(worktrees)) = (settings.chat_keep(), &worktrees) {
         said.extend(worktrees.prune(keep, &chats.places()));
     }
     said
+}
+
+/// Puts the chat `found` back on the board, in its worktree when it still
+/// has one, and tells the board it came back: its name now, who started
+/// it and when it last worked. Why it could not come back is said.
+fn resume_one(
+    found: chats::Found,
+    crew: &Crew<OpenAiCompatible>,
+    worktrees: Option<&worktree::Worktrees>,
+    tell: &std::sync::mpsc::Sender<Update>,
+    said: &mut Vec<String>,
+) -> Option<(String, String, u64)> {
+    let name = found.chat.name.clone();
+    let place = match (&found.chat.folder, worktrees) {
+        (Some(folder), Some(worktrees)) if folder.is_dir() => Some(iq_agent::Placed {
+            folder: folder.clone(),
+            writable: vec![worktrees.common().to_path_buf()],
+            said: String::new(),
+        }),
+        (Some(folder), _) => {
+            said.push(format!(
+                "the chat {name} worked in {}, which is gone: it goes on in this folder",
+                folder.display()
+            ));
+            None
+        }
+        (None, _) => None,
+    };
+    let thread = iq_ui::crew::past(&found.chat.messages);
+    let (task, written, by) = (
+        found.chat.task.clone(),
+        found.chat.written,
+        found.chat.by.clone(),
+    );
+    match crew.resume(found.chat, place) {
+        Ok(agent) => {
+            let _ = tell.send(Update::Back(iq_ui::crew::Back {
+                agent: agent.clone(),
+                task,
+                worked: found.at,
+                written,
+                thread,
+            }));
+            Some((agent, by, found.at))
+        }
+        Err(why) => {
+            said.push(format!("the chat {name} could not be resumed: {why}"));
+            None
+        }
+    }
 }
 
 /// The person's rules, from the files the settings list, as written and
@@ -909,6 +975,11 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     let _ = working.set_effort(&agent, effort);
                 }
                 Request::Stop { agent } => working.stop(&agent),
+                Request::Rename { agent, name } => {
+                    if let Err(why) = working.rename(&agent, &name) {
+                        let _ = told.send(Update::Said(why));
+                    }
+                }
                 Request::Sync { send, always: on } => {
                     if on {
                         always.store(true, Ordering::Relaxed);

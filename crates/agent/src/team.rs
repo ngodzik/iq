@@ -277,6 +277,35 @@ pub(crate) enum Team {
     },
 }
 
+impl Team {
+    /// The agent `from` is called `to` from now on.
+    pub(crate) fn rename(&mut self, from: &str, to: &str) {
+        let renamed = |name: &mut String| {
+            if name == from {
+                *name = to.to_owned();
+            }
+        };
+        match self {
+            Team::Pair {
+                writer, reviewer, ..
+            } => {
+                renamed(writer);
+                if let Some(reviewer) = reviewer {
+                    renamed(reviewer);
+                }
+            }
+            Team::Debate {
+                members, answers, ..
+            } => {
+                members.iter_mut().for_each(renamed);
+                if let Some(answer) = answers.remove(from) {
+                    answers.insert(to.to_owned(), answer);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

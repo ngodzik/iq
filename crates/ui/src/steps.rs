@@ -183,6 +183,21 @@ impl Steps {
                 let agent = if from == PERSON { to } else { from };
                 self.close(agent);
             }
+            Event::Renamed { from, to } => {
+                for fold in &mut self.folds {
+                    if fold.agent == *from {
+                        fold.agent.clone_from(to);
+                    }
+                }
+                if let Some(open) = self.open.remove(from) {
+                    self.open.insert(to.clone(), open);
+                }
+                for (agent, _) in self.asked.values_mut() {
+                    if agent == from {
+                        agent.clone_from(to);
+                    }
+                }
+            }
             Event::Joined { .. }
             | Event::Effort { .. }
             | Event::Text { .. }

@@ -3,7 +3,7 @@
 //! what the person writes.
 
 use iq_agent::{Event, PERSON, Pattern};
-use iq_core::{Effort, TokenCount, Usd};
+use iq_core::{Effort, Message, TokenCount, Usd};
 
 /// What the person asks of the crew, for the program to carry out.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +63,13 @@ pub enum Request {
     Stop {
         /// The agent.
         agent: String,
+    },
+    /// Give an agent another name.
+    Rename {
+        /// The agent.
+        agent: String,
+        /// The name the person gives it.
+        name: String,
     },
     /// Sync iq's data with the repository, or not, as asked.
     Sync {
@@ -166,7 +173,89 @@ pub struct AgentView {
     pub effort: Option<Effort>,
     /// Where it works, when it was given a place of its own.
     pub place: Option<std::path::PathBuf>,
+    /// What it was first asked: its task.
+    pub task: String,
+    /// When it last worked, in seconds since 1970; never yet when none.
+    pub worked: Option<u64>,
 }
+
+/// A chat of an earlier session, back on the board as it was kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Back {
+    /// Its name now.
+    pub agent: String,
+    /// What it was first asked.
+    pub task: String,
+    /// When it last worked, in seconds since 1970.
+    pub worked: u64,
+    /// When the person last wrote to it, if they did.
+    pub written: Option<u64>,
+    /// What it was given, said and did, oldest first.
+    pub thread: Vec<Entry>,
+}
+
+/// An agent's thread as its conversation holds it, for a chat that comes
+/// back: what it was given, what it said and the tools it called, with
+/// what they returned. iq's own words to it (its conversation's size, a
+/// nudge to go on) are left out.
+///
+/// # Examples
+///
+/// ```
+/// use iq_core::Message;
+/// use iq_ui::crew::{Entry, past};
+///
+/// let kept = [
+///     Message::system("You are lead"),
+///     Message::user("fix the login"),
+///     Message::Assistant { content: Some("Fixed.".into()), tool_calls: Vec::new() },
+/// ];
+/// assert_eq!(
+///     past(&kept),
+///     [Entry::Prompt("fix the login".into()), Entry::Text("Fixed.".into())]
+/// );
+/// ```
+#[must_use]
+pub fn past(messages: &[Message]) -> Vec<Entry> {
+    let returned: std::collections::HashMap<&str, &str> = messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool { call_id, content } => Some((call_id.as_str(), content.as_str())),
+            _ => None,
+        })
+        .collect();
+    let mut thread = Vec::new();
+    for message in messages {
+        match message {
+            Message::User(text) if !text.starts_with("(iq: ") && !text.starts_with(URGED) => {
+                thread.push(Entry::Prompt(text.clone()));
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
+                if let Some(text) = content.as_ref().filter(|t| !t.trim().is_empty()) {
+                    thread.push(Entry::Text(text.clone()));
+                }
+                for call in tool_calls {
+                    let output = returned.get(call.id.as_str()).copied().unwrap_or_default();
+                    let input = iq_agent::tool_input(&call.arguments);
+                    thread.push(Entry::Tool {
+                        name: call.name.clone(),
+                        input,
+                        output: output.to_owned(),
+                        ok: !output.starts_with("Error: "),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    thread
+}
+
+/// How iq urges on an agent that answered with nothing.
+const URGED: &str = "Your reply held neither text nor a tool call.";
 
 impl AgentView {
     /// What its last call read: how much of its model's context its
@@ -252,6 +341,53 @@ impl CrewView {
         self.agents.iter().find(|a| a.name == name)
     }
 
+    /// The chats the person started, in the order they joined: those they
+    /// write to.
+    pub fn chats(&self) -> impl Iterator<Item = &AgentView> {
+        self.agents.iter().filter(|a| a.by == PERSON)
+    }
+
+    /// Every agent as the Team page lists them, each with how deep it
+    /// stands: the person's chats in the order they joined, each followed
+    /// by the agents it started, theirs under them; then any whose starter
+    /// is gone.
+    #[must_use]
+    pub fn listed(&self) -> Vec<(usize, &AgentView)> {
+        fn under<'a>(
+            agents: &'a [AgentView],
+            by: &str,
+            depth: usize,
+            listed: &mut Vec<(usize, &'a AgentView)>,
+        ) {
+            for agent in agents.iter().filter(|a| a.by == by) {
+                if listed.iter().any(|(_, seen)| seen.name == agent.name) {
+                    continue;
+                }
+                listed.push((depth, agent));
+                under(agents, &agent.name, depth + 1, listed);
+            }
+        }
+        let mut listed = Vec::new();
+        under(&self.agents, PERSON, 0, &mut listed);
+        for agent in &self.agents {
+            if !listed.iter().any(|(_, seen)| seen.name == agent.name) {
+                listed.push((0, agent));
+                under(&self.agents, &agent.name, 1, &mut listed);
+            }
+        }
+        listed
+    }
+
+    /// A chat of an earlier session came back: its task, when it last
+    /// worked, and its thread as it was kept.
+    pub fn back(&mut self, back: Back) {
+        if let Some(view) = self.agent_mut(&back.agent) {
+            view.task = back.task;
+            view.worked = Some(back.worked);
+            view.thread = back.thread;
+        }
+    }
+
     /// The questions waiting for the person, oldest first.
     #[must_use]
     pub fn questions(&self) -> &[Question] {
@@ -314,11 +450,17 @@ impl CrewView {
                     reads: Vec::new(),
                     effort: None,
                     place: None,
+                    task: String::new(),
+                    worked: None,
                 });
             }
             Event::Working { agent, prompt } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.working = true;
+                    view.worked = Some(crate::now());
+                    if view.task.is_empty() {
+                        view.task.clone_from(&prompt);
+                    }
                     view.thread.push(Entry::Prompt(prompt));
                 }
             }
@@ -442,7 +584,23 @@ impl CrewView {
             Event::Done { agent, outcome } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.working = false;
+                    view.worked = Some(crate::now());
                     view.thread.push(Entry::Done(outcome));
+                }
+            }
+            Event::Renamed { from, to } => {
+                for view in &mut self.agents {
+                    if view.name == from {
+                        view.name.clone_from(&to);
+                    }
+                    if view.by == from {
+                        view.by.clone_from(&to);
+                    }
+                }
+                for question in &mut self.questions {
+                    if question.agent == from {
+                        question.agent.clone_from(&to);
+                    }
                 }
             }
             Event::Notice { agent, text } => {
@@ -555,5 +713,97 @@ mod tests {
             })
         );
         assert_eq!(crew.stop("nobody"), None);
+    }
+
+    fn joined(crew: &mut CrewView, agent: &str, by: &str) {
+        crew.event(Event::Joined {
+            agent: agent.into(),
+            model: "m".into(),
+            by: by.into(),
+        });
+    }
+
+    #[test]
+    fn the_agents_a_chat_started_are_listed_under_it_and_follow_its_name() {
+        let mut crew = CrewView::default();
+        joined(&mut crew, "lead", PERSON);
+        joined(&mut crew, "fix", PERSON);
+        joined(&mut crew, "review", "lead");
+        joined(&mut crew, "helper", "review");
+        let listed = |crew: &CrewView| -> Vec<(usize, String)> {
+            crew.listed()
+                .into_iter()
+                .map(|(depth, a)| (depth, a.name.clone()))
+                .collect()
+        };
+        assert_eq!(
+            listed(&crew),
+            [
+                (0, "lead".to_owned()),
+                (1, "review".to_owned()),
+                (2, "helper".to_owned()),
+                (0, "fix".to_owned()),
+            ]
+        );
+        let chats: Vec<&str> = crew.chats().map(|a| a.name.as_str()).collect();
+        assert_eq!(chats, ["lead", "fix"]);
+        crew.event(Event::Renamed {
+            from: "lead".into(),
+            to: "login".into(),
+        });
+        assert_eq!(crew.agent("review").unwrap().by, "login");
+        assert_eq!(listed(&crew)[0], (0, "login".to_owned()));
+        // A chat that comes back brings what it was asked and its thread.
+        crew.back(Back {
+            agent: "fix".into(),
+            task: "fix the build".into(),
+            worked: 100,
+            written: Some(90),
+            thread: vec![Entry::Prompt("fix the build".into())],
+        });
+        let fix = crew.agent("fix").unwrap();
+        assert_eq!(
+            (fix.task.as_str(), fix.worked),
+            ("fix the build", Some(100))
+        );
+        assert_eq!(fix.thread.len(), 1);
+    }
+
+    #[test]
+    fn a_kept_conversation_becomes_a_thread_without_iq_s_own_words() {
+        let kept = [
+            Message::system("You are lead"),
+            Message::user("fix the login"),
+            Message::user("(iq: your conversation is 30k tokens now.)"),
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![iq_core::ToolCall {
+                    id: "c1".into(),
+                    name: "run".into(),
+                    arguments: r#"{"command":"make test"}"#.into(),
+                }],
+            },
+            Message::Tool {
+                call_id: "c1".into(),
+                content: "Error: the reviewer refused it".into(),
+            },
+            Message::Assistant {
+                content: Some("Blocked.".into()),
+                tool_calls: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            past(&kept),
+            [
+                Entry::Prompt("fix the login".into()),
+                Entry::Tool {
+                    name: "run".into(),
+                    input: "make test".into(),
+                    output: "Error: the reviewer refused it".into(),
+                    ok: false,
+                },
+                Entry::Text("Blocked.".into()),
+            ]
+        );
     }
 }

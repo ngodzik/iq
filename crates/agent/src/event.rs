@@ -30,6 +30,14 @@ pub enum Event {
         /// What the person is told of it, when the place was made for it.
         said: Option<String>,
     },
+    /// The person gave an agent another name: what it did and what was
+    /// written to it goes on under that one.
+    Renamed {
+        /// Its name until now.
+        from: String,
+        /// Its name from now on.
+        to: String,
+    },
     /// How hard an agent thinks, as it joined or as it was changed.
     Effort {
         /// The agent.

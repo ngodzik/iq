@@ -99,6 +99,10 @@ impl Chats {
 }
 
 impl Keeper for Chats {
+    fn forget(&self, name: &str) {
+        let _ = std::fs::remove_file(self.file(name));
+    }
+
     fn keep(&self, chat: &Saved) {
         let Ok(text) = serde_json::to_string(&Kept {
             at: now(),
@@ -151,6 +155,7 @@ mod tests {
             role: None,
             task: "fix it".to_owned(),
             asked: Vec::new(),
+            written: None,
             effort: None,
             folder: Some(PathBuf::from("/place/lead")),
             context: 1200,

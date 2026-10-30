@@ -1568,6 +1568,66 @@ impl iq_agent::Keeper for Kept {
             .unwrap()
             .insert(chat.name.clone(), chat.clone());
     }
+
+    fn forget(&self, name: &str) {
+        self.0.lock().unwrap().remove(name);
+    }
+}
+
+#[tokio::test]
+async fn a_chat_renamed_goes_on_under_its_new_name_and_its_agents_follow_it() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"name": "helper", "model": "cheap/model", "task": "read the tests"}),
+                    ),
+                    say("Started."),
+                ],
+            ),
+            ("helper", vec![say("Read.")]),
+            ("login", vec![say("On it.")]),
+        ],
+        Settings::default(),
+    );
+    let kept = Arc::new(Kept::default());
+    let keeper: Arc<dyn iq_agent::Keeper> = Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>;
+    f.crew.set_keeper(Some(keeper));
+    f.crew.start(
+        "lead",
+        &model("cheap/model"),
+        "fix the login".into(),
+        PERSON,
+    );
+    f.settled().await;
+    // Kept as the person wrote to it, to open on it again.
+    assert!(kept.0.lock().unwrap()["lead"].written.is_some());
+    assert_eq!(f.crew.rename("lead", "Login").unwrap(), "login");
+    assert!(f.crew.rename("helper", "login").is_err());
+    assert!(f.crew.rename("nobody", "x").is_err());
+    assert!(f.events().contains(&Event::Renamed {
+        from: "lead".into(),
+        to: "login".into()
+    }));
+    {
+        let kept = kept.0.lock().unwrap();
+        assert!(!kept.contains_key("lead"));
+        assert_eq!(kept["login"].task, "fix the login");
+        assert_eq!(kept["helper"].by, "login");
+    }
+    let listed = f.crew.list();
+    let helper = listed.iter().find(|a| a.name == "helper").unwrap();
+    assert_eq!(helper.by, "login");
+    // What is written to its old name reaches it, its instructions say
+    // its new one.
+    f.crew.tell("lead", "go on".into()).unwrap();
+    f.settled().await;
+    let seen = f.model.seen_by("login");
+    assert!(seen.contains("go on"), "{seen}");
+    assert!(seen.contains("fix the login"), "{seen}");
 }
 
 #[tokio::test]

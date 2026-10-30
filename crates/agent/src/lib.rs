@@ -41,3 +41,4 @@ pub use place::{Placed, Placer};
 pub use rules::{RulesFile, with_imports};
 pub use team::Pattern;
 pub use tools::board as board_tools;
+pub use tools::tool_input;

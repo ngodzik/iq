@@ -229,6 +229,9 @@ enum Placing {
 struct Board {
     messages: Vec<Posted>,
     members: BTreeMap<String, Member>,
+    /// The names agents were renamed from, and the names they have now:
+    /// what an agent writes to an old one reaches it.
+    aliases: HashMap<String, String>,
 }
 
 /// A message on the board.
@@ -250,6 +253,8 @@ struct Member {
     task: String,
     /// What the person asked of it since, the latest last.
     asked: Vec<String>,
+    /// When the person last wrote to it, in seconds since 1970.
+    written: Option<u64>,
     /// What started its turn under way, or its last.
     prompt: Option<String>,
     /// Its last actions and how they ended, the latest last.
@@ -419,6 +424,7 @@ where
                 role: member.role.clone(),
                 task: member.task.clone(),
                 asked: member.asked.clone(),
+                written: member.written,
                 effort: member.effort,
                 folder: (!Arc::ptr_eq(&member.place, &self.inner.place))
                     .then(|| member.place.gate.workspace().to_path_buf()),
@@ -479,6 +485,7 @@ where
                 role: saved.role,
                 task: saved.task,
                 asked: saved.asked,
+                written: saved.written,
                 prompt: None,
                 done: VecDeque::new(),
                 read,
@@ -873,6 +880,7 @@ where
                 role,
                 task: task.clone(),
                 asked: Vec::new(),
+                written: (by == PERSON).then(now),
                 prompt: None,
                 done: VecDeque::new(),
                 read,
@@ -992,6 +1000,106 @@ where
         self.post(PERSON, to, text)
     }
 
+    /// Gives `agent` the name `name`, as the person calls it now, made a
+    /// name as the crew makes them: what was written to it, the agents it
+    /// started and its teams follow it, what is written to its old name
+    /// reaches it, and it is kept under the new one. Returns its new name.
+    ///
+    /// # Errors
+    ///
+    /// No agent is named `agent`, it works (its turn holds its name until
+    /// it ends), or another agent holds the name.
+    pub fn rename(&self, agent: &str, name: &str) -> Result<String, String> {
+        let new = base_name(name);
+        let folder = {
+            let mut board = lock(&self.inner.board);
+            if new == agent {
+                return Ok(new);
+            }
+            if board.members.contains_key(&new) || board.aliases.contains_key(&new) {
+                return Err(format!("an agent is named {new} already"));
+            }
+            let Some(member) = board.members.get(agent) else {
+                return Err(format!("no agent is named {agent:?}"));
+            };
+            if member.turn.as_ref().is_some_and(|turn| !turn.is_finished()) {
+                return Err(format!("{agent} works: name it once its turn ended"));
+            }
+            let Some(mut member) = board.members.remove(agent) else {
+                return Err(format!("no agent is named {agent:?}"));
+            };
+            let instructions = Message::system(self.instructions(
+                &new,
+                &member.by,
+                member.role.as_deref(),
+                &member.place,
+            ));
+            if let Some(first @ Message::System(_)) = member.messages.first_mut() {
+                *first = instructions;
+            }
+            let own = !Arc::ptr_eq(&member.place, &self.inner.place);
+            let folder = own.then(|| member.place.gate.workspace().to_path_buf());
+            board.members.insert(new.clone(), member);
+            for other in board.members.values_mut() {
+                if other.by == agent {
+                    other.by.clone_from(&new);
+                }
+            }
+            for posted in &mut board.messages {
+                if posted.from == agent {
+                    posted.from.clone_from(&new);
+                }
+                if posted.to == agent {
+                    posted.to.clone_from(&new);
+                }
+            }
+            for named in board.aliases.values_mut() {
+                if named == agent {
+                    named.clone_from(&new);
+                }
+            }
+            board.aliases.insert(agent.to_owned(), new.clone());
+            folder
+        };
+        for team in lock(&self.inner.teams).iter_mut() {
+            team.rename(agent, &new);
+        }
+        let mut refused = lock(&self.inner.refused);
+        if let Some(count) = refused.remove(agent) {
+            refused.insert(new.clone(), count);
+        }
+        drop(refused);
+        if let Some(keeper) = lock(&self.inner.keeper).clone() {
+            keeper.forget(agent);
+        }
+        self.keep(&new);
+        // Those it started are kept with their starter's new name, to come
+        // back under it.
+        let started: Vec<String> = lock(&self.inner.board)
+            .members
+            .iter()
+            .filter(|(_, member)| member.by == new)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &started {
+            self.keep(name);
+        }
+        self.report(Event::Renamed {
+            from: agent.to_owned(),
+            to: new.clone(),
+        });
+        // Told again where it works, under its new name: what the
+        // person's plugins show of its place follows it.
+        if let Some(folder) = folder {
+            self.report(Event::Placed {
+                agent: new.clone(),
+                folder,
+                said: None,
+            });
+        }
+        Ok(new)
+    }
+
     /// Stops `agent`'s turn, if it works.
     pub fn stop(&self, agent: &str) {
         let turn = lock(&self.inner.board)
@@ -1064,6 +1172,15 @@ where
     /// that started it, and a message from another agent, a few times in a
     /// while; others wait to be read.
     pub(crate) fn post(&self, from: &str, to: &str, text: String) -> Result<(), String> {
+        // A name an agent was renamed from leads to it, unless another
+        // agent took that name since.
+        let renamed = {
+            let board = lock(&self.inner.board);
+            (!board.members.contains_key(to))
+                .then(|| board.aliases.get(to).cloned())
+                .flatten()
+        };
+        let to = renamed.as_deref().unwrap_or(to);
         let wakes = {
             let mut board = lock(&self.inner.board);
             if to != ALL && to != PERSON && !board.members.contains_key(to) {
@@ -1084,6 +1201,7 @@ where
                         member.asked.push(text.clone());
                         let over = member.asked.len().saturating_sub(ASKED_KEPT);
                         member.asked.drain(..over);
+                        member.written = Some(now());
                     }
                 }
             }
@@ -1114,6 +1232,11 @@ where
             }
             (true, false, false) => false,
         };
+        // Kept as the person writes, so that iq opens again on the chat
+        // they wrote to last.
+        if from == PERSON && to != ALL {
+            self.keep(to);
+        }
         self.inner.posted.send_modify(|count| *count += 1);
         self.report(Event::Posted {
             from: from.to_owned(),
@@ -1130,7 +1253,9 @@ where
     /// The messages to `agent` it has not read, as one text, marked read.
     fn unread(&self, agent: &str) -> Option<String> {
         let mut board = lock(&self.inner.board);
-        let Board { messages, members } = &mut *board;
+        let Board {
+            messages, members, ..
+        } = &mut *board;
         let member = members.get_mut(agent)?;
         let new: Vec<&Posted> = messages[member.read..]
             .iter()
@@ -2182,6 +2307,13 @@ fn base_name(name: &str) -> String {
     } else {
         base
     }
+}
+
+/// Seconds since 1970.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// `base`, or `base-2`, `base-3`…: the first no member has, nor `taken`.

@@ -1,6 +1,7 @@
-//! The crew's page: each agent, who started it, what it does and what it
-//! spent, the one chosen marked; and an agent's whole thread, written as
-//! the conversation writes it.
+//! The crew's page: the person's chats, each with the agents it started
+//! under it, who started each, what it does and what it spent, what it was
+//! first asked and when it last worked, the one chosen marked; and an
+//! agent's whole thread, written as the conversation writes it.
 
 use iq_agent::PERSON;
 use iq_ui::crew::Entry;
@@ -28,9 +29,10 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
     lines.push(Line::default());
     let chosen = board.screen().chosen();
     let talking = board.screen().talking_to();
-    let name_width = agents
+    let listed = board.crew().listed();
+    let name_width = listed
         .iter()
-        .map(|a| a.name.chars().count())
+        .map(|(depth, a)| a.name.chars().count() + 2 * depth)
         .max()
         .unwrap_or(0)
         + 2;
@@ -40,9 +42,12 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0)
         + 2;
-    for (at, agent) in agents.iter().enumerate() {
-        let tint = p.agent(at);
+    let now = iq_ui::now();
+    for (at, (depth, agent)) in listed.iter().enumerate() {
+        let tint = agent_tint(board, &agent.name, p);
         let on = at == chosen;
+        let depth = *depth;
+        let nested = "  ".repeat(depth);
         let state = if agent.working {
             ("working".to_owned(), p.accent)
         } else {
@@ -61,11 +66,12 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         } else {
             format!("by {}", agent.by)
         };
+        let named = format!("{nested}{}", agent.name);
         let mut spans = vec![
             Span::styled(if on { " ▸ " } else { "   " }, p.fg(p.accent)),
-            Span::styled("● ", p.fg(tint)),
+            Span::styled(if depth > 0 { "◦ " } else { "● " }, p.fg(tint)),
             Span::styled(
-                format!("{:<name_width$}", agent.name),
+                format!("{named:<name_width$}"),
                 if on { p.bold(tint) } else { p.fg(p.text) },
             ),
             Span::styled(format!("{:<model_width$}", agent.model), p.fg(p.dim)),
@@ -88,11 +94,40 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
             ));
         }
         lines.push(Line::from(spans));
-        if let Some(place) = &agent.place {
+        let under = format!("       {nested}");
+        // What it was first asked, and when it last worked: what tells
+        // one chat from another.
+        if !agent.task.trim().is_empty() || agent.worked.is_some() {
+            let worked = agent
+                .worked
+                .map(|at| format!("at work {} · ", iq_ui::ago(at, now)))
+                .unwrap_or_default();
+            let room = seen
+                .width
+                .saturating_sub(under.chars().count() + worked.chars().count() + 3);
+            let asked = first_line(given(&agent.task));
+            let mut said = vec![
+                Span::raw(under.clone()),
+                Span::styled(worked, p.fg(p.faint)),
+            ];
+            if !asked.is_empty() {
+                said.push(Span::styled(
+                    format!("“{}”", cut(&asked, room)),
+                    p.fg(p.dim),
+                ));
+            }
+            lines.push(Line::from(said));
+        }
+        if let Some(place) = &agent.place
+            && depth == 0
+        {
             lines.push(Line::from(Span::styled(
                 format!(
-                    "       in {}",
-                    cut(&place.display().to_string(), seen.width.saturating_sub(12))
+                    "{under}in {}",
+                    cut(
+                        &place.display().to_string(),
+                        seen.width.saturating_sub(under.chars().count() + 4)
+                    )
                 ),
                 p.fg(p.faint),
             )));
@@ -100,12 +135,15 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         // What the person's plugins say of it: its containers, say.
         for said in seen.board.plugins().lines(&agent.name) {
             lines.push(Line::from(Span::styled(
-                format!("       {}", cut(said, seen.width.saturating_sub(9))),
+                format!(
+                    "{under}{}",
+                    cut(said, seen.width.saturating_sub(under.chars().count() + 2))
+                ),
                 p.fg(p.dim),
             )));
         }
     }
-    if let Some(agent) = agents.get(chosen) {
+    if let Some((_, agent)) = listed.get(chosen) {
         seen.heading(
             &mut lines,
             "Lately",

@@ -123,6 +123,16 @@ impl Plugins {
             .filter(|status| !status.is_empty())
     }
 
+    /// What they show under the chat `from` shows under `to`, its new
+    /// name, until they say again.
+    pub fn rename(&mut self, from: &str, to: &str) {
+        for shown in self.shown.values_mut() {
+            if let Some(lines) = shown.lines.remove(from) {
+                shown.lines.insert(to.to_owned(), lines);
+            }
+        }
+    }
+
     /// Their lines under `chat` on the Team page.
     #[must_use]
     pub fn lines(&self, chat: &str) -> Vec<&str> {

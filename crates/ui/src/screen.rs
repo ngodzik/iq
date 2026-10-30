@@ -24,6 +24,9 @@ pub struct NewChat {
     /// How hard its agent thinks, when the person chose; else as the
     /// settings say.
     pub effort: Option<iq_core::Effort>,
+    /// Its name, as the person gave it: empty for one made from its first
+    /// request.
+    pub name: String,
 }
 
 /// Where what the person writes goes.
@@ -289,6 +292,13 @@ impl Screen {
     /// An agent was asked for under `name`.
     pub fn starts(&mut self, name: &str) {
         self.starting.push(name.to_owned());
+    }
+
+    /// The agent `from` is called `to` from now on.
+    pub fn renamed(&mut self, from: &str, to: &str) {
+        if self.talking_to() == Some(from) {
+            self.talk_to(to);
+        }
     }
 
     /// `agent` joined.

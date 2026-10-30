@@ -113,6 +113,16 @@ impl Journal {
                     places.insert(agent.clone(), folder.clone());
                 }
             }
+            Event::Renamed { from, to } => {
+                if let Some(model) = models.remove(from) {
+                    models.insert(to.clone(), model);
+                }
+                if let Ok(mut places) = self.places.lock()
+                    && let Some(place) = places.remove(from)
+                {
+                    places.insert(to.clone(), place);
+                }
+            }
             Event::Working { agent, prompt } => {
                 tasks.entry(agent.clone()).or_insert_with(|| OpenTask {
                     snapshot: {
