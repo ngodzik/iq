@@ -363,9 +363,15 @@ fn moving(
         args.extend(["--project-directory".to_owned(), directory.value.clone()]);
     }
     args.extend(["--project-name".to_owned(), project.to_owned()]);
-    // Every profile's services, which a target may start.
-    let printed =
-        config(persons, &args, &["--profile", "*"]).or_else(|_| config(persons, &args, &[]))?;
+    // Read the first way compose takes: every profile's services first.
+    let mut printed = config(persons, &args, &compose::config_args(compose::READINGS[0]));
+    for way in &compose::READINGS[1..] {
+        if printed.is_ok() {
+            break;
+        }
+        printed = config(persons, &args, &compose::config_args(*way));
+    }
+    let printed = printed?;
     let services = compose::services(&printed)?;
     let mut taken = stack::taken_by_others(kept, folder);
     let (moved, _) = stack::moves(project, &services, Some(place), &mut taken)?;
@@ -411,15 +417,14 @@ fn key(given: &Options) -> String {
     key.join("\n")
 }
 
-/// What `docker compose` with `args`, then `more`, resolves the project
-/// to, as JSON: run as the person's docker runs it, so that it does not
-/// come back here.
+/// What `docker compose` with `args`, then `more`, its `config` among
+/// them, prints of the project: run as the person's docker runs it, so
+/// that it does not come back here.
 fn config(persons: &Path, args: &[String], more: &[&str]) -> Result<String, PortsError> {
     let mut command = std::process::Command::new("docker");
     command
         .args(args)
         .args(more)
-        .args(["config", "--format", "json"])
         .env("DOCKER_CONFIG", persons)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

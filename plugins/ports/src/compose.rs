@@ -17,6 +17,29 @@ pub(crate) const FILES: [&str; 4] = [
     "docker-compose.yaml",
 ];
 
+/// How the project is read, the first way compose takes: every profile's
+/// services, which a target may start, their env files left unread (the
+/// ports do not rest on them, and a profile never started may name one
+/// never made); then with them, for a compose without that flag; then
+/// the services of no profile. Each is what goes before compose's
+/// `config`, then after it.
+pub(crate) const READINGS: [(&[&str], &[&str]); 3] = [
+    (&["--profile", "*"], &["--no-env-resolution"]),
+    (&["--profile", "*"], &[]),
+    (&[], &[]),
+];
+
+/// compose's arguments for `reading`, one of [`READINGS`]: the project
+/// resolved, as JSON.
+pub(crate) fn config_args(
+    (before, after): (&[&'static str], &[&'static str]),
+) -> Vec<&'static str> {
+    let mut args = before.to_vec();
+    args.extend(["config", "--format", "json"]);
+    args.extend_from_slice(after);
+    args
+}
+
 /// The file it reads after it, when there is one.
 const OVERRIDES: [&str; 4] = [
     "compose.override.yml",
@@ -166,18 +189,24 @@ pub fn services(printed: &str) -> Result<Vec<Service>, PortsError> {
 /// The file compose reads after the project's: each service's ports in
 /// place of its own, those `hidden` gives a port of the worktree's moved
 /// to it on localhost, the others as they were; and the fixed names of
-/// containers taken off.
+/// containers taken off. With nothing to move nor rename, its services
+/// are an empty mapping, which compose takes where it refuses none.
 #[must_use]
 pub fn moving(services: &[Service], hidden: impl Fn(&str, &Port) -> Option<u16>) -> String {
     let quoted = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned());
     let mut text = String::from(
         "# Written by iq-ports: this worktree's stack on ports of its own, its\n\
          # containers named by compose. Read after the project's files.\n\
-         services:\n",
+         services:",
     );
+    let mut any = false;
     for service in services {
         if service.host_network || (service.ports.is_empty() && !service.named) {
             continue;
+        }
+        if !any {
+            text.push('\n');
+            any = true;
         }
         text.push_str(&format!("  {}:\n", quoted(&service.name)));
         if service.named {
@@ -205,6 +234,9 @@ pub fn moving(services: &[Service], hidden: impl Fn(&str, &Port) -> Option<u16>)
                 }
             }
         }
+    }
+    if !any {
+        text.push_str(" {}\n");
     }
     text
 }
@@ -273,6 +305,30 @@ mod tests {
                  ports: !override\n      \
                    - target: 80\n        protocol: \"tcp\"\n        published: \"3000-3001\"\n"
         );
+    }
+
+    #[test]
+    fn nothing_to_move_nor_rename_is_an_empty_mapping_of_services() {
+        let services = services(r#"{"services": {"worker": {"image": "x"}}}"#).unwrap();
+        for services in [&services[..], &[]] {
+            assert!(
+                moving(services, |_, _| None).ends_with("\nservices: {}\n"),
+                "{}",
+                moving(services, |_, _| None)
+            );
+        }
+        assert_eq!(
+            config_args(READINGS[0]),
+            [
+                "--profile",
+                "*",
+                "config",
+                "--format",
+                "json",
+                "--no-env-resolution"
+            ]
+        );
+        assert_eq!(config_args(READINGS[2]), ["config", "--format", "json"]);
     }
 
     #[test]

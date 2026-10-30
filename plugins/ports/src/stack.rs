@@ -164,15 +164,14 @@ impl Stack {
             ("COMPOSE_PROJECT_NAME".to_owned(), project.clone()),
             ("COMPOSE_FILE".to_owned(), joined(&files)),
         ]);
-        // Every profile's services, which a target may start.
-        let mut printed = docker::compose(
-            &top,
-            &reading,
-            &["--profile", "*", "config", "--format", "json"],
-        )
-        .await?;
-        if !printed.ok {
-            printed = docker::compose(&top, &reading, &["config", "--format", "json"]).await?;
+        // Read the first way compose takes: every profile's services first.
+        let mut printed =
+            docker::compose(&top, &reading, &compose::config_args(compose::READINGS[0])).await?;
+        for way in &compose::READINGS[1..] {
+            if printed.ok {
+                break;
+            }
+            printed = docker::compose(&top, &reading, &compose::config_args(*way)).await?;
         }
         if !printed.ok {
             return Err(PortsError::Command {
