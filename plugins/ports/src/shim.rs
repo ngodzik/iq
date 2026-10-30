@@ -13,9 +13,10 @@
 //! There, the person's settings are as in theirs (their context, their
 //! credentials helpers, their proxies, their other plugins, and the rest of
 //! their folder linked), but the logins it holds itself, which are not
-//! copied; and docker's compose is iq-ports, which adds to the files given
-//! one that moves their ports, puts the worktree's project in place of
-//! another, then runs docker's own compose in its place.
+//! copied (the names of the registries a credentials helper holds the
+//! logins of are); and docker's compose is iq-ports, which adds to the
+//! files given one that moves their ports, puts the worktree's project in
+//! place of another, then runs docker's own compose in its place.
 
 use std::ffi::OsString;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -163,7 +164,8 @@ pub fn real_compose(persons: &Path, ours: &Path) -> Option<PathBuf> {
 }
 
 /// The settings of the plugin's folder: the person's, in `persons`, but the
-/// logins they hold themselves, with the plugin's `plugins` folder first
+/// logins they hold themselves (the names of the registries a credentials
+/// helper holds the logins of kept), with the plugin's `plugins` folder first
 /// where docker looks for plugins, then the person's; and what is not
 /// carried, said.
 fn settings(persons: &Path, plugins: &Path) -> Result<(String, Vec<String>), PortsError> {
@@ -176,7 +178,10 @@ fn settings(persons: &Path, plugins: &Path) -> Result<(String, Vec<String>), Por
     };
     let mut said = Vec::new();
     if let Some(Value::Object(logins)) = settings.remove("auths") {
-        let held = logins.values().any(|login| {
+        // A credentials helper leaves an empty entry for each registry it
+        // holds a login of: its name alone, which some projects look for
+        // before they start their stack, so it is kept.
+        let (held, named): (Vec<_>, Vec<_>) = logins.into_iter().partition(|(_, login)| {
             LOGIN.iter().any(|field| {
                 login
                     .get(field)
@@ -184,7 +189,14 @@ fn settings(persons: &Path, plugins: &Path) -> Result<(String, Vec<String>), Por
                     .is_some_and(|value| !value.is_empty())
             })
         });
-        if held {
+        if !named.is_empty() {
+            let named = named
+                .into_iter()
+                .map(|(registry, _)| (registry, Value::Object(Map::new())))
+                .collect();
+            settings.insert("auths".to_owned(), Value::Object(named));
+        }
+        if !held.is_empty() {
             said.push(
                 "the registries docker logged in to without a credentials helper are not \
                  logged in to from a worktree: docker's config.json holds those logins \
@@ -650,7 +662,11 @@ mod tests {
         std::fs::write(
             persons.join("config.json"),
             serde_json::json!({
-                "auths": {"registry.example": {"auth": "c2VjcmV0"}},
+                "auths": {
+                    "registry.example": {"auth": "c2VjcmV0"},
+                    "helped.example": {},
+                    "token.example": {"identitytoken": "dG9rZW4="},
+                },
                 "credsStore": "desktop",
                 "currentContext": "desktop-linux",
                 "proxies": {"default": {"httpProxy": "http://proxy:3128"}},
@@ -667,8 +683,9 @@ mod tests {
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(folder.join("config.json")).unwrap())
                 .unwrap();
-        assert!(written.get("auths").is_none());
+        assert_eq!(written["auths"], serde_json::json!({"helped.example": {}}));
         assert!(!written.to_string().contains("c2VjcmV0"));
+        assert!(!written.to_string().contains("dG9rZW4="));
         assert_eq!(written["credsStore"], "desktop");
         assert_eq!(written["currentContext"], "desktop-linux");
         assert_eq!(
