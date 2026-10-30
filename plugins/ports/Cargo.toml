@@ -1,0 +1,24 @@
+[package]
+name    = "iq-ports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A plugin of iq's: each worktree's docker compose stack apart from the others' (its containers, its data, ports of its own), the usual ports of localhost led to the one the person chooses. Nothing of the project is changed."
+
+[[bin]]
+name = "iq-ports"
+path = "src/main.rs"
+
+[dependencies]
+iq-plugin.workspace  = true
+thiserror.workspace  = true
+anyhow.workspace     = true
+serde.workspace      = true
+serde_json.workspace = true
+toml.workspace       = true
+clap.workspace       = true
+tokio = { workspace = true, features = ["net", "io-util", "io-std", "process", "time", "sync", "signal"] }
+
+[dev-dependencies]
+tempfile.workspace = true

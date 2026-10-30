@@ -1083,6 +1083,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "iq-ports"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "iq-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "iq-sync"
 version = "0.1.0"
 dependencies = [
