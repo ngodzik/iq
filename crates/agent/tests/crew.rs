@@ -1574,6 +1574,61 @@ impl iq_agent::Keeper for Kept {
     }
 }
 
+/// Whether `kept` holds `agent` with a tool's answer in its turn.
+fn halfway(kept: &Kept, agent: &str) -> bool {
+    kept.0.lock().unwrap().get(agent).is_some_and(|saved| {
+        saved
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. }))
+    })
+}
+
+/// Waits until `kept` holds `agent` with a tool's answer in its turn.
+async fn kept_halfway(kept: &Kept, agent: &str) -> bool {
+    for _ in 0..500 {
+        if halfway(kept, agent) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_turn_is_kept_as_it_goes_and_as_it_was_once_the_person_stops_it() {
+    let script = || {
+        vec![
+            calls(
+                "write_file",
+                serde_json::json!({"path": "notes.txt", "content": "half\n"}),
+            ),
+            calls("wait_for_messages", serde_json::json!({"seconds": 60})),
+            say("Never said."),
+        ]
+    };
+    for person_stops in [true, false] {
+        let f = fixture(&[("lead", script())], Settings::default());
+        let kept = Arc::new(Kept::default());
+        let keeper: Arc<dyn iq_agent::Keeper> = Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>;
+        f.crew.set_keeper(Some(keeper));
+        f.crew
+            .start("lead", &model("cheap/model"), "write notes".into(), PERSON);
+        // Its first call answered, the turn is kept as it stands: iq
+        // stopped now would find it there.
+        assert!(kept_halfway(&kept, "lead").await, "{:?}", kept.0.lock());
+        if person_stops {
+            // Stopped by the person, it is as it was before the turn.
+            f.crew.stop("lead");
+            assert!(!halfway(&kept, "lead"));
+        } else {
+            // As iq ends, it stays where it stopped.
+            f.crew.end().await;
+            assert!(halfway(&kept, "lead"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_chat_renamed_goes_on_under_its_new_name_and_its_agents_follow_it() {
     let f = fixture(

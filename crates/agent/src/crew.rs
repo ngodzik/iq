@@ -185,6 +185,10 @@ struct Inner<M> {
     placer: Mutex<Option<Arc<dyn Placer>>>,
     /// What keeps the chats between sessions, when the person wants it.
     keeper: Mutex<Option<Arc<dyn Keeper>>>,
+    /// Held while a chat is kept, so that what a turn under way keeps and
+    /// what is kept of it once it is stopped come in the order they were
+    /// taken.
+    keeping: Mutex<()>,
     settings: Settings,
     report: Report,
     autopilot: AtomicBool,
@@ -263,6 +267,8 @@ struct Member {
     read: usize,
     /// Its turn under way, when it works.
     turn: Option<JoinHandle<()>>,
+    /// How many turns it was woken for: the number of its last.
+    turns: u64,
     /// Its conversation, kept between turns.
     messages: Vec<Message>,
     /// How hard it thinks: as it was started or changed, else as the
@@ -321,6 +327,7 @@ where
                 helper,
                 placer: Mutex::new(None),
                 keeper: Mutex::new(None),
+                keeping: Mutex::new(()),
                 settings,
                 report,
                 autopilot: AtomicBool::new(false),
@@ -409,13 +416,37 @@ where
 
     /// Gives `agent` to the keeper, as it stands now.
     fn keep(&self, agent: &str) {
+        self.keep_as(agent, None);
+    }
+
+    /// Gives `agent` to the keeper with its conversation as its turn
+    /// `turn` holds it so far, `messages`, so that iq stopped in the middle
+    /// of it, or crashed, finds it where it stopped. A turn stopped, or
+    /// another begun, keeps nothing more.
+    fn keep_turn(&self, agent: &str, turn: u64, messages: &[Message]) {
+        self.keep_as(agent, Some((turn, messages)));
+    }
+
+    /// Gives `agent` to the keeper, with the conversation of its turn under
+    /// way when `turn` gives it.
+    fn keep_as(&self, agent: &str, turn: Option<(u64, &[Message])>) {
         let Some(keeper) = lock(&self.inner.keeper).clone() else {
             return;
         };
+        let _keeping = lock(&self.inner.keeping);
         let saved = {
             let board = lock(&self.inner.board);
             let Some(member) = board.members.get(agent) else {
                 return;
+            };
+            let messages = match turn {
+                Some((number, messages)) => {
+                    if member.turns != number || member.turn.is_none() {
+                        return;
+                    }
+                    messages.to_vec()
+                }
+                None => member.messages.clone(),
             };
             Saved {
                 name: agent.to_owned(),
@@ -429,7 +460,7 @@ where
                 folder: (!Arc::ptr_eq(&member.place, &self.inner.place))
                     .then(|| member.place.gate.workspace().to_path_buf()),
                 context: member.context,
-                messages: member.messages.clone(),
+                messages,
             }
         };
         keeper.keep(&saved);
@@ -490,6 +521,7 @@ where
                 done: VecDeque::new(),
                 read,
                 turn: None,
+                turns: 0,
                 messages,
                 effort: saved.effort,
                 context: saved.context,
@@ -885,6 +917,7 @@ where
                 done: VecDeque::new(),
                 read,
                 turn: None,
+                turns: 0,
                 messages,
                 effort,
                 context: 0,
@@ -1101,26 +1134,38 @@ where
     }
 
     /// Stops `agent`'s turn, if it works.
+    ///
+    /// It is left as it was before that turn, and kept so.
     pub fn stop(&self, agent: &str) {
+        if self.halt(agent) {
+            self.keep(agent);
+        }
+    }
+
+    /// Stops every agent, as iq ends: what each did in its turn stays kept,
+    /// to come back to.
+    pub fn stop_all(&self) {
+        let names: Vec<String> = lock(&self.inner.board).members.keys().cloned().collect();
+        for name in names {
+            self.halt(&name);
+        }
+    }
+
+    /// Stops `agent`'s turn, if it works; whether it did.
+    fn halt(&self, agent: &str) -> bool {
         let turn = lock(&self.inner.board)
             .members
             .get_mut(agent)
             .and_then(|member| member.turn.take());
-        if let Some(turn) = turn {
-            turn.abort();
-            self.report(Event::Done {
-                agent: agent.to_owned(),
-                outcome: Err("stopped by the person".into()),
-            });
-        }
-    }
-
-    /// Stops every agent.
-    pub fn stop_all(&self) {
-        let names: Vec<String> = lock(&self.inner.board).members.keys().cloned().collect();
-        for name in names {
-            self.stop(&name);
-        }
+        let Some(turn) = turn else {
+            return false;
+        };
+        turn.abort();
+        self.report(Event::Done {
+            agent: agent.to_owned(),
+            outcome: Err("stopped by the person".into()),
+        });
+        true
     }
 
     /// Ends the crew: every agent stopped, and what their commands left
@@ -1303,6 +1348,8 @@ where
             return;
         }
         member.prompt = Some(prompt.clone());
+        member.turns += 1;
+        let number = member.turns;
         self.report(Event::Working {
             agent: name.clone(),
             prompt: prompt.clone(),
@@ -1310,7 +1357,7 @@ where
         self.inner.busy.fetch_add(1, Ordering::SeqCst);
         let busy = Busy(self.clone());
         member.turn = Some(tokio::spawn(async move {
-            crew.turn(name, prompt).await;
+            crew.turn(name, prompt, number).await;
             drop(busy);
         }));
     }
@@ -1318,7 +1365,7 @@ where
     /// One turn of an agent's, until it answers. Its state is taken as it
     /// was, and kept again only when the turn ends: a turn stopped halfway
     /// leaves the agent as it was before it.
-    async fn turn(self, name: String, prompt: String) {
+    async fn turn(self, name: String, prompt: String, number: u64) {
         let (taken, posted_before) = {
             let board = lock(&self.inner.board);
             let taken = board.members.get(&name).map(|member| {
@@ -1333,7 +1380,7 @@ where
         let Some((messages, model, by)) = taken else {
             return;
         };
-        let (messages, outcome) = self.own_turn(&name, &model, messages, prompt).await;
+        let (messages, outcome) = self.own_turn(&name, &model, messages, prompt, number).await;
         let mut compacted_from = None;
         if let Some(member) = lock(&self.inner.board).members.get_mut(&name) {
             member.messages = match member.compacted.take() {
@@ -1496,6 +1543,7 @@ where
         model: &ModelId,
         mut messages: Vec<Message>,
         prompt: String,
+        number: u64,
     ) -> (Vec<Message>, Result<String, String>) {
         messages.push(Message::user(prompt));
         let mut tools = tools::work();
@@ -1582,6 +1630,8 @@ where
                     content,
                 });
             }
+            // Its calls answered, the turn is kept as it stands.
+            self.keep_turn(name, number, &messages);
         }
         let steps = self.inner.settings.steps;
         (
