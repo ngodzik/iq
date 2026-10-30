@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::PortsError;
 
 /// The files compose reads in a folder, the first it finds.
-const FILES: [&str; 4] = [
+pub(crate) const FILES: [&str; 4] = [
     "compose.yaml",
     "compose.yml",
     "docker-compose.yml",

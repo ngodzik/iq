@@ -1,14 +1,16 @@
 //! A worktree's stack kept apart: its compose project, the files compose
 //! reads there with the plugin's after them, the ports of its own its
 //! services are moved to, what cannot be kept apart, and the variables
-//! that make a command's compose the worktree's.
+//! that make a command's compose the worktree's, docker's among them when
+//! the plugin's compose takes its place.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::PortsError;
-use crate::compose::{self, Port};
+use crate::compose::{self, Port, Service};
 use crate::docker::{self, STARTING};
+use crate::shim::Shim;
 use crate::store::{Kept, Moved, Place, Store};
 
 /// The first of the ports a worktree's own are taken from: below the
@@ -32,8 +34,13 @@ pub struct Stack {
     pub files: Vec<PathBuf>,
     /// The plugin's, read after them.
     pub ports_file: PathBuf,
-    /// Its services' ports moved.
+    /// Its services' ports moved: those of its usual files first, then
+    /// those other files compose was run with there moved.
     pub moved: Vec<Moved>,
+    /// The folder docker is pointed to there, where the plugin's compose
+    /// reads the files a command names with the plugin's: none when it
+    /// could not be set up.
+    pub docker: Option<PathBuf>,
     /// What cannot be kept apart, said to the person.
     pub notes: Vec<String>,
 }
@@ -60,13 +67,16 @@ fn project_name(text: &str) -> String {
     }
 }
 
-/// A number of `text`'s, the same from one start to the next: where the
-/// search for a free port starts.
-fn spot(text: &str) -> u16 {
-    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+/// A number of `text`'s, the same from one start to the next.
+pub(crate) fn hash(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    });
-    (hash % u64::from(SPAN)) as u16
+    })
+}
+
+/// Where the search for a free port for `text` starts.
+fn spot(text: &str) -> u16 {
+    (hash(text) % u64::from(SPAN)) as u16
 }
 
 /// Whether `port` of localhost is free for `protocol`.
@@ -112,7 +122,9 @@ impl Stack {
     /// The stack of the worktree `folder` is in, as compose resolves its
     /// files now: its ports moved to those it was given before, else to
     /// free ones, and the file that moves them written. `listed` is the
-    /// person's `COMPOSE_FILE`, when they set one.
+    /// person's `COMPOSE_FILE`, when they set one; `shim`, the compose
+    /// that takes docker's place there, so that a command handing compose
+    /// files of its own keeps it apart too.
     ///
     /// # Errors
     ///
@@ -123,6 +135,7 @@ impl Stack {
         listed: Option<&str>,
         store: &Store,
         kept: &Kept,
+        shim: Option<&Shim>,
     ) -> Result<Self, PortsError> {
         let (repository, top) = named(folder).await;
         let files = compose::files(&top, listed)?;
@@ -169,57 +182,31 @@ impl Stack {
         }
         let services = compose::services(&printed.stdout)?;
         let before = kept.places.get(&top);
-        let mut taken: BTreeSet<u16> = kept
-            .places
-            .iter()
-            .filter(|(other, _)| **other != top)
-            .flat_map(|(_, place)| place.moved.iter().map(|m| m.hidden))
-            .collect();
-        let mut moved = Vec::new();
-        let mut notes = Vec::new();
-        for service in &services {
-            if service.host_network {
-                notes.push(format!(
-                    "{} shares the machine's network: its ports are its own and clash with \
-                     another worktree's",
-                    service.name
-                ));
-                continue;
-            }
-            for port in &service.ports {
-                let Some(usual) = port.usual() else {
-                    if let Some(range) = &port.published {
-                        notes.push(format!(
-                            "the ports {range} of {} are a range: they are not moved",
-                            service.name
-                        ));
-                    }
-                    continue;
-                };
-                let again = before.and_then(|place| {
-                    place.moved.iter().find(|m| {
-                        m.service == service.name
-                            && m.target == port.target
-                            && m.protocol == port.protocol
-                            && !taken.contains(&m.hidden)
-                    })
-                });
-                let hidden = match again {
-                    Some(again) => again.hidden,
-                    None => pick(&project, &service.name, port, &taken)?,
-                };
-                taken.insert(hidden);
-                moved.push(Moved {
-                    service: service.name.clone(),
-                    target: port.target,
-                    protocol: port.protocol.clone(),
-                    usual,
-                    hidden,
-                });
-            }
-        }
+        let mut taken = taken_by_others(kept, &top);
+        let (mut moved, mut notes) = moves(&project, &services, before, &mut taken)?;
         let text = compose::moving(&services, |name, port| hidden_of(&moved, name, port));
         let ports_file = store.write_ports_file(&project, &text)?;
+        // Those other files moved stay its own: their containers may hold
+        // them.
+        for again in before.into_iter().flat_map(|place| &place.moved) {
+            if !moved.iter().any(|m| m.same_port(again)) && taken.insert(again.hidden) {
+                moved.push(again.clone());
+            }
+        }
+        let docker = match shim.map(|shim| shim.set_up(store)) {
+            Some(Ok((folder, said))) => {
+                notes.extend(said);
+                Some(folder)
+            }
+            Some(Err(error)) => {
+                notes.push(format!(
+                    "a command handing compose its files itself (`--file`) reads the \
+                     project's alone, and is not kept apart: {error}"
+                ));
+                None
+            }
+            None => None,
+        };
         Ok(Self {
             folder: top,
             repository,
@@ -227,6 +214,7 @@ impl Stack {
             files,
             ports_file,
             moved,
+            docker,
             notes,
         })
     }
@@ -245,10 +233,14 @@ impl Stack {
     pub fn vars(&self) -> BTreeMap<String, String> {
         let mut files = self.files.clone();
         files.push(self.ports_file.clone());
-        BTreeMap::from([
+        let mut vars = BTreeMap::from([
             ("COMPOSE_PROJECT_NAME".to_owned(), self.project.clone()),
             ("COMPOSE_FILE".to_owned(), joined(&files)),
-        ])
+        ]);
+        if let Some(docker) = &self.docker {
+            vars.insert("DOCKER_CONFIG".to_owned(), docker.display().to_string());
+        }
+        vars
     }
 
     /// The same, as a shell sets them.
@@ -263,14 +255,15 @@ impl Stack {
     }
 
     /// The usual ports of localhost led to the worktree's own, those of
-    /// TCP: the ones a browser and a client reach.
+    /// TCP: the ones a browser and a client reach. A port two services
+    /// publish leads to the one of the usual files.
     #[must_use]
     pub fn relayed(&self) -> HashMap<u16, u16> {
-        self.moved
-            .iter()
-            .filter(|m| m.protocol == "tcp")
-            .map(|m| (m.usual, m.hidden))
-            .collect()
+        let mut routes = HashMap::new();
+        for m in self.moved.iter().filter(|m| m.protocol == "tcp") {
+            routes.entry(m.usual).or_insert(m.hidden);
+        }
+        routes
     }
 
     /// Whether some of its services run.
@@ -285,8 +278,9 @@ impl Stack {
     }
 
     /// What a `make` target `up` names says it runs that hands compose
-    /// its files itself, which reads the project's alone: said, since its
-    /// ports then are not moved.
+    /// its files or its project itself where the plugin's compose does not
+    /// take docker's: said, since that stack is not kept apart. It takes
+    /// it once set up, but for `docker-compose` run alone.
     pub async fn unmoved_by(&self, up: &str) -> Option<String> {
         let target = up.trim().strip_prefix("make")?;
         let target = target.trim();
@@ -295,21 +289,17 @@ impl Stack {
         let dry = docker::run("make", &args, &self.folder, &self.vars(), docker::READING)
             .await
             .ok()?;
-        dry.stdout
-            .lines()
-            .find(|line| {
-                (line.contains("docker compose") || line.contains("docker-compose"))
-                    && line
-                        .split_whitespace()
-                        .any(|word| word == "-f" || word.starts_with("--file"))
-            })
-            .map(|line| {
-                format!(
-                    "`{up}` hands compose its files itself (`{}`): it reads the project's \
-                     alone, so this stack takes the usual ports",
-                    line.trim()
-                )
-            })
+        dry.stdout.lines().find_map(|line| {
+            let alone = line.contains("docker-compose");
+            let compose = alone || (self.docker.is_none() && line.contains("docker compose"));
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let named = words.iter().any(|word| {
+                ["-f", "-p"].contains(word)
+                    || word.starts_with("--file")
+                    || word.starts_with("--project-name")
+            });
+            (compose && named).then(|| unmoved(up, line.trim(), &words, alone))
+        })
     }
 
     /// Starts it with `up`, as the person's settings say it starts.
@@ -351,7 +341,7 @@ impl Stack {
 }
 
 /// The worktree's own port `port` of `service` was moved to.
-fn hidden_of(moved: &[Moved], service: &str, port: &Port) -> Option<u16> {
+pub(crate) fn hidden_of(moved: &[Moved], service: &str, port: &Port) -> Option<u16> {
     moved
         .iter()
         .find(|m| {
@@ -361,6 +351,109 @@ fn hidden_of(moved: &[Moved], service: &str, port: &Port) -> Option<u16> {
                 && Some(m.usual) == port.usual()
         })
         .map(|m| m.hidden)
+}
+
+/// What is said of `up`, whose `line` hands compose its files or its
+/// project, `alone` when it runs `docker-compose` rather than docker's:
+/// what dropping a `--file` naming compose's own file keeps apart, since
+/// compose reads that file without it.
+fn unmoved(up: &str, line: &str, words: &[&str], alone: bool) -> String {
+    let files: Vec<&str> = words
+        .iter()
+        .zip(words.iter().skip(1))
+        .filter_map(|(word, next)| ["-f", "--file"].contains(word).then_some(*next))
+        .chain(words.iter().filter_map(|word| word.strip_prefix("--file=")))
+        .collect();
+    let mut said = format!(
+        "`{up}` hands compose its files or its project itself (`{line}`): this stack is not \
+         kept apart from the others"
+    );
+    if alone {
+        said.push_str(
+            ", since `docker-compose` is not run through docker, whose compose in a worktree is \
+             iq-ports's",
+        );
+    }
+    if let [file] = files.as_slice()
+        && compose::FILES.contains(file)
+        && !words
+            .iter()
+            .any(|word| *word == "-p" || word.starts_with("--project-name"))
+    {
+        said.push_str(&format!(
+            ". Without `--file {file}`, it would be: compose reads that file anyway"
+        ));
+    }
+    said
+}
+
+/// The ports of localhost the stacks of other places than `folder` were
+/// given.
+pub(crate) fn taken_by_others(kept: &Kept, folder: &Path) -> BTreeSet<u16> {
+    kept.places
+        .iter()
+        .filter(|(other, _)| *other != folder)
+        .flat_map(|(_, place)| place.moved.iter().map(|m| m.hidden))
+        .collect()
+}
+
+/// The ports `services` publish moved for `project`: each to the one it
+/// was given `before`, else to a free one, none of `taken`, which takes
+/// those given; and what cannot be moved, said.
+///
+/// # Errors
+///
+/// No port is free for one.
+pub(crate) fn moves(
+    project: &str,
+    services: &[Service],
+    before: Option<&Place>,
+    taken: &mut BTreeSet<u16>,
+) -> Result<(Vec<Moved>, Vec<String>), PortsError> {
+    let mut moved = Vec::new();
+    let mut notes = Vec::new();
+    for service in services {
+        if service.host_network {
+            notes.push(format!(
+                "{} shares the machine's network: its ports are its own and clash with \
+                 another worktree's",
+                service.name
+            ));
+            continue;
+        }
+        for port in &service.ports {
+            let Some(usual) = port.usual() else {
+                if let Some(range) = &port.published {
+                    notes.push(format!(
+                        "the ports {range} of {} are a range: they are not moved",
+                        service.name
+                    ));
+                }
+                continue;
+            };
+            let again = before.and_then(|place| {
+                place.moved.iter().find(|m| {
+                    m.service == service.name
+                        && m.target == port.target
+                        && m.protocol == port.protocol
+                        && !taken.contains(&m.hidden)
+                })
+            });
+            let hidden = match again {
+                Some(again) => again.hidden,
+                None => pick(project, &service.name, port, taken)?,
+            };
+            taken.insert(hidden);
+            moved.push(Moved {
+                service: service.name.clone(),
+                target: port.target,
+                protocol: port.protocol.clone(),
+                usual,
+                hidden,
+            });
+        }
+    }
+    Ok((moved, notes))
 }
 
 /// A free port of localhost for `port` of `service` in `project`, none of
@@ -391,7 +484,7 @@ fn joined(files: &[PathBuf]) -> String {
 }
 
 /// `text` as one word of a shell's line.
-fn quoted(text: &str) -> String {
+pub(crate) fn quoted(text: &str) -> String {
     if !text.is_empty()
         && text
             .chars()
@@ -464,6 +557,7 @@ mod tests {
                     hidden: 20002,
                 },
             ],
+            docker: None,
             notes: Vec::new(),
         };
         assert_eq!(
@@ -481,5 +575,49 @@ mod tests {
             ["stack shop-lead: not started · :8000 → 20001 · localhost leads here"]
         );
         assert_eq!(quoted("/Users/Jo Doe"), "'/Users/Jo Doe'");
+        let mut stack = stack;
+        stack.docker = Some("/s/iq-ports/docker".into());
+        assert_eq!(stack.vars()["DOCKER_CONFIG"], "/s/iq-ports/docker");
+    }
+
+    #[test]
+    fn a_port_two_services_publish_leads_to_the_one_of_the_usual_files() {
+        let moved = |service: &str, hidden: u16| Moved {
+            service: service.into(),
+            target: 80,
+            protocol: "tcp".into(),
+            usual: 8000,
+            hidden,
+        };
+        let stack = Stack {
+            folder: "/w/shop/lead".into(),
+            repository: "shop".into(),
+            project: "shop-lead".into(),
+            files: Vec::new(),
+            ports_file: "/s/iq-ports/shop-lead.yaml".into(),
+            moved: vec![moved("api", 20001), moved("dev-api", 20002)],
+            docker: None,
+            notes: Vec::new(),
+        };
+        assert_eq!(stack.relayed(), HashMap::from([(8000, 20001)]));
+    }
+
+    #[test]
+    fn a_line_handing_compose_its_file_is_said_with_what_would_keep_it_apart() {
+        let said = |line: &str| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            unmoved("make up", line, &words, false)
+        };
+        assert!(said("docker compose --file compose.yaml up -d").ends_with(
+            ". Without `--file compose.yaml`, it would be: compose reads that file anyway"
+        ));
+        assert!(said("docker compose --file=docker-compose.yml up -d").contains("Without"));
+        assert!(!said("docker compose -f compose.yaml -f dev.yaml up -d").contains("Without"));
+        assert!(!said("docker compose -p shop -f compose.yaml up -d").contains("Without"));
+        assert!(!said("docker compose -f deploy/compose.yaml up -d").contains("Without"));
+        let words = ["docker-compose", "-f", "compose.yaml", "up"];
+        assert!(
+            unmoved("make up", &words.join(" "), &words, true).contains("not run through docker")
+        );
     }
 }

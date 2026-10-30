@@ -1,5 +1,6 @@
-//! The `iq-ports` command: the plugin iq starts with `--iq-plugin`, and
-//! what the person runs in a worktree themselves.
+//! The `iq-ports` command: the plugin iq starts with `--iq-plugin`, what
+//! the person runs in a worktree themselves, and docker's compose there,
+//! as docker runs it.
 
 #![deny(unsafe_code)]
 
@@ -10,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use iq_ports::config::Config;
 use iq_ports::relay::Relay;
+use iq_ports::shim::{self, Shim};
 use iq_ports::stack::Stack;
 use iq_ports::store::Store;
 
@@ -53,6 +55,18 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|flag| flag == shim::AS_COMPOSE) {
+        let (Some(store), Some(persons)) = (args.next(), args.next()) else {
+            bail!(
+                "{} is given the store and the person's docker folder",
+                shim::AS_COMPOSE
+            );
+        };
+        let error = shim::run(&Store::at(store), Path::new(&persons), args.collect());
+        eprintln!("iq-ports: docker's compose could not be run: {error}");
+        std::process::exit(126);
+    }
     let runtime = tokio::runtime::Runtime::new().context("starting the runtime")?;
     if std::env::args_os()
         .nth(1)
@@ -76,42 +90,65 @@ fn listed() -> Option<String> {
     std::env::var("COMPOSE_FILE").ok()
 }
 
+/// This program as docker's compose in a worktree, keeping the person's
+/// docker settings.
+fn shim(home: &Path, store: &Store) -> Option<Shim> {
+    let docker_config = std::env::var_os("DOCKER_CONFIG").map(PathBuf::from);
+    Shim::of_person(home, docker_config, store)
+}
+
 /// Spoken to by iq, over the standard input and output.
 async fn as_plugin() -> Result<()> {
     let home = home()?;
     let config = Config::load(&home)?;
+    let store = Store::of_machine(&home);
+    let shim = shim(&home, &store);
     iq_ports::plugin::speak(
         tokio::io::BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
-        Store::of_machine(&home),
+        store,
         config,
         listed(),
+        shim,
     )
     .await?;
     Ok(())
 }
 
 /// The stack of the worktree `folder` is in, this folder's unless given,
-/// kept as it now is.
-async fn stack_of(folder: Option<&Path>, store: &Store) -> Result<Stack> {
+/// kept as it now is, its notes said unless `quiet`.
+async fn stack_of(
+    folder: Option<&Path>,
+    store: &Store,
+    shim: Option<&Shim>,
+    quiet: bool,
+) -> Result<Stack> {
     let here = match folder {
         Some(folder) => folder.to_path_buf(),
         None => std::env::current_dir().context("reading the current folder")?,
     };
     let mut kept = store.load();
-    let stack = Stack::prepare(&here, listed().as_deref(), store, &kept).await?;
-    kept.places.insert(stack.folder.clone(), stack.place());
+    let stack = Stack::prepare(&here, listed().as_deref(), store, &kept, shim).await?;
+    kept.keep(stack.folder.clone(), stack.place());
     store.save(&kept)?;
-    for note in &stack.notes {
-        eprintln!("iq-ports: {note}");
+    if !quiet {
+        for note in &stack.notes {
+            eprintln!("iq-ports: {note}");
+        }
     }
     Ok(stack)
 }
 
-/// Starts `stack` when it does not run.
-async fn started(stack: &Stack, config: &Config) -> Result<()> {
+/// `stack` started when it does not run, then read again: files of its
+/// own the start handed compose moved ports of their own.
+async fn started(
+    stack: Stack,
+    config: &Config,
+    store: &Store,
+    shim: Option<&Shim>,
+) -> Result<Stack> {
     if stack.running().await {
-        return Ok(());
+        return Ok(stack);
     }
     let up = config.up(&stack.repository);
     if let Some(note) = stack.unmoved_by(up).await {
@@ -119,7 +156,7 @@ async fn started(stack: &Stack, config: &Config) -> Result<()> {
     }
     eprintln!("iq-ports: {} starts: `{up}`…", stack.project);
     stack.start(up).await?;
-    Ok(())
+    stack_of(Some(&stack.folder), store, shim, true).await
 }
 
 /// The ports of `stack` as the person reads them.
@@ -136,18 +173,21 @@ async fn run(command: Command) -> Result<()> {
     let home = home()?;
     let store = Store::of_machine(&home);
     let config = Config::load(&home)?;
+    let shim = shim(&home, &store);
+    let shim = shim.as_ref();
     match command {
         Command::Env { folder } => {
-            println!("{}", stack_of(folder.as_deref(), &store).await?.exports());
+            let stack = stack_of(folder.as_deref(), &store, shim, false).await?;
+            println!("{}", stack.exports());
         }
         Command::Up { folder } => {
-            let stack = stack_of(folder.as_deref(), &store).await?;
-            started(&stack, &config).await?;
+            let stack = stack_of(folder.as_deref(), &store, shim, false).await?;
+            let stack = started(stack, &config, &store, shim).await?;
             println!("{} runs: {}", stack.project, ports(&stack));
         }
         Command::Serve { folder } => {
-            let stack = stack_of(folder.as_deref(), &store).await?;
-            started(&stack, &config).await?;
+            let stack = stack_of(folder.as_deref(), &store, shim, false).await?;
+            let stack = started(stack, &config, &store, shim).await?;
             let mut relay = Relay::default();
             let routes: HashMap<u16, u16> = stack.relayed();
             for (port, error) in relay.lead(routes).await {
@@ -170,7 +210,7 @@ async fn run(command: Command) -> Result<()> {
                 .context("waiting for Ctrl-C")?;
         }
         Command::Down { folder } => {
-            let stack = stack_of(folder.as_deref(), &store).await?;
+            let stack = stack_of(folder.as_deref(), &store, shim, false).await?;
             let down = iq_ports::docker::compose(&stack.folder, &stack.vars(), &["down"]).await?;
             if !down.ok {
                 bail!("`docker compose down` failed: {}", down.said());

@@ -25,10 +25,19 @@
 //! line they paste in a terminal (`eval "$(iq-ports env)"`). The plugin's
 //! own files are kept in `~/.local/state/iq-ports`, the machine's alone.
 //!
+//! A command that hands compose its files itself (a `make` target running
+//! `docker compose --file compose.yaml up`) makes it pass `COMPOSE_FILE`
+//! by, and one naming its project, the person's own checkout's, would take
+//! theirs. So docker is pointed to a folder of the plugin's there, its
+//! `DOCKER_CONFIG`, which keeps the person's settings but the logins they
+//! hold themselves, and where docker's compose is iq-ports: it adds to the
+//! files given the one that moves their ports, puts the worktree's project
+//! in place of another, then runs docker's own.
+//!
 //! What compose itself cannot be told from outside is said, not hidden: a
 //! service that shares the machine's network keeps its ports, a range of
-//! ports is not moved, and a `make` target that hands compose its files
-//! with `-f` reads the project's alone.
+//! ports is not moved, and `docker-compose` run alone, not through docker,
+//! reads the files it is handed alone.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -38,6 +47,7 @@ pub mod config;
 pub mod docker;
 pub mod plugin;
 pub mod relay;
+pub mod shim;
 pub mod stack;
 pub mod store;
 
@@ -86,4 +96,18 @@ pub enum PortsError {
     /// No port is free for a service.
     #[error("no port is free for {0}")]
     NoPort(String),
+
+    /// docker's compose plugin is not where docker looks for it.
+    #[error("docker's compose plugin is not where docker looks for it for {0}")]
+    NoComposePlugin(PathBuf),
+
+    /// The person's docker settings could not be read.
+    #[error("{path} is not docker's settings as JSON")]
+    DockerSettings {
+        /// The file.
+        path: PathBuf,
+        /// Why.
+        #[source]
+        source: serde_json::Error,
+    },
 }

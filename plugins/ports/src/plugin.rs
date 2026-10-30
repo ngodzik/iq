@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::relay::Relay;
+use crate::shim::Shim;
 use crate::stack::Stack;
 use crate::store::{Kept, Store};
 use crate::{PortsError, docker};
@@ -56,6 +57,8 @@ struct Plugin {
     config: Config,
     /// The person's `COMPOSE_FILE`, when they set one of their own.
     listed: Option<String>,
+    /// The compose that takes docker's in a worktree.
+    shim: Option<Shim>,
     /// Each chat's place, as iq names it.
     chats: HashMap<String, PathBuf>,
     /// Each place's stack, by the folder iq names.
@@ -73,8 +76,9 @@ struct Plugin {
 
 /// Speaks with iq over `input` and `output` until it says goodbye, or
 /// its side closes: the plugin's files in `store`, its settings `config`,
-/// the person's own `COMPOSE_FILE` in `listed`. What it leads stops being
-/// led as it ends; the stacks go on running.
+/// the person's own `COMPOSE_FILE` in `listed`, the compose that takes
+/// docker's in a worktree `shim`. What it leads stops being led as it
+/// ends; the stacks go on running.
 ///
 /// # Errors
 ///
@@ -85,6 +89,7 @@ pub async fn speak(
     store: Store,
     config: Config,
     listed: Option<String>,
+    shim: Option<Shim>,
 ) -> Result<(), PortsError> {
     let (out, mut said) = mpsc::unbounded_channel::<FromPlugin>();
     let writer = tokio::spawn(async move {
@@ -106,6 +111,7 @@ pub async fn speak(
         store,
         config,
         listed,
+        shim,
         chats: HashMap::new(),
         stacks: HashMap::new(),
         relay: Relay::default(),
@@ -195,7 +201,7 @@ impl Plugin {
                 docker::READING,
             )
             .await;
-            let _ = std::fs::remove_file(self.store.ports_file(&place.project));
+            self.store.forget(&place.project);
             match down {
                 Ok(down) if down.ok => self.say(format!(
                     "{} is gone: its stack {} is stopped. Its data is kept: `docker compose -p \
@@ -221,7 +227,8 @@ impl Plugin {
             self.say(error.to_string());
         }
         if let Some(served) = served {
-            match Stack::prepare(&served, self.listed.as_deref(), &self.store, &kept).await {
+            let listed = self.listed.as_deref();
+            match Stack::prepare(&served, listed, &self.store, &kept, self.shim.as_ref()).await {
                 Ok(stack) => {
                     let name = leaf(&stack.folder);
                     self.lead(&name, served, stack).await;
@@ -245,8 +252,9 @@ impl Plugin {
     async fn placed(&mut self, chat: String, folder: PathBuf) {
         self.chats.insert(chat.clone(), folder.clone());
         let kept = self.store.load();
-        let stack = match Stack::prepare(&folder, self.listed.as_deref(), &self.store, &kept).await
-        {
+        let listed = self.listed.as_deref();
+        let shim = self.shim.as_ref();
+        let stack = match Stack::prepare(&folder, listed, &self.store, &kept, shim).await {
             Ok(stack) => stack,
             // Not a project of containers: nothing to keep apart.
             Err(PortsError::NoCompose(_)) => return,
@@ -257,9 +265,7 @@ impl Plugin {
                 return;
             }
         };
-        self.save(|kept| {
-            kept.places.insert(stack.folder.clone(), stack.place());
-        });
+        self.save(|kept| kept.keep(stack.folder.clone(), stack.place()));
         let _ = self.out.send(FromPlugin::Variables {
             folder: folder.clone(),
             vars: stack.vars(),
@@ -309,15 +315,21 @@ impl Plugin {
             self.say(format!("{chat}'s stack is starting already"));
             return;
         }
-        let (store, listed, out, done) = (
+        let (store, listed, shim, out, done) = (
             self.store.clone(),
             self.listed.clone(),
+            self.shim.clone(),
             self.out.clone(),
             self.done.clone(),
         );
         let config = self.config.clone();
         tokio::spawn(async move {
-            let stack = start(&chat, &folder, &store, &config, listed.as_deref(), &out).await;
+            let reading = Reading {
+                store: &store,
+                listed: listed.as_deref(),
+                shim: shim.as_ref(),
+            };
+            let stack = start(&chat, &folder, &reading, &config, &out).await;
             let _ = done.send(Done::Started {
                 chat,
                 folder,
@@ -351,7 +363,7 @@ impl Plugin {
         }
         let before = self.served.replace((chat.to_owned(), folder.clone()));
         self.save(|kept| {
-            kept.places.insert(stack.folder.clone(), stack.place());
+            kept.keep(stack.folder.clone(), stack.place());
             kept.served = Some(stack.folder.clone());
         });
         let _ = self.out.send(FromPlugin::Status {
@@ -394,22 +406,35 @@ impl Plugin {
     }
 }
 
+/// What a stack is read with.
+struct Reading<'a> {
+    store: &'a Store,
+    listed: Option<&'a str>,
+    shim: Option<&'a Shim>,
+}
+
+impl Reading<'_> {
+    /// The stack of the worktree `folder` is in, as it now is.
+    async fn stack(&self, folder: &Path) -> Result<Stack, String> {
+        let kept = self.store.load();
+        Stack::prepare(folder, self.listed, self.store, &kept, self.shim)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Starts `chat`'s stack in `folder` when it does not run, saying so.
 async fn start(
     chat: &str,
     folder: &Path,
-    store: &Store,
+    reading: &Reading<'_>,
     config: &Config,
-    listed: Option<&str>,
     out: &mpsc::UnboundedSender<FromPlugin>,
 ) -> Result<Stack, String> {
     let say = |text: String| {
         let _ = out.send(FromPlugin::Say { text });
     };
-    let kept = store.load();
-    let stack = Stack::prepare(folder, listed, store, &kept)
-        .await
-        .map_err(|error| error.to_string())?;
+    let stack = reading.stack(folder).await?;
     if stack.running().await {
         return Ok(stack);
     }
@@ -423,7 +448,9 @@ async fn start(
         folder: stack.folder.clone(),
     });
     stack.start(&up).await.map_err(|error| error.to_string())?;
-    Ok(stack)
+    // Read again: files of its own the start handed compose moved ports
+    // of their own.
+    reading.stack(folder).await
 }
 
 /// The last part of `folder`'s path: an iq worktree's is its chat's name.
@@ -455,6 +482,7 @@ mod tests {
             from_plugin,
             store,
             Config::default(),
+            None,
             None,
         )
         .await
