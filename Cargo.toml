@@ -3,6 +3,11 @@ members = [
     "crates/core",
     "crates/llm",
     "crates/gate",
+    "crates/agent",
+    "crates/memory",
+    "crates/observe",
+    "crates/sync",
+    "crates/plugin",
 ]
 resolver = "3"
 
@@ -19,6 +24,11 @@ license     = "MIT"
 iq-core  = { path = "crates/core", version = "0.1.0" }
 iq-llm   = { path = "crates/llm", version = "0.1.0" }
 iq-gate  = { path = "crates/gate", version = "0.1.0" }
+iq-agent = { path = "crates/agent", version = "0.1.0" }
+iq-sync  = { path = "crates/sync", version = "0.1.0" }
+iq-memory = { path = "crates/memory", version = "0.1.0" }
+iq-observe = { path = "crates/observe", version = "0.1.0" }
+iq-plugin = { path = "crates/plugin", version = "0.1.0" }
 
 thiserror  = "2.0.21"
 serde      = { version = "1.0.229", features = ["derive"] }

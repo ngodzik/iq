@@ -1,0 +1,17 @@
+[package]
+name    = "iq-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "What the agents the person starts know beyond their task: the project's memory, kept by its repository, the notes kept of it under ~/.claude, and the person's skills."
+
+[dependencies]
+iq-core.workspace    = true
+iq-agent.workspace   = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace    = true
+tempfile.workspace = true
+iq-gate.workspace  = true

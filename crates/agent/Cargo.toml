@@ -1,0 +1,18 @@
+[package]
+name    = "iq-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "iq's agents: a model's loop with its tools through the gate, the reviewer that answers for the person, and the crew whose agents talk on a board."
+
+[dependencies]
+iq-core.workspace    = true
+iq-gate.workspace    = true
+serde.workspace      = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+
+[dev-dependencies]
+tokio.workspace    = true
+tempfile.workspace = true

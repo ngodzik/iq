@@ -1,0 +1,18 @@
+[package]
+name    = "iq-observe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "What iq's work goes to: each task of its agents placed in the kinds of task the person named, by their rules first, then by a cheap model, as it ends."
+
+[dependencies]
+iq-core.workspace    = true
+iq-agent.workspace   = true
+serde.workspace      = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
+
+[dev-dependencies]
+tokio.workspace    = true
+tempfile.workspace = true

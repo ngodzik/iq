@@ -612,6 +612,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
+name = "iq-agent"
+version = "0.1.0"
+dependencies = [
+ "iq-core",
+ "iq-gate",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "iq-core"
 version = "0.1.0"
 dependencies = [
@@ -648,6 +660,49 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "iq-memory"
+version = "0.1.0"
+dependencies = [
+ "iq-agent",
+ "iq-core",
+ "iq-gate",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "iq-observe"
+version = "0.1.0"
+dependencies = [
+ "iq-agent",
+ "iq-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "iq-plugin"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "iq-sync"
+version = "0.1.0"
+dependencies = [
+ "iq-gate",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
