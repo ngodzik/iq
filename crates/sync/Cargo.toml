@@ -1,0 +1,16 @@
+[package]
+name    = "iq-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "iq's own files kept in a git repository the person chose: what changed here sent, what changed elsewhere taken, by git and nothing else."
+
+[dependencies]
+iq-gate.workspace   = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "time", "sync"] }
+
+[dev-dependencies]
+tokio.workspace    = true
+tempfile.workspace = true
