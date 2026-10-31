@@ -1,0 +1,8 @@
+#!/bin/sh
+# Enabled per clone with: git config core.hooksPath .githooks
+top="$(git rev-parse --show-toplevel)"
+# Git hands a hook the repository the commit is made in (its folder, its
+# index, and more from a worktree): the tests run git in folders of their
+# own, which those would turn back to this repository.
+unset $(git rev-parse --local-env-vars)
+exec "$top/scripts/check.sh"

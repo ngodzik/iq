@@ -1,0 +1,64 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/llm",
+    "crates/gate",
+]
+resolver = "3"
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2024"
+# The oldest toolchain the code is known to build on: the latest stable, since
+# the binary is built from source and an older one buys nothing.
+rust-version = "1.99.1"
+authors     = ["Nicolas Godzik"]
+license     = "MIT"
+
+[workspace.dependencies]
+iq-core  = { path = "crates/core", version = "0.1.0" }
+iq-llm   = { path = "crates/llm", version = "0.1.0" }
+iq-gate  = { path = "crates/gate", version = "0.1.0" }
+
+thiserror  = "2.0.21"
+serde      = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio      = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
+# The default TLS backend verifies against the operating system trust store, so
+# a corporate proxy whose root is installed on the machine just works, where a
+# bundled root list would refuse it.
+reqwest    = { version = "0.13.5", features = ["json"] }
+tracing            = "0.1.44"
+proptest   = "1.12.0"
+tempfile   = "3.27.0"
+toml       = "1.1.8"
+# The sandbox on Linux: Landlock holds what a command may read, write and
+# run, seccomp the sockets it may open. Both through safe interfaces. On
+# macOS, Seatbelt holds it through the system's own sandbox-exec.
+landlock    = "0.4.7"
+seccompiler = "0.5.0"
+# The system's constants: the calls seccomp refuses, and opening a file
+# without following a link.
+libc        = "0.2.180"
+# A network of the commands' own on Linux, where only localhost answers:
+# a user and a network namespace, and the loopback device brought up over
+# netlink, through safe interfaces.
+nix         = { version = "0.31.3", default-features = false, features = ["sched", "user", "socket"] }
+
+# iq's own crates build lightly optimised, so that they still build fast;
+# the others once, optimised and without their debug information, which
+# takes gigabytes and is not what is debugged here.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release]
+lto           = "fat"
+codegen-units = 1
+# Token counts and costs are summed over a whole session. An overflow that
+# wraps silently would print a number that looks like a bill; a panic is the
+# cheaper failure.
+overflow-checks = true
