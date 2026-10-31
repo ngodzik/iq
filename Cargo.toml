@@ -7,7 +7,10 @@ members = [
     "crates/memory",
     "crates/observe",
     "crates/sync",
+    "crates/ui",
+    "crates/tui",
     "crates/plugin",
+    ".",
 ]
 resolver = "3"
 
@@ -28,17 +31,22 @@ iq-agent = { path = "crates/agent", version = "0.1.0" }
 iq-sync  = { path = "crates/sync", version = "0.1.0" }
 iq-memory = { path = "crates/memory", version = "0.1.0" }
 iq-observe = { path = "crates/observe", version = "0.1.0" }
+iq-ui    = { path = "crates/ui", version = "0.1.0" }
+iq-tui   = { path = "crates/tui", version = "0.1.0" }
 iq-plugin = { path = "crates/plugin", version = "0.1.0" }
 
 thiserror  = "2.0.21"
+anyhow     = "1.0.104"
 serde      = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio      = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
+clap       = { version = "4.6.7", features = ["derive", "env"] }
 # The default TLS backend verifies against the operating system trust store, so
 # a corporate proxy whose root is installed on the machine just works, where a
 # bundled root list would refuse it.
 reqwest    = { version = "0.13.5", features = ["json"] }
 tracing            = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 proptest   = "1.12.0"
 tempfile   = "3.27.0"
 toml       = "1.1.8"
@@ -54,6 +62,53 @@ libc        = "0.2.180"
 # a user and a network namespace, and the loopback device brought up over
 # netlink, through safe interfaces.
 nix         = { version = "0.31.3", default-features = false, features = ["sched", "user", "socket"] }
+# How much a terminal holds to read, through a safe interface: what tells
+# a key waiting from a window closed.
+rustix      = { version = "1.1.5", default-features = false, features = ["std"] }
+# Local time for the observations' days, weeks and months, the system's
+# time zone read as the platform keeps it.
+jiff       = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+# The terminal: ratatui draws in it, through the crossterm it ships, which
+# reads its keys and pastes on Linux and macOS alike. Only what iq draws
+# is enabled.
+ratatui    = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+unicode-width = "0.2.2"
+# A terminal emulated in tests, to read the screen iq's output leaves.
+vt100      = "0.18.1"
+
+[package]
+name    = "iq"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "iq"
+path = "src/main.rs"
+
+[dependencies]
+iq-core.workspace            = true
+iq-llm.workspace             = true
+iq-gate.workspace            = true
+iq-agent.workspace           = true
+iq-sync.workspace            = true
+iq-memory.workspace          = true
+iq-observe.workspace         = true
+iq-ui.workspace              = true
+iq-tui.workspace             = true
+iq-plugin.workspace          = true
+anyhow.workspace             = true
+clap.workspace               = true
+tokio = { workspace = true, features = ["sync", "signal", "process", "io-util", "time"] }
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+serde.workspace              = true
+serde_json.workspace         = true
+toml.workspace               = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 # iq's own crates build lightly optimised, so that they still build fast;
 # the others once, optimised and without their debug information, which
