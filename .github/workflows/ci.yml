@@ -46,10 +46,6 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
-      # The window links Wayland's client library.
-      - name: Wayland's headers
-        if: steps.workspace.outputs.rust == 'true'
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
       - name: Cargo's downloads and builds, kept between runs
         if: steps.workspace.outputs.rust == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -108,9 +104,6 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - name: Wayland's headers
-        if: steps.workspace.outputs.rust == 'true' && runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
       # The sandbox gives commands a network of their own, in a user
       # namespace, which Ubuntu's AppArmor keeps from unprivileged programs
       # by default. The runner is thrown away after the job.
@@ -165,9 +158,6 @@ jobs:
         run: |
           rustup toolchain install "$TOOLCHAIN" --profile minimal
           rustup default "$TOOLCHAIN"
-      - name: Wayland's headers
-        if: steps.workspace.outputs.rust != ''
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
       - name: Cargo's downloads and builds, kept between runs
         if: steps.workspace.outputs.rust != ''
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
