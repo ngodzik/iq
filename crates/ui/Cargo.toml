@@ -1,0 +1,13 @@
+[package]
+name    = "iq-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "iq's state in the terminal: what it shows and what the person did with it. Draws nothing."
+
+[dependencies]
+iq-core.workspace  = true
+iq-agent.workspace = true
+thiserror.workspace = true
+jiff.workspace    = true
