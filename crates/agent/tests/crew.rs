@@ -839,6 +839,14 @@ async fn the_lead_follows_the_rules_and_gives_its_agents_what_they_need_of_them(
     assert!(helper.contains("fix it, with no dashes"));
     assert!(!helper.contains("Answer in French.") && !helper.contains("Tests first."));
     assert!(!helper.contains("rules for agents"));
+    // Each is told to pass on what the agents it starts need: the lead of
+    // the rules, the helper of the task it was given, the rules among it.
+    assert!(lead.contains("Write into its task what its part needs of them"));
+    assert!(
+        f.model
+            .instructions_of("helper")
+            .contains("Write into its task what its part needs of yours")
+    );
 
     // A `CLAUDE.md` alone, importing another.
     let g = fixture(&[], Settings::default());

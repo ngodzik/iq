@@ -2140,7 +2140,7 @@ where
             if by == PERSON {
                 self.known(place)
             } else {
-                String::new()
+                HANDING_ON.to_owned()
             },
             self.extended(name, by)
         )
@@ -2414,6 +2414,14 @@ fn compacted(
 }
 
 /// The line of an agent's instructions that gives it its part, if any.
+/// What an agent another started is told of those it starts in turn: they
+/// know of its task only what it writes into theirs, so that the rules it
+/// was given reach them only if it passes them on.
+const HANDING_ON: &str = "\n\nAn agent or a team you start sees only the task you give it: \
+    nothing of your conversation, nor of your own task. Write into its task what its part needs \
+    of yours (the rules its work must follow, the facts it must know, the files it works on), \
+    and nothing more: it reads all of it on every call.";
+
 fn role_line(role: Option<&str>) -> String {
     role.map(|role| {
         format!(
