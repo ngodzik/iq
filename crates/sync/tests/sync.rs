@@ -18,6 +18,9 @@ fn world() -> World {
     let status = std::process::Command::new("git")
         .args(["init", "-q", "--bare", "-b", "main"])
         .arg(&remote)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .status()
         .unwrap();
     assert!(status.success());
