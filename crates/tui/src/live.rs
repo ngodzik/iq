@@ -1363,7 +1363,7 @@ mod tests {
             board.run(iq_ui::command::Command::To(agent.into()), iq_ui::now());
         }
         board.press(
-            &iq_ui::keys::Chord::parse("ctrl+space").unwrap(),
+            &iq_ui::keys::Chord::parse("ctrl+l").unwrap(),
             None,
             iq_ui::now(),
         );
@@ -1387,7 +1387,7 @@ mod tests {
         );
         assert!(rows[at + 2].contains("just now"), "{rows:#?}");
         assert!(
-            rows[at + 6].contains("Ctrl-Space or ↑ ↓ to choose"),
+            rows[at + 6].contains("Ctrl-L or ↑ ↓ to choose"),
             "{rows:#?}"
         );
         assert!(rows[at + 6].contains("2 more ↓"), "{rows:#?}");
@@ -1468,7 +1468,7 @@ mod tests {
         let rows = drawn(&board, &history, 90).join("\n");
         assert!(!rows.contains("╭ ⠋"), "{rows}");
         assert!(
-            rows.contains("also at work: docs  Ctrl-Space goes there"),
+            rows.contains("also at work: docs  Ctrl-L goes there"),
             "{rows}"
         );
     }

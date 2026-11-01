@@ -3,12 +3,13 @@
 //! and asks here what it does, so that the bindings are tested without one.
 //!
 //! The defaults are letters held with Ctrl, which sit where they are named
-//! on QWERTY and AZERTY alike: digits and signs move between the two; and
-//! Ctrl-Space, found at once on any keyboard, for going from chat to chat,
-//! which is done most. None takes a key a terminal keeps for itself
-//! (Ctrl-I is Tab there, Ctrl-M Enter) or one its line editors use (Ctrl-A,
-//! Ctrl-E, Ctrl-K, Ctrl-U, Ctrl-W and their like edit what the person
-//! writes).
+//! on QWERTY and AZERTY alike: digits and signs move between the two; Ctrl-L,
+//! on the middle row, for going from chat to chat, which is done most. None
+//! takes a key a terminal keeps for itself (Ctrl-I is Tab there, Ctrl-M
+//! Enter, Ctrl-Z suspends), one its line editors use (Ctrl-A, Ctrl-E,
+//! Ctrl-K, Ctrl-U, Ctrl-W and their like edit what the person writes), or
+//! one a system keeps: macOS takes Ctrl-Space to change the input source
+//! once a second keyboard layout is added.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -118,7 +119,7 @@ impl Action {
     /// Its key unless the settings say otherwise; empty for none.
     fn default_chord(self) -> &'static str {
         match self {
-            Action::Switch => "ctrl+space",
+            Action::Switch => "ctrl+l",
             Action::NewChat => "ctrl+n",
             Action::Team => "ctrl+t",
             Action::Costs => "ctrl+o",
@@ -359,7 +360,7 @@ mod tests {
         );
         assert_eq!(keys.action(&Chord::plain("esc")), Some(Action::Stop));
         assert_eq!(
-            keys.action(&Chord::parse("ctrl+space").unwrap()),
+            keys.action(&Chord::parse("ctrl+l").unwrap()),
             Some(Action::Switch)
         );
         assert_eq!(keys.action(&Chord::plain("o")), None);

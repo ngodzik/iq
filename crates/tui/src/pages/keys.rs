@@ -34,6 +34,11 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         "Shortcuts",
         "change them in the [keys] of ~/.iq/settings.toml",
     );
+    lines.push(Line::from(Span::styled(
+        "  A key the system or the terminal keeps never reaches iq (macOS takes Ctrl-Space once \
+         a second keyboard layout is added): move its action to another in [keys].",
+        p.fg(p.dim),
+    )));
     let list = seen.board.keys().list();
     let key_width = list
         .iter()

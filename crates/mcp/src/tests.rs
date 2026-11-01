@@ -177,38 +177,89 @@ async fn a_servers_tools_are_offered_prefixed_judged_and_called_with_their_permi
     mcp.end().await;
 }
 
-/// How many times a test's consent page was opened.
-static CONSENTS: AtomicU64 = AtomicU64::new(0);
-
-/// The person consenting at once: the browser goes back to the callback
-/// with the PKCE challenge as its code, for the token endpoint to check
-/// against the verifier. The page asks for the scope the refusal named.
-fn consent_at_once(page: &str) -> bool {
-    CONSENTS.fetch_add(1, Ordering::SeqCst);
-    let page = reqwest::Url::parse(page).unwrap();
-    let param = |name: &str| {
-        page.query_pairs()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.into_owned())
-            .unwrap()
-    };
-    assert_eq!(param("scope"), "connect");
-    let redirect = reqwest::Url::parse(&param("redirect_uri")).unwrap();
-    let target = format!(
-        "{}?code={}&state={}",
-        redirect.path(),
-        param("code_challenge"),
-        param("state")
+#[tokio::test]
+async fn agents_are_given_a_servers_tools_whole_once_they_ask_and_the_settings_choose_which() {
+    let url = serve().await;
+    let declared = BTreeMap::from([(
+        "tracker".to_owned(),
+        Declared::at(url)
+            .header("Authorization", "Bearer t")
+            .only(["get.issue".to_owned()]),
+    )]);
+    let mcp = Mcp::start(declared, None, quiet());
+    mcp.settled(Duration::from_secs(5)).await;
+    assert_eq!(
+        mcp.status()[0].1,
+        "1 tool, 1 only reading, 2 left out as the settings say"
     );
-    let address = format!("127.0.0.1:{}", redirect.port().unwrap());
-    std::thread::spawn(move || {
-        use std::io::{Read, Write};
-        let mut socket = std::net::TcpStream::connect(address).unwrap();
-        write!(socket, "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
-        let mut answer = String::new();
-        let _ = socket.read_to_string(&mut answer);
-    });
-    true
+    let names =
+        |specs: Vec<ToolSpec>| -> Vec<String> { specs.into_iter().map(|s| s.name).collect() };
+    // Listed only, until asked for.
+    assert_eq!(names(mcp.offered("lead")), ["mcp_tools"]);
+    let catalog = &mcp.offered("lead")[0];
+    assert!(
+        catalog
+            .description
+            .ends_with("tracker:\n- get.issue: An issue."),
+        "{}",
+        catalog.description
+    );
+    assert_eq!(
+        catalog.parameters["properties"]["server"]["enum"],
+        json!(["tracker"])
+    );
+    assert_eq!(
+        mcp.give("lead", "tracker").unwrap(),
+        "The tools of tracker are yours from your next step: tracker__get_issue."
+    );
+    assert_eq!(
+        names(mcp.offered("lead")),
+        ["mcp_tools", "tracker__get_issue"]
+    );
+    // Another agent has them only once it asks.
+    assert_eq!(names(mcp.offered("lead/tests")), ["mcp_tools"]);
+    assert!(mcp.give("lead", "other").is_err());
+    // A tool the settings leave out is not had, nor called.
+    assert!(matches!(
+        mcp.action("tracker__create_issue", &json!({})),
+        Err(McpError::NoTool(_))
+    ));
+    mcp.end().await;
+}
+
+/// The person consenting at once, each consent counted on `count`, a
+/// test's own: the browser goes back to the callback with the PKCE
+/// challenge as its code, for the token endpoint to check against the
+/// verifier. The page asks for the scope the refusal named.
+fn consenting(count: &Arc<AtomicU64>) -> Open {
+    let count = Arc::clone(count);
+    Arc::new(move |page: &str| {
+        count.fetch_add(1, Ordering::SeqCst);
+        let page = reqwest::Url::parse(page).unwrap();
+        let param = |name: &str| {
+            page.query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+                .unwrap()
+        };
+        assert_eq!(param("scope"), "connect");
+        let redirect = reqwest::Url::parse(&param("redirect_uri")).unwrap();
+        let target = format!(
+            "{}?code={}&state={}",
+            redirect.path(),
+            param("code_challenge"),
+            param("state")
+        );
+        let address = format!("127.0.0.1:{}", redirect.port().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut socket = std::net::TcpStream::connect(address).unwrap();
+            write!(socket, "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+            let mut answer = String::new();
+            let _ = socket.read_to_string(&mut answer);
+        });
+        true
+    })
 }
 
 /// An MCP server that takes OAuth only, and its authorization server, at
@@ -347,19 +398,20 @@ async fn a_server_that_takes_oauth_only_gets_a_grant_kept_renewed_and_asked_agai
     let dir = tempfile::tempdir().unwrap();
     let grants = dir.path().join("mcp-auth");
     let url = |base: &str| format!("{base}/mcp");
+    let consents = Arc::new(AtomicU64::new(0));
 
     // No grant yet: the person consents once, and the grant is kept.
     let base = serve_oauth(&["t-1", "t-2"]).await;
-    let before = CONSENTS.load(Ordering::SeqCst);
+    let before = consents.load(Ordering::SeqCst);
     let (tell, told) = heard();
     let mcp = Mcp::start_with(
         oauth_server(url(&base)),
         Some(grants.clone()),
         tell,
-        consent_at_once,
+        consenting(&consents),
     );
     assert_eq!(ready(&mcp).await, "1 tool, 1 only reading");
-    assert_eq!(CONSENTS.load(Ordering::SeqCst), before + 1);
+    assert_eq!(consents.load(Ordering::SeqCst), before + 1);
     // Said once, for the person to open the page if no browser did.
     for _ in 0..100 {
         if told.lock().unwrap().len() == 2 {
@@ -381,15 +433,15 @@ async fn a_server_that_takes_oauth_only_gets_a_grant_kept_renewed_and_asked_agai
     // A grant about to end is renewed, without asking.
     let ending = oauth::Grant::for_test(&base, "t-old", "r-old", oauth::now() + 10);
     Grants::new(grants.clone()).save("docs", &ending).unwrap();
-    let before = CONSENTS.load(Ordering::SeqCst);
+    let before = consents.load(Ordering::SeqCst);
     let mcp = Mcp::start_with(
         oauth_server(url(&base)),
         Some(grants.clone()),
         quiet(),
-        consent_at_once,
+        consenting(&consents),
     );
     assert_eq!(ready(&mcp).await, "1 tool, 1 only reading");
-    assert_eq!(CONSENTS.load(Ordering::SeqCst), before);
+    assert_eq!(consents.load(Ordering::SeqCst), before);
     let kept = Grants::new(grants.clone())
         .load("docs", &url(&base))
         .unwrap();
@@ -399,15 +451,15 @@ async fn a_server_that_takes_oauth_only_gets_a_grant_kept_renewed_and_asked_agai
     // asked once more.
     let refused = oauth::Grant::for_test(&base, "t-revoked", "r-x", oauth::now() + 3600);
     Grants::new(grants.clone()).save("docs", &refused).unwrap();
-    let before = CONSENTS.load(Ordering::SeqCst);
+    let before = consents.load(Ordering::SeqCst);
     let mcp = Mcp::start_with(
         oauth_server(url(&base)),
         Some(grants.clone()),
         quiet(),
-        consent_at_once,
+        consenting(&consents),
     );
     assert_eq!(ready(&mcp).await, "1 tool, 1 only reading");
-    assert_eq!(CONSENTS.load(Ordering::SeqCst), before + 1);
+    assert_eq!(consents.load(Ordering::SeqCst), before + 1);
     let kept = Grants::new(grants).load("docs", &url(&base)).unwrap();
     assert_eq!(kept.access_token, "t-1");
 }
@@ -416,7 +468,8 @@ async fn a_server_that_takes_oauth_only_gets_a_grant_kept_renewed_and_asked_agai
 async fn a_server_given_its_authorization_is_never_asked_for_oauth() {
     let dir = tempfile::tempdir().unwrap();
     let base = serve_oauth(&["t-1"]).await;
-    let before = CONSENTS.load(Ordering::SeqCst);
+    let consents = Arc::new(AtomicU64::new(0));
+    let before = consents.load(Ordering::SeqCst);
     let declared = BTreeMap::from([(
         "docs".to_owned(),
         Declared::at(format!("{base}/mcp")).header("authorization", "Bearer wrong"),
@@ -425,7 +478,7 @@ async fn a_server_given_its_authorization_is_never_asked_for_oauth() {
         declared,
         Some(dir.path().join("mcp-auth")),
         quiet(),
-        consent_at_once,
+        consenting(&consents),
     );
     mcp.settled(Duration::from_secs(5)).await;
     assert!(
@@ -433,7 +486,7 @@ async fn a_server_given_its_authorization_is_never_asked_for_oauth() {
         "{:?}",
         mcp.status()
     );
-    assert_eq!(CONSENTS.load(Ordering::SeqCst), before);
+    assert_eq!(consents.load(Ordering::SeqCst), before);
 }
 
 /// A server over stdio, in the shell: it answers by the method each line

@@ -1115,6 +1115,7 @@ dependencies = [
 name = "iq-tui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "iq-agent",
  "iq-core",
  "iq-ui",

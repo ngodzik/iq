@@ -35,14 +35,14 @@ impl Scripted {
             .collect()
     }
 
-    fn first_of(&self, agent: &str) -> ChatRequest {
+    fn requests_of(&self, agent: &str) -> Vec<ChatRequest> {
         self.requests
             .lock()
             .unwrap()
             .iter()
-            .find(|(name, _)| name == agent)
+            .filter(|(name, _)| name == agent)
             .map(|(_, request)| request.clone())
-            .unwrap()
+            .collect()
     }
 }
 
@@ -204,6 +204,7 @@ async fn an_agent_reads_through_the_reviewer_and_changes_only_once_the_person_sa
         (
             "lead".to_owned(),
             VecDeque::from([
+                calls("mcp_tools", json!({"server": "tracker"})),
                 calls("tracker__get_issue", json!({"id": "A-1"})),
                 calls("tracker__close_issue", json!({"id": "A-1"})),
                 say("Closed."),
@@ -278,11 +279,31 @@ async fn an_agent_reads_through_the_reviewer_and_changes_only_once_the_person_sa
     let lead = model.seen_by("lead");
     assert!(lead.contains(r#"get_issue \"A-1\""#), "{lead}");
     assert!(lead.contains(r#"close_issue \"A-1\""#), "{lead}");
-    // The lead was offered the server's tools beside the crew's, and told
-    // how they are judged.
-    let first = model.first_of("lead");
-    let offered: Vec<&str> = first.tools.iter().map(|t| t.name.as_str()).collect();
-    assert!(offered.contains(&"tracker__get_issue") && offered.contains(&"tracker__close_issue"));
-    assert!(lead.contains("Tools named `<server>__<tool>`"), "{lead}");
+    // The lead was first offered the servers' tools listed, each by its
+    // name and a line, and had them whole once it asked for the server's.
+    let offered = |request: &ChatRequest| -> Vec<String> {
+        request.tools.iter().map(|t| t.name.clone()).collect()
+    };
+    let requests = model.requests_of("lead");
+    assert!(offered(&requests[0]).contains(&"mcp_tools".to_owned()));
+    assert!(!offered(&requests[0]).contains(&"tracker__get_issue".to_owned()));
+    let catalog = requests[0]
+        .tools
+        .iter()
+        .find(|t| t.name == "mcp_tools")
+        .unwrap();
+    assert!(
+        catalog
+            .description
+            .contains("tracker:\n- get_issue: Reads an issue.\n- close_issue: Closes an issue."),
+        "{}",
+        catalog.description
+    );
+    assert!(offered(&requests[1]).contains(&"tracker__close_issue".to_owned()));
+    assert!(
+        lead.contains("The tools of tracker are yours from your next step"),
+        "{lead}"
+    );
+    assert!(lead.contains("listed by the tool `mcp_tools`"), "{lead}");
     mcp.end().await;
 }

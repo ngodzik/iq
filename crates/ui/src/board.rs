@@ -1594,7 +1594,7 @@ mod tests {
         let mut board = Board::default();
         started(&mut board, "lab/lead");
         // No chat yet: nothing to go to.
-        key(&mut board, "ctrl+space");
+        key(&mut board, "ctrl+l");
         assert!(board.switcher().is_none());
         assert!(board.screen().noticed(100).unwrap().contains("No chat yet"));
         for chat in ["one", "two", "three", "four", "five", "six", "seven"] {
@@ -1614,7 +1614,7 @@ mod tests {
                 .map(|(view, _)| view.name.clone())
                 .collect()
         };
-        key(&mut board, "ctrl+space");
+        key(&mut board, "ctrl+l");
         assert_eq!(names(&board)[..3], ["three", "one", "two"]);
         // An agent a chat started is no chat of the person's.
         assert_eq!(names(&board).len(), 7);
@@ -1624,13 +1624,13 @@ mod tests {
         assert!(board.switcher().is_none());
         assert_eq!(board.screen().talking_to(), Some("one"));
         // Once more, back to the other: the two used last, one key apart.
-        key(&mut board, "ctrl+space");
+        key(&mut board, "ctrl+l");
         key(&mut board, "enter");
         assert_eq!(board.screen().talking_to(), Some("three"));
         // Again, and again, the next; the rows shown follow the one chosen.
-        key(&mut board, "ctrl+space");
+        key(&mut board, "ctrl+l");
         for _ in 0..5 {
-            key(&mut board, "ctrl+space");
+            key(&mut board, "ctrl+l");
         }
         let switcher = board.switcher().unwrap();
         assert_eq!((switcher.chosen, switcher.first), (6, 2));
@@ -1644,7 +1644,7 @@ mod tests {
         key(&mut board, "escape");
         assert!(board.switcher().is_none());
         assert_eq!(board.screen().talking_to(), Some("three"));
-        key(&mut board, "ctrl+space");
+        key(&mut board, "ctrl+l");
         write(&mut board, "h");
         assert!(board.switcher().is_none());
         assert_eq!(board.screen().editor().text(), "h");
@@ -1653,7 +1653,7 @@ mod tests {
             from: "three".into(),
             to: "login".into(),
         }));
-        key(&mut board, "ctrl+space");
+        key(&mut board, "ctrl+l");
         assert_eq!(names(&board)[..2], ["login", "one"]);
     }
 
@@ -1748,7 +1748,7 @@ mod tests {
         );
         assert_eq!(board.take_recall(), None);
         // Come back to, a chat is recalled once.
-        key(&mut board, "ctrl+space");
+        key(&mut board, "ctrl+l");
         assert_eq!(
             board.switcher().unwrap().chats[1].0.name,
             "yesterday",
@@ -1763,9 +1763,9 @@ mod tests {
                 opening: false
             })
         );
-        key(&mut board, "ctrl+space");
+        key(&mut board, "ctrl+l");
         key(&mut board, "enter");
-        key(&mut board, "ctrl+space");
+        key(&mut board, "ctrl+l");
         key(&mut board, "enter");
         assert_eq!(board.screen().talking_to(), Some("yesterday"));
         assert_eq!(board.take_recall(), None);

@@ -174,13 +174,40 @@ impl Inline {
     }
 }
 
-/// Writes `line` where the cursor stands, each span in its style.
+/// Writes `line` where the cursor stands, each span in its style, a span
+/// that carries a link's address made a hyperlink to it.
 fn write_line(out: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
     for span in &line.spans {
-        let style: ContentStyle = line.style.patch(span.style).into_crossterm();
-        queue!(out, PrintStyledContent(style.apply(span.content.as_ref())))?;
+        let style = line.style.patch(span.style);
+        let text = printable(&span.content);
+        match crate::link::address_of(style) {
+            Some((number, address, plain)) => {
+                let (open, close) = crate::link::escapes(number, &address);
+                let plain: ContentStyle = plain.into_crossterm();
+                out.write_all(open.as_bytes())?;
+                queue!(out, PrintStyledContent(plain.apply(text)))?;
+                out.write_all(close.as_bytes())?;
+            }
+            None => {
+                let style: ContentStyle = style.into_crossterm();
+                queue!(out, PrintStyledContent(style.apply(text)))?;
+            }
+        }
     }
     Ok(())
+}
+
+/// `text` without its control characters. What the conversation shows
+/// comes from models, and through them from files, pages and servers: an
+/// escape sequence among it would be the terminal's to obey (writing to the
+/// clipboard, moving the cursor, renaming the window), so none is written
+/// but those iq makes itself. ratatui does the same for the live part.
+fn printable(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(char::is_control) {
+        text.chars().filter(|c| !c.is_control()).collect()
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +258,52 @@ mod tests {
         parser.process(&out);
         assert_eq!(screen(&parser), ["", "", "three", "four", "five", ""]);
         assert!(!inline.place(&mut Vec::new(), 1).unwrap());
+    }
+
+    #[test]
+    fn no_escape_written_in_the_conversation_reaches_the_terminal() {
+        let mut out = Vec::new();
+        let mut inline = Inline::new(40, 6);
+        inline.place(&mut out, 1).unwrap();
+        let mut written = Vec::new();
+        // A clipboard write, a title and a bell, as a model could echo them.
+        inline
+            .insert(
+                &mut written,
+                &[Line::from(
+                    "ok \u{1b}]52;c;aGk=\u{7}\u{1b}]0;title\u{7}done\u{9b}2J",
+                )],
+            )
+            .unwrap();
+        let text = String::from_utf8(written).unwrap();
+        assert!(text.contains("ok ") && text.contains("]52;c;aGk=") && text.contains("done"));
+        assert!(!text.contains("\u{1b}]52") && !text.contains("\u{7}") && !text.contains('\u{9b}'));
+    }
+
+    #[test]
+    fn a_link_is_written_as_a_hyperlink_around_its_text_alone() {
+        let style =
+            crate::link::mark(ratatui::style::Style::new(), "https://example.com/x").unwrap();
+        let (number, _, _) = crate::link::address_of(style).unwrap();
+        let mut inline = Inline::new(40, 6);
+        inline.place(&mut Vec::new(), 1).unwrap();
+        let mut written = Vec::new();
+        inline
+            .insert(
+                &mut written,
+                &[Line::from(vec![
+                    ratatui::text::Span::raw("see "),
+                    ratatui::text::Span::styled("x", style),
+                ])],
+            )
+            .unwrap();
+        let text = String::from_utf8(written).unwrap();
+        let link = format!("\u{1b}]8;id=iq{number};https://example.com/x\u{1b}\\");
+        let at = text.find(&link).expect("the hyperlink opens");
+        let closed = text[at..].find("\u{1b}]8;;\u{1b}\\").expect("and closes");
+        assert!(text[at..at + closed].contains('x'));
+        // Its address rides on no background the terminal would paint.
+        assert!(!text.contains("48;2;"), "{text:?}");
     }
 
     #[test]
