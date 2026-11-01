@@ -44,6 +44,21 @@ pub enum Action {
         /// What is fetched or searched for, as the agent wrote it.
         target: String,
     },
+    /// Calling a tool of a server the person's settings declare, an MCP
+    /// server: its arguments go to the server, and what the tool does there
+    /// iq does not see.
+    Tool {
+        /// The server, by the name the settings give it.
+        server: String,
+        /// The tool, by the server's own name for it.
+        tool: String,
+        /// Its arguments, a JSON object, as they are sent.
+        arguments: String,
+        /// Whether the server says the tool only reads: a hint of the
+        /// server's, trusted as far as the person trusted the server in
+        /// declaring it.
+        reads: bool,
+    },
 }
 
 /// The gate's answer to an action.

@@ -18,7 +18,7 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 17] = [
+pub const COMMANDS: [Spec; 18] = [
     Spec {
         name: "new",
         args: "[model]",
@@ -78,6 +78,11 @@ pub const COMMANDS: [Spec; 17] = [
         name: "internet",
         args: "",
         what: "the internet open to every command, or only to what fetches packages",
+    },
+    Spec {
+        name: "mcp",
+        args: "",
+        what: "the MCP servers your settings declare, and how each is",
     },
     Spec {
         name: "sync",
@@ -151,6 +156,8 @@ pub enum Command {
     Autopilot,
     /// The internet open to every command, or not.
     Internet,
+    /// How each MCP server is.
+    Mcp,
     /// How hard the agent written to thinks, or the new chat's; none to
     /// be told.
     Effort(Option<iq_core::Effort>),
@@ -230,6 +237,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "keys" | "help" => bare(Command::Keys),
         "autopilot" => bare(Command::Autopilot),
         "internet" => bare(Command::Internet),
+        "mcp" => bare(Command::Mcp),
         "sync" => match one("auto")?.as_deref() {
             None => Ok(Command::Sync(false)),
             Some("auto") => Ok(Command::Sync(true)),
@@ -409,7 +417,8 @@ mod tests {
             names(complete("/t", &[], &[])),
             ["/to ", "/team", "/theme "]
         );
-        assert_eq!(names(complete("/m", &[], &[])), ["/model "]);
+        assert_eq!(names(complete("/m", &[], &[])), ["/model ", "/mcp"]);
+        assert_eq!(names(complete("/mc", &[], &[])), ["/mcp"]);
         assert_eq!(
             names(complete("/stop h", &["helper", "lead"], &[])),
             ["/stop helper"]

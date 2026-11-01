@@ -2259,8 +2259,14 @@ where
     }
 
     /// Judges `action` for `agent`, asking whoever answers for the person
-    /// when the gate asks.
-    pub(crate) async fn act(&self, agent: &str, action: Action) -> Result<Permit, String> {
+    /// when the gate asks: an extension's tool acts through it, as the
+    /// crew's own do, so that what it does was judged.
+    ///
+    /// # Errors
+    ///
+    /// The gate denied it, whoever answers for the person refused it, or
+    /// the audit log could not be written.
+    pub async fn act(&self, agent: &str, action: Action) -> Result<Permit, String> {
         let judged = self
             .place_of(agent)
             .gate
@@ -2306,7 +2312,13 @@ where
                 _ => None,
             };
             match self
-                .review(agent, &action, pending.scope(), &reason, does.as_deref())
+                .review(
+                    agent,
+                    &action,
+                    review::place(pending.action(), pending.scope()),
+                    &reason,
+                    does.as_deref(),
+                )
                 .await
             {
                 Ok((approved, why)) => {
@@ -2411,13 +2423,14 @@ where
         })
     }
 
-    /// The reviewer's verdict on an action of `agent`'s, of `scope`, told
-    /// what the action does when its name alone does not say (`does`).
+    /// The reviewer's verdict on an action of `agent`'s, which runs at
+    /// `place`, told what the action does when its name alone does not say
+    /// (`does`).
     async fn review(
         &self,
         agent: &str,
         action: &str,
-        scope: Scope,
+        place: &str,
         reason: &str,
         does: Option<&str>,
     ) -> Result<(bool, String), String> {
@@ -2431,7 +2444,7 @@ where
                 done: member.done.iter().cloned().collect(),
             })
             .unwrap_or_default();
-        let prompt = review::prompt(&work, action, review::place(scope), reason, does);
+        let prompt = review::prompt(&work, action, place, reason, does);
         let model = self
             .inner
             .settings
@@ -2982,8 +2995,28 @@ fn describe(action: &Action) -> String {
             format!("run `{line}` in {}{more}", folder.display())
         }
         Action::Fetch { target } => format!("reach the network for {target}"),
+        Action::Tool {
+            server,
+            tool,
+            arguments,
+            reads,
+        } => {
+            let only = if *reads {
+                ", which it says only reads"
+            } else {
+                ""
+            };
+            format!(
+                "call {tool} of the server {server}{only}, with {}",
+                cut_to(arguments, TOOL_SAID)
+            )
+        }
     }
 }
+
+/// The most characters of a server's tool's arguments said as its call is
+/// asked: enough for what it writes to be read.
+const TOOL_SAID: usize = 2000;
 
 /// An error with its causes, as one line.
 /// The most characters of a provider's error said while it is waited for.

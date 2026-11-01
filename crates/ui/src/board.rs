@@ -1053,6 +1053,7 @@ impl Board {
             Command::Keys => open(self, Page::Keys),
             Command::Autopilot => return self.act(Action::Autopilot, now).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet, now).into_iter().collect(),
+            Command::Mcp => return vec![Request::Mcp],
             Command::Theme(None) => self.look.next_theme(),
             Command::Theme(Some(theme)) => self.look.set_theme(theme),
             Command::Effort(effort) => return self.effort(effort, now),

@@ -96,7 +96,9 @@ impl Permit {
     fn file(&self) -> Result<&Path, GateError> {
         match &self.action {
             Action::Read { path } | Action::Write { path } => Ok(path),
-            Action::Run { .. } | Action::Fetch { .. } => Err(GateError::NotAFile),
+            Action::Run { .. } | Action::Fetch { .. } | Action::Tool { .. } => {
+                Err(GateError::NotAFile)
+            }
         }
     }
 }

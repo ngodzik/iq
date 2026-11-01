@@ -51,6 +51,10 @@ Rules and the reviewer only spare you questions: they widen nothing you did not 
 
 iq can be extended by plugins: programs of their own, started only when your settings name them, which speak with iq over a small protocol of JSON lines (the `iq-plugin` crate). A plugin may add commands, show a line of status, and give the commands run in a place the variables they need there. What only some projects need (containers, a cluster, a cloud) belongs in a plugin, while iq keeps the generic part. A plugin runs on your machine as you and answers to you alone: no agent can start one or speak to it, what it gives is written to the audit log, and the gate refuses the variables its sandbox rests on. No plugin is published yet.
 
+## MCP servers
+
+The agents can use the tools of the MCP servers your settings declare, by an address or a command: no agent can add one. Each call goes through the gate: a tool its server says only reads is judged as reaching the internet, any other waits for you, since it may change what the server keeps, which others may share. A server that asks for OAuth gets your consent in the browser, its grant kept in iq's own folder for that server's address alone, readable by you only and never synced; what a header carries is read from your environment, never written in the settings.
+
 ## How it is built
 
 A Rust workspace whose crate graph enforces the separation: the agents never depend on the providers, the interface's state is tested without a terminal, and nothing reaches the machine without the gate's permit. `AGENTS.md` describes each crate and the rules every agent working on iq follows, iq's own among them.
