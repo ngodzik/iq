@@ -983,6 +983,7 @@ dependencies = [
  "iq-core",
  "iq-gate",
  "iq-llm",
+ "iq-mcp",
  "iq-memory",
  "iq-observe",
  "iq-plugin",
@@ -1047,6 +1048,24 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "iq-mcp"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64",
+ "iq-agent",
+ "iq-core",
+ "iq-gate",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "url",
 ]
 
 [[package]]

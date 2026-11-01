@@ -43,6 +43,14 @@
 //! commands = ["pytest"]
 //! words = ["django"]
 //!
+//! [mcp.tracker]                          # an MCP server, by a name of yours: its tools offered to the agents as tracker__<tool>
+//! url = "https://mcp.example.com/mcp"    # over HTTP; when it asks for OAuth, you consent in the browser, its grant kept in ~/.iq/mcp-auth
+//! headers = { Authorization = "TRACKER_AUTHORIZATION" }  # or headers sent, each value read from the variable it names; then OAuth is never asked
+//!
+//! [mcp.notes]                            # one over stdio: a program run on your machine as you, with your environment but iq's variables
+//! command = "notes-mcp"
+//! args = ["--folder", "~/notes"]
+//!
 //! [sync]                                 # iq's data kept in a private repository of yours, any name
 //! remote = "https://github.com/someone/any-name.git"
 //! branch = "main"                        # another when main must go through pull requests
@@ -83,9 +91,7 @@ const CHAT_KEEP_DAYS: u64 = 30;
 
 /// What the settings once held and iq reads no more, since it works with
 /// the provider's models alone and lets the lead decide.
-const RETIRED: [&str; 6] = [
-    "budget", "steward", "[limits]", "[mcp]", "[assay]", "[route]",
-];
+const RETIRED: [&str; 5] = ["budget", "steward", "[limits]", "[assay]", "[route]"];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +167,9 @@ pub(crate) struct Settings {
     /// What the work goes to.
     #[serde(default)]
     observe: ObserveFile,
+    /// The MCP servers, by the names the person gives them.
+    #[serde(default)]
+    mcp: BTreeMap<String, McpFile>,
     /// What iq reads no more, in the order of [`RETIRED`]: read, so that
     /// older settings still open, and said, for the person to remove it.
     #[serde(default)]
@@ -169,8 +178,6 @@ pub(crate) struct Settings {
     steward: Option<toml::Value>,
     #[serde(default)]
     limits: Option<toml::Value>,
-    #[serde(default)]
-    mcp: Option<toml::Value>,
     #[serde(default)]
     assay: Option<toml::Value>,
     #[serde(default)]
@@ -193,6 +200,28 @@ struct ObserveFile {
 /// How many tasks wait before a model places them: one, as each call is
 /// small.
 const OBSERVE_EVERY: usize = 1;
+
+/// An MCP server as the settings write it: an address, with the headers
+/// sent there, or a program and its arguments. A header's value is never
+/// written there: only the name of the variable that holds it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpFile {
+    url: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+/// An MCP server ready to start: its name, what reaches it, and the line
+/// its program runs, for the audit log.
+pub(crate) struct McpServer {
+    pub(crate) name: String,
+    pub(crate) declared: iq_mcp::Declared,
+    pub(crate) line: Option<String>,
+}
 
 /// The sync as the settings write it.
 #[derive(Debug, Default, Deserialize)]
@@ -252,7 +281,6 @@ impl Settings {
             self.budget.is_some(),
             self.steward.is_some(),
             self.limits.is_some(),
-            self.mcp.is_some(),
             self.assay.is_some(),
             self.route.is_some(),
         ]
@@ -260,6 +288,90 @@ impl Settings {
         .zip(RETIRED)
         .filter_map(|(set, name)| set.then_some(name))
         .collect()
+    }
+
+    /// The MCP servers the settings declare, their headers read from the
+    /// variables `var` gives and a program's `~/` in `home`, each program
+    /// given `env`; and why each of the others is not started.
+    pub(crate) fn mcp_servers(
+        &self,
+        var: impl Fn(&str) -> Option<String>,
+        home: &Path,
+        env: impl Fn() -> Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    ) -> (Vec<McpServer>, Vec<String>) {
+        let mut servers = Vec::new();
+        let mut wrong = Vec::new();
+        for (name, server) in &self.mcp {
+            let not = |why: String| format!("the MCP server {name} is not started: {why}");
+            let plain = name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if name.is_empty() || !plain {
+                wrong.push(not(
+                    "its name is letters, digits, hyphens and underscores".to_owned()
+                ));
+                continue;
+            }
+            let url = server
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty());
+            let command = server
+                .command
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty());
+            let declared = match (url, command) {
+                (Some(url), None) => {
+                    let mut declared = iq_mcp::Declared::at(url);
+                    let mut missing = Vec::new();
+                    for (header, variable) in &server.headers {
+                        match var(variable) {
+                            Some(value) => declared = declared.header(header, value),
+                            None => missing.push(variable.as_str()),
+                        }
+                    }
+                    if !missing.is_empty() {
+                        wrong.push(not(format!("{} is not set", missing.join(", "))));
+                        continue;
+                    }
+                    McpServer {
+                        name: name.clone(),
+                        declared,
+                        line: None,
+                    }
+                }
+                (None, Some(command)) if server.headers.is_empty() => {
+                    let words: Vec<String> = std::iter::once(command)
+                        .chain(server.args.iter().map(String::as_str))
+                        .map(|word| match word.strip_prefix("~/") {
+                            Some(rest) => home.join(rest).to_string_lossy().into_owned(),
+                            None => word.to_owned(),
+                        })
+                        .collect();
+                    McpServer {
+                        name: name.clone(),
+                        line: Some(words.join(" ")),
+                        declared: iq_mcp::Declared::run(words).env(env()),
+                    }
+                }
+                (None, Some(_)) => {
+                    wrong.push(not("headers are for a server reached by its url".to_owned()));
+                    continue;
+                }
+                (Some(_), Some(_)) => {
+                    wrong.push(not("give it a url or a command, not both".to_owned()));
+                    continue;
+                }
+                (None, None) => {
+                    wrong.push(not("give it a url or a command".to_owned()));
+                    continue;
+                }
+            };
+            servers.push(declared);
+        }
+        (servers, wrong)
     }
 
     /// The files of the person's rules, as the settings write them and
@@ -538,10 +650,62 @@ mod tests {
         assert!(wrong.look().is_err());
         // Older settings still open, what iq reads no more said.
         let older: Settings = toml::from_str(
-            "budget = 2.0\nsteward = true\n[limits]\nrequesty_month = 20.0\n[mcp.notes]\nurl = \"https://notes.example/mcp\"\n[assay]\ngrader = \"x/y\"\n[route]\noff = true",
+            "budget = 2.0\nsteward = true\n[limits]\nrequesty_month = 20.0\n[assay]\ngrader = \"x/y\"\n[route]\noff = true",
         )
         .unwrap();
         assert_eq!(older.retired(), RETIRED);
+    }
+
+    #[test]
+    fn mcp_servers_are_read_their_secrets_from_the_environment_and_the_others_said() {
+        let settings: Settings = toml::from_str(
+            r#"
+            [mcp.tracker]
+            url = "https://mcp.example.com/mcp"
+            headers = { Authorization = "TRACKER_AUTHORIZATION" }
+
+            [mcp.docs]
+            url = " https://docs.example/mcp "
+
+            [mcp.notes]
+            command = "notes-mcp"
+            args = ["--folder", "~/notes"]
+
+            [mcp.unset]
+            url = "https://unset.example/mcp"
+            headers = { Authorization = "NOT_SET" }
+
+            [mcp.both]
+            url = "https://both.example/mcp"
+            command = "both"
+
+            [mcp."bad.name"]
+            url = "https://bad.example/mcp"
+            "#,
+        )
+        .unwrap();
+        let var =
+            |name: &str| (name == "TRACKER_AUTHORIZATION").then(|| "Bearer s3cret".to_owned());
+        let env = || vec![("PATH".into(), "/bin".into())];
+        let (servers, wrong) = settings.mcp_servers(var, Path::new("/h"), env);
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["docs", "notes", "tracker"]);
+        let lines: Vec<Option<&str>> = servers.iter().map(|s| s.line.as_deref()).collect();
+        assert_eq!(lines, [None, Some("notes-mcp --folder /h/notes"), None]);
+        // The header's value is read, and never shown.
+        let tracker = format!("{:?}", servers[2].declared);
+        assert!(
+            tracker.contains("Authorization") && !tracker.contains("s3cret"),
+            "{tracker}"
+        );
+        assert_eq!(
+            wrong,
+            [
+                "the MCP server bad.name is not started: its name is letters, digits, hyphens and underscores",
+                "the MCP server both is not started: give it a url or a command, not both",
+                "the MCP server unset is not started: NOT_SET is not set",
+            ]
+        );
     }
 
     #[test]

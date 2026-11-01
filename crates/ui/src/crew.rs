@@ -104,6 +104,8 @@ pub enum Request {
         /// Its place of its own, when it has one.
         folder: Option<std::path::PathBuf>,
     },
+    /// Say how each MCP server the settings declare is.
+    Mcp,
 }
 
 /// One thing in an agent's thread.

@@ -435,6 +435,23 @@ impl Gate {
                     scope: Scope::Internet,
                 },
             ),
+            Action::Tool {
+                server,
+                tool,
+                arguments,
+                reads,
+            } => {
+                let verdict = self.calling(&server, reads);
+                (
+                    Action::Tool {
+                        server,
+                        tool,
+                        arguments,
+                        reads,
+                    },
+                    verdict,
+                )
+            }
         };
         if let Some(audit) = &self.audit {
             audit.write(&Event::Judged {
@@ -491,6 +508,27 @@ impl Gate {
             })?;
         }
         Ok(())
+    }
+
+    /// The verdict on calling a tool of `server`. One its server says only
+    /// reads sends no more than a command with the internet may: it is
+    /// allowed once the internet is open to every command, and asked as the
+    /// internet is until then. Any other may change what the server keeps,
+    /// which others may share: only the person gives it.
+    fn calling(&self, server: &str, reads: bool) -> Verdict {
+        if !reads {
+            Verdict::Ask {
+                reason: format!("it may change what {server} keeps, which others may share"),
+                scope: Scope::Beyond,
+            }
+        } else if self.internet() {
+            Verdict::Allow
+        } else {
+            Verdict::Ask {
+                reason: format!("it reaches the server {server}"),
+                scope: Scope::Internet,
+            }
+        }
     }
 
     fn reading(&self, path: &Path) -> Verdict {
@@ -783,6 +821,44 @@ mod tests {
             reason(&fetch),
             ("asked", "it reaches the internet".to_owned(), true)
         );
+    }
+
+    #[test]
+    fn a_servers_tool_that_reads_is_judged_as_the_internet_and_any_other_waits_for_the_person() {
+        let f = fixture("");
+        let tool = |reads| Action::Tool {
+            server: "tracker".into(),
+            tool: if reads { "get_issue" } else { "close_issue" }.into(),
+            arguments: r#"{"id":"A-1"}"#.into(),
+            reads,
+        };
+        let judged = f.gate.judge(tool(true)).unwrap();
+        assert_eq!(
+            reason(&judged),
+            ("asked", "it reaches the server tracker".to_owned(), true)
+        );
+        let Judged::Asked { pending, .. } = judged else {
+            unreachable!()
+        };
+        assert_eq!(pending.scope(), Scope::Internet);
+        f.gate.set_internet(true);
+        assert_eq!(reason(&f.gate.judge(tool(true)).unwrap()).0, "allowed");
+        // Open or not, one that may change what the server keeps is the
+        // person's to give, never a reviewer's.
+        let Judged::Asked { reason, pending } = f.gate.judge(tool(false)).unwrap() else {
+            panic!("a tool that writes is asked");
+        };
+        assert_eq!(
+            reason,
+            "it may change what tracker keeps, which others may share"
+        );
+        assert_eq!(pending.scope(), Scope::Beyond);
+        f.gate.set_reviewer_internet(true);
+        f.gate.set_reviewer_host(true);
+        assert!(matches!(
+            f.gate.approve(pending, Approver::Reviewer),
+            Err(GateError::Widens)
+        ));
     }
 
     #[test]

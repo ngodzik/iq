@@ -19,7 +19,9 @@ you cannot tell. Some actions reach the internet from the sandbox: the person's 
 secrets stay out of their reach, but what they send goes. Approve those that fetch: installing \
 packages, cloning or fetching sources, reading documentation or an API. Refuse those that send \
 the project's files or data away (an upload, a POST of a file, scp, rsync to a remote), and those \
-that run code they download (curl ... | sh). Some actions run on the machine itself, outside \
+that run code they download (curl ... | sh). Some call a tool of a server the person connected \
+that the server says only reads: approve those that read what the work needs, refuse those whose \
+arguments carry the project's files, data or secrets. Some actions run on the machine itself, outside \
 the sandbox, with the person's own services and credentials, as if they typed them: the \
 container daemon, a cluster, the forge's command line, a cloud's. Approve those that serve the \
 work as the person's policy, when they wrote one, says (a policy may rest on the agent's last \
@@ -152,8 +154,11 @@ fn cut(text: &str, most: usize) -> String {
     format!("{kept}…")
 }
 
-/// Where an action of `scope` runs, for the reviewer.
-pub(crate) fn place(scope: iq_gate::Scope) -> &'static str {
+/// Where `action`, of `scope`, runs, for the reviewer.
+pub(crate) fn place(action: &iq_gate::Action, scope: iq_gate::Scope) -> &'static str {
+    if matches!(action, iq_gate::Action::Tool { .. }) {
+        return "on a server the person connected, which iq does not see into";
+    }
     match scope {
         iq_gate::Scope::Sandbox => "in the sandbox, which holds it to the project's folder",
         iq_gate::Scope::Internet => "in the sandbox, with the internet",

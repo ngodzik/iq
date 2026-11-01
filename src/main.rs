@@ -215,6 +215,48 @@ pub(crate) fn persons_env() -> impl Iterator<Item = (std::ffi::OsString, std::ff
     })
 }
 
+/// The MCP servers the settings declare, started, each program's line
+/// written to `gate`'s audit log before it runs; what each does, and why
+/// one is not started, told to `tell`. Must run within the runtime.
+fn mcp(settings: &Settings, gate: &Gate, tell: iq_mcp::Tell) -> Result<iq_mcp::Mcp> {
+    let home = home_dir()?;
+    let (servers, wrong) = settings.mcp_servers(
+        |name| std::env::var(name).ok(),
+        &home,
+        || persons_env().collect(),
+    );
+    for said in wrong {
+        tell(said);
+    }
+    let mut declared = std::collections::BTreeMap::new();
+    for server in servers {
+        // A program not written down does not run.
+        if let Some(line) = &server.line
+            && let Err(error) = gate.outside(
+                &format!("MCP server {}", server.name),
+                line,
+                gate.workspace(),
+            )
+        {
+            tell(format!(
+                "the MCP server {} is not started: {error}",
+                server.name
+            ));
+            continue;
+        }
+        declared.insert(server.name, server.declared);
+    }
+    Ok(iq_mcp::Mcp::start(
+        declared,
+        Some(home_folder()?.join(MCP_GRANTS)),
+        tell,
+    ))
+}
+
+/// Where the grants of the MCP servers that ask for OAuth are kept, in
+/// iq's own folder, which no command reaches and no sync sends.
+const MCP_GRANTS: &str = "mcp-auth";
+
 /// The gate of the current folder, as the settings open it.
 fn settings_gate(settings: &Settings) -> Result<Gate> {
     gate(
@@ -452,6 +494,14 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
+/// What `/mcp` says where the settings declare no server.
+const NO_MCP: &str =
+    "no MCP server is declared: [mcp.<name>] in ~/.iq/settings.toml, with its url or its command";
+
+/// How long `iq do` waits for the MCP servers to answer before it starts,
+/// at most.
+const MCP_SETTLING: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What a sync says where the settings name no repository.
 const NO_REPOSITORY: &str = "no repository is set: [sync] remote in ~/.iq/settings.toml";
 
@@ -648,6 +698,11 @@ async fn work(
         }
     });
     let placing = Arc::clone(&plugins);
+    let servers = mcp(
+        &settings,
+        &gate,
+        Arc::new(|said: String| eprintln!("iq: {said}")),
+    )?;
     let crew = crew(
         cli,
         &settings,
@@ -660,6 +715,10 @@ async fn work(
         }),
         gate,
     )?;
+    crew.extend(Arc::new(servers.clone()));
+    // The servers' tools are offered as each answers: a task handed over
+    // at once waits for them a little, as it would for a person.
+    servers.settled(MCP_SETTLING).await;
     let listed = listed(&provider(cli), cli.api_key.is_some()).await;
     for said in unlisted(cli.endpoint(), &in_use(&settings, &lead)?, &listed) {
         eprintln!("iq: {said}");
@@ -694,6 +753,7 @@ async fn work(
         }
     }
     crew.end().await;
+    servers.end().await;
     plugins.end().await;
     println!("\n{}", tally.summary());
     ledger.trim();
@@ -906,9 +966,19 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
             let _ = send.send(Update::Crew(event));
         })
     };
-    let crew = {
+    let (crew, servers) = {
         let _inside = runtime.enter();
-        crew(cli, &settings, report, gate)?
+        let told = send.clone();
+        let servers = mcp(
+            &settings,
+            &gate,
+            Arc::new(move |said: String| {
+                let _ = told.send(Update::Said(said));
+            }),
+        )?;
+        let crew = crew(cli, &settings, report, gate)?;
+        crew.extend(Arc::new(servers.clone()));
+        (crew, servers)
     };
     // The chats of earlier sessions come back before the person writes.
     for note in resume_chats(&settings, &crew, &send) {
@@ -969,6 +1039,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let syncing = sync.clone();
     let always = Arc::clone(&auto);
     let asking = Arc::clone(&plugins);
+    let serving = servers.clone();
     std::thread::spawn(move || {
         let _inside = handle.enter();
         for request in requests {
@@ -1068,6 +1139,15 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     chat,
                     folder,
                 } => asking.command(&plugin, command, args, chat, folder),
+                Request::Mcp => {
+                    let status = serving.status();
+                    if status.is_empty() {
+                        let _ = told.send(Update::Said(NO_MCP.into()));
+                    }
+                    for (name, how) in status {
+                        let _ = told.send(Update::Said(format!("the MCP server {name}: {how}")));
+                    }
+                }
             }
         }
     });
@@ -1076,6 +1156,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let ran = iq_tui::run(feed, ask, board).context("running in the terminal");
     runtime.block_on(async {
         crew.end().await;
+        servers.end().await;
         // The plugins after the crew, whose last commands may still need
         // what they hold.
         plugins.end().await;
