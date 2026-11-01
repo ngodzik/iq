@@ -97,8 +97,9 @@ pub(crate) fn prompt(
     ));
     if let Some(does) = does {
         text.push_str(&format!(
-            "\n\nWhat the make targets do, from the project's Makefile, each with what it depends \
-             on; judge the action by this, not by the targets' names:\n{does}"
+            "\n\nWhat the make targets do, from the project's Makefiles (each under its path), \
+             each with what it depends on and the targets its recipe hands its work to; judge \
+             the action by this, not by the targets' names:\n{does}"
         ));
     }
     text.push_str("\n\nAPPROVE or REFUSE?");

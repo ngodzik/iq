@@ -627,6 +627,67 @@ async fn the_reviewer_reads_what_a_make_target_does_and_thinks_as_hard_as_set() 
 }
 
 #[tokio::test]
+async fn the_reviewer_reads_the_makefile_of_the_folder_make_runs_in() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "run",
+                        serde_json::json!({"command": "cd backend && UV_NO_SYNC=1 make migrate"}),
+                    ),
+                    say("Done."),
+                ],
+            ),
+            ("reviewer", vec![say("REFUSE: not now.")]),
+        ],
+        Settings::default(),
+    );
+    std::fs::create_dir_all(f.root.join("backend")).unwrap();
+    std::fs::write(
+        f.root.join("backend/Makefile"),
+        "migrate:\n\t$(MAKE) -C db up\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(f.root.join("backend/db")).unwrap();
+    std::fs::write(
+        f.root.join("backend/db/Makefile"),
+        "up:\n\talembic upgrade head\n",
+    )
+    .unwrap();
+    let gate = Gate::builder(&f.root)
+        .rules(
+            iq_gate::Rules::parse(
+                "[[rule]]\nprefix = [\"make\", \"migrate\"]\ndecision = \"ask\"\nreason = \"it migrates\"\n",
+            )
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let crew = Crew::new(
+        Model(Arc::clone(&f.model)),
+        gate,
+        Helper::new("/nonexistent", Vec::<String>::new()),
+        Settings {
+            reviewer: Some(model("cheap/reviewer")),
+            ..Settings::default()
+        },
+        Arc::new(|_| {}),
+    );
+    crew.set_autopilot(true);
+    crew.start("lead", &model("cheap/model"), "migrate".into(), PERSON);
+    tokio::time::timeout(Duration::from_secs(10), crew.settled())
+        .await
+        .unwrap();
+    let asked = f.model.seen_by("reviewer");
+    assert!(
+        asked.contains("# backend/Makefile\\nmigrate:\\n    $(MAKE) -C db up\\n# backend/db/Makefile\\nup:\\n    alembic upgrade head"),
+        "{asked}"
+    );
+}
+
+#[tokio::test]
 async fn what_runs_on_the_machine_waits_for_the_person_unless_they_let_the_reviewer() {
     let scripts = |answer: &str| {
         [
@@ -717,13 +778,13 @@ async fn agents_hand_work_to_each_other_on_the_board() {
                 vec![
                     calls(
                         "start_agent",
-                        serde_json::json!({"name": "Helper", "model": "cheap/model", "task": "say hi"}),
+                        serde_json::json!({"role": "helper", "model": "cheap/model", "task": "say hi"}),
                     ),
                     calls("wait_for_messages", serde_json::json!({"seconds": 5})),
                     say("The helper said hi."),
                 ],
             ),
-            ("helper", vec![say("hi from the helper")]),
+            ("lead/helper", vec![say("hi from the helper")]),
         ],
         Settings::default(),
     );
@@ -733,15 +794,15 @@ async fn agents_hand_work_to_each_other_on_the_board() {
     assert!(
         f.model
             .seen_by("lead")
-            .contains("Message from helper: hi from the helper"),
+            .contains("Message from lead/helper: hi from the helper"),
         "{}",
         f.model.seen_by("lead")
     );
-    assert!(f.model.seen_by("helper").contains("say hi"));
+    assert!(f.model.seen_by("lead/helper").contains("say hi"));
     let listed = f.crew.list();
     assert_eq!(listed.len(), 2);
-    assert_eq!(listed[0].name, "helper");
-    assert_eq!(listed[0].by, "lead");
+    assert_eq!(listed[1].name, "lead/helper");
+    assert_eq!(listed[1].by, "lead");
 
     // The person writes to the lead, resting: it wakes and reads it.
     f.crew.tell("lead", "and now?".into()).unwrap();
@@ -810,7 +871,7 @@ async fn the_lead_follows_the_rules_and_gives_its_agents_what_they_need_of_them(
             vec![
                 calls(
                     "start_agent",
-                    serde_json::json!({"name": "helper", "model": "cheap/model", "task": "fix it, with no dashes"}),
+                    serde_json::json!({"role": "helper", "model": "cheap/model", "task": "fix it, with no dashes"}),
                 ),
                 say("Started."),
             ],
@@ -835,7 +896,7 @@ async fn the_lead_follows_the_rules_and_gives_its_agents_what_they_need_of_them(
     // AGENTS.md, imported by CLAUDE.md, is given once.
     assert_eq!(lead.matches("No dashes in prose.").count(), 1);
     // The agent it starts reads only what it was given.
-    let helper = f.model.seen_by("helper");
+    let helper = f.model.seen_by("lead/helper");
     assert!(helper.contains("fix it, with no dashes"));
     assert!(!helper.contains("Answer in French.") && !helper.contains("Tests first."));
     assert!(!helper.contains("rules for agents"));
@@ -844,7 +905,7 @@ async fn the_lead_follows_the_rules_and_gives_its_agents_what_they_need_of_them(
     assert!(lead.contains("Write into its task what its part needs of them"));
     assert!(
         f.model
-            .instructions_of("helper")
+            .instructions_of("lead/helper")
             .contains("Write into its task what its part needs of yours")
     );
 
@@ -908,13 +969,13 @@ async fn what_serves_leads_alone_is_not_the_agents_they_start() {
                 vec![
                     calls(
                         "start_agent",
-                        serde_json::json!({"name": "helper", "model": "cheap/model", "task": "help"}),
+                        serde_json::json!({"role": "helper", "model": "cheap/model", "task": "help"}),
                     ),
                     say("Started."),
                 ],
             ),
             (
-                "helper",
+                "lead/helper",
                 vec![calls("recall", serde_json::json!({})), say("Done.")],
             ),
         ],
@@ -930,16 +991,20 @@ async fn what_serves_leads_alone_is_not_the_agents_they_start() {
             .contains("Your notes: none yet.")
     );
     assert!(f.crew.tools_for("lead").iter().any(|t| t.name == "recall"));
-    assert!(!f.model.instructions_of("helper").contains("Your notes"));
+    assert!(
+        !f.model
+            .instructions_of("lead/helper")
+            .contains("Your notes")
+    );
     assert!(
         f.crew
-            .tools_for("helper")
+            .tools_for("lead/helper")
             .iter()
             .all(|t| t.name != "recall")
     );
     assert!(
         f.model
-            .seen_by("helper")
+            .seen_by("lead/helper")
             .contains("there is no tool named \\\"recall\\\"")
     );
 }
@@ -955,7 +1020,6 @@ async fn a_team_works_as_the_roles_it_was_given_say_and_answers_who_started_it()
                     calls(
                         "start_team",
                         serde_json::json!({
-                            "name": "code",
                             "task": "Add a greeting to hello.txt.",
                             "members": [
                                 {"role": "writer", "model": "lab/a", "effort": "high", "does": "writes the change, then has it reviewed"},
@@ -968,17 +1032,17 @@ async fn a_team_works_as_the_roles_it_was_given_say_and_answers_who_started_it()
                 ],
             ),
             (
-                "code-writer",
+                "lead/writer",
                 vec![
                     calls(
                         "send_message",
-                        serde_json::json!({"to": "code-reviewer", "text": "Review my change."}),
+                        serde_json::json!({"to": "lead/reviewer", "text": "Review my change."}),
                     ),
                     calls("wait_for_messages", serde_json::json!({"seconds": 5})),
                     say("Written and approved."),
                 ],
             ),
-            ("code-reviewer", vec![say("APPROVE")]),
+            ("lead/reviewer", vec![say("APPROVE")]),
         ],
         Settings::default(),
     );
@@ -989,35 +1053,35 @@ async fn a_team_works_as_the_roles_it_was_given_say_and_answers_who_started_it()
     let member = |name: &str| listed.iter().find(|a| a.name == name).unwrap().clone();
     assert_eq!(
         (
-            member("code-writer").model.as_str(),
-            member("code-writer").by.as_str()
+            member("lead/writer").model.as_str(),
+            member("lead/writer").by.as_str()
         ),
         ("lab/a", "lead")
     );
     assert_eq!(
         (
-            member("code-reviewer").model.as_str(),
-            member("code-reviewer").by.as_str()
+            member("lead/reviewer").model.as_str(),
+            member("lead/reviewer").by.as_str()
         ),
-        ("lab/b", "code-writer")
+        ("lab/b", "lead/writer")
     );
     assert!(
         f.model
-            .efforts_of("code-writer")
+            .efforts_of("lead/writer")
             .iter()
             .all(|e| *e == Some(Effort::High))
     );
-    assert_eq!(f.model.efforts_of("code-reviewer"), [None]);
+    assert_eq!(f.model.efforts_of("lead/reviewer"), [None]);
     // The reviewer waited for the writer, its brief and its team before it.
-    let reviewer = f.model.seen_by("code-reviewer");
+    let reviewer = f.model.seen_by("lead/reviewer");
     assert!(reviewer.contains("Add a greeting to hello.txt."));
-    assert!(reviewer.contains("You are code-reviewer") && reviewer.contains("goes to code-writer"));
+    assert!(reviewer.contains("You are lead/reviewer") && reviewer.contains("goes to lead/writer"));
     assert!(reviewer.contains("Review my change."));
-    assert!(f.model.seen_by("code-writer").contains("APPROVE"));
+    assert!(f.model.seen_by("lead/writer").contains("APPROVE"));
     // Only the writer's answer reached the lead.
     let lead = f.model.seen_by("lead");
-    assert!(lead.contains("The team code is started") && lead.contains("Written and approved."));
-    assert!(!lead.contains("Message from code-reviewer"));
+    assert!(lead.contains("The team is started") && lead.contains("Written and approved."));
+    assert!(!lead.contains("Message from lead/reviewer"));
 }
 
 #[tokio::test]
@@ -1028,7 +1092,7 @@ async fn an_agent_given_a_role_is_told_to_keep_to_it() {
             vec![
                 calls(
                     "start_agent",
-                    serde_json::json!({"name": "checker", "model": "cheap/model", "task": "check", "role": "tests"}),
+                    serde_json::json!({"model": "cheap/model", "task": "check", "role": "tests"}),
                 ),
                 say("Started."),
             ],
@@ -1044,11 +1108,11 @@ async fn an_agent_given_a_role_is_told_to_keep_to_it() {
     f.settled().await;
     assert!(
         f.model
-            .seen_by("checker")
+            .seen_by("lead/tests")
             .contains("Your role in the crew: tests")
     );
     let listed = f.crew.list();
-    let checker = listed.iter().find(|a| a.name == "checker").unwrap();
+    let checker = listed.iter().find(|a| a.name == "lead/tests").unwrap();
     assert_eq!(checker.role.as_deref(), Some("tests"));
 }
 
@@ -1061,7 +1125,7 @@ async fn a_writer_and_its_reviewer_go_round_until_it_approves() {
                 vec![say("first try"), say("second try, with a test")],
             ),
             (
-                "review",
+                "writer/review",
                 vec![
                     say("CHANGES: add a test"),
                     say("APPROVE: it has its test now"),
@@ -1083,7 +1147,7 @@ async fn a_writer_and_its_reviewer_go_round_until_it_approves() {
     }
     assert!(
         f.model
-            .seen_by("review")
+            .seen_by("writer/review")
             .contains("Review what writer changed")
     );
     assert!(f.model.seen_by("writer").contains("CHANGES: add a test"));
@@ -1091,7 +1155,9 @@ async fn a_writer_and_its_reviewer_go_round_until_it_approves() {
         .events()
         .into_iter()
         .filter_map(|e| match e {
-            Event::Posted { from, to, text } if from == "review" && to == PERSON => Some(text),
+            Event::Posted { from, to, text } if from == "writer/review" && to == PERSON => {
+                Some(text)
+            }
             _ => None,
         })
         .collect();
@@ -1154,14 +1220,14 @@ async fn an_answer_written_back_is_not_sent_twice() {
                 vec![
                     calls(
                         "start_agent",
-                        serde_json::json!({"name": "helper", "model": "cheap/model", "task": "count"}),
+                        serde_json::json!({"role": "helper", "model": "cheap/model", "task": "count"}),
                     ),
                     calls("wait_for_messages", serde_json::json!({"seconds": 5})),
                     say("Counted."),
                 ],
             ),
             (
-                "helper",
+                "lead/helper",
                 vec![
                     calls(
                         "send_message",
@@ -1183,7 +1249,7 @@ async fn an_answer_written_back_is_not_sent_twice() {
     let posted = f
         .events()
         .into_iter()
-        .filter(|e| matches!(e, Event::Posted { from, to, .. } if from == "helper" && to == "lead"))
+        .filter(|e| matches!(e, Event::Posted { from, to, .. } if from == "lead/helper" && to == "lead"))
         .count();
     assert_eq!(posted, 1);
 }
@@ -1286,7 +1352,7 @@ async fn the_lead_starts_its_agents_on_the_models_it_chooses() {
             vec![
                 calls(
                     "start_agent",
-                    serde_json::json!({"name": "helper", "model": "cheap/other", "task": "fix calc.py"}),
+                    serde_json::json!({"role": "helper", "model": "cheap/other", "task": "fix calc.py"}),
                 ),
                 say("Started."),
             ],
@@ -1297,7 +1363,7 @@ async fn the_lead_starts_its_agents_on_the_models_it_chooses() {
         .start("lead", &model("cheap/model"), "go".into(), PERSON);
     f.settled().await;
     // iq holds it to nothing: what it starts is its choice.
-    assert_eq!(f.model.models_of("helper"), ["cheap/other"]);
+    assert_eq!(f.model.models_of("lead/helper"), ["cheap/other"]);
 }
 
 #[tokio::test]
@@ -1309,7 +1375,7 @@ async fn the_lead_chooses_how_hard_its_agents_think_and_the_person_its_own() {
             vec![
                 calls(
                     "start_agent",
-                    serde_json::json!({"name": "helper", "model": "cheap/other", "task": "rename it", "effort": "low"}),
+                    serde_json::json!({"role": "helper", "model": "cheap/other", "task": "rename it", "effort": "low"}),
                 ),
                 say("Started."),
                 say("Again."),
@@ -1323,7 +1389,7 @@ async fn the_lead_chooses_how_hard_its_agents_think_and_the_person_its_own() {
     f.crew
         .start("lead", &model("cheap/model"), "go".into(), PERSON);
     f.settled().await;
-    assert_eq!(f.model.efforts_of("helper"), [Some(Effort::Low)]);
+    assert_eq!(f.model.efforts_of("lead/helper"), [Some(Effort::Low)]);
     // The lead, as the settings say, its turns woken by the helper too.
     assert!(
         f.model
@@ -1403,13 +1469,13 @@ async fn an_agent_is_given_the_rules_for_the_files_it_touches_once() {
                 vec![
                     calls(
                         "start_agent",
-                        serde_json::json!({"name": "helper", "model": "cheap/model", "task": "fix the api"}),
+                        serde_json::json!({"role": "helper", "model": "cheap/model", "task": "fix the api"}),
                     ),
                     say("Started."),
                 ],
             ),
             (
-                "helper",
+                "lead/helper",
                 vec![
                     calls(
                         "read_file",
@@ -1455,7 +1521,7 @@ async fn an_agent_is_given_the_rules_for_the_files_it_touches_once() {
     assert!(!lead.contains("Validate every input"));
     // The helper, as it first touches their files, once each in its
     // conversation.
-    let last = f.model.requests_of("helper").pop().unwrap();
+    let last = f.model.requests_of("lead/helper").pop().unwrap();
     let helper = format!("{:?}", last.messages);
     assert_eq!(
         helper.matches("Validate every input at the edge.").count(),
@@ -1496,14 +1562,14 @@ async fn the_persons_agents_work_in_places_of_their_own_with_those_they_start() 
                     ),
                     calls(
                         "start_agent",
-                        serde_json::json!({"name": "Helper", "model": "cheap/model", "task": "write"}),
+                        serde_json::json!({"role": "helper", "model": "cheap/model", "task": "write"}),
                     ),
                     calls("wait_for_messages", serde_json::json!({"seconds": 5})),
                     say("Both written."),
                 ],
             ),
             (
-                "helper",
+                "lead/helper",
                 vec![
                     calls(
                         "write_file",
@@ -1544,7 +1610,7 @@ async fn the_persons_agents_work_in_places_of_their_own_with_those_they_start() 
         said: Some(format!("works apart in {}", apart.join("lead").display())),
     }));
     assert!(events.contains(&Event::Placed {
-        agent: "helper".into(),
+        agent: "lead/helper".into(),
         folder: apart.join("lead"),
         said: None,
     }));
@@ -1646,12 +1712,12 @@ async fn a_chat_renamed_goes_on_under_its_new_name_and_its_agents_follow_it() {
                 vec![
                     calls(
                         "start_agent",
-                        serde_json::json!({"name": "helper", "model": "cheap/model", "task": "read the tests"}),
+                        serde_json::json!({"role": "helper", "model": "cheap/model", "task": "read the tests"}),
                     ),
                     say("Started."),
                 ],
             ),
-            ("helper", vec![say("Read.")]),
+            ("lead/helper", vec![say("Read.")]),
             ("login", vec![say("On it.")]),
         ],
         Settings::default(),
@@ -1665,25 +1731,38 @@ async fn a_chat_renamed_goes_on_under_its_new_name_and_its_agents_follow_it() {
         "fix the login".into(),
         PERSON,
     );
+    f.crew
+        .start("other", &model("cheap/model"), "rest".into(), PERSON);
     f.settled().await;
     // Kept as the person wrote to it, to open on it again.
     assert!(kept.0.lock().unwrap()["lead"].written.is_some());
     assert_eq!(f.crew.rename("lead", "Login").unwrap(), "login");
-    assert!(f.crew.rename("helper", "login").is_err());
+    assert!(f.crew.rename("other", "login").is_err());
     assert!(f.crew.rename("nobody", "x").is_err());
-    assert!(f.events().contains(&Event::Renamed {
+    let events = f.events();
+    assert!(events.contains(&Event::Renamed {
         from: "lead".into(),
         to: "login".into()
     }));
+    // Its agent, named after it, follows it.
+    assert!(events.contains(&Event::Renamed {
+        from: "lead/helper".into(),
+        to: "login/helper".into()
+    }));
     {
         let kept = kept.0.lock().unwrap();
-        assert!(!kept.contains_key("lead"));
+        assert!(!kept.contains_key("lead") && !kept.contains_key("lead/helper"));
         assert_eq!(kept["login"].task, "fix the login");
-        assert_eq!(kept["helper"].by, "login");
+        assert_eq!(kept["login/helper"].by, "login");
     }
     let listed = f.crew.list();
-    let helper = listed.iter().find(|a| a.name == "helper").unwrap();
+    let helper = listed.iter().find(|a| a.name == "login/helper").unwrap();
     assert_eq!(helper.by, "login");
+    // An agent named by the person stays part of its chat.
+    assert_eq!(
+        f.crew.rename("login/helper", "tests").unwrap(),
+        "login/tests"
+    );
     // What is written to its old name reaches it, its instructions say
     // its new one.
     f.crew.tell("lead", "go on".into()).unwrap();
@@ -1691,6 +1770,210 @@ async fn a_chat_renamed_goes_on_under_its_new_name_and_its_agents_follow_it() {
     let seen = f.model.seen_by("login");
     assert!(seen.contains("go on"), "{seen}");
     assert!(seen.contains("fix the login"), "{seen}");
+}
+
+#[tokio::test]
+async fn a_chat_at_work_is_named_at_once_and_takes_its_name_as_its_turn_ends() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls("wait_for_messages", serde_json::json!({"seconds": 5})),
+                say("Read it."),
+            ],
+        )],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "wait for me".into(), PERSON);
+    for _ in 0..200 {
+        if f.crew.list().iter().any(|a| a.working) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(f.crew.rename("lead", "inbox").unwrap(), "inbox");
+    // Shown under its new name at once, and written to under it.
+    assert!(f.events().contains(&Event::Renamed {
+        from: "lead".into(),
+        to: "inbox".into()
+    }));
+    f.crew.tell("inbox", "here it is".into()).unwrap();
+    f.settled().await;
+    assert!(f.model.seen_by("lead").contains("here it is"));
+    let events = f.events();
+    let renamed = events
+        .iter()
+        .position(|e| matches!(e, Event::Renamed { .. }))
+        .unwrap();
+    // What it did after shows its new name.
+    assert!(events[renamed..].iter().all(|e| match e {
+        Event::Done { agent, .. } | Event::Text { agent, .. } | Event::Tool { agent, .. } =>
+            agent == "inbox",
+        _ => true,
+    }));
+    // Its turn over, it has it.
+    let listed = f.crew.list();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "inbox");
+    f.crew.tell("inbox", "thanks".into()).unwrap();
+    f.settled().await;
+    assert!(
+        f.model
+            .instructions_of("inbox")
+            .starts_with("You are inbox,")
+    );
+}
+
+#[tokio::test]
+async fn a_chat_is_named_after_its_work_unless_the_person_named_it() {
+    // The namer is told no name of its own: the script answers it as it
+    // answers the reviewer.
+    let f = fixture(
+        &[
+            (
+                "pourriez-coder-partie",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"model": "cheap/model", "task": "tests", "role": "tests"}),
+                    ),
+                    say("On it."),
+                ],
+            ),
+            (
+                "reviewer",
+                vec![say("Paiement-Remboursements\n"), say("other-name")],
+            ),
+        ],
+        Settings {
+            namer: Some(model("cheap/namer")),
+            ..Settings::default()
+        },
+    );
+    let chat = f.crew.start(
+        "pourriez-coder-partie",
+        &model("cheap/model"),
+        "vous pourriez coder la partie paiement pour les remboursements ?".into(),
+        PERSON,
+    );
+    f.crew.name_after_work(&chat);
+    let mut names = Vec::new();
+    for _ in 0..300 {
+        f.settled().await;
+        names = f.crew.list().into_iter().map(|a| a.name).collect();
+        if names.contains(&"paiement-remboursements".to_owned()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Its agent follows it.
+    assert_eq!(
+        names,
+        ["paiement-remboursements", "paiement-remboursements/tests"]
+    );
+    assert!(f.model.seen_by("reviewer").contains("vous pourriez coder"));
+    assert_eq!(f.model.models_of("reviewer"), ["cheap/namer"]);
+    // Its cost is shown as any call's.
+    assert!(f.events().iter().any(
+        |e| matches!(e, Event::Spent { agent, model, .. } if agent == "namer" && model == "cheap/namer")
+    ));
+    // Named by the person, it is named no more.
+    f.crew.rename("paiement-remboursements", "refunds").unwrap();
+    f.crew.name_after_work("refunds");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(f.crew.list()[0].name, "refunds");
+}
+
+#[tokio::test]
+async fn agents_are_named_after_their_chat_and_their_part() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"model": "cheap/model", "task": "one"}),
+                    ),
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"model": "cheap/model", "task": "two", "role": "the Front End, its pages"}),
+                    ),
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"model": "cheap/model", "task": "three", "role": "the front end"}),
+                    ),
+                    say("Started."),
+                ],
+            ),
+            (
+                "lead/2",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"model": "cheap/model", "task": "four"}),
+                    ),
+                    say("Started too."),
+                ],
+            ),
+        ],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "split it".into(), PERSON);
+    for _ in 0..4 {
+        f.settled().await;
+    }
+    let names: Vec<String> = f.crew.list().into_iter().map(|a| a.name).collect();
+    assert_eq!(
+        names,
+        [
+            "lead",
+            "lead/2",
+            "lead/3",
+            "lead/the-front-end",
+            "lead/the-front-end-2"
+        ]
+    );
+    // The agents an agent starts are its chat's too.
+    let listed = f.crew.list();
+    assert_eq!(listed[2].by, "lead/2");
+}
+
+#[tokio::test]
+async fn an_agent_waiting_for_those_it_started_waits_until_they_write() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"model": "cheap/model", "task": "take your time"}),
+                    ),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 1})),
+                    say("Got it."),
+                ],
+            ),
+            (
+                "lead/2",
+                vec![
+                    calls("wait_for_messages", serde_json::json!({"seconds": 2})),
+                    say("done, slowly"),
+                ],
+            ),
+        ],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "delegate".into(), PERSON);
+    f.settled().await;
+    let seen = f.model.seen_by("lead");
+    assert!(seen.contains("Message from lead/2: done, slowly"), "{seen}");
+    assert!(!seen.contains("No message came"), "{seen}");
+    // One call to wait, not one every second.
+    assert_eq!(f.model.requests_of("lead").len(), 3);
 }
 
 #[tokio::test]

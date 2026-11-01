@@ -200,6 +200,7 @@ impl Steps {
             }
             Event::Joined { .. }
             | Event::Effort { .. }
+            | Event::Model { .. }
             | Event::Text { .. }
             | Event::Spent { .. }
             | Event::Placed { said: None, .. } => {}

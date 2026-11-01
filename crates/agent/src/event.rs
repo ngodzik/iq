@@ -30,13 +30,23 @@ pub enum Event {
         /// What the person is told of it, when the place was made for it.
         said: Option<String>,
     },
-    /// The person gave an agent another name: what it did and what was
-    /// written to it goes on under that one.
+    /// An agent was given another name, by the person, after what its
+    /// work is about, or after its chat's: what it did and what was
+    /// written to it goes on under that one. One at work shows it at once,
+    /// and its later events name it so.
     Renamed {
         /// Its name until now.
         from: String,
         /// Its name from now on.
         to: String,
+    },
+    /// The person gave an agent another model, which answers it from its
+    /// next turn.
+    Model {
+        /// The agent.
+        agent: String,
+        /// Its model from now on.
+        model: String,
     },
     /// How hard an agent thinks, as it joined or as it was changed.
     Effort {
@@ -145,4 +155,44 @@ pub enum Event {
         /// What.
         text: String,
     },
+}
+
+impl Event {
+    /// Writes `to` wherever the event names the agent `from`: an agent the
+    /// person named again while it worked is shown under that name at
+    /// once, though it takes it only as its turn ends.
+    pub(crate) fn rename(&mut self, from: &str, to: &str) {
+        let renamed = |name: &mut String| {
+            if name == from {
+                to.clone_into(name);
+            }
+        };
+        match self {
+            Event::Joined { agent, by, .. } => {
+                renamed(agent);
+                renamed(by);
+            }
+            Event::Renamed { .. } | Event::Answered { .. } => {}
+            Event::Posted {
+                from: writer,
+                to: reader,
+                ..
+            } => {
+                renamed(writer);
+                renamed(reader);
+            }
+            Event::Placed { agent, .. }
+            | Event::Model { agent, .. }
+            | Event::Effort { agent, .. }
+            | Event::Working { agent, .. }
+            | Event::TextStart { agent }
+            | Event::Text { agent, .. }
+            | Event::Spent { agent, .. }
+            | Event::Tool { agent, .. }
+            | Event::Asked { agent, .. }
+            | Event::Reviewed { agent, .. }
+            | Event::Done { agent, .. }
+            | Event::Notice { agent, .. } => renamed(agent),
+        }
+    }
 }

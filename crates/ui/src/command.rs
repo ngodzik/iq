@@ -18,11 +18,16 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 16] = [
+pub const COMMANDS: [Spec; 17] = [
     Spec {
         name: "new",
         args: "[model]",
-        what: "start a new chat, on the lead's model or this one",
+        what: "start a new chat, on the lead's model or this model of the provider's",
+    },
+    Spec {
+        name: "model",
+        args: "model",
+        what: "the model the chat you write to answers on, from its next turn, or the new chat's",
     },
     Spec {
         name: "pattern",
@@ -124,6 +129,8 @@ pub fn known(name: &str) -> bool {
 pub enum Command {
     /// A new chat, on this model when one is named.
     New(Option<String>),
+    /// The model the chat written to answers on, or the new chat's.
+    Model(String),
     /// How the new chat's team works, and its partner's model.
     Pattern(Pattern, Option<String>),
     /// The new chat's role; none when empty.
@@ -195,6 +202,9 @@ pub fn parse(line: &str) -> Result<Command, String> {
     };
     match name {
         "new" => Ok(Command::New(one("model")?)),
+        "model" => one("model")?
+            .map(Command::Model)
+            .ok_or_else(|| "/model takes the model to answer on".to_owned()),
         "pattern" => {
             let Some(first) = words.first() else {
                 return Err("/pattern takes solo, lead, pair or debate".to_owned());
@@ -305,7 +315,7 @@ pub fn complete(line: &str, agents: &[&str], models: &[&str]) -> Vec<Completion>
                 "every agent".to_owned(),
             )))
             .collect(),
-        "new" => models
+        "new" | "model" => models
             .iter()
             .map(|m| ((*m).to_owned(), "a model".to_owned()))
             .collect(),
@@ -329,7 +339,12 @@ pub fn complete(line: &str, agents: &[&str], models: &[&str]) -> Vec<Completion>
     };
     values
         .into_iter()
-        .filter(|(value, _)| value.starts_with(arg) && value != arg)
+        .filter(|(value, _)| {
+            // By its start, or by that of its last part: `sage` completes
+            // `lab/sage-5`, `review` completes `login/review`.
+            let last = value.rsplit('/').next().unwrap_or(value);
+            (value.starts_with(arg) || last.starts_with(arg)) && value != arg
+        })
         .map(|(value, what)| Completion {
             line: format!("/{name} {value}"),
             label: value,
@@ -354,6 +369,11 @@ mod tests {
             Command::Pattern(Pattern::Pair, Some("z-ai/glm-5".into()))
         );
         assert_eq!(parse("/to @helper").unwrap(), Command::To("helper".into()));
+        assert_eq!(
+            parse("/model lab/second").unwrap(),
+            Command::Model("lab/second".into())
+        );
+        assert!(parse("/model").is_err());
         assert_eq!(
             parse("/theme ink").unwrap(),
             Command::Theme(Some(Theme::Ink))
@@ -389,6 +409,7 @@ mod tests {
             names(complete("/t", &[], &[])),
             ["/to ", "/team", "/theme "]
         );
+        assert_eq!(names(complete("/m", &[], &[])), ["/model "]);
         assert_eq!(
             names(complete("/stop h", &["helper", "lead"], &[])),
             ["/stop helper"]

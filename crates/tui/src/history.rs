@@ -168,8 +168,9 @@ impl History {
                     ],
                 ));
             }
-            // The box where the person writes says how hard its agent thinks.
-            Event::Joined { .. } | Event::Effort { .. } => {}
+            // The box where the person writes says how hard its agent
+            // thinks, and on which model.
+            Event::Joined { .. } | Event::Effort { .. } | Event::Model { .. } => {}
             Event::Working { agent, prompt } => {
                 self.turns.insert(
                     agent.clone(),

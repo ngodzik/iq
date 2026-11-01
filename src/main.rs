@@ -980,12 +980,18 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     partner,
                     named,
                     effort,
+                    from_words,
                 } => match ModelId::new(&model) {
                     Ok(model) => {
                         let mut models = vec![model];
                         models.extend(partner.and_then(|p| ModelId::new(&p).ok()));
                         let task = with_named(task, &named[named.len().min(1)..]);
-                        working.launch(pattern, &name, &models, task, role, effort);
+                        let started = working.launch(pattern, &name, &models, task, role, effort);
+                        // A debate's chats are named alike, apart only by
+                        // their numbers: they keep the name they share.
+                        if from_words && pattern != iq_agent::Pattern::Debate {
+                            working.name_after_work(&started);
+                        }
                     }
                     Err(error) => tracing::warn!("no chat on `{model}`: {error}"),
                 },
@@ -1000,9 +1006,21 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                 }
                 Request::Stop { agent } => working.stop(&agent),
                 Request::Rename { agent, name } => {
-                    if let Err(why) = working.rename(&agent, &name) {
-                        let _ = told.send(Update::Said(why));
-                    }
+                    let said = match working.rename(&agent, &name) {
+                        Ok(new) => format!("{agent} is named {new} now"),
+                        Err(why) => format!("{agent} keeps its name: {why}"),
+                    };
+                    let _ = told.send(Update::Notice(said));
+                }
+                Request::Model { agent, model } => {
+                    let said = match ModelId::new(&model)
+                        .map_err(|error| error.to_string())
+                        .and_then(|model| working.set_model(&agent, &model))
+                    {
+                        Ok(()) => format!("{agent} answers on {model} from its next turn"),
+                        Err(why) => format!("{agent} keeps its model: {why}"),
+                    };
+                    let _ = told.send(Update::Notice(said));
                 }
                 Request::Sync { send, always: on } => {
                     if on {

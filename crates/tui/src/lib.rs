@@ -345,7 +345,7 @@ impl Iq {
             Wait::Gone => {
                 // Its window closed: nobody is there to answer, and the
                 // agents stop with iq.
-                self.board.act(iq_ui::keys::Action::Quit);
+                self.board.act(iq_ui::keys::Action::Quit, iq_ui::now());
                 return Ok(true);
             }
             Wait::Ready => {}

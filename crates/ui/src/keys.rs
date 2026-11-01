@@ -3,10 +3,12 @@
 //! and asks here what it does, so that the bindings are tested without one.
 //!
 //! The defaults are letters held with Ctrl, which sit where they are named
-//! on QWERTY and AZERTY alike: digits and signs move between the two. None
-//! takes a key a terminal keeps for itself (Ctrl-I is Tab there, Ctrl-M
-//! Enter) or one its line editors use (Ctrl-A, Ctrl-E, Ctrl-K, Ctrl-U,
-//! Ctrl-W and their like edit what the person writes).
+//! on QWERTY and AZERTY alike: digits and signs move between the two; and
+//! Ctrl-Space, found at once on any keyboard, for going from chat to chat,
+//! which is done most. None takes a key a terminal keeps for itself
+//! (Ctrl-I is Tab there, Ctrl-M Enter) or one its line editors use (Ctrl-A,
+//! Ctrl-E, Ctrl-K, Ctrl-U, Ctrl-W and their like edit what the person
+//! writes).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -16,10 +18,10 @@ use crate::error::UiError;
 /// What a shortcut does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Action {
-    /// Writes to the next agent, or to a new chat after the last.
-    NextAgent,
-    /// Writes to the agent before the one written to.
-    PrevAgent,
+    /// The person's chats, the one used last first, to go to one.
+    Switch,
+    /// Writes to a new chat, on the lead's model.
+    NewChat,
     /// The crew's page: each agent, what it does and spends.
     Team,
     /// The costs' page.
@@ -52,8 +54,8 @@ pub enum Action {
 impl Action {
     /// Every action, in the order the list of shortcuts gives them.
     pub const ALL: [Action; 15] = [
-        Action::NextAgent,
-        Action::PrevAgent,
+        Action::Switch,
+        Action::NewChat,
         Action::Team,
         Action::Costs,
         Action::Observations,
@@ -73,8 +75,8 @@ impl Action {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Action::NextAgent => "next_agent",
-            Action::PrevAgent => "prev_agent",
+            Action::Switch => "switch",
+            Action::NewChat => "new_chat",
             Action::Team => "team",
             Action::Costs => "costs",
             Action::Observations => "observations",
@@ -95,8 +97,8 @@ impl Action {
     #[must_use]
     pub fn what(self) -> &'static str {
         match self {
-            Action::NextAgent => "write to the next agent, or start a new chat",
-            Action::PrevAgent => "write to the agent before",
+            Action::Switch => "go to another chat, the one used last first; again for the next",
+            Action::NewChat => "start a new chat",
             Action::Team => "the crew: each agent, what it does and spends",
             Action::Costs => "the costs: by model, by kind of task, over time",
             Action::Observations => "what the work went to, over time",
@@ -116,8 +118,8 @@ impl Action {
     /// Its key unless the settings say otherwise; empty for none.
     fn default_chord(self) -> &'static str {
         match self {
-            Action::NextAgent => "ctrl+n",
-            Action::PrevAgent => "ctrl+p",
+            Action::Switch => "ctrl+space",
+            Action::NewChat => "ctrl+n",
             Action::Team => "ctrl+t",
             Action::Costs => "ctrl+o",
             Action::Observations => "ctrl+j",
@@ -274,7 +276,7 @@ impl Default for Keymap {
 
 /// The actions iq had and has no more: a setting that moves one is left,
 /// so that older settings still open.
-const RETIRED: [&str; 2] = ["assay", "steward"];
+const RETIRED: [&str; 4] = ["assay", "steward", "next_agent", "prev_agent"];
 
 impl Keymap {
     /// The defaults, changed as the settings' `[keys]` say: an action's
@@ -356,6 +358,10 @@ mod tests {
             Some(Action::Autopilot)
         );
         assert_eq!(keys.action(&Chord::plain("esc")), Some(Action::Stop));
+        assert_eq!(
+            keys.action(&Chord::parse("ctrl+space").unwrap()),
+            Some(Action::Switch)
+        );
         assert_eq!(keys.action(&Chord::plain("o")), None);
         // The defaults are built through the same check as the person's.
         assert_eq!(Keymap::with(&BTreeMap::new()).unwrap(), keys);
@@ -390,5 +396,6 @@ mod tests {
         ));
         // A shortcut of an action iq had once is left, not refused.
         assert!(Keymap::with(&changes(&[("assay", "ctrl+l")])).is_ok());
+        assert!(Keymap::with(&changes(&[("next_agent", "ctrl+p")])).is_ok());
     }
 }

@@ -1,9 +1,10 @@
 //! The live part, below the conversation: the agents at work and what
 //! they do, each with its latest steps since its last line of text, the
-//! oldest question waiting for the person, a word to them,
-//! the commands that complete what they write, where they write, the
-//! folder of its own the agent they write to works in, and the status
-//! line, along which messages run between the agents.
+//! oldest question waiting for the person, a word to them, the switcher
+//! of their chats while it is open, the commands that complete what they
+//! write, where they write, the folder of its own the agent they write to
+//! works in, and the status line, along which messages run between the
+//! agents.
 
 use std::collections::HashMap;
 
@@ -143,6 +144,9 @@ impl Live<'_> {
                 &[Span::raw("  ")],
                 &[Span::raw("  ")],
             )));
+        }
+        if let Some(switcher) = self.switcher(motion, width) {
+            parts.push(switcher);
         }
         let listed = self.completions(width);
         if !listed.is_empty() {
@@ -409,6 +413,113 @@ impl Live<'_> {
                 ])
             })
             .collect()
+    }
+
+    /// The person's chats while the switcher is open, the one used last
+    /// first, as many as it shows at once: each with whether it works,
+    /// what it was first asked and when the person last used it; under
+    /// them, the keys, and how many more there are above and below.
+    fn switcher(&self, motion: &Motion, width: usize) -> Option<Part> {
+        let p = self.p;
+        let switcher = self.board.switcher()?;
+        let shown = switcher
+            .chats
+            .iter()
+            .enumerate()
+            .skip(switcher.first)
+            .take(iq_ui::SWITCH_ROWS);
+        let name_width = switcher
+            .chats
+            .iter()
+            .map(|(view, _)| text_width(&view.name))
+            .max()
+            .unwrap_or(0)
+            + 2;
+        let here = self.board.screen().talking_to();
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (at, (view, used)) in shown {
+            let on = at == switcher.chosen;
+            let tint = agent_tint(self.board, &view.name, p);
+            let state = if view.working {
+                Span::styled(format!("{} ", motion.spinner()), p.fg(p.accent))
+            } else {
+                Span::styled("· ", p.fg(p.faint))
+            };
+            let when = match used {
+                Some(at) => iq_ui::ago(*at, self.now),
+                None => String::new(),
+            };
+            let when = if Some(view.name.as_str()) == here {
+                "here".to_owned()
+            } else {
+                when
+            };
+            let task = view
+                .task
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            // Within the box's borders: its mark and state before the
+            // name, a space at least before when, and one after.
+            let room = width.saturating_sub(2 + 5 + name_width + text_width(&when) + 2);
+            let gap = room.saturating_sub(text_width(&cut(&task, room)));
+            lines.push(Line::from(vec![
+                Span::styled(if on { " ▸ " } else { "   " }, p.fg(p.accent)),
+                state,
+                Span::styled(
+                    format!("{:<name_width$}", view.name),
+                    if on { p.bold(tint) } else { p.fg(tint) },
+                ),
+                Span::styled(cut(&task, room), p.fg(if on { p.text } else { p.dim })),
+                Span::raw(" ".repeat(gap + 1)),
+                Span::styled(when, p.fg(p.faint)),
+            ]));
+        }
+        let key = self
+            .board
+            .keys()
+            .chord(Action::Switch)
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let mut foot = vec![
+            Span::raw("   "),
+            Span::styled(key, p.bold(p.accent)),
+            Span::styled(" or ↑ ↓ to choose · ", p.fg(p.dim)),
+            Span::styled("Enter", p.bold(p.accent)),
+            Span::styled(" to go there · ", p.fg(p.dim)),
+            Span::styled("Esc", p.bold(p.accent)),
+        ];
+        let above = switcher.first;
+        let below = switcher
+            .chats
+            .len()
+            .saturating_sub(switcher.first + iq_ui::SWITCH_ROWS);
+        let more: Vec<String> = [(above, "↑"), (below, "↓")]
+            .iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, arrow)| format!("{count} more {arrow}"))
+            .collect();
+        if !more.is_empty() {
+            foot.push(Span::styled(
+                format!(" · {}", more.join(", ")),
+                p.fg(p.faint),
+            ));
+        }
+        lines.push(Line::from(foot));
+        Some(Part::Boxed {
+            title: Line::from(vec![
+                Span::raw(" "),
+                Span::styled("Chats", p.bold(p.accent)),
+                Span::styled(
+                    format!(" · {} · the one used last first ", switcher.chats.len()),
+                    p.fg(p.faint),
+                ),
+            ]),
+            lines,
+            tint: p.accent,
+        })
     }
 
     /// Where the person writes: to whom in the box's title, what the agent
@@ -902,6 +1013,76 @@ mod tests {
             "  cd /data/iq/worktrees/lead && eval \"$(iq-ports env)\""
         );
         assert!(rows[rows.len() - 1].contains("· localhost → lead"));
+    }
+
+    #[test]
+    fn the_switcher_shows_the_chats_used_last_in_a_box_of_its_own() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        let chats = [
+            ("login", "fix the login redirect"),
+            ("refunds", "code the refunds of the payment module"),
+            ("docs", "translate the docs"),
+            ("ci", "make the CI faster"),
+            ("api", "version the API"),
+            ("tests", "flaky tests"),
+            ("theme", "a dark theme"),
+        ];
+        for (agent, task) in chats {
+            crew(
+                &mut board,
+                &mut history,
+                Event::Joined {
+                    agent: agent.into(),
+                    model: "m".into(),
+                    by: PERSON.into(),
+                },
+                &p,
+            );
+            crew(
+                &mut board,
+                &mut history,
+                Event::Working {
+                    agent: agent.into(),
+                    prompt: task.into(),
+                },
+                &p,
+            );
+        }
+        for agent in ["docs", "refunds", "login"] {
+            board.run(iq_ui::command::Command::To(agent.into()), iq_ui::now());
+        }
+        board.press(
+            &iq_ui::keys::Chord::parse("ctrl+space").unwrap(),
+            None,
+            iq_ui::now(),
+        );
+        let rows = drawn(&board, &history, 72);
+        let at = rows.iter().position(|r| r.contains("Chats · 7")).unwrap();
+        assert!(
+            rows[at].starts_with("╭ Chats · 7 · the one used last first"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[at + 1].contains("login") && rows[at + 1].ends_with("here │"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[at + 2].contains("▸") && rows[at + 2].contains("refunds"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[at + 2].contains("code the refunds of the payment module"),
+            "{rows:#?}"
+        );
+        assert!(rows[at + 2].contains("just now"), "{rows:#?}");
+        assert!(
+            rows[at + 6].contains("Ctrl-Space or ↑ ↓ to choose"),
+            "{rows:#?}"
+        );
+        assert!(rows[at + 6].contains("2 more ↓"), "{rows:#?}");
+        assert!(rows[at + 7].starts_with("╰"), "{rows:#?}");
     }
 
     #[test]

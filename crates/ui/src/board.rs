@@ -74,6 +74,9 @@ pub enum Update {
     Models(Vec<String>),
     /// Something iq says to the person in passing, in the conversation.
     Said(String),
+    /// What iq answers the person where they write: what a command they
+    /// gave did, or why it did not.
+    Notice(String),
     /// What a plugin told iq to show.
     Plugin {
         /// The plugin.
@@ -117,6 +120,25 @@ pub struct SyncAsk {
     /// Those files, said for the person to decide on: the person's own by
     /// name, the rest counted by folder.
     pub said: String,
+}
+
+/// The most of the provider's models a command being written is offered.
+const OFFERED: usize = 8;
+
+/// How many of the person's chats the switcher shows at once.
+pub const SWITCH_ROWS: usize = 5;
+
+/// The person's chats as the switcher shows them, the one used last
+/// first.
+#[derive(Debug, Clone)]
+pub struct Switcher<'a> {
+    /// Every chat, the one used last first, each with when the person
+    /// last went to it or wrote to it, if they did.
+    pub chats: Vec<(&'a crate::crew::AgentView, Option<u64>)>,
+    /// The one chosen.
+    pub chosen: usize,
+    /// The first shown: [`SWITCH_ROWS`] are, the chosen among them.
+    pub first: usize,
 }
 
 /// How far back the costs are summed, as the costs' page offers it.
@@ -165,6 +187,11 @@ pub struct Board {
     chose: bool,
     /// When the person wrote last to the chat iq opens on.
     opening: Option<u64>,
+    /// The person's chats they went to or wrote to, the latest first, each
+    /// with when.
+    recent: Vec<(String, u64)>,
+    /// The chat chosen in the switcher, while it is open.
+    switching: Option<usize>,
 }
 
 impl Default for Board {
@@ -198,6 +225,8 @@ impl Board {
             unrecalled: std::collections::HashSet::new(),
             chose: false,
             opening: None,
+            recent: Vec::new(),
+            switching: None,
         }
     }
 
@@ -228,6 +257,105 @@ impl Board {
     fn chose_to(&mut self, agent: &str) {
         self.chose = true;
         self.write_to(agent);
+        self.visit(agent, crate::now());
+    }
+
+    /// The person went to `agent`, or wrote to it, `at`: it comes first
+    /// among the chats they used.
+    fn visit(&mut self, agent: &str, at: u64) {
+        self.recent.retain(|(name, _)| name != agent);
+        self.recent.insert(0, (agent.to_owned(), at));
+    }
+
+    /// The person's chats, the one used last first: those they went to or
+    /// wrote to, then the others, the latest to work first.
+    fn chats_by_use(&self) -> Vec<(&crate::crew::AgentView, Option<u64>)> {
+        let mut chats: Vec<(&crate::crew::AgentView, Option<u64>)> = self
+            .recent
+            .iter()
+            .filter_map(|(name, at)| {
+                let view = self.crew.agent(name).filter(|view| view.by == PERSON)?;
+                Some((view, Some(*at)))
+            })
+            .collect();
+        let mut others: Vec<&crate::crew::AgentView> = self
+            .crew
+            .chats()
+            .filter(|view| !chats.iter().any(|(seen, _)| seen.name == view.name))
+            .collect();
+        others.sort_by_key(|view| std::cmp::Reverse(view.worked));
+        chats.extend(others.into_iter().map(|view| (view, None)));
+        chats
+    }
+
+    /// The switcher, while it is open.
+    #[must_use]
+    pub fn switcher(&self) -> Option<Switcher<'_>> {
+        let chosen = self.switching?;
+        let chats = self.chats_by_use();
+        let chosen = chosen.min(chats.len().saturating_sub(1));
+        let first = (chosen + 1).saturating_sub(SWITCH_ROWS);
+        Some(Switcher {
+            chats,
+            chosen,
+            first,
+        })
+    }
+
+    /// Opens the switcher on the chat used before the one written to, or
+    /// moves it to the next; around from the last to the first.
+    fn switch(&mut self, now: u64) {
+        let count = self.chats_by_use().len();
+        if count == 0 {
+            self.screen
+                .notice("No chat yet: what you write starts one", now);
+            return;
+        }
+        self.screen.close();
+        self.switching = Some(match self.switching {
+            Some(chosen) => (chosen + 1) % count,
+            None => {
+                let current = self.screen.talking_to();
+                let first = self
+                    .chats_by_use()
+                    .first()
+                    .map(|(view, _)| view.name.as_str())
+                    == current;
+                usize::from(first && count > 1)
+            }
+        });
+    }
+
+    /// What a key does while the switcher is open: it moves in it, goes to
+    /// the chat chosen, or closes it; another key closes it and does what
+    /// it does.
+    fn switch_key(&mut self, chord: &Chord, now: u64) -> Option<Vec<Request>> {
+        let chosen = self.switching?;
+        let count = self.chats_by_use().len().max(1);
+        let plain = !chord.ctrl && !chord.alt && !chord.cmd;
+        match (plain, chord.shift, chord.key.as_str()) {
+            (true, false, "Down" | "Tab") => self.switching = Some((chosen + 1) % count),
+            (true, false, "Up") | (true, true, "Tab") => {
+                self.switching = Some((chosen + count - 1) % count);
+            }
+            (true, false, "Enter") => {
+                self.switching = None;
+                let chosen = self
+                    .chats_by_use()
+                    .get(chosen)
+                    .map(|(view, _)| view.name.clone());
+                if let Some(agent) = chosen {
+                    self.chose_to(&agent);
+                }
+            }
+            (true, false, "Escape") => self.switching = None,
+            _ if self.keys.action(chord) == Some(Action::Switch) => self.switch(now),
+            _ => {
+                self.switching = None;
+                return None;
+            }
+        }
+        Some(Vec::new())
     }
 
     /// What the person's plugins show.
@@ -348,7 +476,30 @@ impl Board {
                 })
                 .collect();
         }
-        let models = self.models_offered();
+        let mut models = self.models_offered();
+        // Once a model is begun, the provider's that it begins.
+        if let Some(begun) = ["/new ", "/model "]
+            .iter()
+            .find_map(|command| text.strip_prefix(command))
+            .filter(|begun| !begun.is_empty())
+        {
+            let begun = begun.to_lowercase();
+            models.extend(
+                self.models
+                    .iter()
+                    .filter(|model| {
+                        model.starts_with(&begun)
+                            || model
+                                .rsplit('/')
+                                .next()
+                                .is_some_and(|m| m.starts_with(&begun))
+                    })
+                    .filter(|model| !models.contains(model))
+                    .take(OFFERED)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+        }
         let models: Vec<&str> = models.iter().map(String::as_str).collect();
         let mut completions = command::complete(text, &agents, &models);
         completions.extend(self.plugin_completions(text, &agents));
@@ -430,13 +581,16 @@ impl Board {
     /// and sends what the person writes.
     pub fn press(&mut self, chord: &Chord, typed: Option<char>, now: u64) -> Vec<Request> {
         let plain = !chord.ctrl && !chord.alt && !chord.cmd;
+        if let Some(done) = self.switch_key(chord, now) {
+            return done;
+        }
         if self.screen.page().is_some() {
             if plain && !chord.shift && chord.key == "Escape" {
                 self.screen.close();
                 return Vec::new();
             }
             if let Some(action) = self.keys.action(chord) {
-                return self.act(action).into_iter().collect();
+                return self.act(action, now).into_iter().collect();
             }
             return self.page_key(chord, typed);
         }
@@ -474,7 +628,7 @@ impl Board {
             }
         }
         if let Some(action) = self.keys.action(chord) {
-            return self.act(action).into_iter().collect();
+            return self.act(action, now).into_iter().collect();
         }
         let only_ctrl = chord.ctrl && !chord.alt && !chord.cmd;
         if only_ctrl && (chord.key == "C" || chord.key == "D" && self.screen.editor().is_empty()) {
@@ -526,9 +680,13 @@ impl Board {
         }
     }
 
-    /// Scrolls the page open by `lines`, as the wheel does.
+    /// Scrolls the page open by `lines`, as the wheel does; or the
+    /// switcher, while it is open.
     pub fn scroll(&mut self, lines: isize) {
-        if self.screen.page() == Some(&Page::Team) {
+        if let Some(chosen) = self.switching {
+            let last = self.chats_by_use().len().saturating_sub(1) as isize;
+            self.switching = Some((chosen as isize + lines.signum()).clamp(0, last) as usize);
+        } else if self.screen.page() == Some(&Page::Team) {
             let chosen = self.screen.chosen() as isize + lines.signum();
             self.screen
                 .choose(chosen.max(0) as usize, self.crew.agents().len());
@@ -636,12 +794,16 @@ impl Board {
         }
     }
 
-    /// Does what `action` says. Returns what it asks of the crew, if it
-    /// asks something.
-    pub fn act(&mut self, action: Action) -> Option<Request> {
+    /// Does what `action` says at `now`. Returns what it asks of the crew,
+    /// if it asks something.
+    pub fn act(&mut self, action: Action, now: u64) -> Option<Request> {
         match action {
-            Action::NextAgent => self.next_agent(),
-            Action::PrevAgent => self.prev_agent(),
+            Action::Switch => self.switch(now),
+            Action::NewChat => {
+                self.chose = true;
+                self.screen.new_chat(self.crew.lead());
+                self.screen.close();
+            }
             Action::Team => self.screen.toggle(Page::Team),
             Action::Costs => self.screen.toggle(Page::Costs),
             Action::Observations => self.screen.toggle(Page::Observations),
@@ -688,42 +850,6 @@ impl Board {
         None
     }
 
-    /// Writes to the person's chat after the one written to, in the order
-    /// they joined; after the last, to a new chat on the lead's model. The
-    /// agents a chat started are written to by their name.
-    fn next_agent(&mut self) {
-        self.chose = true;
-        let names: Vec<String> = self.crew.chats().map(|a| a.name.clone()).collect();
-        let next = match self.screen.talking_to() {
-            None => names.first(),
-            Some(agent) => match names.iter().position(|name| name == agent) {
-                Some(at) => names.get(at + 1),
-                None => names.first(),
-            },
-        };
-        match next.cloned() {
-            Some(agent) => self.write_to(&agent),
-            None => self.screen.new_chat(self.crew.lead()),
-        }
-    }
-
-    /// Writes to the person's chat before the one written to, in the order
-    /// they joined; from a new chat, or the first, to the last.
-    fn prev_agent(&mut self) {
-        self.chose = true;
-        let names: Vec<String> = self.crew.chats().map(|a| a.name.clone()).collect();
-        let before = match self.screen.talking_to() {
-            None => names.last(),
-            Some(agent) => match names.iter().position(|name| name == agent) {
-                Some(0) | None => names.last(),
-                Some(at) => names.get(at - 1),
-            },
-        };
-        if let Some(agent) = before.cloned() {
-            self.write_to(&agent);
-        }
-    }
-
     /// Sends what the person wrote at `now`: a command, a message to an
     /// agent named after `@`, a message to the agent written to, or the
     /// task that starts a new chat.
@@ -763,6 +889,7 @@ impl Board {
             }
             self.chose = true;
             self.screen.editor_mut().take();
+            self.visit(name, now);
             let text = message.trim().to_owned();
             return vec![Request::Tell {
                 to: name.to_owned(),
@@ -778,6 +905,7 @@ impl Board {
                         .notice(format!("{agent} is gone: /new starts a chat"), now);
                     return Vec::new();
                 }
+                self.visit(&agent, now);
                 Request::Tell {
                     to: agent,
                     named: crate::named::named(&text, &self.models),
@@ -799,17 +927,26 @@ impl Board {
                     .cloned()
                     .unwrap_or_else(|| chat.model.trim().to_owned());
                 // The name the person gave it, else a one-word role, else
-                // the first words of its task, else its model.
-                let base = match &role {
+                // the first words of its task until a model names it after
+                // what its work is about, else its model.
+                let worded = match &role {
+                    _ if !chat.name.trim().is_empty() => None,
+                    Some(role) if !role.contains(char::is_whitespace) => None,
+                    _ => from_words(&text, &named),
+                };
+                let from_words = worded.is_some();
+                let base = match (&role, worded) {
                     _ if !chat.name.trim().is_empty() => chat.name.trim().to_owned(),
-                    Some(role) if !role.contains(char::is_whitespace) => role.clone(),
-                    _ => from_words(&text, &named).unwrap_or_else(|| model.clone()),
+                    (_, Some(words)) => words,
+                    (Some(role), None) if !role.contains(char::is_whitespace) => role.clone(),
+                    _ => model.clone(),
                 };
                 let name = self.name_for(&base);
                 let partner = Some(chat.partner.trim().to_owned())
                     .filter(|p| !p.is_empty() && chat.pattern.takes_partner());
                 self.screen.starts(&name);
                 self.screen.talk_to(&name);
+                self.visit(&name, now);
                 Request::Start {
                     name,
                     model,
@@ -819,6 +956,7 @@ impl Board {
                     partner,
                     named,
                     effort: chat.effort,
+                    from_words,
                 }
             }
         };
@@ -831,9 +969,41 @@ impl Board {
         let open = |board: &mut Self, page: Page| board.screen.open(page);
         match command {
             Command::New(model) => {
-                let model = model.unwrap_or_else(|| self.crew.lead().to_owned());
+                let model = match model {
+                    None => self.crew.lead().to_owned(),
+                    Some(word) => match self.model_named(&word) {
+                        Ok(model) => model,
+                        Err(why) => {
+                            self.screen.notice(why, now);
+                            return Vec::new();
+                        }
+                    },
+                };
                 self.chose = true;
                 self.screen.new_chat(&model);
+            }
+            Command::Model(word) => {
+                let model = match self.model_named(&word) {
+                    Ok(model) => model,
+                    Err(why) => {
+                        self.screen.notice(why, now);
+                        return Vec::new();
+                    }
+                };
+                match self.screen.talk().clone() {
+                    Talk::To(agent) => {
+                        if self.crew.agent(&agent).is_none() {
+                            self.screen.notice(self.no_agent(&agent), now);
+                            return Vec::new();
+                        }
+                        return vec![Request::Model { agent, model }];
+                    }
+                    Talk::New(_) => {
+                        if let Some(chat) = self.screen.new_chat_mut() {
+                            chat.model = model;
+                        }
+                    }
+                }
             }
             Command::Name(name) => match self.screen.talk().clone() {
                 Talk::To(agent) => {
@@ -875,8 +1045,8 @@ impl Board {
             Command::Costs => open(self, Page::Costs),
             Command::Observations => open(self, Page::Observations),
             Command::Keys => open(self, Page::Keys),
-            Command::Autopilot => return self.act(Action::Autopilot).into_iter().collect(),
-            Command::Internet => return self.act(Action::Internet).into_iter().collect(),
+            Command::Autopilot => return self.act(Action::Autopilot, now).into_iter().collect(),
+            Command::Internet => return self.act(Action::Internet, now).into_iter().collect(),
             Command::Theme(None) => self.look.next_theme(),
             Command::Theme(Some(theme)) => self.look.set_theme(theme),
             Command::Effort(effort) => return self.effort(effort, now),
@@ -885,7 +1055,7 @@ impl Board {
                 self.sync_answered();
                 return vec![Request::Sync { send: true, always }];
             }
-            Command::Stop(None) => return self.act(Action::Stop).into_iter().collect(),
+            Command::Stop(None) => return self.act(Action::Stop, now).into_iter().collect(),
             Command::Stop(Some(all)) if all == "all" => {
                 return self
                     .crew
@@ -938,6 +1108,34 @@ impl Board {
             }
         }
         Vec::new()
+    }
+
+    /// The model of the provider `word` names, as a model named in a
+    /// message is read: by its whole name, the part after the provider's,
+    /// or a word of it.
+    ///
+    /// # Errors
+    ///
+    /// It names none, said with what `/name` is for, as a word after
+    /// `/new` is often meant as the chat's name.
+    fn model_named(&self, word: &str) -> Result<String, String> {
+        if self.models.is_empty() {
+            // The provider's list not read yet: a whole name is taken as
+            // it is.
+            return if word.contains('/') {
+                Ok(word.to_owned())
+            } else {
+                Err(format!(
+                    "iq has not read the provider's models yet, so {word} cannot be matched: \
+                     name it whole (provider/model); /name names a chat"
+                ))
+            };
+        }
+        crate::named::model(word, &self.models).ok_or_else(|| {
+            format!(
+                "The provider has no model {word}: /new and /model take one; /name names a chat"
+            )
+        })
     }
 
     /// What the person is told when no agent is named `name`.
@@ -1068,6 +1266,11 @@ impl Board {
                     Event::Joined { agent, .. } => self.screen.joined(agent),
                     Event::Renamed { from, to } => {
                         self.screen.renamed(from, to);
+                        for (name, _) in &mut self.recent {
+                            if name == from {
+                                name.clone_from(to);
+                            }
+                        }
                         self.plugins.rename(from, to);
                         if self.unrecalled.remove(from) {
                             self.unrecalled.insert(to.clone());
@@ -1092,12 +1295,21 @@ impl Board {
             Update::Back(back) => {
                 let agent = back.agent.clone();
                 let at = back.written.unwrap_or(back.worked);
+                let written = back.written;
                 let chat = self.crew.agent(&agent).is_some_and(|a| a.by == PERSON);
                 self.crew.back(back);
                 if !chat {
                     return;
                 }
                 self.unrecalled.insert(agent.clone());
+                if let Some(written) = written {
+                    let at = self
+                        .recent
+                        .iter()
+                        .position(|(_, seen)| *seen < written)
+                        .unwrap_or(self.recent.len());
+                    self.recent.insert(at, (agent.clone(), written));
+                }
                 // iq opens on the chat the person wrote to last, unless
                 // they chose already.
                 if !self.chose && self.opening.is_none_or(|best| at >= best) {
@@ -1125,6 +1337,7 @@ impl Board {
             Update::Models(models) => self.models = models,
             // The conversation is the terminal's: the board keeps nothing.
             Update::Said(_) => {}
+            Update::Notice(text) => self.screen.notice(text, crate::now()),
             Update::Plugin { plugin, told } => self.plugins.told(&plugin, told),
             Update::Started {
                 lead,
@@ -1261,6 +1474,7 @@ mod tests {
                 partner: None,
                 named: Vec::new(),
                 effort: None,
+                from_words: true,
             }]
         );
         assert_eq!(board.screen().talking_to(), Some("fix-build"));
@@ -1283,7 +1497,7 @@ mod tests {
         write(&mut board, "it loops");
         assert!(matches!(
             &key(&mut board, "enter")[..],
-            [Request::Start { name, .. }] if name == "login-redirect"
+            [Request::Start { name, from_words: false, .. }] if name == "login-redirect"
         ));
         board.run(Command::New(None), 100);
         write(&mut board, "is it?");
@@ -1300,7 +1514,8 @@ mod tests {
                 name: "build".into()
             }]
         );
-        board.run(Command::New(Some("lab/second".into())), 100);
+        board.run(Command::New(None), 100);
+        board.run(Command::Model("lab/second".into()), 100);
         board.run(Command::Role("review".into()), 100);
         board.run(
             Command::Pattern(iq_agent::Pattern::Pair, Some("z-ai/glm-5".into())),
@@ -1361,22 +1576,133 @@ mod tests {
                 .contains("lead, helper")
         );
         assert_eq!(board.screen().editor().text(), "@nobody hi");
-        // Ctrl-N goes round the person's chats, then to a new chat: the
-        // agents a chat started are written to by their name.
+        // Ctrl-N writes to a new chat, on the lead's model.
         key(&mut board, "ctrl+c");
         key(&mut board, "ctrl+n");
-        assert_eq!(board.screen().talking_to(), Some("fix"));
-        key(&mut board, "ctrl+n");
         assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "lab/second"));
-        key(&mut board, "ctrl+n");
-        assert_eq!(board.screen().talking_to(), Some("lead"));
-        // Ctrl-P goes the other way, from the first to the last.
-        key(&mut board, "ctrl+p");
-        assert_eq!(board.screen().talking_to(), Some("fix"));
-        key(&mut board, "ctrl+p");
-        assert_eq!(board.screen().talking_to(), Some("lead"));
-        key(&mut board, "ctrl+p");
-        assert_eq!(board.screen().talking_to(), Some("fix"));
+    }
+
+    #[test]
+    fn the_switcher_goes_to_the_chat_used_before_and_on_to_the_others() {
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        // No chat yet: nothing to go to.
+        key(&mut board, "ctrl+space");
+        assert!(board.switcher().is_none());
+        assert!(board.screen().noticed(100).unwrap().contains("No chat yet"));
+        for chat in ["one", "two", "three", "four", "five", "six", "seven"] {
+            joined(&mut board, chat, PERSON);
+        }
+        joined(&mut board, "one/review", "one");
+        // Used in this order: the latest first, then those never used.
+        for chat in ["two", "one", "three"] {
+            board.run(Command::To(chat.into()), 100);
+        }
+        let names = |board: &Board| -> Vec<String> {
+            board
+                .switcher()
+                .unwrap()
+                .chats
+                .iter()
+                .map(|(view, _)| view.name.clone())
+                .collect()
+        };
+        key(&mut board, "ctrl+space");
+        assert_eq!(names(&board)[..3], ["three", "one", "two"]);
+        // An agent a chat started is no chat of the person's.
+        assert_eq!(names(&board).len(), 7);
+        // Open, on the chat used before the one written to.
+        assert_eq!(board.switcher().unwrap().chosen, 1);
+        key(&mut board, "enter");
+        assert!(board.switcher().is_none());
+        assert_eq!(board.screen().talking_to(), Some("one"));
+        // Once more, back to the other: the two used last, one key apart.
+        key(&mut board, "ctrl+space");
+        key(&mut board, "enter");
+        assert_eq!(board.screen().talking_to(), Some("three"));
+        // Again, and again, the next; the rows shown follow the one chosen.
+        key(&mut board, "ctrl+space");
+        for _ in 0..5 {
+            key(&mut board, "ctrl+space");
+        }
+        let switcher = board.switcher().unwrap();
+        assert_eq!((switcher.chosen, switcher.first), (6, 2));
+        key(&mut board, "down");
+        assert_eq!(board.switcher().unwrap().chosen, 0);
+        key(&mut board, "up");
+        board.scroll(-1);
+        assert_eq!(board.switcher().unwrap().chosen, 5);
+        // Escape closes it where the person writes; a letter closes it and
+        // is written.
+        key(&mut board, "escape");
+        assert!(board.switcher().is_none());
+        assert_eq!(board.screen().talking_to(), Some("three"));
+        key(&mut board, "ctrl+space");
+        write(&mut board, "h");
+        assert!(board.switcher().is_none());
+        assert_eq!(board.screen().editor().text(), "h");
+        // Renamed, a chat keeps its place.
+        board.update(Update::Crew(Event::Renamed {
+            from: "three".into(),
+            to: "login".into(),
+        }));
+        key(&mut board, "ctrl+space");
+        assert_eq!(names(&board)[..2], ["login", "one"]);
+    }
+
+    #[test]
+    fn a_chat_starts_and_goes_on_only_on_a_model_of_the_providers() {
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        // The provider's models not read yet: only a whole name is taken.
+        board.run(Command::New(Some("chat2".into())), 100);
+        assert!(
+            board
+                .screen()
+                .noticed(100)
+                .unwrap()
+                .contains("/name names a chat")
+        );
+        board.update(Update::Models(vec![
+            "lab/lead".into(),
+            "lab/sage-5-5".into(),
+        ]));
+        board.run(Command::New(Some("chat2".into())), 100);
+        assert!(
+            board
+                .screen()
+                .noticed(100)
+                .unwrap()
+                .contains("The provider has no model chat2")
+        );
+        assert!(matches!(board.screen().talk(), Talk::To(_) | Talk::New(_)));
+        board.run(Command::New(Some("sage".into())), 100);
+        assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "lab/sage-5-5"));
+        // The chat written to goes on on another.
+        joined(&mut board, "fix", PERSON);
+        board.run(Command::To("fix".into()), 100);
+        assert_eq!(
+            board.run(Command::Model("lead".into()), 100),
+            vec![Request::Model {
+                agent: "fix".into(),
+                model: "lab/lead".into()
+            }]
+        );
+        assert!(board.run(Command::Model("nothing".into()), 100).is_empty());
+        // What iq answers is said where the person writes.
+        board.update(Update::Notice("fix answers on lab/lead".into()));
+        assert_eq!(
+            board.screen().noticed(crate::now()),
+            Some("fix answers on lab/lead")
+        );
+        // The provider's models complete what is begun.
+        board.screen_mut().editor_mut().set("/model sa");
+        assert!(
+            board
+                .completions()
+                .iter()
+                .any(|c| c.line == "/model lab/sage-5-5")
+        );
     }
 
     fn back(board: &mut Board, agent: &str, worked: u64, written: Option<u64>) {
@@ -1415,7 +1741,13 @@ mod tests {
         );
         assert_eq!(board.take_recall(), None);
         // Come back to, a chat is recalled once.
-        key(&mut board, "ctrl+n");
+        key(&mut board, "ctrl+space");
+        assert_eq!(
+            board.switcher().unwrap().chats[1].0.name,
+            "yesterday",
+            "the one written to before"
+        );
+        key(&mut board, "enter");
         assert_eq!(board.screen().talking_to(), Some("yesterday"));
         assert_eq!(
             board.take_recall(),
@@ -1424,8 +1756,11 @@ mod tests {
                 opening: false
             })
         );
-        key(&mut board, "ctrl+p");
-        key(&mut board, "ctrl+n");
+        key(&mut board, "ctrl+space");
+        key(&mut board, "enter");
+        key(&mut board, "ctrl+space");
+        key(&mut board, "enter");
+        assert_eq!(board.screen().talking_to(), Some("yesterday"));
         assert_eq!(board.take_recall(), None);
         // Renamed, it is written to under its new name.
         board.update(Update::Crew(Event::Renamed {
@@ -1666,7 +2001,7 @@ mod tests {
     #[test]
     fn what_changed_is_sent_once_the_person_says_so() {
         let mut board = Board::default();
-        assert_eq!(board.act(Action::Allow), None);
+        assert_eq!(board.act(Action::Allow, 100), None);
         let ask = || {
             Update::SyncAsk(SyncAsk {
                 remote: "https://example.com/notes.git".into(),
@@ -1677,7 +2012,7 @@ mod tests {
         board.update(ask());
         assert!(board.sync_ask().is_some());
         assert_eq!(
-            board.act(Action::Refuse),
+            board.act(Action::Refuse, 100),
             Some(Request::Sync {
                 send: false,
                 always: false
@@ -1686,7 +2021,7 @@ mod tests {
         assert!(board.sync_ask().is_none());
         board.update(ask());
         assert_eq!(
-            board.act(Action::Allow),
+            board.act(Action::Allow, 100),
             Some(Request::Sync {
                 send: true,
                 always: false
@@ -1771,13 +2106,13 @@ mod tests {
             files: vec!["config/settings.toml".into()],
             said: "config/settings.toml".into(),
         }));
-        assert_eq!(board.act(Action::Changes), Some(Request::Changes));
+        assert_eq!(board.act(Action::Changes, 100), Some(Request::Changes));
         assert_eq!(board.screen().page(), Some(&Page::Changes));
         assert_eq!(board.changes(), None);
         board.update(Update::Changes("diff --git a/x b/x\n+one\n".into()));
         assert_eq!(board.changes(), Some("diff --git a/x b/x\n+one\n"));
         // The same key closes it, and nothing is read again.
-        assert_eq!(board.act(Action::Changes), None);
+        assert_eq!(board.act(Action::Changes, 100), None);
         assert_eq!(board.screen().page(), None);
         assert_eq!(board.changes(), Some("diff --git a/x b/x\n+one\n"));
         // Opened again, it is read afresh; answered there, it closes.
