@@ -19,6 +19,8 @@ nix = { workspace = true, features = ["poll"] }
 rustix.workspace = true
 # Why iq took its terminal for gone, in iq's log.
 tracing.workspace = true
+# The images of diagrams, sent to the terminal as Kitty's protocol asks.
+base64.workspace = true
 
 [dev-dependencies]
 vt100.workspace = true

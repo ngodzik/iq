@@ -1,11 +1,14 @@
 //! What models write, styled as the Markdown it is, a line at a time: a
 //! line is written to the conversation once it is whole, while the model
 //! still writes the next, so that nothing waits for the end of a long
-//! answer. Only fenced code needs what came before, and it is kept.
+//! answer. Fenced code needs what came before, and it is kept; a table is
+//! held until its last row, and a Mermaid diagram until its fence closes,
+//! to be drawn whole.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
+use crate::table::{self, Table};
 use crate::theme::Palette;
 
 /// One line, styled: what goes before its first fold and before the
@@ -38,17 +41,140 @@ impl Styled {
     }
 }
 
+/// What a line, or the end of a text, gives to write.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Out {
+    /// A line, styled.
+    Line(Styled),
+    /// A table, whole.
+    Table(Table),
+    /// The source of a Mermaid diagram, whole.
+    Diagram(String),
+}
+
 /// How the lines of one text are styled, as they come.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Markdown {
     /// The fence of the code block the lines are in, if they are in one.
     fence: Option<String>,
+    /// Whether a link is written as its text alone, a hyperlink.
+    links: bool,
+    /// The rows of the table being written.
+    table: Vec<String>,
+    /// The lines of the Mermaid diagram being written, while its fence is
+    /// open.
+    diagram: Option<Vec<String>>,
+}
+
+/// The fence that opens a block of code in `trimmed`, with its language.
+fn opening(trimmed: &str) -> Option<(String, &str)> {
+    ["```", "~~~"].into_iter().find_map(|fence| {
+        let language = trimmed.strip_prefix(fence)?;
+        let marker = format!(
+            "{fence}{}",
+            language
+                .chars()
+                .take_while(|c| *c == fence.as_bytes()[0] as char)
+                .collect::<String>()
+        );
+        let language = language.trim_matches(|c: char| c == '`' || c == '~' || c.is_whitespace());
+        Some((marker, language))
+    })
+}
+
+/// The lines of a block of code in `language`, as a fenced block is styled.
+pub(crate) fn code(language: &str, source: &str, p: &Palette) -> Vec<Styled> {
+    let gutter = || Span::styled("│ ", p.fg(p.faint));
+    std::iter::once(Styled::plain(vec![Span::styled(
+        format!("╭ {language}"),
+        p.fg(p.faint),
+    )]))
+    .chain(source.lines().map(|line| {
+        Styled::under(
+            gutter(),
+            gutter(),
+            vec![Span::styled(line.to_owned(), p.fg(p.code))],
+        )
+    }))
+    .collect()
 }
 
 impl Markdown {
+    /// Styling that writes a link as its text alone, a hyperlink, when
+    /// `links`, else with its address after it.
+    pub(crate) fn linking(links: bool) -> Markdown {
+        Markdown {
+            links,
+            ..Markdown::default()
+        }
+    }
+
+    /// What `line` gives to write: itself styled, unless it only opens or
+    /// closes a block of code; a table it ends; nothing while a table or a
+    /// diagram is held.
+    pub(crate) fn line(&mut self, line: &str, p: &Palette) -> Vec<Out> {
+        let trimmed = line.trim_start();
+        if let Some(lines) = &mut self.diagram {
+            if self.fence.as_ref().is_some_and(|fence| {
+                trimmed.starts_with(fence.as_str()) && trimmed.trim_end() == fence
+            }) {
+                let source = lines.join("\n");
+                self.diagram = None;
+                self.fence = None;
+                return vec![Out::Diagram(source)];
+            }
+            lines.push(line.to_owned());
+            return Vec::new();
+        }
+        if self.fence.is_none() && table::is_row(line) {
+            self.table.push(line.to_owned());
+            return Vec::new();
+        }
+        let mut out = self.table_out(p);
+        if self.fence.is_none()
+            && let Some((marker, language)) = opening(trimmed)
+            && language.eq_ignore_ascii_case("mermaid")
+        {
+            self.fence = Some(marker);
+            self.diagram = Some(Vec::new());
+            return out;
+        }
+        out.extend(self.styled(line, p).map(Out::Line));
+        out
+    }
+
+    /// What is held as a text ends: a table, and a diagram whose fence
+    /// never closed, written as the code it is.
+    pub(crate) fn flush(&mut self, p: &Palette) -> Vec<Out> {
+        let mut out = self.table_out(p);
+        if let Some(lines) = self.diagram.take() {
+            self.fence = None;
+            out.extend(
+                code("mermaid", &lines.join("\n"), p)
+                    .into_iter()
+                    .map(Out::Line),
+            );
+        }
+        out
+    }
+
+    /// The table held, when one is.
+    fn table_out(&mut self, p: &Palette) -> Vec<Out> {
+        if self.table.is_empty() {
+            return Vec::new();
+        }
+        let rows = std::mem::take(&mut self.table);
+        let links = self.links;
+        vec![Out::Table(Table::new(
+            &rows,
+            |cell| inline(cell, p.fg(p.text), p, links),
+            p.fg(p.faint),
+        ))]
+    }
+
     /// `line` styled, or nothing when it only opens or closes a block of
     /// code.
-    pub(crate) fn line(&mut self, line: &str, p: &Palette) -> Option<Styled> {
+    fn styled(&mut self, line: &str, p: &Palette) -> Option<Styled> {
         let trimmed = line.trim_start();
         let gutter = || Span::styled("│ ", p.fg(p.faint));
         if let Some(fence) = &self.fence {
@@ -62,26 +188,15 @@ impl Markdown {
                 vec![Span::styled(line.to_owned(), p.fg(p.code))],
             ));
         }
-        for fence in ["```", "~~~"] {
-            if let Some(language) = trimmed.strip_prefix(fence) {
-                let marker = format!(
-                    "{fence}{}",
-                    language
-                        .chars()
-                        .take_while(|c| *c == fence.as_bytes()[0] as char)
-                        .collect::<String>()
-                );
-                self.fence = Some(marker);
-                let language =
-                    language.trim_matches(|c: char| c == '`' || c == '~' || c.is_whitespace());
-                if language.is_empty() {
-                    return None;
-                }
-                return Some(Styled::plain(vec![Span::styled(
-                    format!("╭ {language}"),
-                    p.fg(p.faint),
-                )]));
+        if let Some((marker, language)) = opening(trimmed) {
+            self.fence = Some(marker);
+            if language.is_empty() {
+                return None;
             }
+            return Some(Styled::plain(vec![Span::styled(
+                format!("╭ {language}"),
+                p.fg(p.faint),
+            )]));
         }
         let indent: String = line.chars().take_while(|c| *c == ' ').collect();
         if trimmed.is_empty() {
@@ -94,7 +209,12 @@ impl Markdown {
             } else {
                 p.bold(p.text)
             };
-            return Some(Styled::plain(inline(trimmed[hashes..].trim(), style, p)));
+            return Some(Styled::plain(inline(
+                trimmed[hashes..].trim(),
+                style,
+                p,
+                self.links,
+            )));
         }
         if trimmed.chars().all(|c| c == '-' || c == ' ') && trimmed.matches('-').count() >= 3
             || trimmed.chars().all(|c| c == '*' || c == ' ') && trimmed.matches('*').count() >= 3
@@ -123,7 +243,7 @@ impl Markdown {
                         Span::styled(mark, p.fg(p.accent)),
                     ],
                     rest: vec![Span::raw(format!("{indent}  "))],
-                    body: inline(item, p.fg(p.text), p),
+                    body: inline(item, p.fg(p.text), p, self.links),
                 });
             }
         }
@@ -138,7 +258,7 @@ impl Markdown {
                     Span::styled(format!("{number} "), p.fg(p.accent)),
                 ],
                 rest: vec![Span::raw(format!("{indent}{}", " ".repeat(digits + 2)))],
-                body: inline(item, p.fg(p.text), p),
+                body: inline(item, p.fg(p.text), p, self.links),
             });
         }
         if let Some(quote) = trimmed.strip_prefix('>') {
@@ -146,43 +266,17 @@ impl Markdown {
             return Some(Styled::under(
                 Span::styled("▎ ", p.fg(p.faint)),
                 Span::styled("▎ ", p.fg(p.faint)),
-                inline(quote.trim_start(), style, p),
+                inline(quote.trim_start(), style, p, self.links),
             ));
         }
-        if trimmed.starts_with('|') {
-            return Some(Styled::plain(table_row(line, p)));
-        }
-        Some(Styled::plain(inline(line, p.fg(p.text), p)))
+        Some(Styled::plain(inline(line, p.fg(p.text), p, self.links)))
     }
 }
 
-/// A row of a table, its bars and its rule drawn.
-fn table_row(line: &str, p: &Palette) -> Vec<Span<'static>> {
-    let rule = line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
-    if rule {
-        let drawn: String = line
-            .chars()
-            .map(|c| match c {
-                '|' => '┼',
-                '-' | ':' => '─',
-                other => other,
-            })
-            .collect();
-        return vec![Span::styled(drawn, p.fg(p.faint))];
-    }
-    let mut spans = Vec::new();
-    for (at, cell) in line.split('|').enumerate() {
-        if at > 0 {
-            spans.push(Span::styled("│", p.fg(p.faint)));
-        }
-        spans.extend(inline(cell, p.fg(p.text), p));
-    }
-    spans
-}
-
-/// `text` with its emphasis, code and links styled, over `base`. A marker
-/// with nothing to close it stays as it was written.
-pub(crate) fn inline(text: &str, base: Style, p: &Palette) -> Vec<Span<'static>> {
+/// `text` with its emphasis, code and links styled, over `base`: a link as
+/// its text alone, a hyperlink, when `links`, else with its address after
+/// it. A marker with nothing to close it stays as it was written.
+pub(crate) fn inline(text: &str, base: Style, p: &Palette, links: bool) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut plain = String::new();
@@ -256,12 +350,15 @@ pub(crate) fn inline(text: &str, base: Style, p: &Palette) -> Vec<Span<'static>>
             flush(&mut plain, &mut spans, style(bold, italic));
             let label: String = chars[at + 1..close].iter().collect();
             let address: String = chars[close + 2..end].iter().collect();
-            spans.push(Span::styled(
-                label.clone(),
-                p.fg(p.info).add_modifier(Modifier::UNDERLINED),
-            ));
-            if address != label {
-                spans.push(Span::styled(format!(" ({address})"), p.fg(p.faint)));
+            let style = p.fg(p.info).add_modifier(Modifier::UNDERLINED);
+            match links.then(|| crate::link::mark(style, &address)).flatten() {
+                Some(linked) => spans.push(Span::styled(label, linked)),
+                None => {
+                    spans.push(Span::styled(label.clone(), style));
+                    if address != label {
+                        spans.push(Span::styled(format!(" ({address})"), p.fg(p.faint)));
+                    }
+                }
             }
             at = end + 1;
             continue;
@@ -288,11 +385,20 @@ mod tests {
             .collect()
     }
 
+    /// The one line `out` holds, as text; none when it holds none.
+    fn one(out: Vec<Out>) -> Option<String> {
+        match out.as_slice() {
+            [Out::Line(styled)] => Some(text(styled)),
+            [] => None,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn lines_are_styled_as_they_come_code_kept_whole() {
         let p = Palette::new(Theme::Graphite, Depth::True);
         let mut md = Markdown::default();
-        let mut shown = |line: &str| md.line(line, &p).map(|s| text(&s));
+        let mut shown = |line: &str| one(md.line(line, &p));
         assert_eq!(shown("## Plan").as_deref(), Some("Plan"));
         assert_eq!(
             shown("- run `cargo test`").as_deref(),
@@ -318,9 +424,67 @@ mod tests {
     #[test]
     fn emphasis_is_styled_and_an_unclosed_marker_left_as_written() {
         let p = Palette::new(Theme::Ink, Depth::True);
-        let spans = inline("a **bold** and **open", p.fg(p.text), &p);
+        let spans = inline("a **bold** and **open", p.fg(p.text), &p, false);
         let shown: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(shown, "a bold and **open");
         assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn a_table_is_held_until_its_last_row_and_a_diagram_until_its_fence_closes() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut md = Markdown::default();
+        assert!(md.line("| a | b |", &p).is_empty());
+        assert!(md.line("|---|---|", &p).is_empty());
+        assert!(md.line("| 1 | 2 |", &p).is_empty());
+        let out = md.line("after", &p);
+        assert!(matches!(&out[..], [Out::Table(_), Out::Line(after)] if text(after) == "after"));
+        assert!(md.line("```Mermaid", &p).is_empty());
+        assert!(md.line("flowchart LR", &p).is_empty());
+        assert!(md.line("  A --> B", &p).is_empty());
+        assert_eq!(
+            md.line("```", &p),
+            [Out::Diagram("flowchart LR\n  A --> B".into())]
+        );
+        // A row as the text ends, and a diagram never closed, written as
+        // they stand: a table, and code.
+        assert!(md.line("| x |", &p).is_empty());
+        assert!(matches!(&md.flush(&p)[..], [Out::Table(_)]));
+        assert!(md.line("~~~mermaid", &p).is_empty());
+        assert!(md.line("graph TD", &p).is_empty());
+        let shown: Vec<String> = md
+            .flush(&p)
+            .iter()
+            .map(|out| match out {
+                Out::Line(styled) => text(styled),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(shown, ["╭ mermaid", "│ graph TD"]);
+        // A row within code is code.
+        assert!(md.line("```", &p).is_empty());
+        assert_eq!(
+            one(md.line("| in code |", &p)).as_deref(),
+            Some("│ | in code |")
+        );
+    }
+
+    #[test]
+    fn a_link_is_its_text_alone_where_links_are_taken() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut md = Markdown::linking(true);
+        let out = md.line("see [A-1](https://tracker.example/A-1)", &p);
+        let [Out::Line(styled)] = &out[..] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(text(styled), "see A-1");
+        let link = &styled.body[1];
+        let (_, address, _) = crate::link::address_of(link.style).unwrap();
+        assert_eq!(address, "https://tracker.example/A-1");
+        // An address no link takes is written after its text.
+        assert_eq!(
+            one(md.line("[x](javascript:alert(1))", &p)).as_deref(),
+            Some("x (javascript:alert(1))")
+        );
     }
 }

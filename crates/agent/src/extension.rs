@@ -28,6 +28,13 @@ pub trait Extension<M>: Send + Sync {
         false
     }
 
+    /// Whether a call of the tool `name` by `agent` is its to answer: one
+    /// of those it offers `agent`, unless it answers others too, such as
+    /// tools it describes whole only once asked.
+    fn handles(&self, agent: &str, name: &str) -> bool {
+        self.tools(agent).iter().any(|tool| tool.name == name)
+    }
+
     /// What `agent` is told of them, added to its standing instructions.
     fn instructions(&self, agent: &str) -> Option<String> {
         let _ = agent;

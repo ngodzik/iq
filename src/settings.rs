@@ -28,6 +28,7 @@
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set
 //! claude_memory = true                   # the notes kept of the project under ~/.claude read beside iq's own
 //! plugins = ["name"]                     # programs of their own iq starts and speaks with: iq-name for name, found on the PATH, run on your machine as you
+//! mermaid = "auto"                       # Mermaid diagrams drawn as images in Kitty, by mmdr (cargo install mermaid-rs-renderer) run in the sandbox; or a command with {input} and {output}; off unless set
 //!
 //! [keys]                                 # any shortcut moved, "" for none; Ctrl-S lists them
 //! costs = "ctrl+o"
@@ -46,6 +47,7 @@
 //! [mcp.tracker]                          # an MCP server, by a name of yours: its tools offered to the agents as tracker__<tool>
 //! url = "https://mcp.example.com/mcp"    # over HTTP; when it asks for OAuth, you consent in the browser, its grant kept in ~/.iq/mcp-auth
 //! headers = { Authorization = "TRACKER_AUTHORIZATION" }  # or headers sent, each value read from the variable it names; then OAuth is never asked
+//! tools = ["get_issue", "search"]        # the only tools offered, as the server names them; all unless set
 //!
 //! [mcp.notes]                            # one over stdio: a program run on your machine as you, with your environment but iq's variables
 //! command = "notes-mcp"
@@ -158,6 +160,9 @@ pub(crate) struct Settings {
     /// The plugins iq starts, by name: `iq-<name>` on the `PATH`.
     #[serde(default)]
     pub(crate) plugins: Vec<String>,
+    /// What draws the Mermaid diagrams agents write, in Kitty; none unless
+    /// set.
+    pub(crate) mermaid: Option<Mermaid>,
     /// The shortcuts moved: an action's name and its key.
     #[serde(default)]
     keys: BTreeMap<String, String>,
@@ -201,6 +206,40 @@ struct ObserveFile {
 /// small.
 const OBSERVE_EVERY: usize = 1;
 
+/// What draws Mermaid diagrams, as the settings write it: `"auto"`, or a
+/// program and its arguments, `{input}` and `{output}` standing for the
+/// diagram's source and its PNG image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Mermaid {
+    /// mmdr, when installed.
+    Auto,
+    /// The program and its arguments.
+    Command(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for Mermaid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Word(String),
+            Words(Vec<String>),
+        }
+        match Written::deserialize(deserializer)? {
+            Written::Word(word) if word.trim() == "auto" => Ok(Mermaid::Auto),
+            Written::Words(words)
+                if words.first().is_some_and(|w| !w.trim().is_empty())
+                    && words.iter().any(|w| w.contains("{output}")) =>
+            {
+                Ok(Mermaid::Command(words))
+            }
+            _ => Err(serde::de::Error::custom(
+                "mermaid is \"auto\", or a program and its arguments naming {output}, the image it writes",
+            )),
+        }
+    }
+}
+
 /// An MCP server as the settings write it: an address, with the headers
 /// sent there, or a program and its arguments. A header's value is never
 /// written there: only the name of the variable that holds it.
@@ -213,6 +252,8 @@ struct McpFile {
     command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
+    /// The only tools offered, as the server names them.
+    tools: Option<Vec<String>>,
 }
 
 /// An MCP server ready to start: its name, what reaches it, and the line
@@ -368,6 +409,13 @@ impl Settings {
                     wrong.push(not("give it a url or a command".to_owned()));
                     continue;
                 }
+            };
+            let declared = match &server.tools {
+                Some(tools) => McpServer {
+                    declared: declared.declared.only(tools.iter().cloned()),
+                    ..declared
+                },
+                None => declared,
             };
             servers.push(declared);
         }
@@ -654,6 +702,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(older.retired(), RETIRED);
+    }
+
+    #[test]
+    fn mermaid_is_off_unless_set_and_auto_or_a_command_naming_its_image() {
+        assert_eq!(Settings::default().mermaid, None);
+        let auto: Settings = toml::from_str("mermaid = \"auto\"").unwrap();
+        assert_eq!(auto.mermaid, Some(Mermaid::Auto));
+        let own: Settings = toml::from_str(r#"mermaid = ["draw", "{input}", "{output}"]"#).unwrap();
+        assert_eq!(
+            own.mermaid,
+            Some(Mermaid::Command(vec![
+                "draw".into(),
+                "{input}".into(),
+                "{output}".into()
+            ]))
+        );
+        assert!(toml::from_str::<Settings>("mermaid = \"always\"").is_err());
+        assert!(toml::from_str::<Settings>(r#"mermaid = ["draw", "{input}"]"#).is_err());
     }
 
     #[test]

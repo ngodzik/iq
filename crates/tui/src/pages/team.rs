@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 
 use super::Seen;
 use crate::history::{agent_tint, short};
-use crate::markdown::Markdown;
+use crate::markdown::{Markdown, Out, code};
 use crate::wrap::{cut, wrap};
 
 /// The agents, one a line.
@@ -227,13 +227,30 @@ pub(super) fn thread(seen: &Seen<'_>, agent: &str) -> Vec<Line<'static>> {
             }
             Entry::Text(text) => {
                 let mut markdown = Markdown::default();
+                let mut out = Vec::new();
                 for line in text.lines() {
-                    if let Some(styled) = markdown.line(line, p) {
-                        let first: Vec<Span<'static>> =
-                            indent.iter().cloned().chain(styled.first).collect();
-                        let rest: Vec<Span<'static>> =
-                            indent.iter().cloned().chain(styled.rest).collect();
-                        lines.extend(wrap(&styled.body, width, &first, &rest));
+                    out.extend(markdown.line(line, p));
+                }
+                out.extend(markdown.flush(p));
+                // A page shows a diagram as its source: images are the
+                // conversation's.
+                let styled = out.into_iter().flat_map(|out| match out {
+                    Out::Line(styled) => vec![Ok(styled)],
+                    Out::Table(table) => vec![Err(table)],
+                    Out::Diagram(source) => {
+                        code("mermaid", &source, p).into_iter().map(Ok).collect()
+                    }
+                });
+                for styled in styled {
+                    match styled {
+                        Ok(styled) => {
+                            let first: Vec<Span<'static>> =
+                                indent.iter().cloned().chain(styled.first).collect();
+                            let rest: Vec<Span<'static>> =
+                                indent.iter().cloned().chain(styled.rest).collect();
+                            lines.extend(wrap(&styled.body, width, &first, &rest));
+                        }
+                        Err(table) => lines.extend(table.lines(width, &indent)),
                     }
                 }
             }

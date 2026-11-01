@@ -16,18 +16,24 @@
 #![warn(missing_docs)]
 
 mod chart;
+mod diagram;
+mod graphics;
 mod history;
 mod inline;
 mod keys;
+mod link;
 mod live;
 mod markdown;
 mod motion;
 mod pages;
+mod table;
 mod theme;
 mod tty;
 mod wrap;
 
+use std::collections::HashSet;
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -40,8 +46,13 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
 use ratatui::crossterm::terminal::{Clear, ClearType};
 use ratatui::crossterm::{cursor, queue, terminal};
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
+pub use crate::diagram::{Draw, Drawn};
+
+use crate::diagram::Image;
+use crate::graphics::Kitty;
 use crate::history::History;
 use crate::inline::Inline;
 use crate::live::Live;
@@ -60,13 +71,20 @@ const CLOCK: Duration = Duration::from_secs(1);
 
 /// Runs iq in the terminal until the person quits or iq is asked to stop:
 /// `board` as the settings made it, what `feed` brings, what the person
-/// asks of the crew sent on `requests`. The terminal is given back as it
-/// was, the conversation left in its scrollback.
+/// asks of the crew sent on `requests`, the diagrams agents write drawn by
+/// `draw` when the settings give one and the terminal is Kitty. The
+/// terminal is given back as it was, the conversation left in its
+/// scrollback.
 ///
 /// # Errors
 ///
 /// The terminal could not be taken, read or written.
-pub fn run(feed: Receiver<Update>, requests: Sender<Request>, board: Board) -> io::Result<()> {
+pub fn run(
+    feed: Receiver<Update>,
+    requests: Sender<Request>,
+    board: Board,
+    draw: Option<Arc<dyn Draw>>,
+) -> io::Result<()> {
     let tty = Tty::take()?;
     let (cols, rows) = terminal::size()?;
     // What the shell showed goes into the scrollback: iq opens on a clean
@@ -91,13 +109,18 @@ pub fn run(feed: Receiver<Update>, requests: Sender<Request>, board: Board) -> i
         window: None,
         head: None,
         relayout: false,
+        kitty: graphics::detect(|name| std::env::var(name).ok()),
+        sent: HashSet::new(),
     };
     let depth = Depth::detect();
     let p = Palette::new(board.look().theme(), depth);
+    let mut history = History::default();
+    history.set_links(link::supported(|name| std::env::var(name).ok()));
+    history.pictures(screen.kitty.and(draw), cell());
     let mut iq = Iq {
         screen,
         board,
-        history: History::default(),
+        history,
         motion: Motion::default(),
         depth,
         p,
@@ -132,6 +155,10 @@ struct Screen {
     /// Whether the screen is to be laid out again, as it was resized with
     /// panes at its top.
     relayout: bool,
+    /// Kitty, which shows images, when the terminal is.
+    kitty: Option<Kitty>,
+    /// The images it was sent since the screen was last wiped.
+    sent: HashSet<u32>,
 }
 
 impl Screen {
@@ -153,7 +180,8 @@ impl Screen {
     }
 
     /// Clears the screen and the terminal's scrollback, for another chat's
-    /// window: the live part starts again at the bottom of an empty screen.
+    /// window: the live part starts again at the bottom of an empty screen,
+    /// and the images it shows are sent again.
     fn wipe(&mut self) -> io::Result<()> {
         let (cols, rows) = terminal::size()?;
         queue!(
@@ -163,8 +191,35 @@ impl Screen {
             MoveTo(0, 0)
         )?;
         self.inline = Inline::new(cols, rows);
+        self.sent.clear();
         Ok(())
     }
+
+    /// Writes `lines` above the live part, the images they show sent first,
+    /// each once.
+    fn insert(&mut self, images: Vec<Image>, lines: &[Line<'_>]) -> io::Result<()> {
+        if let Some(kitty) = self.kitty {
+            for image in images {
+                if self.sent.insert(image.id) {
+                    let sent = kitty.send(image.id, &image.png, image.cols, image.rows);
+                    self.out.write_all(sent.as_bytes())?;
+                }
+            }
+        }
+        self.inline.insert(&mut self.out, lines)
+    }
+}
+
+/// The size of the terminal's cells in pixels, when it says; none (zeros)
+/// when it does not.
+fn cell() -> (u16, u16) {
+    terminal::window_size().map_or((0, 0), |size| {
+        if size.columns == 0 || size.rows == 0 {
+            (0, 0)
+        } else {
+            (size.width / size.columns, size.height / size.rows)
+        }
+    })
 }
 
 /// The chat whose window shows: that of the agent written to, none for a
@@ -361,14 +416,14 @@ impl Iq {
             Some(shown) if *shown == window && laid_out => {
                 if self.history.waiting() {
                     let lines = self.history.take(width, window.as_deref());
-                    screen.inline.insert(&mut screen.out, &lines)?;
+                    screen.insert(self.history.take_images(), &lines)?;
                     screen.out.flush()?;
                 }
             }
             // The new chat's window becomes the chat's as it starts there.
             Some(None) if laid_out && self.history.adopt(window.as_deref()) => {
                 let lines = self.history.take(width, window.as_deref());
-                screen.inline.insert(&mut screen.out, &lines)?;
+                screen.insert(self.history.take_images(), &lines)?;
                 screen.out.flush()?;
             }
             // Laid out again: another chat's window, or panes coming or
@@ -387,7 +442,7 @@ impl Iq {
                     let room = usize::from(rows);
                     lines = lines.split_off(lines.len().saturating_sub(room));
                 }
-                screen.inline.insert(&mut screen.out, &lines)?;
+                screen.insert(self.history.take_images(), &lines)?;
                 screen.out.flush()?;
                 screen.head = if head > 0 {
                     Some(Terminal::with_options(
@@ -467,6 +522,7 @@ impl Iq {
                     _ => {}
                 },
                 Event::Resize(cols, rows) => {
+                    self.history.set_cell(cell());
                     let narrower = cols < self.screen.inline.cols();
                     if self.screen.paged {
                         self.screen.away = Some(self.screen.away.unwrap_or(false) || narrower);
@@ -506,7 +562,7 @@ impl Iq {
                 .history
                 .recent(width, room, window_of(&self.board).as_deref());
             screen.inline.place(&mut screen.out, height)?;
-            screen.inline.insert(&mut screen.out, &recent)?;
+            screen.insert(self.history.take_images(), &recent)?;
         } else {
             let top = self.caret_top();
             self.screen
@@ -534,7 +590,7 @@ impl Iq {
             screen.head = None;
             let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
             let lines = self.history.window(width, window.as_deref());
-            screen.inline.insert(&mut screen.out, &lines)?;
+            screen.insert(self.history.take_images(), &lines)?;
         }
         let mut billed = Usd(0.0);
         for agent in self.board.crew().agents() {
@@ -550,7 +606,7 @@ impl Iq {
         let screen = &mut self.screen;
         let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
         let lines = self.history.take(width, window.as_deref());
-        screen.inline.insert(&mut screen.out, &lines)?;
+        screen.insert(self.history.take_images(), &lines)?;
         screen.inline.leave(&mut screen.out)?;
         screen.out.flush()
     }

@@ -3,6 +3,7 @@
 #![deny(unsafe_code)]
 
 mod chats;
+mod diagrams;
 mod journal;
 mod ledger;
 mod lock;
@@ -487,6 +488,16 @@ fn person_rules(files: &[(String, PathBuf)], home: &Path) -> Vec<iq_agent::Rules
         .collect()
 }
 
+/// Where iq keeps what it can make again, apart from its own folder: the
+/// cache the system's conventions name.
+fn cache_folder(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|folder| folder.is_absolute())
+        .unwrap_or_else(|| home.join(".cache"))
+        .join("iq")
+}
+
 /// The person's home.
 fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
@@ -940,6 +951,24 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     // The person's plugins, before the crew: the chats put back as it
     // starts are told to them as they come.
     let gate = settings_gate(&settings)?;
+    // What draws the diagrams agents write, when the settings say: its runs
+    // judged and written down as the crew's are.
+    let draw: Option<Arc<dyn iq_tui::Draw>> = match &settings.mermaid {
+        None => None,
+        Some(mermaid) => match diagrams::command(mermaid, diagrams::installed) {
+            Some(command) => Some(Arc::new(diagrams::Diagrams::new(
+                command,
+                cache_folder(&home_dir()?).join("diagrams"),
+                home_dir()?,
+                gate.audit_file().map(Path::to_path_buf),
+                runtime.handle().clone(),
+            ))),
+            None => {
+                let _ = send.send(Update::Said(diagrams::NO_MMDR.into()));
+                None
+            }
+        },
+    };
     let plugins = {
         let _inside = runtime.enter();
         Arc::new(plugins::Plugins::start(
@@ -1153,7 +1182,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     });
 
     let board = iq_ui::Board::new(settings.keymap()?, settings.look()?);
-    let ran = iq_tui::run(feed, ask, board).context("running in the terminal");
+    let ran = iq_tui::run(feed, ask, board, draw).context("running in the terminal");
     runtime.block_on(async {
         crew.end().await;
         servers.end().await;

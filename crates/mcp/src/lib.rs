@@ -20,7 +20,7 @@
 mod error;
 mod oauth;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
@@ -68,13 +68,25 @@ const ANSWER_CHARS: usize = 30_000;
 const ERROR_LINES: usize = 5;
 
 /// What the agents are told of the servers' tools.
-const INSTRUCTIONS: &str = "Tools named `<server>__<tool>` are those of the servers the person \
-connected (MCP servers). One its server says only reads runs at once while the internet is open, \
-and is asked as the internet is otherwise; any other waits for the person, since it may change \
-what the server keeps, which others may share.";
+const INSTRUCTIONS: &str = "The servers the person connected (MCP servers) and their tools are \
+listed by the tool `mcp_tools`: call it with a server's name to have that server's tools whole, \
+named `<server>__<tool>`, from your next step. Ask only for the servers your work needs: each tool \
+had is sent with every call after. A tool its server says only reads runs at once while the \
+internet is open, and is asked as the internet is otherwise; any other waits for the person, since \
+it may change what the server keeps, which others may share.";
+
+/// The tool that lists the servers' tools, and gives an agent a server's
+/// whole.
+const CATALOG: &str = "mcp_tools";
+
+/// The most characters of a tool's description the catalog says.
+const LINE_CHARS: usize = 100;
 
 /// What the person is told of a server, as it happens.
 pub type Tell = Arc<dyn Fn(String) + Send + Sync>;
+
+/// What opens a consent page: the browser, but in tests. Whether it could.
+type Open = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// How a server is reached.
 #[derive(Clone)]
@@ -90,6 +102,8 @@ pub struct Declared {
     reach: Reach,
     headers: BTreeMap<String, String>,
     env: Option<Vec<(OsString, OsString)>>,
+    /// The only tools offered, by the server's names for them.
+    only: Option<BTreeSet<String>>,
 }
 
 /// Written by hand: the headers' values and the environment never show.
@@ -103,6 +117,7 @@ impl fmt::Debug for Declared {
         shown
             .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .field("env", &self.env.as_ref().map(Vec::len))
+            .field("only", &self.only)
             .finish()
     }
 }
@@ -115,6 +130,7 @@ impl Declared {
             reach: Reach::Url(url.into()),
             headers: BTreeMap::new(),
             env: None,
+            only: None,
         }
     }
 
@@ -126,6 +142,7 @@ impl Declared {
             reach: Reach::Command(command),
             headers: BTreeMap::new(),
             env: None,
+            only: None,
         }
     }
 
@@ -142,6 +159,14 @@ impl Declared {
     #[must_use]
     pub fn env(mut self, vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
         self.env = Some(vars.into_iter().collect());
+        self
+    }
+
+    /// Offers only the tools of `names`, as the server names them: the
+    /// others are neither offered nor called.
+    #[must_use]
+    pub fn only(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.only = Some(names.into_iter().collect());
         self
     }
 
@@ -180,9 +205,13 @@ enum State {
     Connecting,
     /// Waiting for the person's consent, on this page.
     Consenting(String),
-    /// Connected, with its tools, and how many it offers that were left out
-    /// for names too long for providers.
-    Ready(Vec<RemoteTool>, usize),
+    /// Connected, with its tools, and how many it offers were left out:
+    /// for names too long for providers, and as the settings say.
+    Ready {
+        tools: Vec<RemoteTool>,
+        too_long: usize,
+        unlisted: usize,
+    },
     Failed(String),
 }
 
@@ -557,6 +586,12 @@ fn first_line(text: &str) -> String {
         .collect()
 }
 
+/// Locks `mutex`, even one a panicking thread left: what it guards is
+/// replaced whole, never left half changed.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The last lines a program wrote of its errors, as said after why it
 /// stopped.
 fn last_errors(errors: &Mutex<VecDeque<String>>) -> String {
@@ -628,7 +663,7 @@ struct Server {
     /// Where its OAuth grant is kept, when it takes OAuth.
     grants: Option<Grants>,
     /// What opens the consent page: the browser, but in tests.
-    open: fn(&str) -> bool,
+    open: Open,
     tell: Tell,
 }
 
@@ -662,16 +697,23 @@ impl Server {
             State::Consenting(page) => {
                 format!("waiting for your consent in the browser; if it did not open: {page}")
             }
-            State::Ready(tools, left_out) => {
+            State::Ready {
+                tools,
+                too_long,
+                unlisted,
+            } => {
                 let read = tools.iter().filter(|t| t.read_only).count();
                 let mut said = format!(
                     "{} tool{}, {read} only reading",
                     tools.len(),
                     if tools.len() == 1 { "" } else { "s" }
                 );
-                if left_out > 0 {
+                if unlisted > 0 {
+                    said.push_str(&format!(", {unlisted} left out as the settings say"));
+                }
+                if too_long > 0 {
                     said.push_str(&format!(
-                        ", {left_out} left out, their names too long for the providers"
+                        ", {too_long} left out, their names too long for the providers"
                     ));
                 }
                 said
@@ -685,12 +727,12 @@ impl Server {
     async fn connect(&self) {
         self.set(State::Connecting);
         match self.connected().await {
-            Ok((link, tools, left_out)) => {
+            Ok((link, ready)) => {
                 let before = self.link.lock().await.replace(link);
                 if let Some(before) = before {
                     before.end().await;
                 }
-                self.set(State::Ready(tools, left_out));
+                self.set(ready);
             }
             Err(why) => self.set(State::Failed(said(&why))),
         }
@@ -699,7 +741,7 @@ impl Server {
     /// A link said hello to, and the tools it lists. A server that refuses
     /// is asked for OAuth when it takes it: the grant kept, else the
     /// person's consent, once more when it no longer takes the one kept.
-    async fn connected(&self) -> Result<(Link, Vec<RemoteTool>, usize), McpError> {
+    async fn connected(&self) -> Result<(Link, State), McpError> {
         let mut link = Link::open(&self.config)?;
         let oauth = self.takes_oauth();
         let mut sent = false;
@@ -707,7 +749,7 @@ impl Server {
             link.set_bearer(token);
             sent = true;
         }
-        let (tools, left_out) = match self.hello(&mut link).await {
+        let ready = match self.hello(&mut link).await {
             Err(McpError::Status { status: 401, .. }) if oauth => {
                 if sent && let Some(grants) = &self.grants {
                     grants.forget(&self.name);
@@ -718,7 +760,7 @@ impl Server {
             }
             other => other?,
         };
-        Ok((link, tools, left_out))
+        Ok((link, ready))
     }
 
     /// The token of the grant kept for its address, renewed when it is
@@ -750,7 +792,7 @@ impl Server {
                     self.name
                 ));
             },
-            self.open,
+            |page| (self.open)(page),
         )
         .await?;
         self.set(State::Connecting);
@@ -758,9 +800,10 @@ impl Server {
         Ok(grant.access_token)
     }
 
-    /// Says hello on `link` and lists the tools, those whose names are too
-    /// long for providers counted apart.
-    async fn hello(&self, link: &mut Link) -> Result<(Vec<RemoteTool>, usize), McpError> {
+    /// Says hello on `link` and lists the tools, as it is once ready: those
+    /// whose names are too long for providers, and those the settings leave
+    /// out, counted apart.
+    async fn hello(&self, link: &mut Link) -> Result<State, McpError> {
         let hello = link
             .request(
                 self.id(),
@@ -783,7 +826,7 @@ impl Server {
         }
         link.notify("notifications/initialized").await?;
         let mut tools: Vec<RemoteTool> = Vec::new();
-        let mut left_out = 0;
+        let (mut too_long, mut unlisted) = (0, 0);
         let mut cursor: Option<String> = None;
         loop {
             let params = cursor.map_or_else(|| json!({}), |c| json!({"cursor": c}));
@@ -794,9 +837,18 @@ impl Server {
                 let Some(name) = tool["name"].as_str() else {
                     continue;
                 };
+                if self
+                    .config
+                    .only
+                    .as_ref()
+                    .is_some_and(|only| !only.contains(name))
+                {
+                    unlisted += 1;
+                    continue;
+                }
                 let offered = format!("{}{SEPARATOR}{}", self.name, plain(name));
                 if offered.len() > NAME_MOST {
-                    left_out += 1;
+                    too_long += 1;
                     continue;
                 }
                 if tools.iter().any(|t| t.offered == offered) {
@@ -818,7 +870,11 @@ impl Server {
                 break;
             }
         }
-        Ok((tools, left_out))
+        Ok(State::Ready {
+            tools,
+            too_long,
+            unlisted,
+        })
     }
 
     /// Calls `tool` with `arguments`. A call the server refused before
@@ -904,11 +960,13 @@ impl Server {
     }
 }
 
-/// The servers the settings declare, and their tools, offered to every
-/// agent of the crew.
+/// The servers the settings declare, and their tools, listed to every agent
+/// of the crew and offered whole to each once it asks for a server's.
 #[derive(Clone)]
 pub struct Mcp {
     servers: Arc<Vec<Arc<Server>>>,
+    /// The servers whose tools each agent has whole, by its name.
+    had: Arc<Mutex<HashMap<String, BTreeSet<String>>>>,
 }
 
 impl fmt::Debug for Mcp {
@@ -932,7 +990,7 @@ impl Mcp {
         grants: Option<PathBuf>,
         tell: Tell,
     ) -> Self {
-        Self::start_with(declared, grants, tell, oauth::open_browser)
+        Self::start_with(declared, grants, tell, Arc::new(oauth::open_browser))
     }
 
     /// As [`Mcp::start`], the consent page opened by `open`.
@@ -940,7 +998,7 @@ impl Mcp {
         declared: BTreeMap<String, Declared>,
         grants: Option<PathBuf>,
         tell: Tell,
-        open: fn(&str) -> bool,
+        open: Open,
     ) -> Self {
         let servers: Vec<Arc<Server>> = declared
             .into_iter()
@@ -952,7 +1010,7 @@ impl Mcp {
                     link: tokio::sync::Mutex::new(None),
                     next_id: AtomicU64::new(1),
                     grants: grants.clone().map(Grants::new),
-                    open,
+                    open: Arc::clone(&open),
                     tell: Arc::clone(&tell),
                 })
             })
@@ -966,6 +1024,7 @@ impl Mcp {
         }
         Self {
             servers: Arc::new(servers),
+            had: Arc::default(),
         }
     }
 
@@ -995,13 +1054,20 @@ impl Mcp {
             .collect()
     }
 
-    /// The tools of the servers connected, as models are offered them.
+    /// The tools of the servers connected, whole, as models are offered
+    /// them.
     #[must_use]
     pub fn specs(&self) -> Vec<ToolSpec> {
+        self.specs_of(|_| true)
+    }
+
+    /// The tools of the servers connected that `wanted` takes, whole.
+    fn specs_of(&self, wanted: impl Fn(&str) -> bool) -> Vec<ToolSpec> {
         self.servers
             .iter()
+            .filter(|server| wanted(&server.name))
             .flat_map(|server| match server.state() {
-                State::Ready(tools, _) => tools
+                State::Ready { tools, .. } => tools
                     .into_iter()
                     .map(|tool| ToolSpec {
                         name: tool.offered,
@@ -1018,9 +1084,79 @@ impl Mcp {
             .collect()
     }
 
+    /// The tools of the servers whose tools `agent` has whole, and the one
+    /// that lists every server's, while one is connected.
+    #[must_use]
+    pub fn offered(&self, agent: &str) -> Vec<ToolSpec> {
+        let had = lock(&self.had).get(agent).cloned().unwrap_or_default();
+        self.catalog()
+            .into_iter()
+            .chain(self.specs_of(|server| had.contains(server)))
+            .collect()
+    }
+
+    /// The tool that lists every connected server's tools, each by its name
+    /// and the first line of what it does; none while none is connected.
+    fn catalog(&self) -> Option<ToolSpec> {
+        let mut listed = String::new();
+        let mut names = Vec::new();
+        for server in self.servers.iter() {
+            let State::Ready { tools, .. } = server.state() else {
+                continue;
+            };
+            names.push(server.name.clone());
+            listed.push_str(&format!("\n\n{}:", server.name));
+            for tool in tools {
+                let line = first_line(&tool.description);
+                let line: String = line.chars().take(LINE_CHARS).collect();
+                listed.push_str(&format!("\n- {}", tool.name));
+                if !line.is_empty() {
+                    listed.push_str(&format!(": {line}"));
+                }
+            }
+        }
+        if names.is_empty() {
+            return None;
+        }
+        Some(ToolSpec {
+            name: CATALOG.to_owned(),
+            description: format!(
+                "Gives you the whole tools of one of the MCP servers the person connected, named \
+                 `<server>__<tool>`, to call from your next step. Ask only for a server your work \
+                 needs: each tool had is sent with every call after. The servers and their \
+                 tools:{listed}"
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {"server": {"type": "string", "enum": names}},
+                "required": ["server"],
+            }),
+        })
+    }
+
+    /// Gives `agent` the whole tools of the server `server`, from its next
+    /// call; what it is told.
+    fn give(&self, agent: &str, server: &str) -> Result<String, String> {
+        let Some(found) = self.servers.iter().find(|s| s.name == server) else {
+            return Err(format!("there is no MCP server {server}"));
+        };
+        let State::Ready { tools, .. } = found.state() else {
+            return Err(format!("{server} is {}", found.said()));
+        };
+        lock(&self.had)
+            .entry(agent.to_owned())
+            .or_default()
+            .insert(server.to_owned());
+        let names: Vec<String> = tools.into_iter().map(|t| t.offered).collect();
+        Ok(format!(
+            "The tools of {server} are yours from your next step: {}.",
+            names.join(", ")
+        ))
+    }
+
     fn find(&self, offered: &str) -> Option<(&Arc<Server>, RemoteTool)> {
         self.servers.iter().find_map(|server| match server.state() {
-            State::Ready(tools, _) => tools
+            State::Ready { tools, .. } => tools
                 .into_iter()
                 .find(|tool| tool.offered == offered)
                 .map(|tool| (server, tool)),
@@ -1090,8 +1226,14 @@ impl<M> Extension<M> for Mcp
 where
     M: ChatModel + 'static,
 {
-    fn tools(&self, _agent: &str) -> Vec<ToolSpec> {
-        self.specs()
+    fn tools(&self, agent: &str) -> Vec<ToolSpec> {
+        self.offered(agent)
+    }
+
+    /// A server's tool is answered whether the agent has it whole or not:
+    /// one it called before, in a conversation kept, still runs.
+    fn handles(&self, _agent: &str, name: &str) -> bool {
+        name == CATALOG || self.find(name).is_some()
     }
 
     fn instructions(&self, _agent: &str) -> Option<String> {
@@ -1101,7 +1243,18 @@ where
     fn call(&self, crew: Crew<M>, agent: String, name: String, args: Value) -> Called {
         let mcp = self.clone();
         Box::pin(async move {
+            if name == CATALOG {
+                let server = args["server"].as_str().unwrap_or_default().trim();
+                return mcp.give(&agent, server);
+            }
             let action = mcp.action(&name, &args).map_err(|e| said(&e))?;
+            // Called, the server's tools are had whole from then on.
+            if let Action::Tool { server, .. } = &action {
+                lock(&mcp.had)
+                    .entry(agent.clone())
+                    .or_default()
+                    .insert(server.clone());
+            }
             let permit = crew.act(&agent, action).await?;
             mcp.call(&permit).await.map_err(|e| said(&e))
         })

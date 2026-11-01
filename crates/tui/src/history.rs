@@ -8,6 +8,8 @@
 //! on, only their count is written, the steps unfolded on their page.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
 
 use iq_agent::{Event, PERSON};
@@ -15,9 +17,12 @@ use iq_core::{TokenCount, Usd};
 use iq_ui::Board;
 use iq_ui::keys::Action;
 use iq_ui::steps::{Fold, Step};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use crate::markdown::{Markdown, Styled, inline};
+use crate::diagram::{Diagram, Draw, Image, Shown};
+use crate::markdown::{Markdown, Out, Styled, code, inline};
+use crate::table::Table;
 use crate::theme::Palette;
 use crate::wrap::{cut, wrap};
 
@@ -82,6 +87,73 @@ impl Para {
     }
 }
 
+/// What a window holds: a paragraph, folded at the width it is written at;
+/// a table, drawn at it; a diagram, its source written as code unless it is
+/// drawn, with the styles of what is said of it.
+#[derive(Debug, Clone)]
+enum Block {
+    Para(Para),
+    Table(Table),
+    Diagram {
+        diagram: Arc<Diagram>,
+        code: Vec<Para>,
+        said: Style,
+        failed: Style,
+    },
+}
+
+impl Block {
+    /// Whether it is a diagram being drawn, which what comes after it waits
+    /// for.
+    fn drawing(&self) -> bool {
+        matches!(self, Block::Diagram { diagram, .. } if diagram.drawing())
+    }
+
+    /// Its lines within `width` columns, on cells of `cell` pixels, the
+    /// images they show put in `images`.
+    fn lines(&self, width: usize, cell: (u16, u16), images: &mut Vec<Image>) -> Vec<Line<'static>> {
+        let indent = [Span::raw("  ")];
+        match self {
+            Block::Para(para) => wrap(&para.body, width, &para.first, &para.rest),
+            Block::Table(table) => table.lines(width, &indent),
+            Block::Diagram {
+                diagram,
+                code,
+                said,
+                failed,
+            } => match diagram.shown(width, &indent, cell, *said, images) {
+                Shown::Image(lines) => lines,
+                Shown::Source(why) => {
+                    let mut lines: Vec<Line<'static>> = code
+                        .iter()
+                        .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest))
+                        .collect();
+                    if let Some(why) = why {
+                        lines.extend(wrap(
+                            &[Span::styled(why, *failed)],
+                            width,
+                            &[Span::raw("  "), Span::styled("! ", *failed)],
+                            &[Span::raw("    ")],
+                        ));
+                    }
+                    lines
+                }
+            },
+        }
+    }
+}
+
+/// What draws diagrams, in a terminal that shows them: none elsewhere, or
+/// as the settings say.
+#[derive(Clone, Default)]
+struct Drawer(Option<Arc<dyn Draw>>);
+
+impl fmt::Debug for Drawer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() { "Drawer" } else { "None" })
+    }
+}
+
 /// An agent's text being written.
 #[derive(Debug, Default)]
 struct Stream {
@@ -112,12 +184,12 @@ enum Kind {
 /// written, the window of the chat written to on the terminal.
 #[derive(Debug, Default)]
 pub(crate) struct History {
-    /// The paragraphs waiting to be written, each with the chat whose
-    /// window it goes in: none for the window on the terminal.
-    paras: Vec<(Option<String>, Para)>,
+    /// The blocks waiting to be written, each with the chat whose window it
+    /// goes in: none for the window on the terminal.
+    paras: Vec<(Option<String>, Block)>,
     /// What each chat's window holds, the latest last, as many as
     /// [`KEPT`]: none is the window of a new chat.
-    kept: HashMap<Option<String>, VecDeque<Para>>,
+    kept: HashMap<Option<String>, VecDeque<Block>>,
     /// The lines iq opens with, at the top of every window.
     opening: Vec<Para>,
     /// Whether the window on the terminal shows them.
@@ -141,9 +213,58 @@ pub(crate) struct History {
     /// Where the line saying an agent joined waits to be written: one that
     /// comes back from an earlier session did not join now.
     joins: HashMap<String, usize>,
+    /// Whether a link is written as its text alone, a hyperlink.
+    links: bool,
+    /// What draws diagrams.
+    drawer: Drawer,
+    /// The size of a cell in pixels, for the images.
+    cell: (u16, u16),
+    /// The images the lines written last show, for the terminal to be sent
+    /// before them.
+    images: Vec<Image>,
+    /// The id the next image takes with the terminal.
+    next_image: u32,
+    /// Whether what follows a diagram being drawn waits for it: not as iq
+    /// ends.
+    hurried: bool,
 }
 
 impl History {
+    /// Writes a link as its text alone, a hyperlink, when `links`.
+    pub(crate) fn set_links(&mut self, links: bool) {
+        self.links = links;
+    }
+
+    /// Draws diagrams with `draw`, when given, as images on cells of `cell`
+    /// pixels. Their ids with the terminal start anywhere, so that they
+    /// take none of an earlier session's, whose images the scrollback
+    /// still shows.
+    pub(crate) fn pictures(&mut self, draw: Option<Arc<dyn Draw>>, cell: (u16, u16)) {
+        self.drawer = Drawer(draw);
+        self.set_cell(cell);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| {
+                d.subsec_nanos() ^ u32::try_from(d.as_secs() & 0xff_ffff).unwrap_or(1)
+            });
+        self.next_image = now & 0x00ff_ffff;
+    }
+
+    /// The size of a cell is now `cell` pixels, as the terminal says; one
+    /// it does not say leaves it as it was.
+    pub(crate) fn set_cell(&mut self, cell: (u16, u16)) {
+        if cell.0 > 0 && cell.1 > 0 {
+            self.cell = cell;
+        } else if self.cell == (0, 0) {
+            self.cell = (8, 16);
+        }
+    }
+
+    /// The images the lines written last show, to be sent first.
+    pub(crate) fn take_images(&mut self) -> Vec<Image> {
+        std::mem::take(&mut self.images)
+    }
+
     /// The lines iq opens with: who leads, where, and how to begin.
     pub(crate) fn opening(&mut self, lead: &str, reviewer: &str, p: &Palette) {
         let folder = home_short(
@@ -227,17 +348,18 @@ impl History {
             }
             Event::TextStart { agent } => self.finish(agent, board, p),
             Event::Text { agent, text } => {
-                let stream = self.streams.entry(agent.clone()).or_default();
+                let links = self.links;
+                let stream = self.streams.entry(agent.clone()).or_insert_with(|| Stream {
+                    partial: String::new(),
+                    markdown: Markdown::linking(links),
+                });
                 stream.partial.push_str(text);
                 while let Some(stream) = self.streams.get_mut(agent)
                     && let Some(end) = stream.partial.find('\n')
                 {
                     let line: String = stream.partial.drain(..=end).collect();
-                    let styled = stream.markdown.line(line.trim_end_matches(['\n', '\r']), p);
-                    if let Some(styled) = styled {
-                        self.header(agent, board, p);
-                        self.push_text(Para::text(styled));
-                    }
+                    let out = stream.markdown.line(line.trim_end_matches(['\n', '\r']), p);
+                    self.write(agent, out, board, p);
                 }
             }
             Event::Spent {
@@ -267,12 +389,13 @@ impl History {
                         "  ",
                         vec![Span::styled("✉ to you", p.fg(p.info))],
                     ));
-                    let mut markdown = Markdown::default();
+                    let mut markdown = Markdown::linking(self.links);
                     for line in text.lines() {
-                        if let Some(styled) = markdown.line(line, p) {
-                            self.push_text(Para::text(styled));
-                        }
+                        let out = markdown.line(line, p);
+                        self.write(from, out, board, p);
                     }
+                    let out = markdown.flush(p);
+                    self.write(from, out, board, p);
                 } else {
                     self.finish(from, board, p);
                     self.folds(from, board, p);
@@ -526,7 +649,7 @@ impl History {
                 p.fg(agent_tint(board, agent, p)),
             ));
         }
-        body.extend(inline(text.trim(), p.fg(p.text), p));
+        body.extend(inline(text.trim(), p.fg(p.text), p, self.links));
         self.push(Para {
             first: vec![Span::styled("› ", p.bold(p.accent))],
             rest: vec![Span::raw("  ")],
@@ -654,23 +777,53 @@ impl History {
         self.set_speaker(Some(agent.to_owned()));
     }
 
-    /// Writes what is left of `agent`'s text after its last whole line.
+    /// Writes what is left of `agent`'s text after its last whole line,
+    /// and what its styling held: a table that ended it.
     fn finish(&mut self, agent: &str, board: &Board, p: &Palette) {
         let Some(stream) = self.streams.get_mut(agent) else {
             return;
         };
         let rest = std::mem::take(&mut stream.partial);
-        if rest.trim().is_empty() {
-            return;
-        }
-        if let Some(styled) = stream.markdown.line(&rest, p) {
+        let mut out = if rest.trim().is_empty() {
+            Vec::new()
+        } else {
+            stream.markdown.line(&rest, p)
+        };
+        out.extend(stream.markdown.flush(p));
+        self.write(agent, out, board, p);
+    }
+
+    /// Writes what `agent`'s text gave, under its name: lines, a table, a
+    /// diagram, which is drawn if anything draws diagrams.
+    fn write(&mut self, agent: &str, out: Vec<Out>, board: &Board, p: &Palette) {
+        for out in out {
             self.header(agent, board, p);
-            self.push_text(Para::text(styled));
+            match out {
+                Out::Line(styled) => self.push_text(Para::text(styled)),
+                Out::Table(table) => self.push_text_block(Block::Table(table)),
+                Out::Diagram(source) => {
+                    let code = code("mermaid", &source, p)
+                        .into_iter()
+                        .map(Para::text)
+                        .collect();
+                    let id = self.next_image.max(1);
+                    self.next_image = (id + 1) & 0x00ff_ffff;
+                    let diagram = Diagram::new(source, id, self.drawer.0.clone());
+                    self.push_text_block(Block::Diagram {
+                        diagram,
+                        code,
+                        said: p.fg(p.faint),
+                        failed: p.fg(p.warn),
+                    });
+                }
+            }
         }
     }
 
-    /// Writes what every agent left unfinished, as iq ends.
+    /// Writes what every agent left unfinished, as iq ends: a diagram still
+    /// being drawn is no longer waited for.
     pub(crate) fn finish_all(&mut self, board: &Board, p: &Palette) {
+        self.hurried = true;
         let agents: Vec<String> = self.streams.keys().cloned().collect();
         for agent in agents {
             self.finish(&agent, board, p);
@@ -732,13 +885,21 @@ impl History {
                     .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest)),
             );
         }
-        for (chat, para) in std::mem::take(&mut self.paras) {
-            let chat = chat.or_else(|| window.clone());
+        let mut queued = std::mem::take(&mut self.paras).into_iter();
+        while let Some((given, block)) = queued.next() {
+            let chat = given.clone().or_else(|| window.clone());
+            // A diagram being drawn holds back what its window writes after
+            // it, all of it, so that the conversation keeps its order.
+            if chat == window && !self.hurried && block.drawing() {
+                self.paras.push((given, block));
+                self.paras.extend(queued);
+                break;
+            }
             if chat == window {
-                lines.extend(wrap(&para.body, width, &para.first, &para.rest));
+                lines.extend(block.lines(width, self.cell, &mut self.images));
             }
             let kept = self.kept.entry(chat).or_default();
-            kept.push_back(para);
+            kept.push_back(block);
             while kept.len() > KEPT {
                 kept.pop_front();
             }
@@ -775,25 +936,29 @@ impl History {
         let _ = self.take(width, window);
         self.opened = true;
         let key = window.map(str::to_owned);
-        self.opening
+        let mut lines: Vec<Line<'static>> = self
+            .opening
             .iter()
-            .chain(self.kept.get(&key).into_iter().flatten())
             .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest))
-            .collect()
+            .collect();
+        for block in self.kept.get(&key).into_iter().flatten() {
+            lines.extend(block.lines(width, self.cell, &mut self.images));
+        }
+        lines
     }
 
     /// The last of the lines written in `window`, as many as `rows`,
     /// folded within `width` columns.
     pub(crate) fn recent(
-        &self,
+        &mut self,
         width: usize,
         rows: usize,
         window: Option<&str>,
     ) -> Vec<Line<'static>> {
         let key = window.map(str::to_owned);
         let mut lines: Vec<Line<'static>> = Vec::new();
-        for para in self.kept.get(&key).into_iter().flatten().rev() {
-            let mut folded = wrap(&para.body, width, &para.first, &para.rest);
+        for block in self.kept.get(&key).into_iter().flatten().rev() {
+            let mut folded = block.lines(width, self.cell, &mut self.images);
             folded.append(&mut lines);
             lines = folded;
             if lines.len() >= rows {
@@ -816,17 +981,28 @@ impl History {
 
     /// Puts `para` in the window being written.
     fn push(&mut self, para: Para) {
+        self.push_block(Block::Para(para));
+    }
+
+    /// Puts `block` in the window being written.
+    fn push_block(&mut self, block: Block) {
         self.kinds.insert(self.at.clone(), Kind::Other);
-        self.paras.push((self.at.clone(), para));
+        self.paras.push((self.at.clone(), block));
     }
 
     /// Puts a line of an agent's text in the window, a line left between
     /// it and the steps before.
     fn push_text(&mut self, para: Para) {
+        self.push_text_block(Block::Para(para));
+    }
+
+    /// Puts what an agent wrote in the window, a line left between it and
+    /// the steps before.
+    fn push_text_block(&mut self, block: Block) {
         if self.kind() == Some(Kind::Steps) {
             self.blank();
         }
-        self.push(para);
+        self.push_block(block);
         self.kinds.insert(self.at.clone(), Kind::Text);
     }
 
@@ -1074,6 +1250,78 @@ mod tests {
     fn crew(board: &mut Board, history: &mut History, event: Event, p: &Palette) {
         board.update(Update::Crew(event.clone()));
         history.event(&event, board, p);
+    }
+
+    /// Draws a diagram as a PNG of 200 by 100 pixels once let go.
+    struct Held(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+
+    impl Draw for Held {
+        fn draw(&self, _source: &str) -> Result<crate::diagram::Drawn, String> {
+            let _ = self.0.lock().unwrap().recv();
+            let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+            png.extend(200u32.to_be_bytes());
+            png.extend(100u32.to_be_bytes());
+            Ok(crate::diagram::Drawn { png, source: None })
+        }
+    }
+
+    #[test]
+    fn a_table_is_drawn_whole_and_a_diagram_holds_back_what_follows_until_drawn() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        let (go, wait) = std::sync::mpsc::channel();
+        history.pictures(Some(Arc::new(Held(std::sync::Mutex::new(wait)))), (10, 20));
+        let run = |board: &mut Board, history: &mut History, event| crew(board, history, event, &p);
+        run(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: "lead".into(),
+                model: "lab/lead".into(),
+                by: PERSON.into(),
+            },
+        );
+        run(
+            &mut board,
+            &mut history,
+            Event::Text {
+                agent: "lead".into(),
+                text: "| a | b |\n|---|---|\n| one | two |\n```mermaid\ngraph TD\n A --> B\n```\nafter it\n"
+                    .into(),
+            },
+        );
+        let text = |lines: Vec<Line<'static>>| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l.to_string().trim_end().to_owned())
+                .collect()
+        };
+        let before = text(history.take(60, Some("lead")));
+        assert!(before.contains(&"  a   │ b".to_owned()), "{before:#?}");
+        assert!(before.contains(&"  one │ two".to_owned()), "{before:#?}");
+        // Held while it is drawn, and what follows with it.
+        assert!(
+            !before
+                .iter()
+                .any(|l| l.contains("after it") || l.contains("graph TD"))
+        );
+        assert!(history.waiting());
+        assert!(text(history.take(60, Some("lead"))).is_empty());
+        go.send(()).unwrap();
+        let mut after = Vec::new();
+        for _ in 0..500 {
+            after = text(history.take(60, Some("lead")));
+            if !after.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // 200 by 100 pixels on cells of 10 by 20: 5 rows of 20 cells.
+        assert_eq!(after.iter().filter(|l| l.contains('\u{10EEEE}')).count(), 5);
+        assert_eq!(after.last().map(String::as_str), Some("  after it"));
+        let images = history.take_images();
+        assert_eq!((images.len(), images[0].cols, images[0].rows), (1, 20, 5));
     }
 
     #[test]

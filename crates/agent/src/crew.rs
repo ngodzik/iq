@@ -1919,8 +1919,6 @@ where
         number: u64,
     ) -> (Vec<Message>, Result<String, String>) {
         messages.push(Message::user(prompt));
-        let mut tools = tools::work();
-        tools.extend(self.tools_for(name));
         let mut urged = false;
         for _ in 0..self.inner.settings.steps {
             if let Some(news) = self.unread(name) {
@@ -1935,10 +1933,14 @@ where
                 .get(name)
                 .and_then(|member| member.effort)
                 .or(self.inner.settings.effort);
+            // Read at each call too: an extension may offer more once the
+            // agent asked for it.
+            let mut tools = tools::work();
+            tools.extend(self.tools_for(name));
             let request = ChatRequest {
                 model: model.clone(),
                 messages: messages.clone(),
-                tools: tools.clone(),
+                tools,
                 effort,
             };
             let response = match self.ask_model(name, &request).await {
@@ -2186,7 +2188,7 @@ where
                 let extension = self
                     .extensions_for(&self.started_by(agent))
                     .into_iter()
-                    .find(|extension| extension.tools(agent).iter().any(|t| t.name == name));
+                    .find(|extension| extension.handles(agent, name));
                 match extension {
                     Some(extension) => {
                         extension
