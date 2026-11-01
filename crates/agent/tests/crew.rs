@@ -120,8 +120,8 @@ impl Scripted {
 fn speaker(request: &ChatRequest) -> String {
     match request.messages.first() {
         Some(Message::System(text)) => text
-            .strip_prefix("You are ")
-            .and_then(|rest| rest.split(',').next())
+            .split_once("you are listed as ")
+            .and_then(|(_, rest)| rest.split(':').next())
             .unwrap_or("reviewer")
             .to_owned(),
         _ => "?".to_owned(),
@@ -1075,7 +1075,10 @@ async fn a_team_works_as_the_roles_it_was_given_say_and_answers_who_started_it()
     // The reviewer waited for the writer, its brief and its team before it.
     let reviewer = f.model.seen_by("lead/reviewer");
     assert!(reviewer.contains("Add a greeting to hello.txt."));
-    assert!(reviewer.contains("You are lead/reviewer") && reviewer.contains("goes to lead/writer"));
+    assert!(
+        reviewer.contains("You are listed as lead/reviewer")
+            && reviewer.contains("goes to lead/writer")
+    );
     assert!(reviewer.contains("Review my change."));
     assert!(f.model.seen_by("lead/writer").contains("APPROVE"));
     // Only the writer's answer reached the lead.
@@ -1821,7 +1824,7 @@ async fn a_chat_at_work_is_named_at_once_and_takes_its_name_as_its_turn_ends() {
     assert!(
         f.model
             .instructions_of("inbox")
-            .starts_with("You are inbox,")
+            .contains("you are listed as inbox:")
     );
 }
 

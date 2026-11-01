@@ -2501,8 +2501,19 @@ where
             format!("The agent {by} started you and gets your answer.")
         };
         let part = role_line(role);
+        // A name on the board is the chat's, or that of a part of it: the
+        // agent is not who it names.
+        let named = if by == PERSON {
+            "the name of this chat, which the person gave it or iq made".to_owned()
+        } else {
+            let chat = name.split('/').next().unwrap_or(name);
+            format!("the name of your part in the chat {chat}, which iq gave it")
+        };
         format!(
-            "You are {name}, an agent of iq, a coding harness, working in {workspace}. {started}{part}\n\n\
+            "You are a coding agent of iq, a coding harness, working in {workspace}. On iq's board, \
+             where the person and the agents write to each other, you are listed as {name}: \
+             {named}, not who you are; what is written to {name} reaches you. \
+             {started}{part}\n\n\
              Your tools act on the machine through iq's gate: files are read and written in the \
              workspace, and commands run in a sandbox that writes only the workspace. Commands \
              reach localhost (servers you start, the tests that talk to them); the internet is \

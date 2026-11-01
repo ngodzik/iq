@@ -77,7 +77,7 @@ pub(crate) fn roster(names: &[String], seats: &[Seat], at: usize, by: &str) -> S
         )
     };
     format!(
-        "You are {}, in a team of {}:\n{}\nWrite to a teammate with send_message. {answer}",
+        "You are listed as {}, in a team of {}:\n{}\nWrite to a teammate with send_message. {answer}",
         names[at],
         names.len(),
         members.join("\n")
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!((team[1].model.as_str(), team[1].effort), ("lab/b", None));
         let names = ["code-writer".to_owned(), "code-reviewer".to_owned()];
         let first = roster(&names, &team, 0, "lead");
-        assert!(first.contains("You are code-writer") && first.contains("goes to lead"));
+        assert!(first.contains("You are listed as code-writer") && first.contains("goes to lead"));
         assert!(first.contains("- code-reviewer, reviewer: reads its diff, two rounds at most"));
         assert!(roster(&names, &team, 1, "lead").contains("goes to code-writer"));
         assert!(seats(&serde_json::json!([])).is_err());

@@ -581,14 +581,25 @@ impl Live<'_> {
                     .rsplit_once('/')
                     .map_or(chat.model.as_str(), |(_, name)| name)
                     .to_owned();
-                (
-                    Line::from(vec![
-                        Span::styled(" new chat", p.bold(p.accent)),
-                        Span::styled(said, p.fg(p.faint)),
-                    ]),
-                    Line::default(),
-                    format!("The task for {short_model}…"),
-                )
+                // The name the person gave it, before it starts.
+                let named = chat.name.trim();
+                let (title, hint) = if named.is_empty() {
+                    (
+                        vec![Span::styled(" new chat", p.bold(p.accent))],
+                        format!("The task for {short_model}…"),
+                    )
+                } else {
+                    (
+                        vec![
+                            Span::styled(format!(" {named}"), p.bold(p.accent)),
+                            Span::styled(" · new chat", p.fg(p.faint)),
+                        ],
+                        format!("The first task of {named}, for {short_model}…"),
+                    )
+                };
+                let mut title = title;
+                title.push(Span::styled(said, p.fg(p.faint)));
+                (Line::from(title), Line::default(), hint)
             }
         };
         let inner = width.saturating_sub(4).max(1);
@@ -896,6 +907,29 @@ mod tests {
         assert!(rows[1].contains("The task for claude-opus-5-5…"));
         assert!(rows[3].starts_with(" ⏵⏵ autopilot"));
         assert!(rows[3].ends_with("you"));
+        // Named before it starts, the new chat shows it at once.
+        board.run(
+            iq_ui::command::Command::Name("billing".into()),
+            iq_ui::now(),
+        );
+        let named = drawn(&board, &history, 60);
+        assert!(
+            named
+                .iter()
+                .any(|r| r.contains("The new chat is named billing")),
+            "{named:#?}"
+        );
+        assert!(
+            named.iter().any(|r| r.contains("billing · new chat")),
+            "{named:#?}"
+        );
+        assert!(
+            named
+                .iter()
+                .any(|r| r.contains("The first task of billing")),
+            "{named:#?}"
+        );
+        board.run(iq_ui::command::Command::New(None), iq_ui::now());
         crew(
             &mut board,
             &mut history,

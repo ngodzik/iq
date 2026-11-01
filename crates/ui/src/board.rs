@@ -1014,6 +1014,12 @@ impl Board {
                     return vec![Request::Rename { agent, name }];
                 }
                 Talk::New(_) => {
+                    // Said at once: the chat starts, under it, with the
+                    // first message.
+                    self.screen.notice(
+                        format!("The new chat is named {name}: it starts with your first message"),
+                        now,
+                    );
                     if let Some(chat) = self.screen.new_chat_mut() {
                         chat.name = name;
                     }
