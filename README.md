@@ -6,6 +6,8 @@ This is a personal project, not a product. Commands, settings and file formats c
 
 ## What it is
 
+iq is short for ironquill: iron, as rust is iron's, for it is written in Rust; a quill, for what it writes.
+
 iq runs coding agents in the terminal, on your machine. For now, the models answer through Requesty's router alone; other providers are meant to come later. A lead agent takes your request and may start other agents, with the roles, models and effort it chooses; they write to each other and to you on a shared board, and each chat may work in a git worktree of its own. iq is the harness around them: the gate, the sandbox, the board and the costs. The models do the work.
 
 Three principles hold it together:
