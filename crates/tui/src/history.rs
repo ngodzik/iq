@@ -40,9 +40,9 @@ pub(crate) const INPUT_CHARS: usize = 160;
 /// How many kinds of step a fold's count names.
 const KINDS: usize = 4;
 
-/// How many paragraphs written are kept, to write the end of the
-/// conversation again when the terminal is made narrower.
-const KEPT: usize = 400;
+/// How many paragraphs of each chat's window are kept, to write it again
+/// as the person comes back to it, or when the terminal is made narrower.
+const KEPT: usize = 4000;
 
 /// A paragraph waiting to be written: folded to the terminal's width only
 /// then.
@@ -98,15 +98,37 @@ struct Turn {
     tokens: u64,
 }
 
-/// The conversation, as written so far.
+/// What a paragraph of a window is, for the lines between two kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Blank,
+    Text,
+    Steps,
+    Other,
+}
+
+/// The conversation, as written so far: a window of its own for each of
+/// the person's chats, where what it and the agents it started do is
+/// written, the window of the chat written to on the terminal.
 #[derive(Debug, Default)]
 pub(crate) struct History {
-    paras: Vec<Para>,
-    /// The last paragraphs written.
-    written: VecDeque<Para>,
-    /// Whose lines were written last: the person, an agent, or nobody's
-    /// since a line of the crew's own.
-    speaker: Option<String>,
+    /// The paragraphs waiting to be written, each with the chat whose
+    /// window it goes in: none for the window on the terminal.
+    paras: Vec<(Option<String>, Para)>,
+    /// What each chat's window holds, the latest last, as many as
+    /// [`KEPT`]: none is the window of a new chat.
+    kept: HashMap<Option<String>, VecDeque<Para>>,
+    /// The lines iq opens with, at the top of every window.
+    opening: Vec<Para>,
+    /// Whether the window on the terminal shows them.
+    opened: bool,
+    /// The chat whose window what is being written goes in.
+    at: Option<String>,
+    /// Whose lines each window wrote last: the person, an agent, or
+    /// nobody's since a line of the crew's own.
+    speakers: HashMap<Option<String>, String>,
+    /// What each window wrote last.
+    kinds: HashMap<Option<String>, Kind>,
     streams: HashMap<String, Stream>,
     turns: HashMap<String, Turn>,
     /// The agents whose task was written.
@@ -129,7 +151,7 @@ impl History {
                 .map(|f| f.display().to_string())
                 .unwrap_or_default(),
         );
-        self.paras.push(Para::indented(
+        self.opening.push(Para::indented(
             " ",
             vec![
                 Span::styled("i", p.bold(p.accent)),
@@ -141,7 +163,7 @@ impl History {
                 ),
             ],
         ));
-        self.paras.push(Para::indented(
+        self.opening.push(Para::indented(
             "    ",
             vec![Span::styled(
                 format!(
@@ -154,17 +176,28 @@ impl History {
 
     /// What the crew just did, as `board` holds it now that it took it.
     pub(crate) fn event(&mut self, event: &Event, board: &Board, p: &Palette) {
+        // Written in the window of the chat it is part of.
+        self.at = match event {
+            Event::Posted { from, to, .. } if from == PERSON => chat_of(board, to),
+            Event::Posted { from, .. } => chat_of(board, from),
+            Event::Renamed { to, .. } => chat_of(board, to),
+            other => agent_of(other).and_then(|agent| chat_of(board, agent)),
+        };
         match event {
             Event::Joined { agent, model, by } if by != PERSON => {
-                self.speaker = None;
+                self.set_speaker(None);
                 self.joins.insert(agent.clone(), self.paras.len());
                 let tint = agent_tint(board, agent, p);
-                self.paras.push(Para::indented(
+                let starter = self.shown_name(board, by);
+                self.push(Para::indented(
                     "",
                     vec![
                         Span::styled("◦ ", p.fg(tint)),
-                        Span::styled(agent.clone(), p.fg(tint)),
-                        Span::styled(format!(" joins, on {model}, started by {by}"), p.fg(p.dim)),
+                        Span::styled(self.shown_name(board, agent), p.fg(tint)),
+                        Span::styled(
+                            format!(" joins, on {model}, started by {starter}"),
+                            p.fg(p.dim),
+                        ),
                     ],
                 ));
             }
@@ -203,7 +236,7 @@ impl History {
                     let styled = stream.markdown.line(line.trim_end_matches(['\n', '\r']), p);
                     if let Some(styled) = styled {
                         self.header(agent, board, p);
-                        self.paras.push(Para::text(styled));
+                        self.push_text(Para::text(styled));
                     }
                 }
             }
@@ -230,27 +263,29 @@ impl History {
                 } else if to == PERSON {
                     self.finish(from, board, p);
                     self.header(from, board, p);
-                    self.paras.push(Para::indented(
+                    self.push(Para::indented(
                         "  ",
                         vec![Span::styled("✉ to you", p.fg(p.info))],
                     ));
                     let mut markdown = Markdown::default();
                     for line in text.lines() {
                         if let Some(styled) = markdown.line(line, p) {
-                            self.paras.push(Para::text(styled));
+                            self.push_text(Para::text(styled));
                         }
                     }
                 } else {
                     self.finish(from, board, p);
                     self.folds(from, board, p);
-                    self.speaker = None;
-                    self.paras.push(Para::indented(
+                    self.set_speaker(None);
+                    let (writer, reader) =
+                        (self.shown_name(board, from), self.shown_name(board, to));
+                    self.push(Para::indented(
                         "  ",
                         vec![
                             Span::styled("✉ ", p.fg(p.info)),
-                            Span::styled(from.clone(), p.fg(agent_tint(board, from, p))),
+                            Span::styled(writer, p.fg(agent_tint(board, from, p))),
                             Span::styled(" → ", p.fg(p.faint)),
-                            Span::styled(to.clone(), p.fg(agent_tint(board, to, p))),
+                            Span::styled(reader, p.fg(agent_tint(board, to, p))),
                         ],
                     ));
                     self.lines_of(text, "    ", p, MESSAGE_LINES);
@@ -259,6 +294,7 @@ impl History {
             Event::Done { agent, outcome } => {
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
+                self.blank();
                 let turn = self.turns.remove(agent);
                 match outcome {
                     Ok(_) => {
@@ -272,7 +308,7 @@ impl History {
                                 said.push_str(&format!(" · {} tokens", TokenCount(turn.tokens)));
                             }
                         }
-                        self.paras.push(Para::indented(
+                        self.push(Para::indented(
                             "  ",
                             vec![
                                 Span::styled("✔ ", p.fg(p.ok)),
@@ -280,18 +316,18 @@ impl History {
                             ],
                         ));
                     }
-                    Err(error) => self.paras.push(Para {
+                    Err(error) => self.push(Para {
                         first: vec![Span::raw("  "), Span::styled("✘ stopped: ", p.fg(p.bad))],
                         rest: vec![Span::raw("    ")],
                         body: vec![Span::styled(short(error), p.fg(p.dim))],
                     }),
                 }
-                self.speaker = None;
+                self.set_speaker(None);
             }
             Event::Notice { agent, text } => {
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
-                self.paras.push(Para {
+                self.push(Para {
                     first: vec![Span::raw("  "), Span::styled("! ", p.fg(p.warn))],
                     rest: vec![Span::raw("    ")],
                     body: vec![Span::styled(short(text), p.fg(p.dim))],
@@ -304,7 +340,7 @@ impl History {
             } => {
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
-                self.paras.push(Para {
+                self.push(Para {
                     first: vec![Span::raw("  "), Span::styled("! ", p.fg(p.warn))],
                     rest: vec![Span::raw("    ")],
                     body: vec![Span::styled(short(&format!("{agent} {said}")), p.fg(p.dim))],
@@ -317,8 +353,27 @@ impl History {
                         name.clone_from(to);
                     }
                 };
-                if let Some(speaker) = &mut self.speaker {
+                for speaker in self.speakers.values_mut() {
                     renamed(speaker);
+                }
+                // A chat's window follows it.
+                let (old, new) = (Some(from.clone()), Some(to.clone()));
+                if let Some(speaker) = self.speakers.remove(&old) {
+                    self.speakers.insert(new.clone(), speaker);
+                }
+                if let Some(kept) = self.kept.remove(&old) {
+                    self.kept.insert(new.clone(), kept);
+                }
+                if let Some(kind) = self.kinds.remove(&old) {
+                    self.kinds.insert(new.clone(), kind);
+                }
+                for (chat, _) in &mut self.paras {
+                    if *chat == old {
+                        chat.clone_from(&new);
+                    }
+                }
+                if self.at == old {
+                    self.at.clone_from(&new);
                 }
                 if let Some(stream) = self.streams.remove(from) {
                     self.streams.insert(to.clone(), stream);
@@ -335,8 +390,8 @@ impl History {
                 if let Some(told) = self.told.remove(from) {
                     self.told.insert(to.clone(), told);
                 }
-                self.speaker = None;
-                self.paras.push(Para::indented(
+                self.set_speaker(None);
+                self.push(Para::indented(
                     "  ",
                     vec![
                         Span::styled(from.clone(), p.fg(p.dim)),
@@ -374,6 +429,7 @@ impl History {
         let Some(view) = board.crew().agent(agent) else {
             return;
         };
+        self.at = chat_of(board, agent);
         let mut exchanges: Vec<(&str, Option<&str>)> = Vec::new();
         for entry in &view.thread {
             match entry {
@@ -386,7 +442,7 @@ impl History {
                 _ => {}
             }
         }
-        self.speaker = None;
+        self.set_speaker(None);
         self.named(agent, board, p);
         let mut said = String::from("↺ back");
         if let Some(worked) = view.worked {
@@ -397,11 +453,10 @@ impl History {
             .chord(Action::Team)
             .map_or("/chats".to_owned(), |chord| chord.to_string());
         said.push_str(&format!(" · its whole thread: {team}, then →"));
-        self.paras
-            .push(Para::indented("  ", vec![Span::styled(said, p.fg(p.info))]));
+        self.push(Para::indented("  ", vec![Span::styled(said, p.fg(p.info))]));
         let skipped = exchanges.len().saturating_sub(RECALLED);
         if skipped > 0 {
-            self.paras.push(Para::indented(
+            self.push(Para::indented(
                 "  ",
                 vec![Span::styled(
                     format!(
@@ -431,18 +486,19 @@ impl History {
                     if others == 1 { "" } else { "s" }
                 ));
             }
-            self.paras.push(Para::indented(
+            self.push(Para::indented(
                 "  ",
                 vec![Span::styled(said, p.fg(p.accent))],
             ));
         }
-        self.speaker = None;
+        self.set_speaker(None);
     }
 
     /// Something said to the person by iq itself, in passing.
     pub(crate) fn say(&mut self, text: &str, p: &Palette) {
-        self.speaker = None;
-        self.paras.push(Para::indented(
+        self.at = None;
+        self.set_speaker(None);
+        self.push(Para::indented(
             "  ",
             vec![Span::styled(text.to_owned(), p.fg(p.dim))],
         ));
@@ -456,25 +512,30 @@ impl History {
     /// What the person wrote, to `agent`, after what it did before.
     fn person(&mut self, text: &str, agent: &str, board: &Board, p: &Palette) {
         self.folds(agent, board, p);
-        self.paras.push(Para::blank());
+        self.blank();
         let mut body = Vec::new();
-        if board.crew().agents().len() > 1 {
+        // In the chat's window, written to its own agent but for one it
+        // started.
+        if board
+            .crew()
+            .agent(agent)
+            .is_some_and(|view| view.by != PERSON)
+        {
             body.push(Span::styled(
-                format!("@{agent} "),
+                format!("@{} ", label(board, agent).0),
                 p.fg(agent_tint(board, agent, p)),
             ));
         }
         body.extend(inline(text.trim(), p.fg(p.text), p));
-        self.paras.push(Para {
+        self.push(Para {
             first: vec![Span::styled("› ", p.bold(p.accent))],
             rest: vec![Span::raw("  ")],
             body,
         });
         if let Some(said) = self.after.remove(agent) {
-            self.paras
-                .push(Para::indented("  ", vec![Span::styled(said, p.fg(p.info))]));
+            self.push(Para::indented("  ", vec![Span::styled(said, p.fg(p.info))]));
         }
-        self.speaker = Some(PERSON.to_owned());
+        self.set_speaker(Some(PERSON.to_owned()));
     }
 
     /// The first lines of `text`, dimmed, after `first`.
@@ -491,7 +552,7 @@ impl History {
             } else {
                 (*line).to_owned()
             };
-            self.paras.push(Para {
+            self.push(Para {
                 first: vec![lead],
                 rest: vec![Span::raw(" ".repeat(crate::wrap::width(first)))],
                 body: vec![Span::styled(more, p.fg(p.dim))],
@@ -538,7 +599,7 @@ impl History {
                 [] => {}
                 [step] => {
                     let (first, body) = step_line(step, p);
-                    self.paras.push(Para {
+                    self.push_step(Para {
                         first,
                         rest: vec![Span::raw("    ")],
                         body,
@@ -552,14 +613,14 @@ impl History {
                             .filter(|l| !l.trim().is_empty())
                             .take(FAILED_LINES)
                         {
-                            self.paras.push(Para::indented(
+                            self.push_step(Para::indented(
                                 "    ",
                                 vec![Span::styled(short(line), p.fg(p.faint))],
                             ));
                         }
                     }
                 }
-                _ => self.paras.push(Para {
+                _ => self.push_step(Para {
                     first: vec![Span::raw("  "), Span::styled("▸ ", p.fg(p.faint))],
                     rest: vec![Span::raw("    ")],
                     body: counted(fold, unfold.as_deref(), p),
@@ -570,25 +631,27 @@ impl History {
 
     /// `agent`'s name and model, when another spoke last.
     fn named(&mut self, agent: &str, board: &Board, p: &Palette) {
-        if self.speaker.as_deref() == Some(agent) {
+        if self.speaker() == Some(agent) {
             return;
         }
         let tint = agent_tint(board, agent, p);
-        let model = board
-            .crew()
-            .agent(agent)
-            .map(|a| a.serving().to_owned())
-            .unwrap_or_default();
-        self.paras.push(Para::blank());
-        self.paras.push(Para::indented(
+        // In its chat's window: by its model, or its part and its model.
+        let (name, beside) = label(board, agent);
+        let beside = if beside.is_empty() {
+            String::new()
+        } else {
+            format!("  {beside}")
+        };
+        self.blank();
+        self.push(Para::indented(
             "",
             vec![
                 Span::styled("● ", p.fg(tint)),
-                Span::styled(agent.to_owned(), p.bold(tint)),
-                Span::styled(format!("  {model}"), p.fg(p.faint)),
+                Span::styled(name, p.bold(tint)),
+                Span::styled(beside, p.fg(p.faint)),
             ],
         ));
-        self.speaker = Some(agent.to_owned());
+        self.set_speaker(Some(agent.to_owned()));
     }
 
     /// Writes what is left of `agent`'s text after its last whole line.
@@ -602,7 +665,7 @@ impl History {
         }
         if let Some(styled) = stream.markdown.line(&rest, p) {
             self.header(agent, board, p);
-            self.paras.push(Para::text(styled));
+            self.push_text(Para::text(styled));
         }
     }
 
@@ -651,29 +714,85 @@ impl History {
 
     /// Whether lines wait to be written.
     pub(crate) fn waiting(&self) -> bool {
-        !self.paras.is_empty()
+        !self.paras.is_empty() || !self.opened && !self.opening.is_empty()
     }
 
-    /// The lines waiting, folded within `width` columns.
-    pub(crate) fn take(&mut self, width: usize) -> Vec<Line<'static>> {
+    /// The lines waiting for `window`'s chat, or for a new chat's when
+    /// none, folded within `width` columns; those of other chats are kept
+    /// in their windows, written as the person comes back to them.
+    pub(crate) fn take(&mut self, width: usize, window: Option<&str>) -> Vec<Line<'static>> {
         self.joins.clear();
-        let paras: Vec<Para> = std::mem::take(&mut self.paras);
-        let lines = paras
-            .iter()
-            .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest))
-            .collect();
-        self.written.extend(paras);
-        while self.written.len() > KEPT {
-            self.written.pop_front();
+        let window = window.map(str::to_owned);
+        let mut lines = Vec::new();
+        if !self.opened {
+            self.opened = true;
+            lines.extend(
+                self.opening
+                    .iter()
+                    .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest)),
+            );
+        }
+        for (chat, para) in std::mem::take(&mut self.paras) {
+            let chat = chat.or_else(|| window.clone());
+            if chat == window {
+                lines.extend(wrap(&para.body, width, &para.first, &para.rest));
+            }
+            let kept = self.kept.entry(chat).or_default();
+            kept.push_back(para);
+            while kept.len() > KEPT {
+                kept.pop_front();
+            }
         }
         lines
     }
 
-    /// The last of the lines written, as many as `rows`, folded within
-    /// `width` columns.
-    pub(crate) fn recent(&self, width: usize, rows: usize) -> Vec<Line<'static>> {
+    /// Makes what the new chat's window holds `chat`'s, as the chat starts
+    /// there, when it has no window of its own yet. Whether it did.
+    pub(crate) fn adopt(&mut self, chat: Option<&str>) -> bool {
+        let Some(chat) = chat else {
+            return false;
+        };
+        let key = Some(chat.to_owned());
+        if self.kept.get(&key).is_some_and(|kept| !kept.is_empty()) {
+            return false;
+        }
+        let mut kept = self.kept.remove(&None).unwrap_or_default();
+        kept.extend(self.kept.remove(&key).unwrap_or_default());
+        self.kept.insert(key.clone(), kept);
+        if let Some(kind) = self.kinds.remove(&None) {
+            self.kinds.insert(key.clone(), kind);
+        }
+        if let Some(speaker) = self.speakers.remove(&None) {
+            self.speakers.insert(key, speaker);
+        }
+        true
+    }
+
+    /// `window`'s chat whole, as the person comes to it, folded within
+    /// `width` columns: what iq opens with, then all its window kept.
+    pub(crate) fn window(&mut self, width: usize, window: Option<&str>) -> Vec<Line<'static>> {
+        // What waits for it first, kept with the rest.
+        let _ = self.take(width, window);
+        self.opened = true;
+        let key = window.map(str::to_owned);
+        self.opening
+            .iter()
+            .chain(self.kept.get(&key).into_iter().flatten())
+            .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest))
+            .collect()
+    }
+
+    /// The last of the lines written in `window`, as many as `rows`,
+    /// folded within `width` columns.
+    pub(crate) fn recent(
+        &self,
+        width: usize,
+        rows: usize,
+        window: Option<&str>,
+    ) -> Vec<Line<'static>> {
+        let key = window.map(str::to_owned);
         let mut lines: Vec<Line<'static>> = Vec::new();
-        for para in self.written.iter().rev() {
+        for para in self.kept.get(&key).into_iter().flatten().rev() {
             let mut folded = wrap(&para.body, width, &para.first, &para.rest);
             folded.append(&mut lines);
             lines = folded;
@@ -684,6 +803,129 @@ impl History {
         let extra = lines.len().saturating_sub(rows);
         lines.split_off(extra)
     }
+
+    /// How `agent` is named in the window being written: as [`label`]
+    /// names it when it is of that window's chat, else by its whole name.
+    fn shown_name(&self, board: &Board, agent: &str) -> String {
+        if self.at.is_some() && chat_of(board, agent) == self.at {
+            label(board, agent).0
+        } else {
+            agent.to_owned()
+        }
+    }
+
+    /// Puts `para` in the window being written.
+    fn push(&mut self, para: Para) {
+        self.kinds.insert(self.at.clone(), Kind::Other);
+        self.paras.push((self.at.clone(), para));
+    }
+
+    /// Puts a line of an agent's text in the window, a line left between
+    /// it and the steps before.
+    fn push_text(&mut self, para: Para) {
+        if self.kind() == Some(Kind::Steps) {
+            self.blank();
+        }
+        self.push(para);
+        self.kinds.insert(self.at.clone(), Kind::Text);
+    }
+
+    /// Puts a line of an agent's steps in the window, a line left between
+    /// it and the text before.
+    fn push_step(&mut self, para: Para) {
+        if self.kind() == Some(Kind::Text) {
+            self.blank();
+        }
+        self.push(para);
+        self.kinds.insert(self.at.clone(), Kind::Steps);
+    }
+
+    /// Leaves a line empty in the window, one at most between two others.
+    fn blank(&mut self) {
+        if self.kind() == Some(Kind::Blank) {
+            return;
+        }
+        self.push(Para::blank());
+        self.kinds.insert(self.at.clone(), Kind::Blank);
+    }
+
+    /// What the window being written wrote last; none yet when empty.
+    fn kind(&self) -> Option<Kind> {
+        self.kinds.get(&self.at).copied()
+    }
+
+    /// Whose lines the window being written wrote last.
+    fn speaker(&self) -> Option<&str> {
+        self.speakers.get(&self.at).map(String::as_str)
+    }
+
+    fn set_speaker(&mut self, speaker: Option<String>) {
+        match speaker {
+            Some(speaker) => self.speakers.insert(self.at.clone(), speaker),
+            None => self.speakers.remove(&self.at),
+        };
+    }
+}
+
+/// The agent `event` is of, when it is of one.
+fn agent_of(event: &Event) -> Option<&str> {
+    match event {
+        Event::Joined { agent, .. }
+        | Event::Placed { agent, .. }
+        | Event::Model { agent, .. }
+        | Event::Effort { agent, .. }
+        | Event::Working { agent, .. }
+        | Event::TextStart { agent }
+        | Event::Text { agent, .. }
+        | Event::Spent { agent, .. }
+        | Event::Tool { agent, .. }
+        | Event::Asked { agent, .. }
+        | Event::Reviewed { agent, .. }
+        | Event::Done { agent, .. }
+        | Event::Notice { agent, .. } => Some(agent),
+        Event::Posted { from, .. } => Some(from),
+        Event::Renamed { to, .. } => Some(to),
+        Event::Answered { .. } => None,
+    }
+}
+
+/// The person's chat `agent` is part of: itself when the person started
+/// it, else that of the agent that started it. None for one unknown.
+pub(crate) fn chat_of(board: &Board, agent: &str) -> Option<String> {
+    let mut name = agent;
+    // As many steps as there are agents, so that a loop ends.
+    for _ in 0..=board.crew().agents().len() {
+        let view = board.crew().agent(name)?;
+        if view.by == PERSON {
+            return Some(view.name.clone());
+        }
+        name = &view.by;
+    }
+    None
+}
+
+/// How `agent` is named in its chat's window, where the chat's name says
+/// nothing more: the chat's own agent by its model, one it started by its
+/// part; then what is said beside, its model and how hard it thinks.
+pub(crate) fn label(board: &Board, agent: &str) -> (String, String) {
+    let Some(view) = board.crew().agent(agent) else {
+        return (agent.to_owned(), String::new());
+    };
+    let model = view.serving();
+    let short = model.rsplit('/').next().unwrap_or(model).to_owned();
+    let effort = view.effort.map(|e| e.as_str().to_owned());
+    if view.by == PERSON {
+        return (short, effort.unwrap_or_default());
+    }
+    let part = agent
+        .split_once('/')
+        .map_or(agent, |(_, part)| part)
+        .to_owned();
+    let beside = match effort {
+        Some(effort) => format!("{short} · {effort}"),
+        None => short,
+    };
+    (part, beside)
 }
 
 /// A step in a line: its mark, then what it did.
@@ -885,12 +1127,17 @@ mod tests {
         }));
         let recall = board.take_recall().unwrap();
         history.recall(&recall, &board, &p);
-        let lines: Vec<String> = history.take(100).iter().map(ToString::to_string).collect();
+        let lines: Vec<String> = history
+            .take(100, Some("login"))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(
             lines,
             [
                 "",
-                "● login  lab/model",
+                // In its own window, the chat's agent is named by its model.
+                "● model",
                 "  ↺ back, at work just now · its whole thread: Ctrl-T, then →",
                 "  … 1 exchange before",
                 "  › ask 2",
@@ -913,7 +1160,7 @@ mod tests {
             },
             &p,
         );
-        assert!(history.take(100).is_empty());
+        assert!(history.take(100, Some("login")).is_empty());
     }
 
     #[test]
@@ -982,19 +1229,27 @@ mod tests {
                 outcome: Ok("done".into()),
             },
         );
-        let lines: Vec<String> = history.take(80).iter().map(ToString::to_string).collect();
+        let lines: Vec<String> = history
+            .take(80, Some("lead"))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(
             lines,
             [
                 "",
                 "› fix the build",
                 "",
-                "● lead  anthropic/claude-opus-5-5",
+                "● claude-opus-5-5",
                 "  I will look",
                 "  at the tests",
+                // A line between its text and its steps, and before the end
+                // of its turn.
+                "",
                 "  ✗ Bash cargo test",
                 "    error: one",
                 "    error: two",
+                "",
                 "  ✔ 0s",
             ]
         );
@@ -1065,7 +1320,11 @@ mod tests {
         );
         // While it works, its steps are the live part's, not the
         // conversation's.
-        let lines: Vec<String> = history.take(80).iter().map(ToString::to_string).collect();
+        let lines: Vec<String> = history
+            .take(80, Some("lead"))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(lines, ["", "› look"]);
         assert_eq!(board.steps().open("lead").unwrap().steps.len(), 4);
         run(
@@ -1092,16 +1351,23 @@ mod tests {
                 outcome: Ok("done".into()),
             },
         );
-        let lines: Vec<String> = history.take(120).iter().map(ToString::to_string).collect();
+        let lines: Vec<String> = history
+            .take(120, Some("lead"))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(
             lines,
             [
                 "",
-                "● lead  m",
+                "● m",
                 "  ▸ 4 steps · read_file 2, run 1, asked you 1 · 1 went wrong  Ctrl-X unfolds #1",
+                "",
                 "  I add the test.",
+                "",
                 // One step is written as it is: nothing to unfold.
                 "  ▸ read_file src/c.rs",
+                "",
                 "  ✔ 0s",
             ]
         );
@@ -1136,7 +1402,11 @@ mod tests {
             },
             &p,
         );
-        let lines: Vec<String> = history.take(80).iter().map(ToString::to_string).collect();
+        let lines: Vec<String> = history
+            .take(80, Some("haiku"))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(
             lines,
             [
@@ -1194,12 +1464,17 @@ mod tests {
             },
             &p,
         );
-        let lines: Vec<String> = history.take(80).iter().map(ToString::to_string).collect();
+        let lines: Vec<String> = history
+            .take(80, Some("lead"))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(
             lines,
             [
-                "◦ helper joins, on m, started by lead",
-                "  ✉ lead → helper",
+                // In the chat's window, its own agent goes by its model.
+                "◦ helper joins, on m, started by m",
+                "  ✉ m → helper",
                 "    1",
                 "    2",
                 "    3",

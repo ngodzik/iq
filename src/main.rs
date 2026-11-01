@@ -775,11 +775,13 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let (ask, requests) = std::sync::mpsc::channel::<Request>();
     let _ = send.send(Update::Started {
         lead: lead.to_string(),
-        reviewer: settings
-            .crew()?
-            .reviewer
-            .map(|r| r.to_string())
-            .unwrap_or_default(),
+        // Shown with how hard it thinks, which the settings say.
+        reviewer: {
+            let crew = settings.crew()?;
+            crew.reviewer
+                .map(|r| format!("{r} · {}", crew.reviewer_effort.as_str()))
+                .unwrap_or_default()
+        },
         autopilot: settings.autopilot,
         internet: settings.internet,
     });

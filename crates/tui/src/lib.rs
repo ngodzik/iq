@@ -88,6 +88,7 @@ pub fn run(feed: Receiver<Update>, requests: Sender<Request>, board: Board) -> i
         paged: false,
         away: None,
         caret: None,
+        window: None,
     };
     let depth = Depth::detect();
     let p = Palette::new(board.look().theme(), depth);
@@ -120,6 +121,9 @@ struct Screen {
     /// top: after a resize, where the terminal moved it says where the
     /// live part went.
     caret: Option<u16>,
+    /// The chat whose window shows, none for a new chat's; not yet one
+    /// before the first draw.
+    window: Option<Option<String>>,
 }
 
 impl Screen {
@@ -139,6 +143,29 @@ impl Screen {
         )?;
         Ok(())
     }
+
+    /// Clears the screen and the terminal's scrollback, for another chat's
+    /// window: the live part starts again at the bottom of an empty screen.
+    fn wipe(&mut self) -> io::Result<()> {
+        let (cols, rows) = terminal::size()?;
+        queue!(
+            self.out,
+            Clear(ClearType::Purge),
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        self.inline = Inline::new(cols, rows);
+        Ok(())
+    }
+}
+
+/// The chat whose window shows: that of the agent written to, none for a
+/// new chat.
+fn window_of(board: &Board) -> Option<String> {
+    board
+        .screen()
+        .talking_to()
+        .and_then(|agent| history::chat_of(board, agent))
 }
 
 /// iq at work in the terminal.
@@ -310,12 +337,34 @@ impl Iq {
                 .draw(|frame| pages::draw(frame, board, p, now))?;
             return Ok(());
         }
-        if self.history.waiting() {
-            let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
-            let lines = self.history.take(width);
-            screen.inline.insert(&mut screen.out, &lines)?;
-            screen.out.flush()?;
+        let window = window_of(&self.board);
+        let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
+        match &screen.window {
+            Some(shown) if *shown == window => {
+                if self.history.waiting() {
+                    let lines = self.history.take(width, window.as_deref());
+                    screen.inline.insert(&mut screen.out, &lines)?;
+                    screen.out.flush()?;
+                }
+            }
+            // The new chat's window becomes the chat's as it starts there.
+            Some(None) if self.history.adopt(window.as_deref()) => {
+                let lines = self.history.take(width, window.as_deref());
+                screen.inline.insert(&mut screen.out, &lines)?;
+                screen.out.flush()?;
+            }
+            // Another chat's window: the screen is its alone, what it holds
+            // written again; on the first draw, under what the shell showed.
+            shown => {
+                if shown.is_some() {
+                    screen.wipe()?;
+                }
+                let lines = self.history.window(width, window.as_deref());
+                screen.inline.insert(&mut screen.out, &lines)?;
+                screen.out.flush()?;
+            }
         }
+        screen.window = Some(window);
         let live = Live {
             board: &self.board,
             history: &self.history,
@@ -400,7 +449,9 @@ impl Iq {
             let height = live.height(&self.motion, cols);
             let width = usize::from(cols.saturating_sub(1)).max(10);
             let room = usize::from(rows.saturating_sub(height + 1));
-            let recent = self.history.recent(width, room);
+            let recent = self
+                .history
+                .recent(width, room, window_of(&self.board).as_deref());
             screen.inline.place(&mut screen.out, height)?;
             screen.inline.insert(&mut screen.out, &recent)?;
         } else {
@@ -431,9 +482,10 @@ impl Iq {
             "iq ends.".to_owned()
         };
         self.history.say(&said, &self.p);
+        let window = window_of(&self.board);
         let screen = &mut self.screen;
         let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
-        let lines = self.history.take(width);
+        let lines = self.history.take(width, window.as_deref());
         screen.inline.insert(&mut screen.out, &lines)?;
         screen.inline.leave(&mut screen.out)?;
         screen.out.flush()
