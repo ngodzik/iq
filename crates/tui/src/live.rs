@@ -32,8 +32,14 @@ const HINT_TASK_CHARS: usize = 48;
 /// side by side.
 const PANES: usize = 4;
 
-/// The lines within a pane: its latest steps, then what it writes.
+/// The fewest lines within a pane: its latest steps, then what it writes.
 const PANE_LINES: usize = 4;
+
+/// The most lines within a pane.
+const PANE_MOST: usize = 14;
+
+/// How much of the screen's height the panes take, in hundredths.
+const PANES_SHARE: usize = 45;
 
 /// The most completions listed at once.
 const LISTED: usize = 6;
@@ -75,15 +81,18 @@ fn pane_columns(panes: usize) -> usize {
     panes.clamp(1, 2)
 }
 
-/// The rows the panes of `count` agents take at the top of the screen,
-/// the same whatever they hold, so that the screen is laid out again only
-/// as agents come and go.
-fn panes_height(count: usize) -> u16 {
+/// The rows the panes of `count` agents take at the top of a screen
+/// `rows` tall, a share of it, the same whatever they hold, so that the
+/// screen is laid out again only as agents come and go or it is resized.
+fn panes_height(count: usize, rows: u16) -> u16 {
     if count < 2 {
         return 0;
     }
     let count = count.min(PANES);
-    (count.div_ceil(pane_columns(count)) * (PANE_LINES + 2)) as u16
+    let rows_of_panes = count.div_ceil(pane_columns(count));
+    let share = usize::from(rows) * PANES_SHARE / 100 / rows_of_panes;
+    let inner = share.saturating_sub(2).clamp(PANE_LINES, PANE_MOST);
+    (rows_of_panes * (inner + 2)) as u16
 }
 
 impl Part {
@@ -116,10 +125,10 @@ impl Live<'_> {
         here
     }
 
-    /// How many rows at the top of the screen the panes take: none unless
-    /// several agents of the chat written to work side by side.
-    pub(crate) fn head_height(&self) -> u16 {
-        panes_height(self.here().len())
+    /// How many rows at the top of a screen `rows` tall the panes take:
+    /// none unless several agents of the chat written to work side by side.
+    pub(crate) fn head_height(&self, rows: u16) -> u16 {
+        panes_height(self.here().len(), rows)
     }
 
     /// Draws the panes of the agents of the chat written to at work side
@@ -134,12 +143,14 @@ impl Live<'_> {
         let area = frame.area();
         let columns = pane_columns(count);
         let wide = area.width / columns as u16;
+        // As tall as the area the screen gave them allows.
+        let tall = (area.height / count.div_ceil(columns) as u16).max(3);
+        let inner = usize::from(tall - 2);
         let panes: Vec<Pane> = here
             .iter()
             .take(PANES)
-            .map(|agent| self.pane(agent, motion, usize::from(wide)))
+            .map(|agent| self.pane(agent, motion, usize::from(wide), inner))
             .collect();
-        let tall = (PANE_LINES + 2) as u16;
         for (at, (title, lines, tint)) in panes.into_iter().enumerate() {
             let (row, column) = (at / columns, at % columns);
             let x = area.left() + column as u16 * wide;
@@ -437,8 +448,14 @@ impl Live<'_> {
 
     /// A pane of an agent of the chat written to, as several work side by
     /// side: its title, then its latest steps and what it writes, within
-    /// `width` columns.
-    fn pane(&self, agent: &iq_ui::crew::AgentView, motion: &Motion, width: usize) -> Pane {
+    /// `width` columns and `lines` lines.
+    fn pane(
+        &self,
+        agent: &iq_ui::crew::AgentView,
+        motion: &Motion,
+        width: usize,
+        lines_in: usize,
+    ) -> Pane {
         let p = self.p;
         let inner = width.saturating_sub(4);
         let mut title = vec![Span::raw(" ")];
@@ -447,7 +464,7 @@ impl Live<'_> {
         title.push(Span::raw(" "));
         let fold = self.board.steps().open(&agent.name);
         let doing = self.doing(agent, fold.is_some());
-        let room = PANE_LINES - usize::from(doing.is_some());
+        let room = lines_in.max(1) - usize::from(doing.is_some());
         let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(fold) = fold {
             let earlier = fold.steps.len().saturating_sub(room);
@@ -1087,7 +1104,7 @@ mod tests {
             p: &p,
             now: iq_ui::now(),
         };
-        let height = live.head_height();
+        let height = live.head_height(30);
         if height == 0 {
             return Vec::new();
         }
@@ -1430,6 +1447,12 @@ mod tests {
             &p,
         );
         board.screen_mut().talk_to("api");
+        // A share of the screen: on a taller one, taller panes, as far as
+        // a most.
+        assert_eq!(panes_height(4, 30), 12);
+        assert_eq!(panes_height(4, 50), 22);
+        assert_eq!(panes_height(2, 50), 16);
+        assert_eq!(panes_height(1, 50), 0);
         // At the top of the screen, two to a row, each six rows tall.
         let head = headed(&board, &history, 90);
         let joined = head.join("\n");

@@ -355,7 +355,7 @@ impl Iq {
             p: &self.p,
             now,
         }
-        .head_height();
+        .head_height(terminal::size()?.1);
         let laid_out = head == screen.inline.head() && !screen.relayout;
         match &screen.window {
             Some(shown) if *shown == window && laid_out => {
