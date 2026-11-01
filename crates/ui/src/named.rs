@@ -59,6 +59,24 @@ pub fn named(text: &str, known: &[String]) -> Vec<String> {
     found
 }
 
+/// The model of `known` that `word` names, as [`named`] reads a word
+/// after "with": its whole name, the part after the provider's, or one
+/// word of it. None when it names none.
+///
+/// # Examples
+///
+/// ```
+/// use iq_ui::named::model;
+///
+/// let known = ["lab/sage-5-5".to_owned()];
+/// assert_eq!(model("Sage", &known).as_deref(), Some("lab/sage-5-5"));
+/// assert_eq!(model("chat2", &known), None);
+/// ```
+#[must_use]
+pub fn model(word: &str, known: &[String]) -> Option<String> {
+    resolve(&word.trim().to_lowercase(), known)
+}
+
 /// The model `word` names, if it names one.
 fn resolve(word: &str, known: &[String]) -> Option<String> {
     if word.is_empty() {

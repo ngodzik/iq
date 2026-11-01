@@ -111,6 +111,7 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
         },
         Event::Notice { agent, text } => writeln!(out, "\n! {agent}: {text}"),
         Event::Renamed { from, to } => writeln!(out, "\n! {from} is called {to} now"),
+        Event::Model { agent, model } => writeln!(out, "\n! {agent} answers on {model} now"),
         Event::Placed {
             agent,
             said: Some(said),

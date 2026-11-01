@@ -11,11 +11,12 @@ const LINES: usize = 2_000;
 /// The longest line `read_file` gives whole.
 const LINE_CHARS: usize = 2_000;
 
-/// How long `wait_for_messages` waits by default, in seconds: short enough
-/// for an agent's tool call to come back within its client's own limits.
+/// How long `wait_for_messages` waits by default, in seconds, for agents
+/// it did not start: short enough for an agent's tool call to come back
+/// within its client's own limits.
 pub(crate) const WAIT_SECONDS: u64 = 30;
 
-/// The longest it waits.
+/// The longest it waits, for the agents it started among others.
 pub(crate) const WAIT_MOST: u64 = 600;
 
 /// The tools that act on the workspace.
@@ -99,19 +100,19 @@ pub fn board() -> Vec<ToolSpec> {
             name: "start_agent".into(),
             description: "Starts another agent on a task, beside you. `model` is a model of the \
                           provider, by its whole name; `effort`, how hard it thinks, lower for \
-                          plain work, as it costs less. It returns at once; the agent's answer \
-                          comes to you as a message."
+                          plain work, as it costs less. It is named after your chat and its \
+                          role. It returns at once with its name; the agent's answer comes to \
+                          you as a message."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "A short name for it, one word."},
                     "model": {"type": "string"},
                     "task": {"type": "string", "description": "All it needs to know: it sees nothing of your conversation."},
-                    "role": {"type": "string", "description": "Its part in the crew, which it keeps to: tests, review, the front end."},
+                    "role": {"type": "string", "description": "Its part in the crew, in a word or two, which it keeps to and is named after: tests, review, front end."},
                     "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "How hard it thinks; left out, as the crew's settings say."},
                 },
-                "required": ["name", "model", "task"],
+                "required": ["model", "task"],
             }),
         },
         ToolSpec {
@@ -120,12 +121,12 @@ pub fn board() -> Vec<ToolSpec> {
                           its model, who write to each other. The first member works on the task \
                           at once, and its answer comes to you as a message; the others wait until \
                           a teammate writes to them, and answer the first. Each sees the task, the \
-                          team and its own part, nothing of your conversation."
+                          team and its own part, nothing of your conversation, and is named after \
+                          your chat and its role."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "A short name for the team, one word: its members are named after it and their roles."},
                     "task": {"type": "string", "description": "The brief all members share: all they need to know of the work."},
                     "members": {
                         "type": "array",
@@ -142,7 +143,7 @@ pub fn board() -> Vec<ToolSpec> {
                         },
                     },
                 },
-                "required": ["name", "task", "members"],
+                "required": ["task", "members"],
             }),
         },
         ToolSpec {
@@ -176,7 +177,10 @@ pub fn board() -> Vec<ToolSpec> {
         ToolSpec {
             name: "wait_for_messages".into(),
             description: "Gives the messages written to you since you last read them, waiting \
-                          up to `seconds` (30 by default) for one when there is none."
+                          up to `seconds` (30 by default) for one when there is none, and while \
+                          agents you started work, until one of them writes. Ending your turn \
+                          is the cheaper wait: an agent you started wakes you with its answer, \
+                          and each call made to wait again reads your whole conversation."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -317,6 +321,8 @@ pub(crate) fn summary(args: &Value) -> String {
         "file_path",
         "pattern",
         "url",
+        "role",
+        "task",
     ] {
         if let Some(text) = args[key].as_str() {
             return short(text);

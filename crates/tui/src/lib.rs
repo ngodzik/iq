@@ -88,6 +88,9 @@ pub fn run(feed: Receiver<Update>, requests: Sender<Request>, board: Board) -> i
         paged: false,
         away: None,
         caret: None,
+        window: None,
+        head: None,
+        relayout: false,
     };
     let depth = Depth::detect();
     let p = Palette::new(board.look().theme(), depth);
@@ -120,6 +123,15 @@ struct Screen {
     /// top: after a resize, where the terminal moved it says where the
     /// live part went.
     caret: Option<u16>,
+    /// The chat whose window shows, none for a new chat's; not yet one
+    /// before the first draw.
+    window: Option<Option<String>>,
+    /// Where the panes of agents at work side by side are drawn, at the
+    /// top of the screen, while there are some.
+    head: Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    /// Whether the screen is to be laid out again, as it was resized with
+    /// panes at its top.
+    relayout: bool,
 }
 
 impl Screen {
@@ -139,6 +151,29 @@ impl Screen {
         )?;
         Ok(())
     }
+
+    /// Clears the screen and the terminal's scrollback, for another chat's
+    /// window: the live part starts again at the bottom of an empty screen.
+    fn wipe(&mut self) -> io::Result<()> {
+        let (cols, rows) = terminal::size()?;
+        queue!(
+            self.out,
+            Clear(ClearType::Purge),
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        self.inline = Inline::new(cols, rows);
+        Ok(())
+    }
+}
+
+/// The chat whose window shows: that of the agent written to, none for a
+/// new chat.
+fn window_of(board: &Board) -> Option<String> {
+    board
+        .screen()
+        .talking_to()
+        .and_then(|agent| history::chat_of(board, agent))
 }
 
 /// iq at work in the terminal.
@@ -310,12 +345,68 @@ impl Iq {
                 .draw(|frame| pages::draw(frame, board, p, now))?;
             return Ok(());
         }
-        if self.history.waiting() {
-            let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
-            let lines = self.history.take(width);
-            screen.inline.insert(&mut screen.out, &lines)?;
-            screen.out.flush()?;
+        let window = window_of(&self.board);
+        let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
+        // The rows the panes take at the top, while several agents of the
+        // chat work side by side.
+        let head = Live {
+            board: &self.board,
+            history: &self.history,
+            p: &self.p,
+            now,
         }
+        .head_height(terminal::size()?.1);
+        let laid_out = head == screen.inline.head() && !screen.relayout;
+        match &screen.window {
+            Some(shown) if *shown == window && laid_out => {
+                if self.history.waiting() {
+                    let lines = self.history.take(width, window.as_deref());
+                    screen.inline.insert(&mut screen.out, &lines)?;
+                    screen.out.flush()?;
+                }
+            }
+            // The new chat's window becomes the chat's as it starts there.
+            Some(None) if laid_out && self.history.adopt(window.as_deref()) => {
+                let lines = self.history.take(width, window.as_deref());
+                screen.inline.insert(&mut screen.out, &lines)?;
+                screen.out.flush()?;
+            }
+            // Laid out again: another chat's window, or panes coming or
+            // going. The screen is the window's alone, what it holds written
+            // again; on the first draw, under what the shell showed. Below
+            // panes, only what the screen shows: their going writes it whole.
+            shown => {
+                if shown.is_some() {
+                    screen.wipe()?;
+                }
+                screen.relayout = false;
+                screen.inline.hold(head);
+                let mut lines = self.history.window(width, window.as_deref());
+                if head > 0 {
+                    let (_, rows) = terminal::size()?;
+                    let room = usize::from(rows);
+                    lines = lines.split_off(lines.len().saturating_sub(room));
+                }
+                screen.inline.insert(&mut screen.out, &lines)?;
+                screen.out.flush()?;
+                screen.head = if head > 0 {
+                    Some(Terminal::with_options(
+                        CrosstermBackend::new(io::stdout()),
+                        TerminalOptions {
+                            viewport: Viewport::Fixed(Rect::new(
+                                0,
+                                0,
+                                screen.inline.cols(),
+                                screen.inline.head(),
+                            )),
+                        },
+                    )?)
+                } else {
+                    None
+                };
+            }
+        }
+        screen.window = Some(window);
         let live = Live {
             board: &self.board,
             history: &self.history,
@@ -333,6 +424,14 @@ impl Iq {
         screen
             .terminal
             .draw(|frame| caret = live.draw(frame, motion))?;
+        if let Some(head) = &mut screen.head {
+            head.draw(|frame| live.draw_head(frame, motion))?;
+            // The cursor stays where the person writes.
+            if let Some(at) = caret {
+                queue!(screen.out, MoveTo(at.0, at.1))?;
+                screen.out.flush()?;
+            }
+        }
         screen.caret = caret.map(|(_, y)| y.saturating_sub(top));
         Ok(())
     }
@@ -345,7 +444,7 @@ impl Iq {
             Wait::Gone => {
                 // Its window closed: nobody is there to answer, and the
                 // agents stop with iq.
-                self.board.act(iq_ui::keys::Action::Quit);
+                self.board.act(iq_ui::keys::Action::Quit, iq_ui::now());
                 return Ok(true);
             }
             Wait::Ready => {}
@@ -372,6 +471,9 @@ impl Iq {
                     if self.screen.paged {
                         self.screen.away = Some(self.screen.away.unwrap_or(false) || narrower);
                         self.screen.refit(Rect::new(0, 0, cols, rows))?;
+                    } else if self.screen.inline.head() > 0 {
+                        // Panes at the top: laid out again whole.
+                        self.screen.relayout = true;
                     } else {
                         self.fit(cols, rows, narrower)?;
                     }
@@ -400,7 +502,9 @@ impl Iq {
             let height = live.height(&self.motion, cols);
             let width = usize::from(cols.saturating_sub(1)).max(10);
             let room = usize::from(rows.saturating_sub(height + 1));
-            let recent = self.history.recent(width, room);
+            let recent = self
+                .history
+                .recent(width, room, window_of(&self.board).as_deref());
             screen.inline.place(&mut screen.out, height)?;
             screen.inline.insert(&mut screen.out, &recent)?;
         } else {
@@ -421,6 +525,17 @@ impl Iq {
             self.screen.paged = false;
         }
         self.history.finish_all(&self.board, &self.p);
+        if self.screen.inline.head() > 0 {
+            // The panes go: the window is written whole, for the shell's
+            // scrollback.
+            let window = window_of(&self.board);
+            let screen = &mut self.screen;
+            screen.wipe()?;
+            screen.head = None;
+            let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
+            let lines = self.history.window(width, window.as_deref());
+            screen.inline.insert(&mut screen.out, &lines)?;
+        }
         let mut billed = Usd(0.0);
         for agent in self.board.crew().agents() {
             billed += agent.billed;
@@ -431,9 +546,10 @@ impl Iq {
             "iq ends.".to_owned()
         };
         self.history.say(&said, &self.p);
+        let window = window_of(&self.board);
         let screen = &mut self.screen;
         let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
-        let lines = self.history.take(width);
+        let lines = self.history.take(width, window.as_deref());
         screen.inline.insert(&mut screen.out, &lines)?;
         screen.inline.leave(&mut screen.out)?;
         screen.out.flush()

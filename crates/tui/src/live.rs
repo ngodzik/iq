@@ -1,9 +1,10 @@
 //! The live part, below the conversation: the agents at work and what
 //! they do, each with its latest steps since its last line of text, the
-//! oldest question waiting for the person, a word to them,
-//! the commands that complete what they write, where they write, the
-//! folder of its own the agent they write to works in, and the status
-//! line, along which messages run between the agents.
+//! oldest question waiting for the person, a word to them, the switcher
+//! of their chats while it is open, the commands that complete what they
+//! write, where they write, the folder of its own the agent they write to
+//! works in, and the status line, along which messages run between the
+//! agents.
 
 use std::collections::HashMap;
 
@@ -18,7 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
-use crate::history::{History, agent_tint, seconds, short, step_line};
+use crate::history::{History, agent_tint, chat_of, label, seconds, short, step_line};
 use crate::motion::{Motion, YOU};
 use crate::theme::Palette;
 use crate::wrap::{cut, spans_width, width as text_width, wrap};
@@ -27,8 +28,18 @@ use crate::wrap::{cut, spans_width, width as text_width, wrap};
 /// shows, in characters.
 const HINT_TASK_CHARS: usize = 48;
 
-/// The most agents at work given a line each.
-const WORKING: usize = 3;
+/// The most agents of the chat written to given a pane each, as they work
+/// side by side.
+const PANES: usize = 4;
+
+/// The fewest lines within a pane: its latest steps, then what it writes.
+const PANE_LINES: usize = 4;
+
+/// The most lines within a pane.
+const PANE_MOST: usize = 14;
+
+/// How much of the screen's height the panes take, in hundredths.
+const PANES_SHARE: usize = 45;
 
 /// The most completions listed at once.
 const LISTED: usize = 6;
@@ -62,6 +73,28 @@ enum Part {
     Status,
 }
 
+/// A pane: its title, its lines and its tint.
+type Pane = (Line<'static>, Vec<Line<'static>>, crate::theme::Rgb);
+
+/// How many panes go on a row.
+fn pane_columns(panes: usize) -> usize {
+    panes.clamp(1, 2)
+}
+
+/// The rows the panes of `count` agents take at the top of a screen
+/// `rows` tall, a share of it, the same whatever they hold, so that the
+/// screen is laid out again only as agents come and go or it is resized.
+fn panes_height(count: usize, rows: u16) -> u16 {
+    if count < 2 {
+        return 0;
+    }
+    let count = count.min(PANES);
+    let rows_of_panes = count.div_ceil(pane_columns(count));
+    let share = usize::from(rows) * PANES_SHARE / 100 / rows_of_panes;
+    let inner = share.saturating_sub(2).clamp(PANE_LINES, PANE_MOST);
+    (rows_of_panes * (inner + 2)) as u16
+}
+
 impl Part {
     fn rows(&self) -> u16 {
         match self {
@@ -73,6 +106,70 @@ impl Part {
 }
 
 impl Live<'_> {
+    /// The agents of the chat written to at work, its own first.
+    fn here(&self) -> Vec<&iq_ui::crew::AgentView> {
+        let window = self
+            .board
+            .screen()
+            .talking_to()
+            .and_then(|agent| chat_of(self.board, agent));
+        let mut here: Vec<_> = self
+            .board
+            .crew()
+            .agents()
+            .iter()
+            .filter(|a| a.working)
+            .filter(|a| window.is_some() && chat_of(self.board, &a.name) == window)
+            .collect();
+        here.sort_by_key(|a| (Some(&a.name) != window.as_ref(), a.name.clone()));
+        here
+    }
+
+    /// How many rows at the top of a screen `rows` tall the panes take:
+    /// none unless several agents of the chat written to work side by side.
+    pub(crate) fn head_height(&self, rows: u16) -> u16 {
+        panes_height(self.here().len(), rows)
+    }
+
+    /// Draws the panes of the agents of the chat written to at work side
+    /// by side, two to a row, as many as [`PANES`], in `frame`, whose area
+    /// is the top of the screen.
+    pub(crate) fn draw_head(&self, frame: &mut Frame<'_>, motion: &Motion) {
+        let here = self.here();
+        let count = here.len().min(PANES);
+        if count < 2 {
+            return;
+        }
+        let area = frame.area();
+        let columns = pane_columns(count);
+        let wide = area.width / columns as u16;
+        // As tall as the area the screen gave them allows.
+        let tall = (area.height / count.div_ceil(columns) as u16).max(3);
+        let inner = usize::from(tall - 2);
+        let panes: Vec<Pane> = here
+            .iter()
+            .take(PANES)
+            .map(|agent| self.pane(agent, motion, usize::from(wide), inner))
+            .collect();
+        for (at, (title, lines, tint)) in panes.into_iter().enumerate() {
+            let (row, column) = (at / columns, at % columns);
+            let x = area.left() + column as u16 * wide;
+            // The last of a row takes what the division left.
+            let w = if column + 1 == columns {
+                area.right().saturating_sub(x)
+            } else {
+                wide
+            };
+            let y = area.top() + row as u16 * tall;
+            let pane = Rect::new(x, y, w, tall).intersection(area);
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(self.p.fg(tint))
+                .title(title);
+            frame.render_widget(Paragraph::new(lines).block(block), pane);
+        }
+    }
+
     /// How many rows the live part takes at `width`.
     pub(crate) fn height(&self, motion: &Motion, width: u16) -> u16 {
         self.parts(motion, width).iter().map(Part::rows).sum()
@@ -128,10 +225,7 @@ impl Live<'_> {
     fn parts(&self, motion: &Motion, width: u16) -> Vec<Part> {
         let width = usize::from(width);
         let mut parts = Vec::new();
-        let working = self.working(motion, width);
-        if !working.is_empty() {
-            parts.push(Part::Lines(working));
-        }
+        parts.extend(self.working(motion, width));
         if let Some(question) = self.question(width) {
             parts.push(question);
         }
@@ -143,6 +237,9 @@ impl Live<'_> {
                 &[Span::raw("  ")],
                 &[Span::raw("  ")],
             )));
+        }
+        if let Some(switcher) = self.switcher(motion, width) {
+            parts.push(switcher);
         }
         let listed = self.completions(width);
         if !listed.is_empty() {
@@ -189,91 +286,224 @@ impl Live<'_> {
         ]))
     }
 
-    /// A line for each agent at work: what it does, for how long, and
-    /// what it is writing; under it, its latest steps since its last line
-    /// of text, as many as the settings say, the earlier counted.
-    fn working(&self, motion: &Motion, width: usize) -> Vec<Line<'static>> {
+    /// The agents at work. Those of the chat written to: alone, a line
+    /// with its latest steps under it; side by side, a pane each, as many
+    /// as [`PANES`]. Those of other chats: a line saying which work, their
+    /// questions coming to the person all the same.
+    fn working(&self, motion: &Motion, width: usize) -> Vec<Part> {
         let p = self.p;
-        let talking = self.board.screen().talking_to();
-        let mut agents: Vec<_> = self
+        let here = self.here();
+        let elsewhere: Vec<_> = self
             .board
             .crew()
             .agents()
             .iter()
-            .filter(|a| a.working)
+            .filter(|a| a.working && !here.iter().any(|h| h.name == a.name))
             .collect();
-        agents.sort_by_key(|a| Some(a.name.as_str()) != talking);
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for agent in agents.iter().take(WORKING) {
-            let tint = agent_tint(self.board, &agent.name, p);
+        let mut parts = Vec::new();
+        match here.len() {
+            0 => {}
+            1 => parts.push(Part::Lines(self.alone(here[0], motion, width))),
+            // Their panes are at the top of the screen.
+            more if more > PANES => parts.push(Part::Lines(vec![Line::from(Span::styled(
+                format!("  and {} more of this chat at work", more - PANES),
+                p.fg(p.faint),
+            ))])),
+            _ => {}
+        }
+        if !elsewhere.is_empty() {
+            let mut chats: Vec<(String, usize)> = Vec::new();
+            for agent in &elsewhere {
+                let chat = chat_of(self.board, &agent.name).unwrap_or_else(|| agent.name.clone());
+                match chats.iter_mut().find(|(name, _)| *name == chat) {
+                    Some((_, count)) => *count += 1,
+                    None => chats.push((chat, 1)),
+                }
+            }
             let mut spans = vec![
-                Span::styled(format!("{} ", motion.spinner()), p.fg(p.accent)),
-                Span::styled(agent.name.clone(), p.bold(tint)),
-                Span::styled(format!(" · {} ", agent.serving()), p.fg(p.dim)),
+                Span::styled(format!("  {} ", motion.spinner()), p.fg(p.faint)),
+                Span::styled("also at work: ", p.fg(p.faint)),
             ];
-            spans.extend(motion.shimmer("working…", p.dim, p.text, p));
-            let lasted = self
-                .history
-                .working_for(&agent.name)
-                .map(|d| seconds(d.as_secs()))
+            for (at, (chat, count)) in chats.iter().enumerate() {
+                if at > 0 {
+                    spans.push(Span::styled(" · ", p.fg(p.faint)));
+                }
+                spans.push(Span::styled(
+                    chat.clone(),
+                    p.fg(agent_tint(self.board, chat, p)),
+                ));
+                if *count > 1 {
+                    spans.push(Span::styled(format!(" ({count} agents)"), p.fg(p.faint)));
+                }
+            }
+            let switch = self
+                .board
+                .keys()
+                .chord(Action::Switch)
+                .map(|chord| format!("  {} goes there", chord))
                 .unwrap_or_default();
-            let mut after = format!(" {lasted}");
-            if let Some(spent) = self.history.turn_spent(&agent.name) {
-                after.push_str(&format!(" · {spent}"));
-            }
-            if Some(agent.name.as_str()) == talking
-                && let Some(stop) = self.board.keys().chord(Action::Stop)
-            {
-                after.push_str(&format!(" · {} to stop", hint(&stop.to_string())));
-            }
-            spans.push(Span::styled(after, p.fg(p.faint)));
-            let shown = self.board.look().steps();
-            let fold = self.board.steps().open(&agent.name).filter(|_| shown > 0);
-            let doing = self
-                .history
-                .partial(&agent.name)
-                .map(|text| format!("  {}", text.replace('\n', " ")))
-                .or_else(|| match agent.thread.last() {
-                    // Its steps show under it, unless the settings show none.
-                    Some(Entry::Tool { name, input, .. }) if fold.is_none() => {
-                        Some(format!("  ▸ {name} {}", short(input).replace('\n', " ")))
-                    }
-                    _ => None,
-                });
-            if let Some(doing) = doing {
-                let room = width.saturating_sub(spans_width(&spans) + 1);
-                if room > 8 {
-                    spans.push(Span::styled(cut(&doing, room), p.fg(p.dim)));
+            spans.push(Span::styled(switch, p.fg(p.faint)));
+            parts.push(Part::Lines(vec![fit(spans, width)]));
+        }
+        parts
+    }
+
+    /// How `agent` is said at work: its spinner, its name in its chat's
+    /// window and beside it its model and effort.
+    fn titled(&self, agent: &iq_ui::crew::AgentView, motion: &Motion) -> Vec<Span<'static>> {
+        let p = self.p;
+        let tint = agent_tint(self.board, &agent.name, p);
+        let (name, beside) = label(self.board, &agent.name);
+        let mut spans = vec![
+            Span::styled(format!("{} ", motion.spinner()), p.fg(p.accent)),
+            Span::styled(name, p.bold(tint)),
+        ];
+        if !beside.is_empty() {
+            spans.push(Span::styled(format!(" · {beside}"), p.fg(p.dim)));
+        }
+        spans
+    }
+
+    /// For how long `agent` works, and what its turn spent.
+    fn lasted(&self, agent: &iq_ui::crew::AgentView) -> Span<'static> {
+        let p = self.p;
+        let mut after = self
+            .history
+            .working_for(&agent.name)
+            .map(|d| format!(" · {}", seconds(d.as_secs())))
+            .unwrap_or_default();
+        if let Some(spent) = self.history.turn_spent(&agent.name) {
+            after.push_str(&format!(" · {spent}"));
+        }
+        Span::styled(after, p.fg(p.faint))
+    }
+
+    /// What `agent` does now: the line it writes, else its last tool.
+    fn doing(&self, agent: &iq_ui::crew::AgentView, steps_shown: bool) -> Option<String> {
+        self.history
+            .partial(&agent.name)
+            .map(|text| text.replace('\n', " "))
+            .or_else(|| match agent.thread.last() {
+                Some(Entry::Tool { name, input, .. }) if !steps_shown => {
+                    Some(format!("▸ {name} {}", short(input).replace('\n', " ")))
                 }
-            }
-            lines.push(Line::from(spans));
-            if let Some(fold) = fold {
-                let earlier = fold.steps.len().saturating_sub(shown);
-                if earlier > 0 {
-                    let mut said = format!(
-                        "    ⋯ {earlier} step{} before",
-                        if earlier == 1 { "" } else { "s" }
-                    );
-                    if let Some(unfold) = self.board.keys().chord(Action::Steps) {
-                        said.push_str(&format!(" · {} unfolds", hint(&unfold.to_string())));
-                    }
-                    lines.push(Line::from(Span::styled(said, p.fg(p.faint))));
-                }
-                for step in &fold.steps[earlier..] {
-                    let (mut first, body) = step_line(step, p);
-                    first.insert(0, Span::raw("  "));
-                    first.extend(body);
-                    lines.push(fit(first, width));
-                }
+                _ => None,
+            })
+    }
+
+    /// The one agent of the chat written to at work: a line, its latest
+    /// steps under it, as many as the settings say, the earlier counted.
+    fn alone(
+        &self,
+        agent: &iq_ui::crew::AgentView,
+        motion: &Motion,
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        let p = self.p;
+        let mut spans = self.titled(agent, motion);
+        spans.push(Span::raw(" "));
+        spans.extend(motion.shimmer("working…", p.dim, p.text, p));
+        spans.push(self.lasted(agent));
+        if Some(agent.name.as_str()) == self.board.screen().talking_to()
+            && let Some(stop) = self.board.keys().chord(Action::Stop)
+        {
+            spans.push(Span::styled(
+                format!(" · {} to stop", hint(&stop.to_string())),
+                p.fg(p.faint),
+            ));
+        }
+        let shown = self.board.look().steps();
+        let fold = self.board.steps().open(&agent.name).filter(|_| shown > 0);
+        if let Some(doing) = self.doing(agent, fold.is_some()) {
+            let room = width.saturating_sub(spans_width(&spans) + 3);
+            if room > 8 {
+                spans.push(Span::styled(
+                    format!("  {}", cut(&doing, room)),
+                    p.fg(p.dim),
+                ));
             }
         }
-        if agents.len() > WORKING {
-            lines.push(Line::from(Span::styled(
-                format!("  and {} more at work", agents.len() - WORKING),
-                p.fg(p.faint),
-            )));
+        let mut lines = vec![Line::from(spans)];
+        if let Some(fold) = fold {
+            let earlier = fold.steps.len().saturating_sub(shown);
+            if earlier > 0 {
+                let mut said = format!(
+                    "    ⋯ {earlier} step{} before",
+                    if earlier == 1 { "" } else { "s" }
+                );
+                if let Some(unfold) = self.board.keys().chord(Action::Steps) {
+                    said.push_str(&format!(" · {} unfolds", hint(&unfold.to_string())));
+                }
+                lines.push(Line::from(Span::styled(said, p.fg(p.faint))));
+            }
+            for step in &fold.steps[earlier..] {
+                let (mut first, body) = step_line(step, p);
+                first.insert(0, Span::raw("  "));
+                first.extend(body);
+                lines.push(fit(first, width));
+            }
         }
         lines
+    }
+
+    /// A pane of an agent of the chat written to, as several work side by
+    /// side: its title, then its latest steps and what it writes, within
+    /// `width` columns and `lines` lines.
+    fn pane(
+        &self,
+        agent: &iq_ui::crew::AgentView,
+        motion: &Motion,
+        width: usize,
+        lines_in: usize,
+    ) -> Pane {
+        let p = self.p;
+        let inner = width.saturating_sub(4);
+        let mut title = vec![Span::raw(" ")];
+        title.extend(self.titled(agent, motion));
+        title.push(self.lasted(agent));
+        title.push(Span::raw(" "));
+        let fold = self.board.steps().open(&agent.name);
+        let doing = self.doing(agent, fold.is_some());
+        let room = lines_in.max(1) - usize::from(doing.is_some());
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(fold) = fold {
+            let earlier = fold.steps.len().saturating_sub(room);
+            if earlier > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!(" ⋯ {earlier} before"),
+                    p.fg(p.faint),
+                )));
+            }
+            let left = room - lines.len();
+            for step in fold
+                .steps
+                .iter()
+                .skip(fold.steps.len().saturating_sub(left))
+            {
+                let (mut first, body) = step_line(step, p);
+                // Within the pane, the step's own indent is the border's.
+                first.remove(0);
+                first.insert(0, Span::raw(" "));
+                first.extend(body);
+                lines.push(fit(first, inner));
+            }
+        }
+        match doing {
+            Some(doing) => lines.push(Line::from(Span::styled(
+                format!(" {}", cut(&doing, inner.saturating_sub(1))),
+                p.fg(p.text),
+            ))),
+            None => {
+                let mut said = vec![Span::raw(" ")];
+                said.extend(motion.shimmer("working…", p.dim, p.text, p));
+                lines.push(Line::from(said));
+            }
+        }
+        (
+            Line::from(title),
+            lines,
+            agent_tint(self.board, &agent.name, p),
+        )
     }
 
     /// The oldest question waiting, in a box, with the keys that answer it.
@@ -318,11 +548,25 @@ impl Live<'_> {
         }
         lines.push(Line::from(keys));
         let tint = agent_tint(self.board, &question.agent, p);
+        // Named as in its chat's window when it is this one's; else by its
+        // whole name, its chat's first.
+        let window = self
+            .board
+            .screen()
+            .talking_to()
+            .and_then(|agent| chat_of(self.board, agent));
+        let theirs = chat_of(self.board, &question.agent);
+        let (who, from) = if theirs.is_some() && theirs == window {
+            (label(self.board, &question.agent).0, String::new())
+        } else {
+            (question.agent.clone(), " · from another chat".to_owned())
+        };
         Some(Part::Boxed {
             title: Line::from(vec![
                 Span::raw(" "),
-                Span::styled(question.agent.clone(), p.bold(tint)),
-                Span::styled(" asks ", p.fg(p.warn)),
+                Span::styled(who, p.bold(tint)),
+                Span::styled(" asks", p.fg(p.warn)),
+                Span::styled(format!("{from} "), p.fg(p.faint)),
             ]),
             lines,
             tint: p.warn,
@@ -411,6 +655,113 @@ impl Live<'_> {
             .collect()
     }
 
+    /// The person's chats while the switcher is open, the one used last
+    /// first, as many as it shows at once: each with whether it works,
+    /// what it was first asked and when the person last used it; under
+    /// them, the keys, and how many more there are above and below.
+    fn switcher(&self, motion: &Motion, width: usize) -> Option<Part> {
+        let p = self.p;
+        let switcher = self.board.switcher()?;
+        let shown = switcher
+            .chats
+            .iter()
+            .enumerate()
+            .skip(switcher.first)
+            .take(iq_ui::SWITCH_ROWS);
+        let name_width = switcher
+            .chats
+            .iter()
+            .map(|(view, _)| text_width(&view.name))
+            .max()
+            .unwrap_or(0)
+            + 2;
+        let here = self.board.screen().talking_to();
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (at, (view, used)) in shown {
+            let on = at == switcher.chosen;
+            let tint = agent_tint(self.board, &view.name, p);
+            let state = if view.working {
+                Span::styled(format!("{} ", motion.spinner()), p.fg(p.accent))
+            } else {
+                Span::styled("· ", p.fg(p.faint))
+            };
+            let when = match used {
+                Some(at) => iq_ui::ago(*at, self.now),
+                None => String::new(),
+            };
+            let when = if Some(view.name.as_str()) == here {
+                "here".to_owned()
+            } else {
+                when
+            };
+            let task = view
+                .task
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            // Within the box's borders: its mark and state before the
+            // name, a space at least before when, and one after.
+            let room = width.saturating_sub(2 + 5 + name_width + text_width(&when) + 2);
+            let gap = room.saturating_sub(text_width(&cut(&task, room)));
+            lines.push(Line::from(vec![
+                Span::styled(if on { " ▸ " } else { "   " }, p.fg(p.accent)),
+                state,
+                Span::styled(
+                    format!("{:<name_width$}", view.name),
+                    if on { p.bold(tint) } else { p.fg(tint) },
+                ),
+                Span::styled(cut(&task, room), p.fg(if on { p.text } else { p.dim })),
+                Span::raw(" ".repeat(gap + 1)),
+                Span::styled(when, p.fg(p.faint)),
+            ]));
+        }
+        let key = self
+            .board
+            .keys()
+            .chord(Action::Switch)
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let mut foot = vec![
+            Span::raw("   "),
+            Span::styled(key, p.bold(p.accent)),
+            Span::styled(" or ↑ ↓ to choose · ", p.fg(p.dim)),
+            Span::styled("Enter", p.bold(p.accent)),
+            Span::styled(" to go there · ", p.fg(p.dim)),
+            Span::styled("Esc", p.bold(p.accent)),
+        ];
+        let above = switcher.first;
+        let below = switcher
+            .chats
+            .len()
+            .saturating_sub(switcher.first + iq_ui::SWITCH_ROWS);
+        let more: Vec<String> = [(above, "↑"), (below, "↓")]
+            .iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, arrow)| format!("{count} more {arrow}"))
+            .collect();
+        if !more.is_empty() {
+            foot.push(Span::styled(
+                format!(" · {}", more.join(", ")),
+                p.fg(p.faint),
+            ));
+        }
+        lines.push(Line::from(foot));
+        Some(Part::Boxed {
+            title: Line::from(vec![
+                Span::raw(" "),
+                Span::styled("Chats", p.bold(p.accent)),
+                Span::styled(
+                    format!(" · {} · the one used last first ", switcher.chats.len()),
+                    p.fg(p.faint),
+                ),
+            ]),
+            lines,
+            tint: p.accent,
+        })
+    }
+
     /// Where the person writes: to whom in the box's title, what the agent
     /// spent on its right, and the cursor where it stands.
     fn input(&self, width: usize) -> Part {
@@ -470,14 +821,25 @@ impl Live<'_> {
                     .rsplit_once('/')
                     .map_or(chat.model.as_str(), |(_, name)| name)
                     .to_owned();
-                (
-                    Line::from(vec![
-                        Span::styled(" new chat", p.bold(p.accent)),
-                        Span::styled(said, p.fg(p.faint)),
-                    ]),
-                    Line::default(),
-                    format!("The task for {short_model}…"),
-                )
+                // The name the person gave it, before it starts.
+                let named = chat.name.trim();
+                let (title, hint) = if named.is_empty() {
+                    (
+                        vec![Span::styled(" new chat", p.bold(p.accent))],
+                        format!("The task for {short_model}…"),
+                    )
+                } else {
+                    (
+                        vec![
+                            Span::styled(format!(" {named}"), p.bold(p.accent)),
+                            Span::styled(" · new chat", p.fg(p.faint)),
+                        ],
+                        format!("The first task of {named}, for {short_model}…"),
+                    )
+                };
+                let mut title = title;
+                title.push(Span::styled(said, p.fg(p.faint)));
+                (Line::from(title), Line::default(), hint)
             }
         };
         let inner = width.saturating_sub(4).max(1);
@@ -732,6 +1094,43 @@ mod tests {
         history.event(&event, board, p);
     }
 
+    /// The rows the panes draw at the top of the screen, as text.
+    fn headed(board: &Board, history: &History, width: u16) -> Vec<String> {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let motion = Motion::default();
+        let live = Live {
+            board,
+            history,
+            p: &p,
+            now: iq_ui::now(),
+        };
+        let height = live.head_height(30);
+        if height == 0 {
+            return Vec::new();
+        }
+        let area = Rect::new(0, 0, width, height);
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(width, height),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        terminal
+            .draw(|frame| live.draw_head(frame, &motion))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
     /// The rows the live part draws, as text.
     fn drawn(board: &Board, history: &History, width: u16) -> Vec<String> {
         let p = Palette::new(Theme::Graphite, Depth::True);
@@ -785,6 +1184,29 @@ mod tests {
         assert!(rows[1].contains("The task for claude-opus-5-5…"));
         assert!(rows[3].starts_with(" ⏵⏵ autopilot"));
         assert!(rows[3].ends_with("you"));
+        // Named before it starts, the new chat shows it at once.
+        board.run(
+            iq_ui::command::Command::Name("billing".into()),
+            iq_ui::now(),
+        );
+        let named = drawn(&board, &history, 60);
+        assert!(
+            named
+                .iter()
+                .any(|r| r.contains("The new chat is named billing")),
+            "{named:#?}"
+        );
+        assert!(
+            named.iter().any(|r| r.contains("billing · new chat")),
+            "{named:#?}"
+        );
+        assert!(
+            named
+                .iter()
+                .any(|r| r.contains("The first task of billing")),
+            "{named:#?}"
+        );
+        board.run(iq_ui::command::Command::New(None), iq_ui::now());
         crew(
             &mut board,
             &mut history,
@@ -827,14 +1249,12 @@ mod tests {
             &p,
         );
         let rows = drawn(&board, &history, 80);
-        assert!(
-            rows[0].contains("lead · anthropic/claude-opus-5-5 working…"),
-            "{}",
-            rows[0]
-        );
+        // In its chat's window, the agent is named by its model.
+        assert!(rows[0].contains("claude-opus-5-5 working…"), "{}", rows[0]);
         assert!(rows[0].contains("Esc to stop"));
         assert!(rows[0].ends_with("Reading the tes"));
-        assert!(rows[1].contains("lead asks"));
+        // Its chat's own agent, by its model, in its window.
+        assert!(rows[1].contains("claude-opus-5-5 asks"), "{}", rows[1]);
         assert!(rows[2].contains("run `git push`"));
         assert!(
             rows.iter()
@@ -905,6 +1325,155 @@ mod tests {
     }
 
     #[test]
+    fn the_switcher_shows_the_chats_used_last_in_a_box_of_its_own() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        let chats = [
+            ("login", "fix the login redirect"),
+            ("refunds", "code the refunds of the payment module"),
+            ("docs", "translate the docs"),
+            ("ci", "make the CI faster"),
+            ("api", "version the API"),
+            ("tests", "flaky tests"),
+            ("theme", "a dark theme"),
+        ];
+        for (agent, task) in chats {
+            crew(
+                &mut board,
+                &mut history,
+                Event::Joined {
+                    agent: agent.into(),
+                    model: "m".into(),
+                    by: PERSON.into(),
+                },
+                &p,
+            );
+            crew(
+                &mut board,
+                &mut history,
+                Event::Working {
+                    agent: agent.into(),
+                    prompt: task.into(),
+                },
+                &p,
+            );
+        }
+        for agent in ["docs", "refunds", "login"] {
+            board.run(iq_ui::command::Command::To(agent.into()), iq_ui::now());
+        }
+        board.press(
+            &iq_ui::keys::Chord::parse("ctrl+space").unwrap(),
+            None,
+            iq_ui::now(),
+        );
+        let rows = drawn(&board, &history, 72);
+        let at = rows.iter().position(|r| r.contains("Chats · 7")).unwrap();
+        assert!(
+            rows[at].starts_with("╭ Chats · 7 · the one used last first"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[at + 1].contains("login") && rows[at + 1].ends_with("here │"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[at + 2].contains("▸") && rows[at + 2].contains("refunds"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[at + 2].contains("code the refunds of the payment module"),
+            "{rows:#?}"
+        );
+        assert!(rows[at + 2].contains("just now"), "{rows:#?}");
+        assert!(
+            rows[at + 6].contains("Ctrl-Space or ↑ ↓ to choose"),
+            "{rows:#?}"
+        );
+        assert!(rows[at + 6].contains("2 more ↓"), "{rows:#?}");
+        assert!(rows[at + 7].starts_with("╰"), "{rows:#?}");
+    }
+
+    #[test]
+    fn agents_of_the_chat_at_work_side_by_side_have_a_pane_each() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        for (agent, model, by) in [
+            ("api", "lab/sage", PERSON),
+            ("api/tests", "lab/cheap", "api"),
+            ("api/review", "lab/sage", "api"),
+            ("docs", "lab/sage", PERSON),
+        ] {
+            crew(
+                &mut board,
+                &mut history,
+                Event::Joined {
+                    agent: agent.into(),
+                    model: model.into(),
+                    by: by.into(),
+                },
+                &p,
+            );
+            crew(
+                &mut board,
+                &mut history,
+                Event::Working {
+                    agent: agent.into(),
+                    prompt: "go".into(),
+                },
+                &p,
+            );
+        }
+        crew(
+            &mut board,
+            &mut history,
+            Event::Effort {
+                agent: "api/tests".into(),
+                effort: Some(iq_core::Effort::Low),
+            },
+            &p,
+        );
+        crew(
+            &mut board,
+            &mut history,
+            Event::Tool {
+                agent: "api/tests".into(),
+                name: "run".into(),
+                input: "pytest -q".into(),
+                output: String::new(),
+                ok: true,
+            },
+            &p,
+        );
+        board.screen_mut().talk_to("api");
+        // A share of the screen: on a taller one, taller panes, as far as
+        // a most.
+        assert_eq!(panes_height(4, 30), 12);
+        assert_eq!(panes_height(4, 50), 22);
+        assert_eq!(panes_height(2, 50), 16);
+        assert_eq!(panes_height(1, 50), 0);
+        // At the top of the screen, two to a row, each six rows tall.
+        let head = headed(&board, &history, 90);
+        let joined = head.join("\n");
+        assert_eq!(head.len(), 12, "{joined}");
+        // The chat's own agent first, by its model; those it started by
+        // their part, each with its model and effort.
+        assert!(head[0].starts_with("╭ ⠋ sage"), "{joined}");
+        assert!(head[0].contains("╭ ⠋ review · sage"), "{joined}");
+        assert!(head[6].starts_with("╭ ⠋ tests · cheap · low"), "{joined}");
+        assert!(head[7].contains("▸ run pytest -q"), "{joined}");
+        // Not in the live part, where another chat at work is said in a
+        // line, to go to.
+        let rows = drawn(&board, &history, 90).join("\n");
+        assert!(!rows.contains("╭ ⠋"), "{rows}");
+        assert!(
+            rows.contains("also at work: docs  Ctrl-Space goes there"),
+            "{rows}"
+        );
+    }
+
+    #[test]
     fn a_path_is_one_word_of_the_shell_quoted_only_when_it_must_be() {
         assert_eq!(
             shell_word("/data/iq/worktrees/lead-2"),
@@ -955,8 +1524,10 @@ mod tests {
                 &p,
             );
         }
+        // Written to, its chat's window is on the terminal.
+        board.screen_mut().talk_to("lead");
         let rows = drawn(&board, &history, 80);
-        let at = rows.iter().position(|r| r.contains("lead · m")).unwrap();
+        let at = rows.iter().position(|r| r.contains("m working…")).unwrap();
         assert_eq!(
             rows[at + 1..at + 4],
             [
@@ -1001,8 +1572,9 @@ mod tests {
         ] {
             crew(&mut quiet, &mut history, event, &p);
         }
+        quiet.screen_mut().talk_to("lead");
         let rows = drawn(&quiet, &history, 120);
-        let line = rows.iter().find(|r| r.contains("lead · m")).unwrap();
+        let line = rows.iter().find(|r| r.contains("m working…")).unwrap();
         assert!(line.ends_with("▸ read_file a.rs"), "{line}");
         assert!(!rows.iter().any(|r| r.starts_with("    ▸")));
     }

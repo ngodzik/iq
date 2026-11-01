@@ -29,6 +29,16 @@ pub enum Request {
         /// How hard it thinks, when the person chose; else as the
         /// settings say.
         effort: Option<Effort>,
+        /// Whether its name was made from its task's first words, for a
+        /// model to name it after what its work is about.
+        from_words: bool,
+    },
+    /// Have an agent answered by this model from its next turn.
+    Model {
+        /// The agent.
+        agent: String,
+        /// Its model, one of the provider's.
+        model: String,
     },
     /// Have an agent think with this effort from its next call.
     Effort {
@@ -623,6 +633,13 @@ impl CrewView {
             Event::Effort { agent, effort } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.effort = effort;
+                }
+            }
+            Event::Model { agent, model } => {
+                if let Some(view) = self.agent_mut(&agent) {
+                    view.model = model;
+                    // Its next call says which answered.
+                    view.answered.clear();
                 }
             }
         }

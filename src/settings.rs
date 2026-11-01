@@ -432,6 +432,8 @@ impl Settings {
                 .command_quiet
                 .map_or(iq_agent::COMMAND_QUIET, std::time::Duration::from_secs),
             busy_tries: self.provider_retries.unwrap_or(iq_agent::BUSY_TRIES),
+            // The cheap model that places the tasks names the chats.
+            namer: Some(self.observing()?.model),
             ..iq_agent::Settings::default()
         })
     }

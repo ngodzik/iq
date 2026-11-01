@@ -93,8 +93,11 @@ impl Chats {
             .collect()
     }
 
+    /// The file of the chat or agent `name`: an agent's name holds its
+    /// chat's and a slash, `login/review`, which no file's may, and a name
+    /// never holds a `+`.
     fn file(&self, name: &str) -> PathBuf {
-        self.folder.join(format!("{name}.json"))
+        self.folder.join(format!("{}.json", name.replace('/', "+")))
     }
 }
 
@@ -121,7 +124,9 @@ impl Keeper for Chats {
         }
         // Whole or not at all: the file is read by the next iq.
         let file = self.file(&chat.name);
-        let part = self.folder.join(format!(".{}.part", chat.name));
+        let part = self
+            .folder
+            .join(format!(".{}.part", chat.name.replace('/', "+")));
         let written = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -168,7 +173,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let chats = Chats::open(dir.path(), "github.com/org/repo");
         chats.keep(&saved("lead"));
-        chats.keep(&saved("helper"));
+        // An agent of the chat, named after it.
+        chats.keep(&saved("lead/helper"));
         let mut again = saved("lead");
         again.messages.push(Message::User("and the tests".into()));
         chats.keep(&again);
@@ -182,6 +188,12 @@ mod tests {
         );
         let file = dir.path().join("chats/github.com-org-repo/lead.json");
         assert!(file.is_file());
+        assert!(
+            dir.path()
+                .join("chats/github.com-org-repo/lead+helper.json")
+                .is_file()
+        );
+        assert!(listed.iter().any(|f| f.chat.name == "lead/helper"));
         let mode = |path: &Path| {
             std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions())
                 & 0o777
