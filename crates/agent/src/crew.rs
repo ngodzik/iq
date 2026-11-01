@@ -2397,6 +2397,16 @@ where
             if !path.is_file() || !path.canonicalize().ok()?.starts_with(&real) {
                 return None;
             }
+            // By its own name, as its folder lists it: where names are not
+            // told apart by case, `makefile` would find `Makefile`.
+            let name = path.file_name()?;
+            let listed = std::fs::read_dir(path.parent()?)
+                .ok()?
+                .flatten()
+                .any(|entry| entry.file_name() == name);
+            if !listed {
+                return None;
+            }
             self.read_quietly(&place.gate, path)
         })
     }
