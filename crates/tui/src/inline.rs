@@ -8,7 +8,9 @@
 //!
 //! The rows above are scrolled within a scrolling region that starts at
 //! the top of the screen, which terminals keep in their scrollback as they
-//! do a whole screen's.
+//! do a whole screen's. While the panes of agents at work side by side
+//! hold the top rows, the region starts below them, and what it scrolls
+//! away is not kept: the window is written again whole once they go.
 
 use std::io::{self, Write};
 
@@ -23,6 +25,8 @@ use ratatui::text::Line;
 /// The live part's place on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Inline {
+    /// The rows at the top held by the panes, none when there are none.
+    head: u16,
     /// Its first row: the screen's height less its own.
     top: u16,
     /// How many rows it takes.
@@ -35,6 +39,7 @@ impl Inline {
     /// The live part on a screen of `cols` by `rows`, empty, at its bottom.
     pub(crate) fn new(cols: u16, rows: u16) -> Inline {
         Inline {
+            head: 0,
             top: rows,
             height: 0,
             cols,
@@ -53,6 +58,17 @@ impl Inline {
         queue!(out, MoveTo(0, 0))
     }
 
+    /// Holds the `head` rows at the top for the panes, on a screen just
+    /// wiped: the conversation scrolls below them.
+    pub(crate) fn hold(&mut self, head: u16) {
+        self.head = head.min(self.rows.saturating_sub(3));
+    }
+
+    /// The rows held at the top for the panes.
+    pub(crate) fn head(&self) -> u16 {
+        self.head
+    }
+
     /// Where it is.
     pub(crate) fn area(&self) -> Rect {
         Rect::new(0, self.top, self.cols, self.height)
@@ -67,7 +83,7 @@ impl Inline {
     /// of the screen left above it, the conversation moved to stay just
     /// above it. Returns whether it changed, to be drawn again whole.
     pub(crate) fn place(&mut self, out: &mut impl Write, height: u16) -> io::Result<bool> {
-        let height = height.clamp(1, self.rows.saturating_sub(1).max(1));
+        let height = height.clamp(1, self.rows.saturating_sub(self.head + 1).max(1));
         let before = (self.top, self.height);
         let top = self.rows - height;
         self.follow(out, self.top.min(self.rows), top)?;
@@ -80,8 +96,9 @@ impl Inline {
     /// above row `to`: up, its top lines into the scrollback, or down, the
     /// rows between cleared first.
     fn follow(&self, out: &mut impl Write, from: u16, to: u16) -> io::Result<()> {
+        let first = self.head + 1;
         if to < from {
-            write!(out, "\x1b[1;{from}r")?;
+            write!(out, "\x1b[{first};{from}r")?;
             queue!(out, MoveTo(0, from - 1))?;
             for _ in to..from {
                 out.write_all(b"\n")?;
@@ -92,8 +109,8 @@ impl Inline {
                 queue!(out, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
             }
             // A reverse index at the region's top scrolls it down.
-            write!(out, "\x1b[1;{to}r")?;
-            queue!(out, MoveTo(0, 0))?;
+            write!(out, "\x1b[{first};{to}r")?;
+            queue!(out, MoveTo(0, self.head))?;
             for _ in from..to {
                 out.write_all(b"\x1bM")?;
             }
@@ -105,10 +122,10 @@ impl Inline {
     /// Writes `lines` just above the live part, the rows above it scrolled
     /// up to make room.
     pub(crate) fn insert(&mut self, out: &mut impl Write, lines: &[Line<'_>]) -> io::Result<()> {
-        if lines.is_empty() || self.top == 0 {
+        if lines.is_empty() || self.top <= self.head {
             return Ok(());
         }
-        write!(out, "\x1b[1;{}r", self.top)?;
+        write!(out, "\x1b[{};{}r", self.head + 1, self.top)?;
         queue!(out, MoveTo(0, self.top - 1))?;
         for line in lines {
             out.write_all(b"\n\r")?;
@@ -135,7 +152,10 @@ impl Inline {
         queue!(out, MoveTo(0, was), Clear(ClearType::FromCursorDown))?;
         self.cols = cols;
         self.rows = rows;
-        self.height = self.height.clamp(1, rows.saturating_sub(1).max(1));
+        self.head = self.head.min(rows.saturating_sub(3));
+        self.height = self
+            .height
+            .clamp(1, rows.saturating_sub(self.head + 1).max(1));
         let top = rows - self.height;
         self.follow(out, was, top)?;
         self.top = top;
@@ -211,5 +231,27 @@ mod tests {
         parser.process(&out);
         assert_eq!(screen(&parser), ["", "", "three", "four", "five", ""]);
         assert!(!inline.place(&mut Vec::new(), 1).unwrap());
+    }
+
+    #[test]
+    fn below_held_rows_the_conversation_scrolls_and_leaves_them_be() {
+        let size = |n: u16| std::num::NonZeroU16::new(n).unwrap();
+        let mut parser = vt100::Parser::new(size(8), size(20), 50);
+        let mut out = Vec::new();
+        let mut inline = Inline::new(20, 8);
+        inline.hold(2);
+        assert!(inline.place(&mut out, 2).unwrap());
+        // What the panes draw at the top.
+        out.extend_from_slice(b"\x1b[1;1Hpane one\x1b[2;1Hpane two");
+        let lines: Vec<Line> = ["a", "b", "c", "d", "e"]
+            .into_iter()
+            .map(Line::from)
+            .collect();
+        inline.insert(&mut out, &lines).unwrap();
+        parser.process(&out);
+        assert_eq!(
+            screen(&parser)[..8],
+            ["pane one", "pane two", "b", "c", "d", "e", "", ""]
+        );
     }
 }

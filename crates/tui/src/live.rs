@@ -33,7 +33,7 @@ const HINT_TASK_CHARS: usize = 48;
 const PANES: usize = 4;
 
 /// The lines within a pane: its latest steps, then what it writes.
-const PANE_LINES: usize = 5;
+const PANE_LINES: usize = 4;
 
 /// The most completions listed at once.
 const LISTED: usize = 6;
@@ -64,25 +64,26 @@ enum Part {
         lines: Vec<Line<'static>>,
         cursor: Option<(u16, u16)>,
     },
-    /// The agents of the chat written to at work side by side, two to a
-    /// row: each its title, its lines and its tint.
-    Panes(Vec<(Line<'static>, Vec<Line<'static>>, crate::theme::Rgb)>),
     Status,
 }
+
+/// A pane: its title, its lines and its tint.
+type Pane = (Line<'static>, Vec<Line<'static>>, crate::theme::Rgb);
 
 /// How many panes go on a row.
 fn pane_columns(panes: usize) -> usize {
     panes.clamp(1, 2)
 }
 
-/// How many lines each pane holds: as many as the fullest, two at least.
-fn pane_lines(panes: &[(Line<'static>, Vec<Line<'static>>, crate::theme::Rgb)]) -> usize {
-    panes
-        .iter()
-        .map(|(_, lines, _)| lines.len())
-        .max()
-        .unwrap_or(0)
-        .clamp(2, PANE_LINES)
+/// The rows the panes of `count` agents take at the top of the screen,
+/// the same whatever they hold, so that the screen is laid out again only
+/// as agents come and go.
+fn panes_height(count: usize) -> u16 {
+    if count < 2 {
+        return 0;
+    }
+    let count = count.min(PANES);
+    (count.div_ceil(pane_columns(count)) * (PANE_LINES + 2)) as u16
 }
 
 impl Part {
@@ -90,16 +91,74 @@ impl Part {
         match self {
             Part::Lines(lines) => lines.len() as u16,
             Part::Boxed { lines, .. } | Part::Input { lines, .. } => lines.len() as u16 + 2,
-            Part::Panes(panes) => {
-                let rows = panes.len().div_ceil(pane_columns(panes.len()));
-                (rows * (pane_lines(panes) + 2)) as u16
-            }
             Part::Status => 1,
         }
     }
 }
 
 impl Live<'_> {
+    /// The agents of the chat written to at work, its own first.
+    fn here(&self) -> Vec<&iq_ui::crew::AgentView> {
+        let window = self
+            .board
+            .screen()
+            .talking_to()
+            .and_then(|agent| chat_of(self.board, agent));
+        let mut here: Vec<_> = self
+            .board
+            .crew()
+            .agents()
+            .iter()
+            .filter(|a| a.working)
+            .filter(|a| window.is_some() && chat_of(self.board, &a.name) == window)
+            .collect();
+        here.sort_by_key(|a| (Some(&a.name) != window.as_ref(), a.name.clone()));
+        here
+    }
+
+    /// How many rows at the top of the screen the panes take: none unless
+    /// several agents of the chat written to work side by side.
+    pub(crate) fn head_height(&self) -> u16 {
+        panes_height(self.here().len())
+    }
+
+    /// Draws the panes of the agents of the chat written to at work side
+    /// by side, two to a row, as many as [`PANES`], in `frame`, whose area
+    /// is the top of the screen.
+    pub(crate) fn draw_head(&self, frame: &mut Frame<'_>, motion: &Motion) {
+        let here = self.here();
+        let count = here.len().min(PANES);
+        if count < 2 {
+            return;
+        }
+        let area = frame.area();
+        let columns = pane_columns(count);
+        let wide = area.width / columns as u16;
+        let panes: Vec<Pane> = here
+            .iter()
+            .take(PANES)
+            .map(|agent| self.pane(agent, motion, usize::from(wide)))
+            .collect();
+        let tall = (PANE_LINES + 2) as u16;
+        for (at, (title, lines, tint)) in panes.into_iter().enumerate() {
+            let (row, column) = (at / columns, at % columns);
+            let x = area.left() + column as u16 * wide;
+            // The last of a row takes what the division left.
+            let w = if column + 1 == columns {
+                area.right().saturating_sub(x)
+            } else {
+                wide
+            };
+            let y = area.top() + row as u16 * tall;
+            let pane = Rect::new(x, y, w, tall).intersection(area);
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(self.p.fg(tint))
+                .title(title);
+            frame.render_widget(Paragraph::new(lines).block(block), pane);
+        }
+    }
+
     /// How many rows the live part takes at `width`.
     pub(crate) fn height(&self, motion: &Motion, width: u16) -> u16 {
         self.parts(motion, width).iter().map(Part::rows).sum()
@@ -137,28 +196,6 @@ impl Live<'_> {
                         .title_top(spent.right_aligned());
                     frame.render_widget(Paragraph::new(lines).block(block), place);
                     cursor = at.map(|(x, line)| (place.left() + 1 + x, place.top() + 1 + line));
-                }
-                Part::Panes(panes) => {
-                    let columns = pane_columns(panes.len());
-                    let tall = pane_lines(&panes) + 2;
-                    let wide = place.width / columns as u16;
-                    for (at, (title, lines, tint)) in panes.into_iter().enumerate() {
-                        let (row, column) = (at / columns, at % columns);
-                        let x = place.left() + column as u16 * wide;
-                        // The last of a row takes what the division left.
-                        let w = if column + 1 == columns {
-                            place.right().saturating_sub(x)
-                        } else {
-                            wide
-                        };
-                        let y = place.top() + (row * tall) as u16;
-                        let pane = Rect::new(x, y, w, tall as u16).intersection(place);
-                        let block = Block::bordered()
-                            .border_type(BorderType::Rounded)
-                            .border_style(self.p.fg(tint))
-                            .title(title);
-                        frame.render_widget(Paragraph::new(lines).block(block), pane);
-                    }
                 }
                 Part::Status => status_row = Some(place),
             }
@@ -244,40 +281,24 @@ impl Live<'_> {
     /// questions coming to the person all the same.
     fn working(&self, motion: &Motion, width: usize) -> Vec<Part> {
         let p = self.p;
-        let window = self
-            .board
-            .screen()
-            .talking_to()
-            .and_then(|agent| chat_of(self.board, agent));
-        let (mut here, elsewhere): (Vec<_>, Vec<_>) = self
+        let here = self.here();
+        let elsewhere: Vec<_> = self
             .board
             .crew()
             .agents()
             .iter()
-            .filter(|a| a.working)
-            .partition(|a| window.is_some() && chat_of(self.board, &a.name) == window);
-        // The chat's own agent first, then those it started.
-        here.sort_by_key(|a| (Some(&a.name) != window.as_ref(), a.name.clone()));
+            .filter(|a| a.working && !here.iter().any(|h| h.name == a.name))
+            .collect();
         let mut parts = Vec::new();
         match here.len() {
             0 => {}
             1 => parts.push(Part::Lines(self.alone(here[0], motion, width))),
-            _ => {
-                let panes = here
-                    .iter()
-                    .take(PANES)
-                    .map(|agent| {
-                        self.pane(agent, motion, width / pane_columns(here.len().min(PANES)))
-                    })
-                    .collect();
-                parts.push(Part::Panes(panes));
-                if here.len() > PANES {
-                    parts.push(Part::Lines(vec![Line::from(Span::styled(
-                        format!("  and {} more of this chat at work", here.len() - PANES),
-                        p.fg(p.faint),
-                    ))]));
-                }
-            }
+            // Their panes are at the top of the screen.
+            more if more > PANES => parts.push(Part::Lines(vec![Line::from(Span::styled(
+                format!("  and {} more of this chat at work", more - PANES),
+                p.fg(p.faint),
+            ))])),
+            _ => {}
         }
         if !elsewhere.is_empty() {
             let mut chats: Vec<(String, usize)> = Vec::new();
@@ -417,12 +438,7 @@ impl Live<'_> {
     /// A pane of an agent of the chat written to, as several work side by
     /// side: its title, then its latest steps and what it writes, within
     /// `width` columns.
-    fn pane(
-        &self,
-        agent: &iq_ui::crew::AgentView,
-        motion: &Motion,
-        width: usize,
-    ) -> (Line<'static>, Vec<Line<'static>>, crate::theme::Rgb) {
+    fn pane(&self, agent: &iq_ui::crew::AgentView, motion: &Motion, width: usize) -> Pane {
         let p = self.p;
         let inner = width.saturating_sub(4);
         let mut title = vec![Span::raw(" ")];
@@ -1061,6 +1077,43 @@ mod tests {
         history.event(&event, board, p);
     }
 
+    /// The rows the panes draw at the top of the screen, as text.
+    fn headed(board: &Board, history: &History, width: u16) -> Vec<String> {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let motion = Motion::default();
+        let live = Live {
+            board,
+            history,
+            p: &p,
+            now: iq_ui::now(),
+        };
+        let height = live.head_height();
+        if height == 0 {
+            return Vec::new();
+        }
+        let area = Rect::new(0, 0, width, height);
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(width, height),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        terminal
+            .draw(|frame| live.draw_head(frame, &motion))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
     /// The rows the live part draws, as text.
     fn drawn(board: &Board, history: &History, width: u16) -> Vec<String> {
         let p = Palette::new(Theme::Graphite, Depth::True);
@@ -1377,22 +1430,23 @@ mod tests {
             &p,
         );
         board.screen_mut().talk_to("api");
-        let rows = drawn(&board, &history, 90);
-        let joined = rows.join("\n");
+        // At the top of the screen, two to a row, each six rows tall.
+        let head = headed(&board, &history, 90);
+        let joined = head.join("\n");
+        assert_eq!(head.len(), 12, "{joined}");
         // The chat's own agent first, by its model; those it started by
         // their part, each with its model and effort.
-        let top = rows.iter().position(|r| r.starts_with("╭ ⠋ sage")).unwrap();
-        assert!(rows[top].contains("╭ ⠋ review · sage"), "{joined}");
-        // Two to a row, as tall as the fullest needs.
+        assert!(head[0].starts_with("╭ ⠋ sage"), "{joined}");
+        assert!(head[0].contains("╭ ⠋ review · sage"), "{joined}");
+        assert!(head[6].starts_with("╭ ⠋ tests · cheap · low"), "{joined}");
+        assert!(head[7].contains("▸ run pytest -q"), "{joined}");
+        // Not in the live part, where another chat at work is said in a
+        // line, to go to.
+        let rows = drawn(&board, &history, 90).join("\n");
+        assert!(!rows.contains("╭ ⠋"), "{rows}");
         assert!(
-            rows[top + 4].starts_with("╭ ⠋ tests · cheap · low"),
-            "{joined}"
-        );
-        assert!(rows[top + 5].contains("▸ run pytest -q"), "{joined}");
-        // Another chat at work is said in a line, to go to.
-        assert!(
-            joined.contains("also at work: docs  Ctrl-Space goes there"),
-            "{joined}"
+            rows.contains("also at work: docs  Ctrl-Space goes there"),
+            "{rows}"
         );
     }
 
