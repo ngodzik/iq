@@ -25,7 +25,7 @@
 //! steps = 5                              # an agent's latest steps (tools, what was allowed) shown as it works; once it writes again only their count, Ctrl-X unfolds them; 0 none
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
-//! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set
+//! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set; the project's .claude/skills are read after them, yours winning a name both hold
 //! claude_memory = true                   # the notes kept of the project under ~/.claude read beside iq's own
 //! plugins = ["name"]                     # programs of their own iq starts and speaks with: iq-name for name, found on the PATH, run on your machine as you
 //! mermaid = "auto"                       # Mermaid diagrams drawn as images in Kitty, by mmdr (cargo install mermaid-rs-renderer) run in the sandbox; or a command with {input} and {output}; off unless set
@@ -86,6 +86,10 @@ const CLAUDE_RULES: &str = "~/.claude/CLAUDE.md";
 
 /// The folders of the person's skills unless the settings list others.
 const SKILLS: [&str; 1] = ["~/.iq/skills"];
+
+/// The project's own skills, read beside the person's whatever the settings
+/// list: never the reviewer's policy, which no workspace may hold.
+const PROJECT_SKILLS: &str = ".claude/skills";
 
 /// How many days a chat may go untouched before iq forgets it, unless the
 /// settings say.
@@ -443,13 +447,21 @@ impl Settings {
     /// The folders of the person's skills: `~/` in `home`, others in
     /// `workspace`.
     pub(crate) fn skill_folders(&self, home: &Path, workspace: &Path) -> Vec<PathBuf> {
-        self.skills
+        let mut folders: Vec<PathBuf> = self
+            .skills
             .clone()
             .unwrap_or_else(|| SKILLS.map(str::to_owned).to_vec())
             .iter()
             .filter(|folder| !folder.trim().is_empty())
             .map(|folder| placed(folder.trim(), home, workspace))
-            .collect()
+            .collect();
+        // The project's own after the person's, whose skills win where both
+        // hold one of the same name.
+        let project = workspace.join(PROJECT_SKILLS);
+        if !folders.contains(&project) {
+            folders.push(project);
+        }
+        folders
     }
 
     /// Whether the rules read are `~/.claude/CLAUDE.md`, by default: there are no
@@ -796,7 +808,10 @@ mod tests {
         assert!(!none.claude_rules_by_default(dir.path()));
         assert_eq!(
             none.skill_folders(home, work),
-            [PathBuf::from("/h/.iq/skills")]
+            [
+                PathBuf::from("/h/.iq/skills"),
+                PathBuf::from("/w/.claude/skills")
+            ]
         );
         assert!(none.claude_memory());
         let set: Settings = toml::from_str(

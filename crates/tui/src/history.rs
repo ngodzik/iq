@@ -29,12 +29,10 @@ use crate::wrap::{cut, wrap};
 /// How many lines of a message between agents are written.
 const MESSAGE_LINES: usize = 4;
 
-/// How many of a chat's last exchanges are written again as the person
-/// comes back to it.
-const RECALLED: usize = 3;
-
-/// How many lines of each answer recalled are written.
-const RECALLED_LINES: usize = 6;
+/// How many of a chat's last exchanges of an earlier session are written
+/// again as the person comes back to it: as far back as a scrollback is
+/// worth filling.
+const RECALLED: usize = 40;
 
 /// How many lines of a failed tool's output are written.
 const FAILED_LINES: usize = 3;
@@ -447,6 +445,21 @@ impl History {
                 }
                 self.set_speaker(None);
             }
+            // A line once it waits for those it started: how long, the live
+            // part says.
+            Event::Waiting { agent, on } => {
+                self.finish(agent, board, p);
+                self.header(agent, board, p);
+                let names: Vec<String> =
+                    on.iter().map(|name| self.shown_name(board, name)).collect();
+                self.push_step(Para::indented(
+                    "  ",
+                    vec![
+                        Span::styled("⧗ ", p.fg(p.info)),
+                        Span::styled(format!("waiting for {}", names.join(", ")), p.fg(p.dim)),
+                    ],
+                ));
+            }
             Event::Notice { agent, text } => {
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
@@ -543,28 +556,18 @@ impl History {
         }
     }
 
-    /// Writes again the last exchanges of a chat of an earlier session the
-    /// person comes back to: what was asked of it and what it answered,
-    /// and where its whole thread is. As iq opens on it, says that it is
-    /// the chat written to last.
+    /// Writes again a chat of an earlier session the person comes back to,
+    /// as it was shown: what was asked of it, its text as the Markdown it
+    /// is, its steps folded, what was asked of the person and answered,
+    /// the messages, the ends of its turns; from its last [`RECALLED`]
+    /// exchanges, the earlier counted, and where its whole thread is. As
+    /// iq opens on it, says that it is the chat written to last.
     pub(crate) fn recall(&mut self, recall: &iq_ui::Recall, board: &Board, p: &Palette) {
         let agent = recall.agent.as_str();
         let Some(view) = board.crew().agent(agent) else {
             return;
         };
         self.at = chat_of(board, agent);
-        let mut exchanges: Vec<(&str, Option<&str>)> = Vec::new();
-        for entry in &view.thread {
-            match entry {
-                iq_ui::crew::Entry::Prompt(text) => exchanges.push((text, None)),
-                iq_ui::crew::Entry::Text(text) if !text.trim().is_empty() => {
-                    if let Some((_, answer)) = exchanges.last_mut() {
-                        *answer = Some(text);
-                    }
-                }
-                _ => {}
-            }
-        }
         self.set_speaker(None);
         self.named(agent, board, p);
         let mut said = String::from("↺ back");
@@ -577,7 +580,15 @@ impl History {
             .map_or("/chats".to_owned(), |chord| chord.to_string());
         said.push_str(&format!(" · its whole thread: {team}, then →"));
         self.push(Para::indented("  ", vec![Span::styled(said, p.fg(p.info))]));
-        let skipped = exchanges.len().saturating_sub(RECALLED);
+        let asked: Vec<usize> = view
+            .thread
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| matches!(entry, iq_ui::crew::Entry::Prompt(_)))
+            .map(|(at, _)| at)
+            .collect();
+        let skipped = asked.len().saturating_sub(RECALLED);
+        let from = if skipped > 0 { asked[skipped] } else { 0 };
         if skipped > 0 {
             self.push(Para::indented(
                 "  ",
@@ -590,16 +601,150 @@ impl History {
                 )],
             ));
         }
-        for (asked, answer) in exchanges.iter().skip(skipped) {
-            let asked = asked
-                .trim()
-                .strip_prefix("Message from person: ")
-                .unwrap_or(asked.trim());
-            self.lines_of(asked, "  › ", p, MESSAGE_LINES);
-            if let Some(answer) = answer {
-                self.lines_of(answer, "    ", p, RECALLED_LINES);
+        let mut steps: Vec<(String, String, bool)> = Vec::new();
+        for entry in &view.thread[from..] {
+            use iq_ui::crew::Entry;
+            if !matches!(entry, Entry::Tool { .. }) {
+                self.recalled_steps(agent, &mut steps, board, p);
+            }
+            match entry {
+                Entry::Prompt(text) => {
+                    let text = text.trim();
+                    match text
+                        .strip_prefix("Message from ")
+                        .and_then(|rest| rest.split_once(": "))
+                    {
+                        Some((PERSON, said)) => self.person(said, agent, board, p),
+                        Some((from, said)) => {
+                            self.set_speaker(None);
+                            self.push(Para::indented(
+                                "  ",
+                                vec![
+                                    Span::styled("✉ ", p.fg(p.info)),
+                                    Span::styled(
+                                        self.shown_name(board, from),
+                                        p.fg(agent_tint(board, from, p)),
+                                    ),
+                                    Span::styled(" → ", p.fg(p.faint)),
+                                    Span::styled(
+                                        self.shown_name(board, agent),
+                                        p.fg(agent_tint(board, agent, p)),
+                                    ),
+                                ],
+                            ));
+                            self.lines_of(said, "    ", p, MESSAGE_LINES);
+                        }
+                        None => self.person(text, agent, board, p),
+                    }
+                }
+                Entry::Text(text) => {
+                    let mut markdown = Markdown::linking(self.links);
+                    for line in text.lines() {
+                        let out = markdown.line(line, p);
+                        self.write(agent, out, board, p);
+                    }
+                    let out = markdown.flush(p);
+                    self.write(agent, out, board, p);
+                }
+                Entry::Tool {
+                    name, input, ok, ..
+                } => steps.push((name.clone(), input.clone(), *ok)),
+                Entry::Reviewed {
+                    action,
+                    approved,
+                    why,
+                } => {
+                    self.header(agent, board, p);
+                    let (mark, colour, did) = if *approved {
+                        ("✓ ", p.ok, "allowed")
+                    } else {
+                        ("✗ ", p.bad, "refused")
+                    };
+                    self.push_step(Para {
+                        first: vec![Span::raw("  "), Span::styled(mark, p.fg(colour))],
+                        rest: vec![Span::raw("    ")],
+                        body: vec![Span::styled(
+                            format!("the reviewer {did} {}: {}", short(action), short(why)),
+                            p.fg(p.dim),
+                        )],
+                    });
+                }
+                Entry::Asked { action, answer, .. } => {
+                    self.header(agent, board, p);
+                    let said = match answer {
+                        Some(true) => "you allowed",
+                        Some(false) => "you refused",
+                        None => "asked you, unanswered:",
+                    };
+                    self.push_step(Para {
+                        first: vec![Span::raw("  "), Span::styled("? ", p.fg(p.warn))],
+                        rest: vec![Span::raw("    ")],
+                        body: vec![Span::styled(
+                            format!("{said} {}", short(action)),
+                            p.fg(p.dim),
+                        )],
+                    });
+                }
+                Entry::Message { from, to, text } => {
+                    if to == PERSON {
+                        self.header(from, board, p);
+                        self.push(Para::indented(
+                            "  ",
+                            vec![Span::styled("✉ to you", p.fg(p.info))],
+                        ));
+                        let mut markdown = Markdown::linking(self.links);
+                        for line in text.lines() {
+                            let out = markdown.line(line, p);
+                            self.write(from, out, board, p);
+                        }
+                        let out = markdown.flush(p);
+                        self.write(from, out, board, p);
+                    } else if from != agent || to != agent {
+                        self.set_speaker(None);
+                        self.push(Para::indented(
+                            "  ",
+                            vec![
+                                Span::styled("✉ ", p.fg(p.info)),
+                                Span::styled(
+                                    self.shown_name(board, from),
+                                    p.fg(agent_tint(board, from, p)),
+                                ),
+                                Span::styled(" → ", p.fg(p.faint)),
+                                Span::styled(
+                                    self.shown_name(board, to),
+                                    p.fg(agent_tint(board, to, p)),
+                                ),
+                            ],
+                        ));
+                        self.lines_of(text, "    ", p, MESSAGE_LINES);
+                    }
+                }
+                Entry::Notice(text) => {
+                    self.header(agent, board, p);
+                    self.push(Para {
+                        first: vec![Span::raw("  "), Span::styled("! ", p.fg(p.warn))],
+                        rest: vec![Span::raw("    ")],
+                        body: vec![Span::styled(short(text), p.fg(p.dim))],
+                    });
+                }
+                Entry::Done(outcome) => {
+                    self.header(agent, board, p);
+                    self.blank();
+                    match outcome {
+                        Ok(_) => {
+                            self.push(Para::indented("  ", vec![Span::styled("✔", p.fg(p.ok))]))
+                        }
+                        Err(error) => self.push(Para {
+                            first: vec![Span::raw("  "), Span::styled("✘ stopped: ", p.fg(p.bad))],
+                            rest: vec![Span::raw("    ")],
+                            body: vec![Span::styled(short(error), p.fg(p.dim))],
+                        }),
+                    }
+                    self.set_speaker(None);
+                }
             }
         }
+        self.recalled_steps(agent, &mut steps, board, p);
         if recall.opening {
             let others = board.crew().chats().count().saturating_sub(1);
             let mut said = format!("you write to {agent}, the chat you wrote to last");
@@ -615,6 +760,62 @@ impl History {
             ));
         }
         self.set_speaker(None);
+    }
+
+    /// Writes the steps of a chat coming back since its last line, as a
+    /// fold is written once its agent goes on: one step as itself, more as
+    /// their count, by tool.
+    fn recalled_steps(
+        &mut self,
+        agent: &str,
+        steps: &mut Vec<(String, String, bool)>,
+        board: &Board,
+        p: &Palette,
+    ) {
+        if steps.is_empty() {
+            return;
+        }
+        let taken = std::mem::take(steps);
+        self.header(agent, board, p);
+        let body = match taken.as_slice() {
+            [(name, input, ok)] => {
+                let colour = if *ok { p.dim } else { p.bad };
+                vec![
+                    Span::styled(name.clone(), p.fg(p.text)),
+                    Span::styled(format!(" {}", short(input)), p.fg(colour)),
+                ]
+            }
+            all => {
+                let mut tools: Vec<(String, usize)> = Vec::new();
+                for (name, _, _) in all {
+                    match tools.iter_mut().find(|(seen, _)| seen == name) {
+                        Some((_, count)) => *count += 1,
+                        None => tools.push((name.clone(), 1)),
+                    }
+                }
+                let named: Vec<String> = tools
+                    .iter()
+                    .map(|(name, count)| {
+                        if *count > 1 {
+                            format!("{name} ×{count}")
+                        } else {
+                            name.clone()
+                        }
+                    })
+                    .collect();
+                let failed = all.iter().filter(|(_, _, ok)| !ok).count();
+                let mut said = format!("{} steps: {}", all.len(), named.join(", "));
+                if failed > 0 {
+                    said.push_str(&format!(", {failed} failed"));
+                }
+                vec![Span::styled(said, p.fg(p.dim))]
+            }
+        };
+        self.push_step(Para {
+            first: vec![Span::raw("  "), Span::styled("▸ ", p.fg(p.faint))],
+            rest: vec![Span::raw("    ")],
+            body,
+        });
     }
 
     /// Something said to the person by iq itself, in passing.
@@ -1058,6 +1259,7 @@ fn agent_of(event: &Event) -> Option<&str> {
         | Event::Asked { agent, .. }
         | Event::Reviewed { agent, .. }
         | Event::Done { agent, .. }
+        | Event::Waiting { agent, .. }
         | Event::Notice { agent, .. } => Some(agent),
         Event::Posted { from, .. } => Some(from),
         Event::Renamed { to, .. } => Some(to),
@@ -1325,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chat_come_back_to_has_its_last_exchanges_written_again() {
+    fn a_chat_come_back_to_is_written_as_it_was_shown() {
         use iq_ui::crew::{Back, Entry};
         let p = Palette::new(Theme::Graphite, Depth::True);
         let mut board = Board::default();
@@ -1353,6 +1555,7 @@ mod tests {
             });
             thread.push(Entry::Text(format!("answer {n}")));
         }
+        thread.push(Entry::Text("| a | b |\n|---|---|\n| one | two |".into()));
         // An agent a chat started, back with it, did not join now.
         crew(
             &mut board,
@@ -1380,23 +1583,45 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert_eq!(
-            lines,
+        let mut shown: Vec<String> = [
+            "",
+            // In its own window, the chat's agent is named by its model.
+            "● model",
+            "  ↺ back, at work just now · its whole thread: Ctrl-T, then →",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        // Each exchange as it was shown: what was asked, the agent, its
+        // step folded, its answer.
+        for n in 1..=4 {
+            shown.extend([
+                String::new(),
+                format!("› ask {n}"),
+                String::new(),
+                "● model".to_owned(),
+                "  ▸ run make test".to_owned(),
+                String::new(),
+                format!("  answer {n}"),
+            ]);
+        }
+        shown.extend(
             [
-                "",
-                // In its own window, the chat's agent is named by its model.
-                "● model",
-                "  ↺ back, at work just now · its whole thread: Ctrl-T, then →",
-                "  … 1 exchange before",
-                "  › ask 2",
-                "    answer 2",
-                "  › ask 3",
-                "    answer 3",
-                "  › ask 4",
-                "    answer 4",
+                "  a   │ b",
+                "  ────┼────",
+                "  one │ two",
                 "  you write to login, the chat you wrote to last; Ctrl-T or /chats lists the 1 other",
             ]
+            .map(str::to_owned),
         );
+        let trimmed: Vec<String> = lines.iter().map(|l| l.trim_end().to_owned()).collect();
+        assert_eq!(trimmed, shown);
+        // Gone to again, its window is the same conversation.
+        let again: Vec<String> = history
+            .window(100, Some("login"))
+            .iter()
+            .map(|l| l.to_string().trim_end().to_owned())
+            .collect();
+        assert!(again.ends_with(&trimmed), "{again:#?}");
         // Its next turn, woken by the person's message, is not written as
         // a task of its own.
         crew(

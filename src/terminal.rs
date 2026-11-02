@@ -110,6 +110,7 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
             Err(error) => writeln!(out, "\n✘ {agent} stopped: {error}"),
         },
         Event::Notice { agent, text } => writeln!(out, "\n! {agent}: {text}"),
+        Event::Waiting { agent, on } => writeln!(out, "  ⧗ {agent} waits for {}", on.join(", ")),
         Event::Renamed { from, to } => writeln!(out, "\n! {from} is called {to} now"),
         Event::Model { agent, model } => writeln!(out, "\n! {agent} answers on {model} now"),
         Event::Placed {

@@ -1975,6 +1975,19 @@ async fn an_agent_waiting_for_those_it_started_waits_until_they_write() {
     let seen = f.model.seen_by("lead");
     assert!(seen.contains("Message from lead/2: done, slowly"), "{seen}");
     assert!(!seen.contains("No message came"), "{seen}");
+    // Whom it waited for was said, once.
+    let waits: Vec<Event> = f
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Waiting { .. }))
+        .collect();
+    assert_eq!(
+        waits,
+        [Event::Waiting {
+            agent: "lead".into(),
+            on: vec!["lead/2".into()],
+        }]
+    );
     // One call to wait, not one every second.
     assert_eq!(f.model.requests_of("lead").len(), 3);
 }

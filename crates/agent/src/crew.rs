@@ -1616,6 +1616,16 @@ where
         Ok(())
     }
 
+    /// Whether a message to `agent` waits for it, left unread.
+    fn has_unread(&self, agent: &str) -> bool {
+        let board = lock(&self.inner.board);
+        board.members.get(agent).is_some_and(|member| {
+            board.messages[member.read..]
+                .iter()
+                .any(|m| m.from != agent && (m.to == agent || m.to == ALL))
+        })
+    }
+
     /// The messages to `agent` it has not read, as one text, marked read.
     fn unread(&self, agent: &str) -> Option<String> {
         let mut board = lock(&self.inner.board);
@@ -1648,6 +1658,16 @@ where
     async fn wait(&self, agent: &str, seconds: u64) -> String {
         let mut posted = self.inner.posted.subscribe();
         let started = tokio::time::Instant::now();
+        // Said once, unless a message is there already: who it waits for.
+        if !self.has_unread(agent) {
+            let on = self.at_work_by(agent);
+            if !on.is_empty() {
+                self.report(Event::Waiting {
+                    agent: agent.to_owned(),
+                    on,
+                });
+            }
+        }
         let most = started + Duration::from_secs(tools::WAIT_MOST);
         let mut seen: Option<tokio::time::Instant> = None;
         loop {
@@ -1683,9 +1703,22 @@ where
 
     /// Whether an agent `agent` started works.
     fn started_at_work(&self, agent: &str) -> bool {
-        lock(&self.inner.board).members.values().any(|member| {
-            member.by == agent && member.turn.as_ref().is_some_and(|turn| !turn.is_finished())
-        })
+        !self.at_work_by(agent).is_empty()
+    }
+
+    /// The agents `agent` started that are at work, by name.
+    fn at_work_by(&self, agent: &str) -> Vec<String> {
+        let board = lock(&self.inner.board);
+        let mut names: Vec<String> = board
+            .members
+            .iter()
+            .filter(|(_, member)| {
+                member.by == agent && member.turn.as_ref().is_some_and(|turn| !turn.is_finished())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Starts a turn of `agent`'s on `prompt`.

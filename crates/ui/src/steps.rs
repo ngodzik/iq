@@ -183,6 +183,8 @@ impl Steps {
                 let agent = if from == PERSON { to } else { from };
                 self.close(agent);
             }
+            // It waits; what it did before is still its fold.
+            Event::Waiting { .. } => {}
             Event::Renamed { from, to } => {
                 for fold in &mut self.folds {
                     if fold.agent == *from {

@@ -148,6 +148,14 @@ pub enum Event {
         /// Its answer, or why it failed.
         outcome: Result<String, String>,
     },
+    /// An agent waits for the agents it started to write: none of them
+    /// has yet, and they work.
+    Waiting {
+        /// The agent that waits.
+        agent: String,
+        /// Those it waits for, at work.
+        on: Vec<String>,
+    },
     /// Something the person should know about how an agent works.
     Notice {
         /// The agent.
@@ -193,6 +201,10 @@ impl Event {
             | Event::Reviewed { agent, .. }
             | Event::Done { agent, .. }
             | Event::Notice { agent, .. } => renamed(agent),
+            Event::Waiting { agent, on } => {
+                renamed(agent);
+                on.iter_mut().for_each(renamed);
+            }
         }
     }
 }

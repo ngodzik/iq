@@ -189,6 +189,17 @@ pub struct AgentView {
     pub task: String,
     /// When it last worked, in seconds since 1970; never yet when none.
     pub worked: Option<u64>,
+    /// Whom it waits for, while it waits for the agents it started.
+    pub waiting: Option<Waiting>,
+}
+
+/// An agent waiting for the agents it started to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Waiting {
+    /// Those it waits for.
+    pub on: Vec<String>,
+    /// Since when, in seconds since 1970.
+    pub since: u64,
 }
 
 /// A chat of an earlier session, back on the board as it was kept.
@@ -464,6 +475,7 @@ impl CrewView {
                     place: None,
                     task: String::new(),
                     worked: None,
+                    waiting: None,
                 });
             }
             Event::Working { agent, prompt } => {
@@ -513,11 +525,21 @@ impl CrewView {
                 ok,
             } => {
                 if let Some(view) = self.agent_mut(&agent) {
+                    // Its wait, when it waited, ended with this call.
+                    view.waiting = None;
                     view.thread.push(Entry::Tool {
                         name,
                         input,
                         output,
                         ok,
+                    });
+                }
+            }
+            Event::Waiting { agent, on } => {
+                if let Some(view) = self.agent_mut(&agent) {
+                    view.waiting = Some(Waiting {
+                        on,
+                        since: crate::now(),
                     });
                 }
             }
@@ -596,6 +618,7 @@ impl CrewView {
             Event::Done { agent, outcome } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.working = false;
+                    view.waiting = None;
                     view.worked = Some(crate::now());
                     view.thread.push(Entry::Done(outcome));
                 }
@@ -607,6 +630,11 @@ impl CrewView {
                     }
                     if view.by == from {
                         view.by.clone_from(&to);
+                    }
+                    for name in view.waiting.iter_mut().flat_map(|w| w.on.iter_mut()) {
+                        if *name == from {
+                            name.clone_from(&to);
+                        }
                     }
                 }
                 for question in &mut self.questions {
