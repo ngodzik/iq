@@ -51,6 +51,9 @@ const JOB_SHOWN: usize = 4000;
 /// How many wakes an agent may wait for at once.
 const WAKES_MOST: usize = 3;
 
+/// How many wakes an agent may ask for within an hour.
+const WAKES_PER_HOUR: usize = 12;
+
 /// How often two agents may wake each other in [`PEER_SPAN`], whichever
 /// writes: more, and they talk on without the work moving, on the
 /// person's money.
@@ -249,8 +252,41 @@ struct Inner<M> {
     /// The commands left to run in the background, by number.
     jobs: Mutex<HashMap<u64, Job>>,
     next_job: AtomicU64,
-    /// The wakes agents asked for, each agent's count.
-    wakes: Mutex<HashMap<String, usize>>,
+    /// The wakes agents asked for, each agent's.
+    wakes: Mutex<HashMap<String, Wakes>>,
+}
+
+/// The wakes an agent asked for: how many wait, and when it asked those of
+/// the last hour.
+#[derive(Debug, Default)]
+struct Wakes {
+    waiting: usize,
+    asked: Vec<Instant>,
+}
+
+impl Wakes {
+    /// Whether one more may be asked at `now`: as many as [`WAKES_MOST`]
+    /// waiting, as many as [`WAKES_PER_HOUR`] asked within an hour, so that
+    /// an agent waking itself again and again is held, each wake a call.
+    /// Counted when it may.
+    fn ask(&mut self, now: Instant) -> Result<(), String> {
+        self.asked
+            .retain(|at| now.duration_since(*at) < Duration::from_secs(3600));
+        if self.waiting >= WAKES_MOST {
+            return Err(format!(
+                "you already asked to be woken {WAKES_MOST} times: wait for those"
+            ));
+        }
+        if self.asked.len() >= WAKES_PER_HOUR {
+            return Err(format!(
+                "you asked to be woken {WAKES_PER_HOUR} times within the hour: end your turn, \
+                 and what you wait for, or the person, wakes you"
+            ));
+        }
+        self.waiting += 1;
+        self.asked.push(now);
+        Ok(())
+    }
 }
 
 /// A command an agent left to run in the background.
@@ -2727,16 +2763,10 @@ where
 
     /// Wakes `agent` after `seconds`, saying `why`; a few at a time.
     fn wake_me(&self, agent: &str, seconds: u64, why: String) -> Result<String, String> {
-        {
-            let mut wakes = lock(&self.inner.wakes);
-            let count = wakes.entry(agent.to_owned()).or_default();
-            if *count >= WAKES_MOST {
-                return Err(format!(
-                    "you already asked to be woken {WAKES_MOST} times: wait for those"
-                ));
-            }
-            *count += 1;
-        }
+        lock(&self.inner.wakes)
+            .entry(agent.to_owned())
+            .or_default()
+            .ask(Instant::now())?;
         self.report(Event::Notice {
             agent: agent.to_owned(),
             text: format!("asked to be woken in {}: {why}", short_span(seconds)),
@@ -2745,8 +2775,8 @@ where
         let name = agent.to_owned();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(seconds)).await;
-            if let Some(count) = lock(&crew.inner.wakes).get_mut(&name) {
-                *count = count.saturating_sub(1);
+            if let Some(wakes) = lock(&crew.inner.wakes).get_mut(&name) {
+                wakes.waiting = wakes.waiting.saturating_sub(1);
             }
             crew.iq_says(&name, format!("You asked to be woken now: {why}"));
         });
@@ -3547,6 +3577,30 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_waking_itself_again_and_again_is_held_within_the_hour() {
+        let mut wakes = Wakes::default();
+        let start = Instant::now();
+        // Three at a time.
+        for _ in 0..WAKES_MOST {
+            assert!(wakes.ask(start).is_ok());
+        }
+        assert!(wakes.ask(start).unwrap_err().contains("wait for those"));
+        // Each fired, it asks again: as many as twelve within the hour.
+        let mut at = start;
+        loop {
+            wakes.waiting = 0;
+            at += Duration::from_secs(60);
+            if wakes.ask(at).is_err() {
+                break;
+            }
+        }
+        assert_eq!(wakes.asked.len(), WAKES_PER_HOUR);
+        assert!(wakes.ask(at).unwrap_err().contains("within the hour"));
+        // An hour on, it may again.
+        assert!(wakes.ask(at + Duration::from_secs(3600)).is_ok());
+    }
 
     #[test]
     fn an_agent_is_told_where_its_models_price_rises() {

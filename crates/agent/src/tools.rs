@@ -118,7 +118,8 @@ pub(crate) fn work() -> Vec<ToolSpec> {
             description:
                 "Wakes you after `seconds` (ten at least, an hour at most), with `why`: to \
                           look again at something outside iq that takes its time, a deploy or a \
-                          CI run, rather than waiting in a command. End your turn after it."
+                          CI run, rather than waiting in a command; three waiting at once, \
+                          twelve within an hour. End your turn after it."
                     .into(),
             parameters: json!({
                 "type": "object",

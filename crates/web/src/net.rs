@@ -129,7 +129,10 @@ async fn sent(
 ) -> Result<reqwest::Response, WebError> {
     let at = resolved(url).await?;
     let host = url.host_str().unwrap_or_default().to_owned();
+    // No proxy of the environment's: one would connect where it resolves,
+    // past the address checked.
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .resolve(&host, at)
         .timeout(PAGE_WITHIN)
