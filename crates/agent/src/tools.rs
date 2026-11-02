@@ -81,7 +81,11 @@ pub(crate) fn work() -> Vec<ToolSpec> {
                           another command that needs the machine, as a make target starting \
                           containers, ask with `host`. Never get around a refusal by \
                           downloading or building a replacement. Its output comes back, errors \
-                          included."
+                          included. With `background`, a long command that needs no attention \
+                          meanwhile (a whole test suite, checks against several environments, a \
+                          CI run watched to its end) is judged the same and left to run, \
+                          for up to two hours: you get its number at once, `job` reads its \
+                          output so far or stops it, and you are woken when it ends."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -89,8 +93,40 @@ pub(crate) fn work() -> Vec<ToolSpec> {
                     "command": {"type": "string"},
                     "network": {"type": "boolean"},
                     "host": {"type": "boolean"},
+                    "background": {"type": "boolean"},
                 },
                 "required": ["command"],
+            }),
+        },
+        ToolSpec {
+            name: "job".into(),
+            description: "A command you left to run in the background, by its number: how long it \
+                          has run or how it ended, and the end of its output so far; with \
+                          `stop`, it is stopped."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "stop": {"type": "boolean"},
+                },
+                "required": ["id"],
+            }),
+        },
+        ToolSpec {
+            name: "wake_me".into(),
+            description:
+                "Wakes you after `seconds` (ten at least, an hour at most), with `why`: to \
+                          look again at something outside iq that takes its time, a deploy or a \
+                          CI run, rather than waiting in a command. End your turn after it."
+                    .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "seconds": {"type": "integer"},
+                    "why": {"type": "string"},
+                },
+                "required": ["seconds", "why"],
             }),
         },
     ]

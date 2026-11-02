@@ -399,6 +399,21 @@ impl Sandbox {
     ///
     /// [`Gate::give`]: crate::Gate::give
     pub async fn run(&self, permit: Permit) -> Result<Ran, GateError> {
+        self.run_with(permit, &Live::default()).await
+    }
+
+    /// Runs the command `permit` allows as [`Sandbox::run`] does, what it
+    /// writes readable in `live` as it comes: a command left to run in the
+    /// background, read before it ends.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sandbox::run`].
+    pub async fn run_live(&self, permit: Permit, live: &Live) -> Result<Ran, GateError> {
+        self.run_with(permit, live).await
+    }
+
+    async fn run_with(&self, permit: Permit, live: &Live) -> Result<Ran, GateError> {
         let Action::Run {
             line,
             folder,
@@ -490,7 +505,18 @@ impl Sandbox {
         }
         let mut stopping = Stopping(group);
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let ended = waited(&mut child, stdout, stderr, self.timeout, self.quiet).await;
+        if let Ok(mut redactor) = live.redactor.lock() {
+            *redactor = Some(Redactor::new(std::env::vars_os(), workspace));
+        }
+        let ended = waited(
+            &mut child,
+            stdout,
+            stderr,
+            self.timeout,
+            self.quiet,
+            Arc::clone(&live.out),
+        )
+        .await;
         stopping.0 = None;
         if let Some(group) = group {
             if ended.stopped.is_some() {
@@ -541,6 +567,32 @@ impl Sandbox {
     }
 }
 
+/// What a command run in the background has written so far, readable as
+/// it runs, its secrets taken out as its output's are.
+#[derive(Debug, Clone, Default)]
+pub struct Live {
+    out: Arc<Mutex<Vec<u8>>>,
+    redactor: Arc<Mutex<Option<Redactor>>>,
+}
+
+impl Live {
+    /// The end of what it wrote so far, as many as `bytes`, its secrets
+    /// taken out.
+    #[must_use]
+    pub fn so_far(&self, bytes: usize) -> String {
+        let written = self
+            .out
+            .lock()
+            .map(|out| String::from_utf8_lossy(&out).into_owned())
+            .unwrap_or_default();
+        let redacted = match self.redactor.lock().ok().and_then(|r| r.clone()) {
+            Some(redactor) => redactor.redact(&written),
+            None => written,
+        };
+        tail(&redacted, bytes)
+    }
+}
+
 /// How a command ended: its status when it ended on its own, else why it
 /// was stopped; and what it wrote.
 struct Ended {
@@ -560,10 +612,10 @@ async fn waited(
     stderr: Option<tokio::process::ChildStderr>,
     timeout: Duration,
     quiet: Duration,
+    out: Arc<Mutex<Vec<u8>>>,
 ) -> Ended {
     let started = Instant::now();
     let last = Arc::new(Mutex::new(Instant::now()));
-    let out = Arc::new(Mutex::new(Vec::new()));
     let err = Arc::new(Mutex::new(Vec::new()));
     let readers = [
         stdout.map(|pipe| tokio::spawn(reading(pipe, Arc::clone(&out), Arc::clone(&last)))),

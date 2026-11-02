@@ -312,6 +312,28 @@ impl Live<'_> {
         if let Some(own) = self.own() {
             parts.push(Part::Lines(self.alone(own, motion, width)));
         }
+        // What the chat's agents left to run in the background.
+        let window = self.window();
+        for job in self
+            .board
+            .crew()
+            .jobs()
+            .iter()
+            .filter(|job| window.is_some() && self.board.crew().chat_of(&job.agent) == window)
+        {
+            parts.push(Part::Lines(vec![fit(
+                vec![
+                    Span::styled(format!("  {} ", motion.spinner()), p.fg(p.info)),
+                    Span::styled(format!("job {} ", job.id), p.fg(p.dim)),
+                    Span::styled(short(&job.line), p.fg(p.text)),
+                    Span::styled(
+                        format!(" · {}", seconds(self.now.saturating_sub(job.since))),
+                        p.fg(p.faint),
+                    ),
+                ],
+                width,
+            )]));
+        }
         let more = self.started().len().saturating_sub(PANES);
         if more > 0 {
             parts.push(Part::Lines(vec![Line::from(Span::styled(

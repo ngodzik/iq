@@ -180,6 +180,19 @@ pub enum Entry {
     },
 }
 
+/// A command an agent left to run in the background, while it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobView {
+    /// The agent.
+    pub agent: String,
+    /// Its number.
+    pub id: u64,
+    /// The command line.
+    pub line: String,
+    /// Since when, in seconds since 1970.
+    pub since: u64,
+}
+
 /// A question with choices an agent asks the person.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
@@ -343,6 +356,8 @@ pub struct CrewView {
     questions: Vec<Question>,
     /// The questions with choices waiting for the person, the oldest first.
     choices: Vec<Choice>,
+    /// The commands agents left to run in the background, while they run.
+    jobs: Vec<JobView>,
     autopilot: bool,
     internet: bool,
     /// The lead's model and the reviewer's, as the program starts them.
@@ -403,6 +418,12 @@ impl CrewView {
     #[must_use]
     pub fn choices(&self) -> &[Choice] {
         &self.choices
+    }
+
+    /// The commands agents left to run in the background, while they run.
+    #[must_use]
+    pub fn jobs(&self) -> &[JobView] {
+        &self.jobs
     }
 
     /// The person's chat `agent` is part of: itself when the person started
@@ -591,6 +612,13 @@ impl CrewView {
                     });
                 }
             }
+            Event::JobStarted { agent, id, line } => self.jobs.push(JobView {
+                agent,
+                id,
+                line,
+                since: crate::now(),
+            }),
+            Event::JobEnded { id, .. } => self.jobs.retain(|job| job.id != id),
             Event::Choose {
                 id,
                 agent,
@@ -723,6 +751,11 @@ impl CrewView {
                 for choice in &mut self.choices {
                     if choice.agent == from {
                         choice.agent.clone_from(&to);
+                    }
+                }
+                for job in &mut self.jobs {
+                    if job.agent == from {
+                        job.agent.clone_from(&to);
                     }
                 }
             }

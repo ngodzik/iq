@@ -2232,3 +2232,48 @@ async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
         answer: Some("staging".into())
     }));
 }
+
+#[tokio::test]
+async fn a_command_left_in_the_background_returns_at_once_and_its_end_wakes_its_agent() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "run",
+                    serde_json::json!({"command": "make test", "background": true}),
+                ),
+                say("It runs; I will look when it ends."),
+                // Woken by its end.
+                say("It could not run."),
+            ],
+        )],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "test it all".into(), PERSON);
+    for _ in 0..6 {
+        f.settled().await;
+    }
+    let seen = f.model.seen_by("lead");
+    assert!(
+        seen.contains("Job 1 runs `make test` in the background"),
+        "{seen}"
+    );
+    // Nothing here starts the sandbox: it ends at once, and says so.
+    assert!(
+        seen.contains("Message from iq: Job 1, `make test`, ended: it could not run"),
+        "{seen}"
+    );
+    let events = f.events();
+    assert!(events.contains(&Event::JobStarted {
+        agent: "lead".into(),
+        id: 1,
+        line: "make test".into(),
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::JobEnded { id: 1, .. }))
+    );
+}

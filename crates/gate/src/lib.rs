@@ -61,5 +61,5 @@ pub fn holds_secrets(path: &std::path::Path, home: Option<&std::path::Path>) -> 
 }
 
 pub use sandbox::{
-    HELPER_FLAG, HOLD_FLAG, Helper, Ran, Sandbox, helper_failure, hold_network, sandboxed,
+    HELPER_FLAG, HOLD_FLAG, Helper, Live, Ran, Sandbox, helper_failure, hold_network, sandboxed,
 };

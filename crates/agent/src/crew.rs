@@ -35,6 +35,22 @@ pub type Report = Arc<dyn Fn(Event) + Send + Sync>;
 /// Everyone on the board: a message to `all` reaches every agent.
 pub const ALL: &str = "all";
 
+/// Who writes iq's own messages to an agent: a job it left that ended, a
+/// wake it asked for.
+const IQ: &str = "iq";
+
+/// How long a command left to run in the background may run.
+const BACKGROUND_MOST: Duration = Duration::from_secs(2 * 3600);
+
+/// How long it may write nothing: a CI run watched may be quiet a while.
+const BACKGROUND_QUIET: Duration = Duration::from_secs(30 * 60);
+
+/// How much of a job's output an agent is shown, in bytes.
+const JOB_SHOWN: usize = 4000;
+
+/// How many wakes an agent may wait for at once.
+const WAKES_MOST: usize = 3;
+
 /// How often two agents may wake each other in [`PEER_SPAN`], whichever
 /// writes: more, and they talk on without the work moving, on the
 /// person's money.
@@ -230,6 +246,23 @@ struct Inner<M> {
     images: Mutex<HashMap<String, Vec<Message>>>,
     /// The questions with choices waiting for the person.
     choices: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
+    /// The commands left to run in the background, by number.
+    jobs: Mutex<HashMap<u64, Job>>,
+    next_job: AtomicU64,
+    /// The wakes agents asked for, each agent's count.
+    wakes: Mutex<HashMap<String, usize>>,
+}
+
+/// A command an agent left to run in the background.
+struct Job {
+    agent: String,
+    line: String,
+    started: Instant,
+    live: iq_gate::Live,
+    /// Its task, while it runs.
+    running: Option<JoinHandle<()>>,
+    /// How it ended, once it did.
+    ended: Option<String>,
 }
 
 /// Where agents work: the gate that judges their actions there, and the
@@ -412,6 +445,9 @@ where
                 shown: Mutex::new(HashMap::new()),
                 images: Mutex::new(HashMap::new()),
                 choices: Mutex::new(HashMap::new()),
+                jobs: Mutex::new(HashMap::new()),
+                next_job: AtomicU64::new(1),
+                wakes: Mutex::new(HashMap::new()),
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
                 peer_wakes: Mutex::new(Vec::new()),
@@ -1517,6 +1553,8 @@ where
         let Some(agent) = lock(&self.inner.board).named(agent) else {
             return;
         };
+        // What it left to run stops with it.
+        self.stop_jobs(Some(&agent));
         let Some(turn) = self.halt(&agent) else {
             return;
         };
@@ -1563,6 +1601,7 @@ where
     /// running stopped with the sandboxes, in every place.
     pub async fn end(&self) {
         self.stop_all();
+        self.stop_jobs(None);
         let mut places = vec![Arc::clone(&self.inner.place)];
         for member in lock(&self.inner.board).members.values() {
             if !places.iter().any(|place| Arc::ptr_eq(place, &member.place)) {
@@ -2210,12 +2249,15 @@ where
             "run" => {
                 let line = args.text("command")?.to_owned();
                 let action = Action::Run {
-                    line,
+                    line: line.clone(),
                     folder: workspace,
                     network: args.flag("network"),
                     host: args.flag("host"),
                 };
                 let permit = self.act(agent, action).await?;
+                if args.flag("background") {
+                    return Ok(self.background(agent, line, permit));
+                }
                 self.run(agent, permit, OWN_ASK).await.map(|(text, _)| text)
             }
             _ => self.board_tool(agent, name, args).await,
@@ -2285,6 +2327,15 @@ where
                     .unwrap_or(tools::WAIT_SECONDS)
                     .min(tools::WAIT_MOST);
                 Ok(self.wait(agent, seconds).await)
+            }
+            "job" => {
+                let id = args.number("id").ok_or("`id` names the job")?;
+                Ok(self.job(agent, id, args.flag("stop")))
+            }
+            "wake_me" => {
+                let seconds = args.number("seconds").unwrap_or(60).clamp(10, 3600);
+                let why = args.text("why")?.trim().to_owned();
+                self.wake_me(agent, seconds, why)
             }
             "ask_person" => {
                 let question = args.text("question")?.trim().to_owned();
@@ -2514,6 +2565,185 @@ where
                 self.refused(agent, &gate, pending, Approver::Person, &why);
                 Err(refusal("the gate", &why, true))
             }
+        }
+    }
+
+    /// Leaves the command `permit` allows, `line`, to run in the background
+    /// for `agent`, as long as two hours: it is woken with how it ended.
+    fn background(&self, agent: &str, line: String, permit: Permit) -> String {
+        let id = self.inner.next_job.fetch_add(1, Ordering::Relaxed);
+        let live = iq_gate::Live::default();
+        let sandbox = self
+            .place_of(agent)
+            .sandbox
+            .clone()
+            .with_timeout(BACKGROUND_MOST)
+            .with_quiet(BACKGROUND_QUIET);
+        let crew = self.clone();
+        let (name, kept_line, watched) = (agent.to_owned(), line.clone(), live.clone());
+        let running = tokio::spawn(async move {
+            let said = match sandbox.run_live(permit, &watched).await {
+                Ok(ran) if ran.timed_out => "it was stopped, out of time".to_owned(),
+                Ok(ran) => match ran.status {
+                    Some(status) => format!("exit status {status}"),
+                    None => "ended by a signal".to_owned(),
+                },
+                Err(error) => format!("it could not run: {}", chain(&error)),
+            };
+            crew.job_ended(&name, id, &kept_line, said);
+        });
+        lock(&self.inner.jobs).insert(
+            id,
+            Job {
+                agent: agent.to_owned(),
+                line: line.clone(),
+                started: Instant::now(),
+                live,
+                running: Some(running),
+                ended: None,
+            },
+        );
+        self.report(Event::JobStarted {
+            agent: agent.to_owned(),
+            id,
+            line: line.clone(),
+        });
+        format!(
+            "Job {id} runs `{line}` in the background. `job` with id {id} reads its output so \
+             far or stops it; you are woken when it ends."
+        )
+    }
+
+    /// Writes down how the job `id` of `agent`'s ended, and wakes it with
+    /// its status and the end of its output.
+    fn job_ended(&self, agent: &str, id: u64, line: &str, said: String) {
+        let last = {
+            let mut jobs = lock(&self.inner.jobs);
+            let Some(job) = jobs.get_mut(&id) else {
+                return;
+            };
+            if job.ended.is_some() {
+                return;
+            }
+            job.ended = Some(said.clone());
+            job.running = None;
+            job.live.so_far(JOB_SHOWN)
+        };
+        self.report(Event::JobEnded {
+            agent: agent.to_owned(),
+            id,
+            said: said.clone(),
+        });
+        self.iq_says(
+            agent,
+            format!("Job {id}, `{line}`, ended: {said}. The end of its output:\n{last}"),
+        );
+    }
+
+    /// The job `id` of `agent`'s: how long it has run or how it ended, and
+    /// the end of its output; stopped first when `stop`.
+    fn job(&self, agent: &str, id: u64, stop: bool) -> String {
+        let (line, started, running) = {
+            let jobs = lock(&self.inner.jobs);
+            let Some(job) = jobs.get(&id).filter(|job| job.agent == agent) else {
+                return format!("you have no job {id}");
+            };
+            (job.line.clone(), job.started, job.running.is_some())
+        };
+        if stop && running {
+            if let Some(task) = lock(&self.inner.jobs)
+                .get_mut(&id)
+                .and_then(|job| job.running.take())
+            {
+                task.abort();
+            }
+            self.job_ended(agent, id, &line, "stopped, as you asked".to_owned());
+        }
+        let jobs = lock(&self.inner.jobs);
+        let Some(job) = jobs.get(&id) else {
+            return format!("you have no job {id}");
+        };
+        let state = match &job.ended {
+            Some(said) => format!("ended: {said}"),
+            None => format!("running for {}", short_span(started.elapsed().as_secs())),
+        };
+        format!(
+            "Job {id}, `{line}`, {state}. The end of its output so far:\n{}",
+            job.live.so_far(JOB_SHOWN)
+        )
+    }
+
+    /// Stops the jobs of `agent`, or every one when none.
+    fn stop_jobs(&self, agent: Option<&str>) {
+        let stopped: Vec<(u64, String, String)> = {
+            let mut jobs = lock(&self.inner.jobs);
+            jobs.iter_mut()
+                .filter(|(_, job)| agent.is_none_or(|a| job.agent == a))
+                .filter_map(|(id, job)| {
+                    let task = job.running.take()?;
+                    task.abort();
+                    Some((*id, job.agent.clone(), job.line.clone()))
+                })
+                .collect()
+        };
+        for (id, agent, line) in stopped {
+            self.job_ended(&agent, id, &line, "stopped with its agent".to_owned());
+        }
+    }
+
+    /// Wakes `agent` after `seconds`, saying `why`; a few at a time.
+    fn wake_me(&self, agent: &str, seconds: u64, why: String) -> Result<String, String> {
+        {
+            let mut wakes = lock(&self.inner.wakes);
+            let count = wakes.entry(agent.to_owned()).or_default();
+            if *count >= WAKES_MOST {
+                return Err(format!(
+                    "you already asked to be woken {WAKES_MOST} times: wait for those"
+                ));
+            }
+            *count += 1;
+        }
+        self.report(Event::Notice {
+            agent: agent.to_owned(),
+            text: format!("asked to be woken in {}: {why}", short_span(seconds)),
+        });
+        let crew = self.clone();
+        let name = agent.to_owned();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            if let Some(count) = lock(&crew.inner.wakes).get_mut(&name) {
+                *count = count.saturating_sub(1);
+            }
+            crew.iq_says(&name, format!("You asked to be woken now: {why}"));
+        });
+        Ok(format!(
+            "You will be woken in {}. End your turn now.",
+            short_span(seconds)
+        ))
+    }
+
+    /// Writes `text` to `agent` as iq's own message, waking it when it
+    /// rests: what a job or a wake it asked for says.
+    fn iq_says(&self, agent: &str, text: String) {
+        let resting = {
+            let mut board = lock(&self.inner.board);
+            if !board.members.contains_key(agent) {
+                return;
+            }
+            board.messages.push(Posted {
+                from: IQ.to_owned(),
+                to: agent.to_owned(),
+                text: text.clone(),
+            });
+            board
+                .members
+                .get(agent)
+                .is_some_and(|m| m.turn.as_ref().is_none_or(JoinHandle::is_finished))
+        };
+        self.inner.posted.send_modify(|count| *count += 1);
+        if resting {
+            let prompt = self.unread(agent).unwrap_or(text);
+            self.wake(agent, prompt);
         }
     }
 

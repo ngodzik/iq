@@ -168,6 +168,24 @@ pub enum Event {
         /// none.
         answer: Option<String>,
     },
+    /// A command an agent left to run in the background began.
+    JobStarted {
+        /// The agent.
+        agent: String,
+        /// Its number, as the agent names it.
+        id: u64,
+        /// The command line.
+        line: String,
+    },
+    /// A command run in the background ended, or was stopped.
+    JobEnded {
+        /// The agent.
+        agent: String,
+        /// Its number.
+        id: u64,
+        /// How it ended, in words: its status, or that it was stopped.
+        said: String,
+    },
     /// An agent waits for the agents it started to write: none of them
     /// has yet, and they work.
     Waiting {
@@ -201,7 +219,9 @@ impl Event {
                 renamed(by);
             }
             Event::Renamed { .. } | Event::Answered { .. } | Event::Chosen { .. } => {}
-            Event::Choose { agent, .. } => renamed(agent),
+            Event::Choose { agent, .. }
+            | Event::JobStarted { agent, .. }
+            | Event::JobEnded { agent, .. } => renamed(agent),
             Event::Posted {
                 from: writer,
                 to: reader,

@@ -228,6 +228,8 @@ pub(crate) struct History {
     /// The questions with choices asked, by number: the agent that asked,
     /// and the window the answer goes in.
     chosen: HashMap<u64, (String, Option<String>)>,
+    /// The commands left to run in the background, by number.
+    jobs: HashMap<u64, String>,
 }
 
 impl History {
@@ -479,6 +481,38 @@ impl History {
                         body: vec![Span::styled(said, style)],
                     });
                 }
+            }
+            // A command left to run, and how it ended: the live part says
+            // meanwhile for how long it has run.
+            Event::JobStarted { agent, id, line } => {
+                self.finish(agent, board, p);
+                self.header(agent, board, p);
+                self.jobs.insert(*id, line.clone());
+                self.push_step(Para {
+                    first: vec![Span::raw("  "), Span::styled("⚙ ", p.fg(p.info))],
+                    rest: vec![Span::raw("    ")],
+                    body: vec![
+                        Span::styled(format!("job {id} in the background: "), p.fg(p.dim)),
+                        Span::styled(short(line), p.fg(p.text)),
+                    ],
+                });
+            }
+            Event::JobEnded { agent, id, said } => {
+                self.header(agent, board, p);
+                let line = self.jobs.remove(id).unwrap_or_default();
+                let colour = if said == "exit status 0" {
+                    p.ok
+                } else {
+                    p.warn
+                };
+                self.push_step(Para {
+                    first: vec![Span::raw("  "), Span::styled("⚙ ", p.fg(colour))],
+                    rest: vec![Span::raw("    ")],
+                    body: vec![
+                        Span::styled(format!("job {id} ended, {said}: "), p.fg(p.dim)),
+                        Span::styled(short(&line), p.fg(p.text)),
+                    ],
+                });
             }
             // A line once it waits for those it started: how long, the live
             // part says.
@@ -1311,6 +1345,8 @@ fn agent_of(event: &Event) -> Option<&str> {
         | Event::Done { agent, .. }
         | Event::Waiting { agent, .. }
         | Event::Choose { agent, .. }
+        | Event::JobStarted { agent, .. }
+        | Event::JobEnded { agent, .. }
         | Event::Notice { agent, .. } => Some(agent),
         Event::Posted { from, .. } => Some(from),
         Event::Renamed { to, .. } => Some(to),

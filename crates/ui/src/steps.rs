@@ -185,7 +185,11 @@ impl Steps {
             }
             // It waits, for its agents or the person: what it did before
             // is still its fold.
-            Event::Waiting { .. } | Event::Choose { .. } | Event::Chosen { .. } => {}
+            Event::Waiting { .. }
+            | Event::Choose { .. }
+            | Event::Chosen { .. }
+            | Event::JobStarted { .. }
+            | Event::JobEnded { .. } => {}
             Event::Renamed { from, to } => {
                 for fold in &mut self.folds {
                     if fold.agent == *from {
