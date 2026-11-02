@@ -61,6 +61,12 @@ pub enum Request {
         /// The images the person attached to it, by their paths.
         images: Vec<std::path::PathBuf>,
     },
+    /// Open the image at `path`, a diagram drawn, in the system's viewer:
+    /// the person's own action.
+    Open {
+        /// The image.
+        path: std::path::PathBuf,
+    },
     /// Answer a question with choices: a choice, or the person's own words;
     /// none when they gave none.
     Choose {

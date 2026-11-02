@@ -111,6 +111,7 @@ pub fn run(
         relayout: false,
         kitty: graphics::detect(|name| std::env::var(name).ok()),
         sent: HashSet::new(),
+        placed: None,
     };
     let depth = Depth::detect();
     let p = Palette::new(board.look().theme(), depth);
@@ -159,6 +160,8 @@ struct Screen {
     kitty: Option<Kitty>,
     /// The images it was sent since the screen was last wiped.
     sent: HashSet<u32>,
+    /// The image the diagram page shows, while it does.
+    placed: Option<u32>,
 }
 
 impl Screen {
@@ -395,13 +398,22 @@ impl Iq {
         let screen = &mut self.screen;
         if screen.paged {
             let (board, p) = (&mut self.board, &self.p);
+            let images = screen.kitty.is_some();
+            let mut body = Rect::default();
             screen
                 .terminal
-                .draw(|frame| pages::draw(frame, board, p, now))?;
-            return Ok(());
+                .draw(|frame| body = pages::draw(frame, board, p, now, images))?;
+            return self.picture(body);
         }
+        if screen.placed.is_some() {
+            self.unpicture()?;
+        }
+        let screen = &mut self.screen;
         let window = window_of(&self.board);
         let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
+        for (chat, image) in self.history.take_drawn() {
+            self.board.drawn_diagram(chat, image);
+        }
         // The rows the panes take at the top, while several agents of the
         // chat work side by side.
         let head = Live {
@@ -488,6 +500,67 @@ impl Iq {
             }
         }
         screen.caret = caret.map(|(_, y)| y.saturating_sub(top));
+        Ok(())
+    }
+
+    /// Shows the diagram the page shows over `body`, in Kitty: the part its
+    /// zoom and how far it was moved say, as large as the body lets it,
+    /// centred; taken away from another page.
+    fn picture(&mut self, body: Rect) -> io::Result<()> {
+        let shown = (self.board.screen().page() == Some(&iq_ui::screen::Page::Diagram))
+            .then(|| self.board.picture())
+            .flatten()
+            .and_then(|(path, view)| Some((self.history.picture(path)?, view)));
+        let (Some(kitty), Some(((id, png, (w, h)), view))) = (self.screen.kitty, shown) else {
+            return self.unpicture();
+        };
+        // Below the line the page says it with.
+        let body = Rect::new(
+            body.x,
+            body.y + 1,
+            body.width,
+            body.height.saturating_sub(1),
+        );
+        let zoom = view.zoom.max(1);
+        let (vw, vh) = ((w / zoom).max(1), (h / zoom).max(1));
+        let shift = |moved: i32, seen: u32, whole: u32| -> u32 {
+            let middle = i64::from(whole - seen) / 2;
+            let moved = i64::from(moved) * i64::from(seen) / 10;
+            u32::try_from((middle + moved).clamp(0, i64::from(whole - seen))).unwrap_or(0)
+        };
+        let crop = (
+            shift(view.moved.0, vw, w),
+            shift(view.moved.1, vh, h),
+            vw,
+            vh,
+        );
+        let cell = self.history.cell();
+        let (cols, rows) = graphics::fit((vw, vh), cell, body.width.max(1), body.height.max(1));
+        let x = body.x + body.width.saturating_sub(cols) / 2;
+        let y = body.y + body.height.saturating_sub(rows) / 2;
+        let screen = &mut self.screen;
+        if screen.sent.insert(id) {
+            screen.out.write_all(kitty.transmit(id, &png).as_bytes())?;
+        }
+        if let Some(before) = screen.placed.filter(|before| *before != id) {
+            screen.out.write_all(kitty.unplace(before).as_bytes())?;
+        }
+        queue!(screen.out, MoveTo(x, y))?;
+        screen
+            .out
+            .write_all(kitty.place_in(id, crop, cols, rows).as_bytes())?;
+        screen.out.flush()?;
+        screen.placed = Some(id);
+        Ok(())
+    }
+
+    /// Takes the diagram page's image away, when it shows one.
+    fn unpicture(&mut self) -> io::Result<()> {
+        let screen = &mut self.screen;
+        if let (Some(kitty), Some(id)) = (screen.kitty, screen.placed.take()) {
+            screen.out.write_all(kitty.unplace(id).as_bytes())?;
+            screen.out.flush()?;
+        }
         Ok(())
     }
 

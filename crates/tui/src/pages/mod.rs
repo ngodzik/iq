@@ -30,6 +30,8 @@ pub(crate) struct Seen<'a> {
     pub(crate) now: u64,
     /// The columns it has.
     pub(crate) width: usize,
+    /// Whether the terminal shows images, Kitty.
+    pub(crate) images: bool,
 }
 
 impl Seen<'_> {
@@ -81,15 +83,47 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String) {
         Page::Keys => (keys::lines(seen), "↑↓ scroll"),
         Page::Changes => return (changes::lines(seen), changes::foot(seen)),
         Page::Steps => (steps::lines(seen), "↑↓ scroll · the latest last"),
+        Page::Diagram => (
+            diagram(seen),
+            "+ − enlarge · ← → ↑ ↓ move · 0 whole · [ ] an earlier, a later · o your viewer",
+        ),
     };
     (lines, foot.to_owned())
 }
 
+/// What the diagram page says beside the image: what it is, and, where
+/// the terminal shows no image, how to see it.
+fn diagram(seen: &Seen<'_>) -> Vec<Line<'static>> {
+    let p = seen.p;
+    let mut lines = Vec::new();
+    match seen.board.picture() {
+        None => seen.said(&mut lines, "no diagram is drawn in this chat", p.dim),
+        Some(_) if !seen.images => seen.said(
+            &mut lines,
+            "the diagram shows here in Kitty alone: o opens it in your viewer",
+            p.dim,
+        ),
+        Some((path, picture)) => seen.said(
+            &mut lines,
+            &format!("{} · ×{}", path.display(), picture.zoom.max(1)),
+            p.faint,
+        ),
+    }
+    lines
+}
+
 /// Draws the page open over the whole screen, and keeps its scroll
-/// within its lines.
-pub(crate) fn draw(frame: &mut Frame<'_>, board: &mut Board, p: &Palette, now: u64) {
+/// within its lines. Returns where its body is, under its heading and
+/// above its foot.
+pub(crate) fn draw(
+    frame: &mut Frame<'_>,
+    board: &mut Board,
+    p: &Palette,
+    now: u64,
+    images: bool,
+) -> Rect {
     let Some(page) = board.screen().page().cloned() else {
-        return;
+        return Rect::default();
     };
     let area = frame.area();
     let seen = Seen {
@@ -97,6 +131,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, board: &mut Board, p: &Palette, now: u
         p,
         now,
         width: usize::from(area.width),
+        images,
     };
     let (lines, foot) = content(&page, &seen);
     let mut top: Vec<Line<'static>> = vec![title(&page, &seen)];
@@ -168,6 +203,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, board: &mut Board, p: &Palette, now: u
         );
     }
     board.screen_mut().drawn(most, usize::from(body_rows));
+    body
 }
 
 /// The page's title: iq's name, the page's, and on the right the page's

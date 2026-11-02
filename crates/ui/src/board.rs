@@ -3,6 +3,8 @@
 //! key the person presses is taken here, so that what it does is tested
 //! without a terminal.
 
+use std::collections::HashMap;
+
 use iq_agent::{Event, PERSON};
 
 use crate::command::{self, Command, Completion};
@@ -197,7 +199,27 @@ pub struct Board {
     attached: Vec<std::path::PathBuf>,
     /// The choice picked in the question with choices shown.
     picking: usize,
+    /// The images of the diagrams drawn in each chat's window, the latest
+    /// last: none for a new chat's.
+    diagrams: HashMap<Option<String>, Vec<std::path::PathBuf>>,
+    /// How the diagram page shows one of them.
+    picture: Picture,
 }
+
+/// How the diagram page shows a diagram: which, from the latest; how much
+/// it is enlarged; and how far it is moved, in tenths of what shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Picture {
+    /// Which diagram, from the latest: 0 for it.
+    pub back: usize,
+    /// How many times it is enlarged, from one.
+    pub zoom: u32,
+    /// How far it is moved right, then down.
+    pub moved: (i32, i32),
+}
+
+/// The most a diagram is enlarged.
+const ZOOM_MOST: u32 = 8;
 
 /// The image a paste is, when it is the path of one alone: a file dropped
 /// on the terminal pastes its path, quoted, escaped or as a `file://`
@@ -258,7 +280,90 @@ impl Board {
             switching: None,
             attached: Vec::new(),
             picking: 0,
+            diagrams: HashMap::new(),
+            picture: Picture::default(),
         }
+    }
+
+    /// The diagram drawn as the image at `image` was written in `chat`'s
+    /// window.
+    pub fn drawn_diagram(&mut self, chat: Option<String>, image: std::path::PathBuf) {
+        let drawn = self.diagrams.entry(chat).or_default();
+        if drawn.last() != Some(&image) {
+            drawn.retain(|seen| *seen != image);
+            drawn.push(image);
+        }
+    }
+
+    /// The diagram the page shows, and how: of the chat written to.
+    #[must_use]
+    pub fn picture(&self) -> Option<(&std::path::Path, Picture)> {
+        let window = self
+            .screen
+            .talking_to()
+            .and_then(|agent| self.crew.chat_of(agent));
+        let drawn = self.diagrams.get(&window)?;
+        let at = drawn.len().checked_sub(1 + self.picture.back)?;
+        Some((&drawn[at], self.picture))
+    }
+
+    /// What a key does on the diagram page: `+` and `-` enlarge it or less,
+    /// the arrows move it, `[` and `]` go to an earlier diagram or a later,
+    /// `0` shows it whole again, `o` opens it in the system's viewer.
+    fn diagram_key(&mut self, chord: &Chord, typed: Option<char>) -> Vec<Request> {
+        let count = self
+            .screen
+            .talking_to()
+            .and_then(|agent| self.crew.chat_of(agent))
+            .map_or_else(
+                || self.diagrams.get(&None),
+                |chat| self.diagrams.get(&Some(chat)),
+            )
+            .map_or(0, Vec::len);
+        let mut picture = self.picture;
+        let reach = |zoom: u32| (zoom as i32 - 1) * 5;
+        match (chord.key.as_str(), typed) {
+            (_, Some('+' | '=')) => picture.zoom = (picture.zoom.max(1) + 1).min(ZOOM_MOST),
+            (_, Some('-')) => picture.zoom = picture.zoom.max(2) - 1,
+            (_, Some('0')) => {
+                picture.zoom = 1;
+                picture.moved = (0, 0);
+            }
+            ("Left", _) => picture.moved.0 -= 1,
+            ("Right", _) => picture.moved.0 += 1,
+            ("Up", _) => picture.moved.1 -= 1,
+            ("Down", _) => picture.moved.1 += 1,
+            (_, Some('[')) if picture.back + 1 < count => {
+                picture = Picture {
+                    back: picture.back + 1,
+                    ..Picture::default()
+                };
+            }
+            (_, Some(']')) if picture.back > 0 => {
+                picture = Picture {
+                    back: picture.back - 1,
+                    ..Picture::default()
+                };
+            }
+            (_, Some('o')) => {
+                return self
+                    .picture()
+                    .map(|(path, _)| Request::Open {
+                        path: path.to_path_buf(),
+                    })
+                    .into_iter()
+                    .collect();
+            }
+            _ => {}
+        }
+        picture.zoom = picture.zoom.max(1);
+        let most = reach(picture.zoom);
+        picture.moved = (
+            picture.moved.0.clamp(-most, most),
+            picture.moved.1.clamp(-most, most),
+        );
+        self.picture = picture;
+        Vec::new()
     }
 
     /// The question with choices the person answers where they write: the
@@ -824,6 +929,9 @@ impl Board {
         let Some(page) = self.screen.page().cloned() else {
             return Vec::new();
         };
+        if page == Page::Diagram {
+            return self.diagram_key(chord, typed);
+        }
         let letter = typed.map(|c| c.to_ascii_lowercase());
         let step = self.screen.rows().saturating_sub(2).max(1) as isize;
         let agents = self.crew.agents().len();
@@ -901,7 +1009,7 @@ impl Board {
                 }
             }
             Page::Thread(_) if key == "Left" => self.screen.close(),
-            Page::Thread(_) | Page::Keys | Page::Changes | Page::Steps => {}
+            Page::Thread(_) | Page::Keys | Page::Changes | Page::Steps | Page::Diagram => {}
         }
         Vec::new()
     }
@@ -1177,6 +1285,22 @@ impl Board {
             Command::Autopilot => return self.act(Action::Autopilot, now).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet, now).into_iter().collect(),
             Command::Mcp => return vec![Request::Mcp],
+            Command::Diagram => {
+                if self.picture.zoom == 0 || self.picture().is_none() {
+                    self.picture = Picture {
+                        zoom: 1,
+                        ..Picture::default()
+                    };
+                }
+                if self.picture().is_some() {
+                    open(self, Page::Diagram);
+                } else {
+                    self.screen.notice(
+                        "no diagram is drawn in this chat: they are, in Kitty, once the settings' mermaid says so",
+                        now,
+                    );
+                }
+            }
             Command::Image(None) => {
                 let said = match self.attached.len() {
                     0 => "/image takes the path of an image to attach".to_owned(),
@@ -1550,6 +1674,59 @@ fn from_words(request: &str, named: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_last_diagram_of_the_chat_is_shown_alone_enlarged_moved_and_opened() {
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        board.update(Update::Crew(Event::Joined {
+            agent: "lead".into(),
+            model: "lab/lead".into(),
+            by: PERSON.into(),
+        }));
+        board.screen_mut().talk_to("lead");
+        board.run(Command::Diagram, 1);
+        assert_eq!(board.screen().page(), None, "no diagram yet");
+        for image in ["/cache/a/diagram.png", "/cache/b/diagram.png"] {
+            board.drawn_diagram(Some("lead".into()), image.into());
+        }
+        board.run(Command::Diagram, 2);
+        assert_eq!(board.screen().page(), Some(&Page::Diagram));
+        let shown = |board: &Board| {
+            board
+                .picture()
+                .map(|(path, view)| (path.to_path_buf(), view))
+        };
+        let (path, view) = shown(&board).unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/cache/b/diagram.png"));
+        assert_eq!((view.zoom, view.moved), (1, (0, 0)));
+        let press =
+            |board: &mut Board, c: char| board.press(&Chord::plain(&c.to_string()), Some(c), 3);
+        press(&mut board, '+');
+        press(&mut board, '+');
+        key(&mut board, "right");
+        assert_eq!(shown(&board).unwrap().1.zoom, 3);
+        assert_eq!(shown(&board).unwrap().1.moved, (1, 0));
+        // Moved no further than enlarged, nor smaller than whole.
+        for _ in 0..20 {
+            key(&mut board, "left");
+            press(&mut board, '-');
+        }
+        assert_eq!(shown(&board).unwrap().1.zoom, 1);
+        assert_eq!(shown(&board).unwrap().1.moved, (0, 0));
+        // An earlier one, then opened in the viewer.
+        press(&mut board, '[');
+        assert_eq!(
+            shown(&board).unwrap().0,
+            std::path::PathBuf::from("/cache/a/diagram.png")
+        );
+        assert_eq!(
+            press(&mut board, 'o'),
+            vec![Request::Open {
+                path: "/cache/a/diagram.png".into()
+            }]
+        );
+    }
 
     #[test]
     fn a_question_with_choices_is_answered_with_a_digit_the_arrows_or_ones_own_words() {

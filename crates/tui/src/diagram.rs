@@ -32,7 +32,13 @@ pub struct Drawn {
     pub png: Vec<u8>,
     /// The file its source is kept in, for the person to open.
     pub source: Option<PathBuf>,
+    /// The file the image is kept in, for the person to open it larger.
+    pub image: Option<PathBuf>,
 }
+
+/// A diagram's image: its id with the terminal, its PNG and its size in
+/// pixels.
+pub(crate) type Shot = (u32, Arc<Vec<u8>>, (u32, u32));
 
 /// The most rows an image takes, so that one fits on screen with what was
 /// said of it.
@@ -101,6 +107,20 @@ impl Diagram {
             });
         }
         diagram
+    }
+
+    /// Its image, once drawn: its id with the terminal, the PNG, its size
+    /// in pixels, and the file it is kept in.
+    pub(crate) fn image(&self) -> Option<(Shot, PathBuf)> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let State::Drawn(drawn) = &*state else {
+            return None;
+        };
+        let pixels = graphics::png_size(&drawn.png)?;
+        Some((
+            (self.id, Arc::new(drawn.png.clone()), pixels),
+            drawn.image.clone()?,
+        ))
     }
 
     /// Whether it is still being drawn, and waited for.
@@ -196,6 +216,7 @@ mod tests {
         let diagram = drawn(Some(Fixed(Ok(Drawn {
             png,
             source: Some("/cache/d.mmd".into()),
+            image: Some("/cache/d.png".into()),
         }))));
         let mut images = Vec::new();
         let shown = diagram.shown(80, &[Span::raw("  ")], (10, 20), Style::new(), &mut images);
@@ -229,6 +250,7 @@ mod tests {
         let not_png = drawn(Some(Fixed(Ok(Drawn {
             png: b"<svg/>".to_vec(),
             source: None,
+            image: None,
         }))));
         assert!(
             matches!(shown(&not_png), Shown::Source(Some(why)) if why.ends_with("no PNG image"))

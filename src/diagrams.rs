@@ -192,6 +192,7 @@ impl Draw for Diagrams {
         Ok(Drawn {
             png,
             source: Some(input),
+            image: Some(output),
         })
     }
 }
