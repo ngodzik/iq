@@ -193,6 +193,28 @@ pub fn board() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "ask_person".into(),
+            description: "Asks the person a question with two to four choices, which they pick \
+                          with a digit or the arrows, or answer in their own words; waits for \
+                          their answer. For a choice that is theirs to make: an option, an \
+                          environment, whether to start again. Not for leave to act, which the \
+                          tools ask themselves."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 2,
+                        "maxItems": 4,
+                    },
+                },
+                "required": ["question", "choices"],
+            }),
+        },
+        ToolSpec {
             name: "list_agents".into(),
             description: "The agents of the crew: their names, models, and whether they work."
                 .into(),

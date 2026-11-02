@@ -228,6 +228,8 @@ struct Inner<M> {
     /// The images each agent is shown with its next call: what the person
     /// attached, what a file or a tool showed.
     images: Mutex<HashMap<String, Vec<Message>>>,
+    /// The questions with choices waiting for the person.
+    choices: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
 }
 
 /// Where agents work: the gate that judges their actions there, and the
@@ -409,6 +411,7 @@ where
                 board: Mutex::new(Board::default()),
                 shown: Mutex::new(HashMap::new()),
                 images: Mutex::new(HashMap::new()),
+                choices: Mutex::new(HashMap::new()),
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
                 peer_wakes: Mutex::new(Vec::new()),
@@ -691,6 +694,14 @@ where
     pub fn answer(&self, id: u64, approved: bool) {
         if let Some(reply) = lock(&self.inner.questions).remove(&id) {
             let _ = reply.send(approved);
+        }
+    }
+
+    /// Answers the question with choices `id`: a choice, or the person's
+    /// own words; none when they gave none.
+    pub fn choose(&self, id: u64, answer: Option<String>) {
+        if let Some(reply) = lock(&self.inner.choices).remove(&id) {
+            let _ = reply.send(answer);
         }
     }
 
@@ -2275,6 +2286,20 @@ where
                     .min(tools::WAIT_MOST);
                 Ok(self.wait(agent, seconds).await)
             }
+            "ask_person" => {
+                let question = args.text("question")?.trim().to_owned();
+                let choices: Vec<String> = args.value()["choices"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|c| c.as_str().map(str::trim).filter(|c| !c.is_empty()))
+                    .map(str::to_owned)
+                    .collect();
+                if question.is_empty() || !(2..=4).contains(&choices.len()) {
+                    return Err("ask one question with two to four choices".into());
+                }
+                Ok(self.ask_person(agent, question, choices).await)
+            }
             "list_agents" => Ok(self
                 .list()
                 .iter()
@@ -2489,6 +2514,51 @@ where
                 self.refused(agent, &gate, pending, Approver::Person, &why);
                 Err(refusal("the gate", &why, true))
             }
+        }
+    }
+
+    /// Asks the person `question`, offering `choices`, and waits for their
+    /// answer as long as the settings' patience. What they answered is
+    /// kept with what they asked of `agent`, so that the reviewer reads a
+    /// "yes" with the question it answered.
+    async fn ask_person(&self, agent: &str, question: String, choices: Vec<String>) -> String {
+        let id = self.inner.next_question.fetch_add(1, Ordering::Relaxed);
+        let (reply, answer) = oneshot::channel();
+        lock(&self.inner.choices).insert(id, reply);
+        self.report(Event::Choose {
+            id,
+            agent: agent.to_owned(),
+            question: question.clone(),
+            choices: choices.clone(),
+        });
+        let answer = tokio::time::timeout(self.inner.settings.patience, answer)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .map(|a| a.trim().to_owned())
+            .filter(|a| !a.is_empty());
+        lock(&self.inner.choices).remove(&id);
+        self.report(Event::Chosen {
+            id,
+            answer: answer.clone(),
+        });
+        match answer {
+            Some(answer) => {
+                if let Some(member) = lock(&self.inner.board).members.get_mut(agent) {
+                    member
+                        .asked
+                        .push(format!("To your question \"{question}\": {answer}"));
+                }
+                if choices.contains(&answer) {
+                    format!("The person chose: {answer}")
+                } else {
+                    format!("The person answered in their own words: {answer}")
+                }
+            }
+            None => "The person gave no answer: go on as best you can, and say what you \
+                     needed to know."
+                .to_owned(),
         }
     }
 

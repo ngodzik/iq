@@ -148,6 +148,26 @@ pub enum Event {
         /// Its answer, or why it failed.
         outcome: Result<String, String>,
     },
+    /// An agent asks the person to choose among `choices`, or to answer in
+    /// their own words.
+    Choose {
+        /// The question's number, to answer it with.
+        id: u64,
+        /// The agent that asks.
+        agent: String,
+        /// The question.
+        question: String,
+        /// What it offers, two to four.
+        choices: Vec<String>,
+    },
+    /// The person answered a question with choices, or nobody did.
+    Chosen {
+        /// The question.
+        id: u64,
+        /// Their answer: a choice, or their own words; none when they gave
+        /// none.
+        answer: Option<String>,
+    },
     /// An agent waits for the agents it started to write: none of them
     /// has yet, and they work.
     Waiting {
@@ -180,7 +200,8 @@ impl Event {
                 renamed(agent);
                 renamed(by);
             }
-            Event::Renamed { .. } | Event::Answered { .. } => {}
+            Event::Renamed { .. } | Event::Answered { .. } | Event::Chosen { .. } => {}
+            Event::Choose { agent, .. } => renamed(agent),
             Event::Posted {
                 from: writer,
                 to: reader,

@@ -225,6 +225,9 @@ pub(crate) struct History {
     /// Whether what follows a diagram being drawn waits for it: not as iq
     /// ends.
     hurried: bool,
+    /// The questions with choices asked, by number: the agent that asked,
+    /// and the window the answer goes in.
+    chosen: HashMap<u64, (String, Option<String>)>,
 }
 
 impl History {
@@ -444,6 +447,38 @@ impl History {
                     }),
                 }
                 self.set_speaker(None);
+            }
+            // The question as it is asked, its answer below it once given:
+            // the live part shows its choices meanwhile.
+            Event::Choose {
+                id,
+                agent,
+                question,
+                ..
+            } => {
+                self.finish(agent, board, p);
+                self.header(agent, board, p);
+                self.chosen.insert(*id, (agent.clone(), self.at.clone()));
+                self.push_step(Para {
+                    first: vec![Span::raw("  "), Span::styled("? ", p.fg(p.warn))],
+                    rest: vec![Span::raw("    ")],
+                    body: inline(question.trim(), p.fg(p.text), p, self.links),
+                });
+            }
+            Event::Chosen { id, answer } => {
+                if let Some((agent, at)) = self.chosen.remove(id) {
+                    self.at = at;
+                    self.header(&agent, board, p);
+                    let (said, style) = match answer {
+                        Some(answer) => (answer.clone(), p.fg(p.accent)),
+                        None => ("no answer".to_owned(), p.fg(p.faint)),
+                    };
+                    self.push_step(Para {
+                        first: vec![Span::raw("    "), Span::styled("→ ", p.fg(p.faint))],
+                        rest: vec![Span::raw("      ")],
+                        body: vec![Span::styled(said, style)],
+                    });
+                }
             }
             // A line once it waits for those it started: how long, the live
             // part says.
@@ -725,6 +760,21 @@ impl History {
                         first: vec![Span::raw("  "), Span::styled("! ", p.fg(p.warn))],
                         rest: vec![Span::raw("    ")],
                         body: vec![Span::styled(short(text), p.fg(p.dim))],
+                    });
+                }
+                Entry::Chose { question, answer } => {
+                    self.header(agent, board, p);
+                    self.push_step(Para {
+                        first: vec![Span::raw("  "), Span::styled("? ", p.fg(p.warn))],
+                        rest: vec![Span::raw("    ")],
+                        body: vec![
+                            Span::styled(question.trim().to_owned(), p.fg(p.text)),
+                            Span::styled(" → ", p.fg(p.faint)),
+                            Span::styled(
+                                answer.clone().unwrap_or_else(|| "no answer".to_owned()),
+                                p.fg(p.accent),
+                            ),
+                        ],
                     });
                 }
                 Entry::Done(outcome) => {
@@ -1260,10 +1310,11 @@ fn agent_of(event: &Event) -> Option<&str> {
         | Event::Reviewed { agent, .. }
         | Event::Done { agent, .. }
         | Event::Waiting { agent, .. }
+        | Event::Choose { agent, .. }
         | Event::Notice { agent, .. } => Some(agent),
         Event::Posted { from, .. } => Some(from),
         Event::Renamed { to, .. } => Some(to),
-        Event::Answered { .. } => None,
+        Event::Answered { .. } | Event::Chosen { .. } => None,
     }
 }
 

@@ -2189,3 +2189,46 @@ async fn an_image_read_or_attached_is_shown_to_the_model_with_its_next_call() {
     assert!(content.contains("is an image (image/png"), "{content}");
     assert_eq!(mime, "image/png");
 }
+
+#[tokio::test]
+async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "ask_person",
+                    serde_json::json!({"question": "Which environment?", "choices": ["staging", "production"]}),
+                ),
+                say("On staging, then."),
+            ],
+        )],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "deploy".into(), PERSON);
+    let mut asked = None;
+    for _ in 0..200 {
+        asked = f.events().iter().find_map(|event| match event {
+            Event::Choose { id, choices, .. } => Some((*id, choices.clone())),
+            _ => None,
+        });
+        if asked.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (id, choices) = asked.expect("the person is asked");
+    assert_eq!(choices, ["staging", "production"]);
+    f.crew.choose(id, Some("staging".into()));
+    f.settled().await;
+    assert!(
+        f.model
+            .seen_by("lead")
+            .contains("The person chose: staging")
+    );
+    assert!(f.events().contains(&Event::Chosen {
+        id,
+        answer: Some("staging".into())
+    }));
+}

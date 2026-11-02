@@ -195,6 +195,8 @@ pub struct Board {
     /// The images the person attached to what they write, by their paths,
     /// sent with it.
     attached: Vec<std::path::PathBuf>,
+    /// The choice picked in the question with choices shown.
+    picking: usize,
 }
 
 /// The image a paste is, when it is the path of one alone: a file dropped
@@ -255,6 +257,76 @@ impl Board {
             recent: Vec::new(),
             switching: None,
             attached: Vec::new(),
+            picking: 0,
+        }
+    }
+
+    /// The question with choices the person answers where they write: the
+    /// oldest of the chat written to's. Another chat's waits for them to go
+    /// there, so that a message to this one is never taken for its answer.
+    #[must_use]
+    pub fn choice(&self) -> Option<&crate::crew::Choice> {
+        let window = self
+            .screen
+            .talking_to()
+            .and_then(|agent| self.crew.chat_of(agent))?;
+        self.crew
+            .choices()
+            .iter()
+            .find(|c| self.crew.chat_of(&c.agent).as_ref() == Some(&window))
+    }
+
+    /// The choice picked in the question with choices shown.
+    #[must_use]
+    pub fn picking(&self) -> usize {
+        self.picking
+    }
+
+    /// What `chord` does to the question with choices shown: a digit picks
+    /// one, the arrows move among them and Enter picks the one chosen, or
+    /// answers with what the person wrote; Escape gives no answer. None
+    /// when the key is not one of those, or no question is shown.
+    fn choice_key(&mut self, chord: &Chord, typed: Option<char>) -> Option<Vec<Request>> {
+        let plain = !chord.ctrl && !chord.alt && !chord.cmd;
+        let choice = self.choice()?.clone();
+        if !plain {
+            return None;
+        }
+        let empty = self.screen.editor().is_empty();
+        let count = choice.choices.len();
+        let answered = |board: &mut Self, answer: Option<String>| {
+            board.picking = 0;
+            Some(vec![Request::Choose {
+                id: choice.id,
+                answer,
+            }])
+        };
+        match (chord.key.as_str(), typed) {
+            (_, Some(digit)) if empty && digit.is_ascii_digit() => {
+                let at = digit.to_digit(10).unwrap_or(0) as usize;
+                if (1..=count).contains(&at) {
+                    return answered(self, Some(choice.choices[at - 1].clone()));
+                }
+                None
+            }
+            ("Up", _) if empty => {
+                self.picking = self.picking.saturating_sub(1);
+                Some(Vec::new())
+            }
+            ("Down", _) if empty => {
+                self.picking = (self.picking + 1).min(count - 1);
+                Some(Vec::new())
+            }
+            ("Enter", _) if !chord.shift => {
+                let answer = if empty {
+                    choice.choices.get(self.picking.min(count - 1)).cloned()
+                } else {
+                    Some(self.screen.editor_mut().take().trim().to_owned())
+                };
+                answered(self, answer)
+            }
+            ("Escape", _) => answered(self, None),
+            _ => None,
         }
     }
 
@@ -634,6 +706,9 @@ impl Board {
                 return self.act(action, now).into_iter().collect();
             }
             return self.page_key(chord, typed);
+        }
+        if let Some(done) = self.choice_key(chord, typed) {
+            return done;
         }
         let completions = self.completions();
         if !completions.is_empty() && plain {
@@ -1475,6 +1550,78 @@ fn from_words(request: &str, named: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_with_choices_is_answered_with_a_digit_the_arrows_or_ones_own_words() {
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        for (agent, by) in [("lead", PERSON), ("other", PERSON)] {
+            board.update(Update::Crew(Event::Joined {
+                agent: agent.into(),
+                model: "lab/lead".into(),
+                by: by.into(),
+            }));
+        }
+        let ask = |board: &mut Board, id: u64, agent: &str| {
+            board.update(Update::Crew(Event::Choose {
+                id,
+                agent: agent.into(),
+                question: "Which one?".into(),
+                choices: vec!["a".into(), "b".into(), "c".into()],
+            }));
+        };
+        ask(&mut board, 1, "lead");
+        board.screen_mut().talk_to("lead");
+        // A digit picks.
+        assert_eq!(
+            board.press(&Chord::plain("2"), Some('2'), 100),
+            vec![Request::Choose {
+                id: 1,
+                answer: Some("b".into())
+            }]
+        );
+        board.update(Update::Crew(Event::Chosen {
+            id: 1,
+            answer: Some("b".into()),
+        }));
+        assert!(board.choice().is_none());
+        // The arrows move, and Enter picks.
+        ask(&mut board, 2, "lead");
+        key(&mut board, "down");
+        key(&mut board, "down");
+        assert_eq!(
+            key(&mut board, "enter"),
+            vec![Request::Choose {
+                id: 2,
+                answer: Some("c".into())
+            }]
+        );
+        board.update(Update::Crew(Event::Chosen {
+            id: 2,
+            answer: None,
+        }));
+        // What the person writes is their own answer.
+        ask(&mut board, 3, "lead");
+        write(&mut board, "neither, wait");
+        assert_eq!(
+            key(&mut board, "enter"),
+            vec![Request::Choose {
+                id: 3,
+                answer: Some("neither, wait".into())
+            }]
+        );
+        board.update(Update::Crew(Event::Chosen {
+            id: 3,
+            answer: None,
+        }));
+        // Another chat's question never takes what is written here.
+        ask(&mut board, 4, "other");
+        assert!(board.choice().is_none());
+        write(&mut board, "go on");
+        assert!(
+            matches!(&key(&mut board, "enter")[..], [Request::Tell { to, .. }] if to == "lead")
+        );
+    }
 
     #[test]
     fn a_dropped_image_is_attached_and_sent_with_the_message_and_text_is_written() {

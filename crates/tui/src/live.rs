@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use crate::history::{History, agent_tint, chat_of, label, seconds, short, step_line};
+use crate::markdown::inline;
 use crate::motion::{Motion, YOU};
 use crate::theme::Palette;
 use crate::wrap::{cut, spans_width, width as text_width, wrap};
@@ -240,6 +241,9 @@ impl Live<'_> {
         parts.extend(self.working(motion, width));
         if let Some(question) = self.question(width) {
             parts.push(question);
+        }
+        if let Some(choosing) = self.choosing(width) {
+            parts.push(choosing);
         }
         if let Some(said) = self.board.screen().noticed(self.now) {
             let p = self.p;
@@ -496,6 +500,69 @@ impl Live<'_> {
             lines,
             agent_tint(self.board, &agent.name, p),
         )
+    }
+
+    /// The question with choices of the chat written to, in a box, its
+    /// choices numbered, the one picked marked; another chat's said in a
+    /// line, to go there.
+    fn choosing(&self, width: usize) -> Option<Part> {
+        let p = self.p;
+        let Some(choice) = self.board.choice() else {
+            let other = self.board.crew().choices().first()?;
+            let chat = self
+                .board
+                .crew()
+                .chat_of(&other.agent)
+                .unwrap_or_else(|| other.agent.clone());
+            let go = self
+                .board
+                .keys()
+                .chord(Action::Switch)
+                .map(|chord| format!(" · {chord} goes there"))
+                .unwrap_or_default();
+            return Some(Part::Lines(vec![fit(
+                vec![
+                    Span::styled("  ? ", p.fg(p.warn)),
+                    Span::styled(chat.clone(), p.fg(agent_tint(self.board, &chat, p))),
+                    Span::styled(format!(" asks you to choose{go}"), p.fg(p.faint)),
+                ],
+                width,
+            )]));
+        };
+        let inner = width.saturating_sub(4);
+        let pad = [Span::raw(" ")];
+        let mut lines = wrap(
+            &inline(choice.question.trim(), p.fg(p.text), p, false),
+            inner,
+            &pad,
+            &pad,
+        );
+        let picked = self
+            .board
+            .picking()
+            .min(choice.choices.len().saturating_sub(1));
+        for (at, option) in choice.choices.iter().enumerate() {
+            let on = at == picked;
+            lines.push(Line::from(vec![
+                Span::styled(if on { " ▸ " } else { "   " }, p.fg(p.accent)),
+                Span::styled(format!("{}. ", at + 1), p.bold(p.accent)),
+                Span::styled(
+                    cut(option, inner.saturating_sub(6)),
+                    if on { p.bold(p.text) } else { p.fg(p.text) },
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            " a digit, or ↑ ↓ and Enter · or write your own answer and Enter · Esc no answer",
+            p.fg(p.faint),
+        )));
+        let tint = agent_tint(self.board, &choice.agent, p);
+        let title = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(label(self.board, &choice.agent).0, p.bold(tint)),
+            Span::styled(" asks you ", p.fg(p.dim)),
+        ]);
+        Some(Part::Boxed { title, lines, tint })
     }
 
     /// The oldest question waiting, in a box, with the keys that answer it.
@@ -1674,6 +1741,50 @@ mod tests {
             .collect();
         assert!(
             written.iter().any(|l| l.trim() == "⧗ waiting for reviewer"),
+            "{written:#?}"
+        );
+    }
+
+    #[test]
+    fn a_question_with_choices_is_drawn_in_a_box_its_choices_numbered() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        crew(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: "deploy".into(),
+                model: "lab/sage".into(),
+                by: PERSON.into(),
+            },
+            &p,
+        );
+        crew(
+            &mut board,
+            &mut history,
+            Event::Choose {
+                id: 1,
+                agent: "deploy".into(),
+                question: "Which environment?".into(),
+                choices: vec!["staging".into(), "production".into()],
+            },
+            &p,
+        );
+        board.screen_mut().talk_to("deploy");
+        let rows = drawn(&board, &history, 80).join("\n");
+        assert!(rows.contains("╭ sage asks you"), "{rows}");
+        assert!(rows.contains("│ Which environment?"), "{rows}");
+        assert!(rows.contains("│ ▸ 1. staging"), "{rows}");
+        assert!(rows.contains("│   2. production"), "{rows}");
+        // Its question is in the conversation, its answer to come below it.
+        let written: Vec<String> = history
+            .take(80, Some("deploy"))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            written.iter().any(|l| l.trim() == "? Which environment?"),
             "{written:#?}"
         );
     }

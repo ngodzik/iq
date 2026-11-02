@@ -184,6 +184,11 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
                 Entry::Notice(text) => format!("! {text}"),
                 Entry::Done(Ok(_)) => "✔ done".to_owned(),
                 Entry::Done(Err(error)) => format!("✘ stopped: {error}"),
+                Entry::Chose { question, answer } => format!(
+                    "? {} → {}",
+                    first_line(question),
+                    answer.as_deref().unwrap_or("no answer")
+                ),
             };
             lines.push(Line::from(Span::styled(
                 format!(
@@ -345,6 +350,21 @@ pub(super) fn thread(seen: &Seen<'_>, agent: &str) -> Vec<Line<'static>> {
                     &[Span::styled(text.clone(), p.fg(p.warn))],
                     width,
                     &[Span::raw("  ! ")],
+                    &[Span::raw("    ")],
+                ));
+            }
+            Entry::Chose { question, answer } => {
+                lines.extend(wrap(
+                    &[
+                        Span::styled(question.trim().to_owned(), p.fg(p.text)),
+                        Span::styled(" → ", p.fg(p.faint)),
+                        Span::styled(
+                            answer.clone().unwrap_or_else(|| "no answer".to_owned()),
+                            p.fg(p.accent),
+                        ),
+                    ],
+                    width,
+                    &[Span::raw("  "), Span::styled("? ", p.fg(p.warn))],
                     &[Span::raw("    ")],
                 ));
             }

@@ -802,6 +802,20 @@ async fn work(
     );
     let mut tally = terminal::Tally::default();
     let handle = |event: Event, tally: &mut terminal::Tally| {
+        if let Event::Choose {
+            id,
+            agent,
+            question,
+            choices,
+        } = &event
+        {
+            let crew = crew.clone();
+            let (id, agent, question, choices) =
+                (*id, agent.clone(), question.clone(), choices.clone());
+            tokio::task::spawn_blocking(move || {
+                crew.choose(id, terminal::choose(&agent, &question, &choices));
+            });
+        }
         if let Some((id, question)) = terminal::show(&event, tally) {
             let crew = crew.clone();
             tokio::task::spawn_blocking(move || crew.answer(id, terminal::ask(&question)));
@@ -1175,6 +1189,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     let _ = working.tell(&to, with_named(text, &named));
                 }
                 Request::Answer { id, approved } => working.answer(id, approved),
+                Request::Choose { id, answer } => working.choose(id, answer),
                 Request::Autopilot(on) => working.set_autopilot(on),
                 Request::Internet(open) => working.set_internet(open),
                 Request::Effort { agent, effort } => {

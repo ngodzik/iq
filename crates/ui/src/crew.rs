@@ -61,6 +61,14 @@ pub enum Request {
         /// The images the person attached to it, by their paths.
         images: Vec<std::path::PathBuf>,
     },
+    /// Answer a question with choices: a choice, or the person's own words;
+    /// none when they gave none.
+    Choose {
+        /// The question.
+        id: u64,
+        /// Their answer.
+        answer: Option<String>,
+    },
     /// Answer a question.
     Answer {
         /// The question.
@@ -163,6 +171,26 @@ pub enum Entry {
     Notice(String),
     /// Its turn ended: its answer, or why it failed.
     Done(Result<String, String>),
+    /// What it asked the person to choose, and what they answered.
+    Chose {
+        /// The question.
+        question: String,
+        /// Their answer; none when they gave none.
+        answer: Option<String>,
+    },
+}
+
+/// A question with choices an agent asks the person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    /// Its number, to answer it with.
+    pub id: u64,
+    /// The agent that asks.
+    pub agent: String,
+    /// The question.
+    pub question: String,
+    /// What it offers.
+    pub choices: Vec<String>,
 }
 
 /// An agent of the crew, as shown.
@@ -313,6 +341,8 @@ pub struct Question {
 pub struct CrewView {
     agents: Vec<AgentView>,
     questions: Vec<Question>,
+    /// The questions with choices waiting for the person, the oldest first.
+    choices: Vec<Choice>,
     autopilot: bool,
     internet: bool,
     /// The lead's model and the reviewer's, as the program starts them.
@@ -366,6 +396,28 @@ impl CrewView {
     #[must_use]
     pub fn agent(&self, name: &str) -> Option<&AgentView> {
         self.agents.iter().find(|a| a.name == name)
+    }
+
+    /// The questions with choices waiting for the person, the oldest
+    /// first.
+    #[must_use]
+    pub fn choices(&self) -> &[Choice] {
+        &self.choices
+    }
+
+    /// The person's chat `agent` is part of: itself when the person started
+    /// it, else its starter's.
+    #[must_use]
+    pub fn chat_of(&self, agent: &str) -> Option<String> {
+        let mut name = agent;
+        for _ in 0..self.agents.len() + 1 {
+            let view = self.agent(name)?;
+            if view.by == PERSON {
+                return Some(view.name.clone());
+            }
+            name = &view.by;
+        }
+        None
     }
 
     /// The chats the person started, in the order they joined: those they
@@ -539,6 +591,28 @@ impl CrewView {
                     });
                 }
             }
+            Event::Choose {
+                id,
+                agent,
+                question,
+                choices,
+            } => self.choices.push(Choice {
+                id,
+                agent,
+                question,
+                choices,
+            }),
+            Event::Chosen { id, answer } => {
+                if let Some(at) = self.choices.iter().position(|c| c.id == id) {
+                    let choice = self.choices.remove(at);
+                    if let Some(view) = self.agent_mut(&choice.agent) {
+                        view.thread.push(Entry::Chose {
+                            question: choice.question,
+                            answer,
+                        });
+                    }
+                }
+            }
             Event::Waiting { agent, on } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.waiting = Some(Waiting {
@@ -644,6 +718,11 @@ impl CrewView {
                 for question in &mut self.questions {
                     if question.agent == from {
                         question.agent.clone_from(&to);
+                    }
+                }
+                for choice in &mut self.choices {
+                    if choice.agent == from {
+                        choice.agent.clone_from(&to);
                     }
                 }
             }
