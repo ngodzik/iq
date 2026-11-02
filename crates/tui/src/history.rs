@@ -86,21 +86,39 @@ impl Para {
 }
 
 /// What a window holds: a paragraph, folded at the width it is written at;
-/// a table, drawn at it; a diagram, its source written as code unless it is
-/// drawn, with the styles of what is said of it.
+/// a line of code, written as it is; a table, drawn at it; a diagram, its
+/// source written as code unless it is drawn, with the styles of what is
+/// said of it.
 #[derive(Debug, Clone)]
 enum Block {
     Para(Para),
+    Whole(Line<'static>),
     Table(Table),
     Diagram {
         diagram: Arc<Diagram>,
-        code: Vec<Para>,
+        code: Vec<Block>,
         said: Style,
         failed: Style,
     },
 }
 
 impl Block {
+    /// A styled line of an agent's text: code at the line's start, whole,
+    /// the rest under its block's indent.
+    fn text(styled: Styled) -> Block {
+        if styled.whole {
+            Block::Whole(Line::from(
+                styled
+                    .first
+                    .into_iter()
+                    .chain(styled.body)
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
+            Block::Para(Para::text(styled))
+        }
+    }
+
     /// Whether it is a diagram being drawn, which what comes after it waits
     /// for.
     fn drawing(&self) -> bool {
@@ -113,6 +131,7 @@ impl Block {
         let indent = [Span::raw("  ")];
         match self {
             Block::Para(para) => wrap(&para.body, width, &para.first, &para.rest),
+            Block::Whole(line) => vec![line.clone()],
             Block::Table(table) => table.lines(width, &indent),
             Block::Diagram {
                 diagram,
@@ -122,10 +141,10 @@ impl Block {
             } => match diagram.shown(width, &indent, cell, *said, images) {
                 Shown::Image(lines) => lines,
                 Shown::Source(why) => {
-                    let mut lines: Vec<Line<'static>> = code
-                        .iter()
-                        .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest))
-                        .collect();
+                    let mut lines: Vec<Line<'static>> = Vec::new();
+                    for block in code {
+                        lines.extend(block.lines(width, cell, images));
+                    }
                     if let Some(why) = why {
                         lines.extend(wrap(
                             &[Span::styled(why, *failed)],
@@ -1096,14 +1115,25 @@ impl History {
     /// diagram, which is drawn if anything draws diagrams.
     fn write(&mut self, agent: &str, out: Vec<Out>, board: &Board, p: &Palette) {
         for out in out {
+            // An empty line of text leaves one between two of its
+            // paragraphs: none after the agent's name or its steps, as a
+            // model's text that is only new lines would, and never two.
+            if let Out::Line(styled) = &out
+                && styled.is_empty()
+            {
+                if self.speaker() == Some(agent) && self.kind() == Some(Kind::Text) {
+                    self.blank();
+                }
+                continue;
+            }
             self.header(agent, board, p);
             match out {
-                Out::Line(styled) => self.push_text(Para::text(styled)),
+                Out::Line(styled) => self.push_text_block(Block::text(styled)),
                 Out::Table(table) => self.push_text_block(Block::Table(table)),
                 Out::Diagram(source) => {
                     let code = code("mermaid", &source, p)
                         .into_iter()
-                        .map(Para::text)
+                        .map(Block::text)
                         .collect();
                     let id = self.next_image.max(1);
                     self.next_image = (id + 1) & 0x00ff_ffff;
@@ -1315,12 +1345,6 @@ impl History {
     fn push_block(&mut self, block: Block) {
         self.kinds.insert(self.at.clone(), Kind::Other);
         self.paras.push((self.at.clone(), block));
-    }
-
-    /// Puts a line of an agent's text in the window, a line left between
-    /// it and the steps before.
-    fn push_text(&mut self, para: Para) {
-        self.push_text_block(Block::Para(para));
     }
 
     /// Puts what an agent wrote in the window, a line left between it and
@@ -1860,6 +1884,102 @@ mod tests {
             ]
         );
         assert!(!history.waiting());
+    }
+
+    #[test]
+    fn empty_lines_leave_one_between_paragraphs_and_code_is_written_whole() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        let run = |board: &mut Board, history: &mut History, event| crew(board, history, event, &p);
+        run(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: "lead".into(),
+                model: "lab/m".into(),
+                by: PERSON.into(),
+            },
+        );
+        let long = format!("run --flag {}", "x".repeat(60));
+        for text in [
+            // Pieces of an answer that are only new lines, as some models
+            // send them before a tool.
+            "\n".to_owned(),
+            "\n\n\n".to_owned(),
+            "Run this:\n\n\n\n".to_owned(),
+            format!("```sh\n{long}\n\n  echo done\n```\n\n"),
+        ] {
+            run(
+                &mut board,
+                &mut history,
+                Event::Text {
+                    agent: "lead".into(),
+                    text,
+                },
+            );
+        }
+        run(
+            &mut board,
+            &mut history,
+            Event::Tool {
+                agent: "lead".into(),
+                name: "run".into(),
+                input: "ls".into(),
+                output: String::new(),
+                ok: true,
+            },
+        );
+        run(
+            &mut board,
+            &mut history,
+            Event::TextStart {
+                agent: "lead".into(),
+            },
+        );
+        run(
+            &mut board,
+            &mut history,
+            Event::Text {
+                agent: "lead".into(),
+                text: "\n\nDone.\n".into(),
+            },
+        );
+        run(
+            &mut board,
+            &mut history,
+            Event::Done {
+                agent: "lead".into(),
+                outcome: Ok("done".into()),
+            },
+        );
+        let lines: Vec<String> = history
+            .take(40, Some("lead"))
+            .iter()
+            .map(|l| l.to_string().trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "",
+                "● m",
+                "  Run this:",
+                "",
+                // Code at the line's start, its marks above and below it,
+                // a line longer than the screen not folded by iq.
+                "╭ sh",
+                long.as_str(),
+                "",
+                "  echo done",
+                "╰",
+                "",
+                "  ▸ run ls",
+                "",
+                "  Done.",
+                "",
+                "  ✔",
+            ]
+        );
     }
 
     #[test]

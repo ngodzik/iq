@@ -261,6 +261,33 @@ mod tests {
     }
 
     #[test]
+    fn a_line_wider_than_the_screen_is_folded_by_the_terminal_itself() {
+        let size = |n: u16| std::num::NonZeroU16::new(n).unwrap();
+        let mut parser = vt100::Parser::new(size(6), size(20), 50);
+        let mut out = Vec::new();
+        let mut inline = Inline::new(20, 6);
+        inline.place(&mut out, 2).unwrap();
+        // What the live part draws on its first row.
+        out.extend_from_slice(b"\x1b[5;1Hlive");
+        let long = format!("cp {} b", "a".repeat(25));
+        inline
+            .insert(&mut out, &[Line::from(long.as_str()), Line::from("after")])
+            .unwrap();
+        parser.process(&out);
+        assert_eq!(
+            screen(&parser)[..6],
+            ["", &long[..20], &long[20..], "after", "live", ""]
+        );
+        // Folded by the terminal, not cut by iq: a selection of it copies
+        // one line.
+        assert!(parser.screen().row_wrapped(1));
+        assert_eq!(
+            parser.screen().contents_between(1, 0, 2, 20).trim_end(),
+            long
+        );
+    }
+
+    #[test]
     fn no_escape_written_in_the_conversation_reaches_the_terminal() {
         let mut out = Vec::new();
         let mut inline = Inline::new(40, 6);

@@ -21,6 +21,11 @@ pub(crate) struct Styled {
     pub(crate) rest: Vec<Span<'static>>,
     /// The line.
     pub(crate) body: Vec<Span<'static>>,
+    /// Whether it is code, or a mark above or below it: written as it is,
+    /// at the line's start and never folded by iq, so that a person's
+    /// selection copies it as the model wrote it, the terminal folding it
+    /// where it must.
+    pub(crate) whole: bool,
 }
 
 impl Styled {
@@ -29,6 +34,7 @@ impl Styled {
             first: Vec::new(),
             rest: Vec::new(),
             body,
+            whole: false,
         }
     }
 
@@ -37,7 +43,20 @@ impl Styled {
             first: vec![prefix],
             rest: vec![hang],
             body,
+            whole: false,
         }
+    }
+
+    fn whole(body: Vec<Span<'static>>) -> Styled {
+        Styled {
+            whole: true,
+            ..Styled::plain(body)
+        }
+    }
+
+    /// Whether it is an empty line of text, not of code.
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.whole && self.first.is_empty() && self.body.iter().all(|s| s.content.is_empty())
     }
 }
 
@@ -84,19 +103,32 @@ fn opening(trimmed: &str) -> Option<(String, &str)> {
 
 /// The lines of a block of code in `language`, as a fenced block is styled.
 pub(crate) fn code(language: &str, source: &str, p: &Palette) -> Vec<Styled> {
-    let gutter = || Span::styled("│ ", p.fg(p.faint));
-    std::iter::once(Styled::plain(vec![Span::styled(
-        format!("╭ {language}"),
-        p.fg(p.faint),
-    )]))
-    .chain(source.lines().map(|line| {
-        Styled::under(
-            gutter(),
-            gutter(),
-            vec![Span::styled(line.to_owned(), p.fg(p.code))],
-        )
-    }))
-    .collect()
+    std::iter::once(above(language, p))
+        .chain(source.lines().map(|line| code_line(line, p)))
+        .chain(std::iter::once(below(p)))
+        .collect()
+}
+
+/// The mark above a block of code, with its language when it has one.
+/// Marks stand above and below the code rather than before each of its
+/// lines, which a selection would take with them.
+fn above(language: &str, p: &Palette) -> Styled {
+    let mark = if language.is_empty() {
+        "╭".to_owned()
+    } else {
+        format!("╭ {language}")
+    };
+    Styled::whole(vec![Span::styled(mark, p.fg(p.faint))])
+}
+
+/// The mark below a block of code.
+fn below(p: &Palette) -> Styled {
+    Styled::whole(vec![Span::styled("╰", p.fg(p.faint))])
+}
+
+/// A line of code, as it is written.
+fn code_line(line: &str, p: &Palette) -> Styled {
+    Styled::whole(vec![Span::styled(line.to_owned(), p.fg(p.code))])
 }
 
 impl Markdown {
@@ -143,8 +175,9 @@ impl Markdown {
         out
     }
 
-    /// What is held as a text ends: a table, and a diagram whose fence
-    /// never closed, written as the code it is.
+    /// What is held as a text ends: a table, a diagram whose fence never
+    /// closed, written as the code it is, and the mark below a block of
+    /// code left open.
     pub(crate) fn flush(&mut self, p: &Palette) -> Vec<Out> {
         let mut out = self.table_out(p);
         if let Some(lines) = self.diagram.take() {
@@ -154,6 +187,8 @@ impl Markdown {
                     .into_iter()
                     .map(Out::Line),
             );
+        } else if self.fence.take().is_some() {
+            out.push(Out::Line(below(p)));
         }
         out
     }
@@ -172,31 +207,19 @@ impl Markdown {
         ))]
     }
 
-    /// `line` styled, or nothing when it only opens or closes a block of
-    /// code.
+    /// `line` styled: a fence as the mark above or below its code.
     fn styled(&mut self, line: &str, p: &Palette) -> Option<Styled> {
         let trimmed = line.trim_start();
-        let gutter = || Span::styled("│ ", p.fg(p.faint));
         if let Some(fence) = &self.fence {
             if trimmed.starts_with(fence.as_str()) && trimmed.trim_end() == fence.as_str() {
                 self.fence = None;
-                return None;
+                return Some(below(p));
             }
-            return Some(Styled::under(
-                gutter(),
-                gutter(),
-                vec![Span::styled(line.to_owned(), p.fg(p.code))],
-            ));
+            return Some(code_line(line, p));
         }
         if let Some((marker, language)) = opening(trimmed) {
             self.fence = Some(marker);
-            if language.is_empty() {
-                return None;
-            }
-            return Some(Styled::plain(vec![Span::styled(
-                format!("╭ {language}"),
-                p.fg(p.faint),
-            )]));
+            return Some(above(language, p));
         }
         let indent: String = line.chars().take_while(|c| *c == ' ').collect();
         if trimmed.is_empty() {
@@ -244,6 +267,7 @@ impl Markdown {
                     ],
                     rest: vec![Span::raw(format!("{indent}  "))],
                     body: inline(item, p.fg(p.text), p, self.links),
+                    whole: false,
                 });
             }
         }
@@ -259,6 +283,7 @@ impl Markdown {
                 ],
                 rest: vec![Span::raw(format!("{indent}{}", " ".repeat(digits + 2)))],
                 body: inline(item, p.fg(p.text), p, self.links),
+                whole: false,
             });
         }
         if let Some(quote) = trimmed.strip_prefix('>') {
@@ -406,11 +431,14 @@ mod tests {
         );
         assert_eq!(shown("12. then").as_deref(), Some("12. then"));
         assert_eq!(shown("```rust").as_deref(), Some("╭ rust"));
-        assert_eq!(
-            shown("let x = *a * b;").as_deref(),
-            Some("│ let x = *a * b;")
-        );
-        assert_eq!(shown("```"), None);
+        // Code as it is written, nothing before it, whole.
+        let [Out::Line(code)] = &md.line("    let x = *a * b;", &p)[..] else {
+            panic!("one line of code")
+        };
+        assert_eq!(text(code), "    let x = *a * b;");
+        assert!(code.whole && code.first.is_empty());
+        let mut shown = |line: &str| one(md.line(line, &p));
+        assert_eq!(shown("```").as_deref(), Some("╰"));
         assert_eq!(shown("a *b* c").as_deref(), Some("a b c"));
         assert_eq!(shown("snake_case_name").as_deref(), Some("snake_case_name"));
         assert_eq!(shown("2 * 3 = 6").as_deref(), Some("2 * 3 = 6"));
@@ -460,13 +488,16 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert_eq!(shown, ["╭ mermaid", "│ graph TD"]);
-        // A row within code is code.
-        assert!(md.line("```", &p).is_empty());
+        assert_eq!(shown, ["╭ mermaid", "graph TD", "╰"]);
+        // A row within code is code, and a block left open is closed as
+        // the text ends.
+        assert_eq!(one(md.line("```", &p)).as_deref(), Some("╭"));
         assert_eq!(
             one(md.line("| in code |", &p)).as_deref(),
-            Some("│ | in code |")
+            Some("| in code |")
         );
+        assert_eq!(one(md.flush(&p)).as_deref(), Some("╰"));
+        assert_eq!(one(md.line("| out |", &p)), None);
     }
 
     #[test]

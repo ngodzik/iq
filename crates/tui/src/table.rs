@@ -1,7 +1,7 @@
 //! A Markdown table, held until its last row, then drawn at the width it is
 //! written at: its columns as wide as their widest cell, aligned as its rule
 //! says, the widest made narrower when the terminal is, each cell's text
-//! folding within its column.
+//! folding within its column, a faint rule between its rows once one folds.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -175,8 +175,22 @@ impl Table {
             rule.push(Span::styled(drawn.join("─┼─"), self.bars));
             lines.push(Line::from(rule));
         }
-        for row in &self.rows {
-            lines.extend(self.row(row, &widths, indent));
+        let rows: Vec<Vec<Line<'static>>> = self
+            .rows
+            .iter()
+            .map(|row| self.row(row, &widths, indent))
+            .collect();
+        // A row folded onto several lines runs into the next without
+        // something between them; rows of one line each need nothing.
+        let folded = rows.iter().any(|row| row.len() > 1);
+        for (at, row) in rows.into_iter().enumerate() {
+            if folded && at > 0 {
+                let mut rule = indent.to_vec();
+                let drawn: Vec<String> = widths.iter().map(|w| "┈".repeat(*w)).collect();
+                rule.push(Span::styled(drawn.join("┈┼┈"), self.bars));
+                lines.push(Line::from(rule));
+            }
+            lines.extend(row);
         }
         lines
     }
@@ -276,6 +290,7 @@ mod tests {
             "| Name | What it does |",
             "|---|---|",
             "| fetch | reads one page of the documentation and gives its text back |",
+            "| search | lists pages |",
         ])
         .lines(30, &[]);
         let shown = text(&drawn);
@@ -283,9 +298,13 @@ mod tests {
             shown.iter().all(|line| line.chars().count() <= 30),
             "{shown:#?}"
         );
-        assert_eq!(shown[2], "fetch │ reads one page of the");
-        assert_eq!(shown[3], "      │ documentation and");
-        assert_eq!(shown[4], "      │ gives its text back");
+        assert_eq!(shown[2], "fetch  │ reads one page of the");
+        assert_eq!(shown[3], "       │ documentation and");
+        assert_eq!(shown[4], "       │ gives its text back");
+        // A faint rule tells a folded row from the next.
+        assert_eq!(shown[5], "┈┈┈┈┈┈┈┼┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈");
+        assert_eq!(shown[6], "search │ lists pages");
+        assert_eq!(shown.len(), 7);
     }
 
     #[test]

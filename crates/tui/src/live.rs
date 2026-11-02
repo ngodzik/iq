@@ -25,10 +25,6 @@ use crate::motion::{Motion, YOU};
 use crate::theme::Palette;
 use crate::wrap::{cut, spans_width, width as text_width, wrap};
 
-/// How much of a chat's first request the box where the person writes
-/// shows, in characters.
-const HINT_TASK_CHARS: usize = 48;
-
 /// The most agents the chat written to started given a pane each, as they
 /// work.
 const PANES: usize = 4;
@@ -886,20 +882,9 @@ impl Live<'_> {
                         Span::styled(format!(" {model} "), p.fg(p.faint)),
                     ]),
                     Line::from(Span::styled(spent, p.fg(p.faint))),
-                    // What it was first asked tells the chat from another.
-                    match view.map(|v| v.task.trim()).filter(|task| !task.is_empty()) {
-                        Some(task) => {
-                            let asked: String = task
-                                .lines()
-                                .next()
-                                .unwrap_or_default()
-                                .chars()
-                                .take(HINT_TASK_CHARS)
-                                .collect();
-                            format!("Write to {agent}, first asked “{asked}”…")
-                        }
-                        None => format!("Write to {agent}…"),
-                    },
+                    // The chat is named after its work: its first request
+                    // says nothing the next one needs.
+                    format!("Write to {agent}…"),
                 )
             }
             Talk::New(chat) => {
@@ -1063,8 +1048,16 @@ impl Live<'_> {
                 p.fg(p.warn),
             ));
         }
-        // On the right, the person and the agents, by name while they fit.
-        let agents = crew.agents();
+        // On the right, the person, the chat written to and the agents it
+        // started, by name while they fit: the other chats are the
+        // switcher's. Each keeps its tint among all the crew.
+        let window = self.window();
+        let agents: Vec<(usize, &iq_ui::crew::AgentView)> = crew
+            .agents()
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| window.is_some() && chat_of(self.board, &agent.name) == window)
+            .collect();
         let talking = self.board.screen().talking_to();
         let right = |named: bool| -> (Vec<Span<'static>>, Vec<(String, u16)>) {
             let mut spans = Vec::new();
@@ -1077,9 +1070,9 @@ impl Live<'_> {
             marks.push((YOU.to_owned(), at));
             let you = p.dim.mix(p.text, motion.glow(YOU));
             put(&mut spans, Span::styled(YOU, p.fg(you)), &mut at);
-            for (index, agent) in agents.iter().enumerate() {
+            for (index, agent) in &agents {
                 put(&mut spans, Span::raw(" "), &mut at);
-                let tint = p.agent(index);
+                let tint = p.agent(*index);
                 let dot = if agent.working {
                     p.faint.mix(tint, 0.35 + 0.65 * motion.pulse(5.0))
                 } else {
@@ -1585,12 +1578,14 @@ mod tests {
         // at work is the switcher's.
         let rows = drawn(&board, &history, 90).join("\n");
         assert!(rows.contains("⠋ sage working…"), "{rows}");
-        // Only the status line, where messages run, names it.
+        // Not even the status line names it: it shows the chat written to
+        // and the agents it started, the sparks running between them.
         assert!(!rows.contains("also at work"), "{rows}");
-        assert_eq!(
-            rows.lines().filter(|row| row.contains("docs")).count(),
-            1,
-            "{rows}"
+        assert!(!rows.contains("docs"), "{rows}");
+        let status = rows.lines().last().unwrap_or_default();
+        assert!(
+            status.ends_with("you ● api ● api/tests ● api/review"),
+            "{status}"
         );
     }
 
