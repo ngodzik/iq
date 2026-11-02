@@ -18,6 +18,6 @@ pub use error::CoreError;
 pub use glob::glob_matches;
 pub use traits::ChatModel;
 pub use types::{
-    Busy, CacheTtl, CacheUse, ChatRequest, ChatResponse, Dearer, Effort, Message, ModelId, Pricing,
-    TokenCount, ToolCall, ToolSpec, Usage, Usd,
+    Busy, CacheTtl, CacheUse, ChatRequest, ChatResponse, Dearer, Effort, IMAGE_MOST, Message,
+    ModelId, Pricing, TokenCount, ToolCall, ToolSpec, Usage, Usd, image_type,
 };

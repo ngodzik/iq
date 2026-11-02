@@ -38,8 +38,8 @@ pub enum Action {
         host: bool,
     },
     /// Reaching the network outside a command: fetching a page, searching
-    /// the web. Always asked of the person: what leaves cannot be taken
-    /// back.
+    /// the web. Asked as a command with the internet is: what leaves cannot
+    /// be taken back.
     Fetch {
         /// What is fetched or searched for, as the agent wrote it.
         target: String,

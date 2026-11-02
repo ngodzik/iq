@@ -110,6 +110,18 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
             Err(error) => writeln!(out, "\n✘ {agent} stopped: {error}"),
         },
         Event::Notice { agent, text } => writeln!(out, "\n! {agent}: {text}"),
+        Event::Waiting { agent, on } => writeln!(out, "  ⧗ {agent} waits for {}", on.join(", ")),
+        Event::JobStarted { agent, id, line } => {
+            writeln!(out, "  ⚙ {agent} runs job {id} in the background: {line}")
+        }
+        Event::JobEnded { agent, id, said } => {
+            writeln!(out, "  ⚙ job {id} of {agent} ended: {said}")
+        }
+        // Asked where `iq do` reads its answers: see [`choose`].
+        Event::Choose { .. } => Ok(()),
+        Event::Chosen { answer, .. } => {
+            writeln!(out, "  → {}", answer.as_deref().unwrap_or("no answer"))
+        }
         Event::Renamed { from, to } => writeln!(out, "\n! {from} is called {to} now"),
         Event::Model { agent, model } => writeln!(out, "\n! {agent} answers on {model} now"),
         Event::Placed {
@@ -149,6 +161,27 @@ pub(crate) fn heard(update: &iq_ui::Update) {
 }
 
 /// Asks the person on the terminal; no answer refuses.
+/// Asks the person `question` on the terminal, `agent`'s, offering
+/// `choices` by number; their own words when they write something else,
+/// none when they write nothing.
+pub(crate) fn choose(agent: &str, question: &str, choices: &[String]) -> Option<String> {
+    println!("\n? {agent} asks: {question}");
+    for (at, choice) in choices.iter().enumerate() {
+        println!("  {}. {choice}", at + 1);
+    }
+    print!("A number, or your own answer: ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer).is_err() {
+        return None;
+    }
+    let answer = answer.trim();
+    match answer.parse::<usize>() {
+        Ok(at) if (1..=choices.len()).contains(&at) => Some(choices[at - 1].clone()),
+        _ => Some(answer.to_owned()).filter(|a| !a.is_empty()),
+    }
+}
+
 pub(crate) fn ask(question: &str) -> bool {
     print!("{question} Allow it? [y/N] ");
     let _ = std::io::stdout().flush();

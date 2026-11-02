@@ -12,6 +12,8 @@ iq-gate.workspace    = true
 serde.workspace      = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
+# Images shown to a model: a file read, what a tool gave.
+base64.workspace     = true
 
 [dev-dependencies]
 tokio.workspace    = true

@@ -311,6 +311,8 @@ fn crew(
         skills = skills.with_reviewer(name, &workspace);
     }
     crew.extend(Arc::new(skills));
+    // And the web, read with tools of iq's own, judged by the gate.
+    crew.extend(Arc::new(iq_web::Web::new(settings.search()?)));
     Ok(crew)
 }
 
@@ -486,6 +488,91 @@ fn person_rules(files: &[(String, PathBuf)], home: &Path) -> Vec<iq_agent::Rules
             })
         })
         .collect()
+}
+
+/// The images the person attached, by their `paths`, read as their own
+/// action wherever they are: judged by `gate`, which refuses a file of
+/// secrets and writes down that the person read one outside the workspace,
+/// then taken only when they are images of a size a model is shown. Why
+/// one is not is told on `told`.
+fn attached(
+    gate: &Gate,
+    paths: &[PathBuf],
+    told: &std::sync::mpsc::Sender<Update>,
+) -> Vec<iq_core::Message> {
+    use base64::Engine;
+    let mut shown = Vec::new();
+    for path in paths {
+        let read = (|| -> Result<iq_core::Message, String> {
+            let permit = match gate
+                .judge(iq_gate::Action::Read { path: path.clone() })
+                .map_err(|e| e.to_string())?
+            {
+                iq_gate::Judged::Allowed(permit) => permit,
+                // The person's own: given as they asked it.
+                iq_gate::Judged::Asked { pending, .. } => gate
+                    .approve(pending, iq_gate::Approver::Person)
+                    .map_err(|e| e.to_string())?,
+                iq_gate::Judged::Denied { reason } => return Err(reason),
+            };
+            let bytes = permit.read().map_err(|e| e.to_string())?;
+            let mime =
+                iq_core::image_type(&bytes).ok_or("it is no PNG, JPEG, GIF or WebP image")?;
+            if bytes.len() > iq_core::IMAGE_MOST {
+                return Err(format!(
+                    "it is {} KB, more than the {} KB a model is shown",
+                    bytes.len().div_ceil(1024),
+                    iq_core::IMAGE_MOST / 1024
+                ));
+            }
+            Ok(iq_core::Message::Image {
+                mime: mime.to_owned(),
+                data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            })
+        })();
+        match read {
+            Ok(image) => shown.push(image),
+            Err(why) => {
+                let _ = told.send(Update::Notice(format!(
+                    "{} is not sent: {why}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    shown
+}
+
+/// Opens the image of a diagram drawn, `path`, in the system's viewer, as
+/// the person asked: `open` on macOS, `xdg-open` elsewhere; only an image
+/// of iq's own cache of diagrams, and written to `gate`'s audit log.
+fn open_diagram(gate: &Gate, path: &Path) -> Result<()> {
+    let cache = cache_folder(&home_dir()?).join("diagrams");
+    let real = path.canonicalize().context("reading where it is")?;
+    let cache = cache.canonicalize().context("reading iq's cache")?;
+    if !real.starts_with(&cache) || real.extension().is_none_or(|e| e != "png") {
+        anyhow::bail!("only a diagram iq drew is opened");
+    }
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    gate.outside(
+        "the person",
+        &format!("{program} {}", real.display()),
+        gate.workspace(),
+    )?;
+    let mut child = std::process::Command::new(program)
+        .arg(&real)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("starting {program}"))?;
+    // Waited for on a thread of its own, so that it leaves no zombie.
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 /// Where iq keeps what it can make again, apart from its own folder: the
@@ -738,9 +825,31 @@ async fn work(
     if let Some(partner) = partner {
         models.push(ModelId::new(partner)?);
     }
-    crew.launch(pattern, LEAD, &models, task.to_owned(), None, None);
+    crew.launch(
+        pattern,
+        LEAD,
+        &models,
+        task.to_owned(),
+        None,
+        None,
+        Vec::new(),
+    );
     let mut tally = terminal::Tally::default();
     let handle = |event: Event, tally: &mut terminal::Tally| {
+        if let Event::Choose {
+            id,
+            agent,
+            question,
+            choices,
+        } = &event
+        {
+            let crew = crew.clone();
+            let (id, agent, question, choices) =
+                (*id, agent.clone(), question.clone(), choices.clone());
+            tokio::task::spawn_blocking(move || {
+                crew.choose(id, terminal::choose(&agent, &question, &choices));
+            });
+        }
         if let Some((id, question)) = terminal::show(&event, tally) {
             let crew = crew.clone();
             tokio::task::spawn_blocking(move || crew.answer(id, terminal::ask(&question)));
@@ -1083,12 +1192,15 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     named,
                     effort,
                     from_words,
+                    images,
                 } => match ModelId::new(&model) {
                     Ok(model) => {
                         let mut models = vec![model];
                         models.extend(partner.and_then(|p| ModelId::new(&p).ok()));
                         let task = with_named(task, &named[named.len().min(1)..]);
-                        let started = working.launch(pattern, &name, &models, task, role, effort);
+                        let shown = attached(working.gate(), &images, &told);
+                        let started =
+                            working.launch(pattern, &name, &models, task, role, effort, shown);
                         // A debate's chats are named alike, apart only by
                         // their numbers: they keep the name they share.
                         if from_words && pattern != iq_agent::Pattern::Debate {
@@ -1097,10 +1209,29 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     }
                     Err(error) => tracing::warn!("no chat on `{model}`: {error}"),
                 },
-                Request::Tell { to, text, named } => {
+                Request::Tell {
+                    to,
+                    text,
+                    named,
+                    images,
+                } => {
+                    // Shown before the message wakes it, so that its next
+                    // call sees both.
+                    for image in attached(working.gate(), &images, &told) {
+                        working.show(&to, image);
+                    }
                     let _ = working.tell(&to, with_named(text, &named));
                 }
                 Request::Answer { id, approved } => working.answer(id, approved),
+                Request::Choose { id, answer } => working.choose(id, answer),
+                Request::Open { path } => {
+                    if let Err(why) = open_diagram(working.gate(), &path) {
+                        let _ = told.send(Update::Notice(format!(
+                            "{} is not opened: {why}",
+                            path.display()
+                        )));
+                    }
+                }
                 Request::Autopilot(on) => working.set_autopilot(on),
                 Request::Internet(open) => working.set_internet(open),
                 Request::Effort { agent, effort } => {

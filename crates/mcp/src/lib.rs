@@ -605,7 +605,8 @@ fn last_errors(errors: &Mutex<VecDeque<String>>) -> String {
 
 /// A tool call's result as text: its text parts, what else it holds named;
 /// as much as a model is given of it.
-fn call_text(result: &Value) -> Result<String, McpError> {
+fn call_text(result: &Value) -> Result<Answer, McpError> {
+    let mut images = Vec::new();
     let parts: Vec<String> = result["content"]
         .as_array()
         .into_iter()
@@ -615,6 +616,13 @@ fn call_text(result: &Value) -> Result<String, McpError> {
             Some("resource") => part["resource"]["text"]
                 .as_str()
                 .map_or_else(|| "[a resource]".to_owned(), str::to_owned),
+            Some("image") => match image_of(part) {
+                Ok(image) => {
+                    images.push(image);
+                    "[an image: it is shown to you after this step's results]".to_owned()
+                }
+                Err(why) => format!("[an image, not shown: {why}]"),
+            },
             Some(other) => format!("[{other}]"),
             None => String::new(),
         })
@@ -636,8 +644,41 @@ fn call_text(result: &Value) -> Result<String, McpError> {
     if result["isError"].as_bool() == Some(true) {
         Err(McpError::Failed(text))
     } else {
-        Ok(text)
+        Ok(Answer { text, images })
     }
+}
+
+/// The image of an `image` part of a tool's answer, as a model is shown
+/// it: base64 data of a PNG, a JPEG, a GIF or a WebP, as its first bytes
+/// say whatever the part names it, no larger than a model is shown.
+fn image_of(part: &Value) -> Result<iq_core::Message, String> {
+    use base64::Engine;
+    let data = part["data"].as_str().ok_or("it holds no data")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .map_err(|_| "its data is no base64".to_owned())?;
+    let mime = iq_core::image_type(&bytes).ok_or("it is no PNG, JPEG, GIF or WebP image")?;
+    if bytes.len() > iq_core::IMAGE_MOST {
+        return Err(format!(
+            "it is {} KB, more than the {} KB a model is shown",
+            bytes.len().div_ceil(1024),
+            iq_core::IMAGE_MOST / 1024
+        ));
+    }
+    Ok(iq_core::Message::Image {
+        mime: mime.to_owned(),
+        data: data.trim().to_owned(),
+    })
+}
+
+/// What a tool answered: its text, and the images it showed, for the
+/// agent's next call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answer {
+    /// Its text, an image said where it stood.
+    pub text: String,
+    /// The images, as image messages.
+    pub images: Vec<iq_core::Message>,
 }
 
 /// A name as model providers take it: letters, digits, `_` and `-`.
@@ -881,7 +922,7 @@ impl Server {
     /// taking it (its grant no longer taken, its session gone) connects
     /// again and is made once more; a program that stopped is started
     /// again for the next call.
-    async fn call(&self, tool: &str, arguments: &Value) -> Result<String, McpError> {
+    async fn call(&self, tool: &str, arguments: &Value) -> Result<Answer, McpError> {
         let first = self.call_once(tool, arguments).await;
         let again = match &first {
             Err(McpError::Status { status: 401, .. }) => self.takes_oauth(),
@@ -906,7 +947,7 @@ impl Server {
         self.call_once(tool, arguments).await
     }
 
-    async fn call_once(&self, tool: &str, arguments: &Value) -> Result<String, McpError> {
+    async fn call_once(&self, tool: &str, arguments: &Value) -> Result<Answer, McpError> {
         let mut link = self.link.lock().await;
         let open = link
             .as_mut()
@@ -1194,7 +1235,7 @@ impl Mcp {
     ///
     /// The permit is not for a server's tool, its server is not connected,
     /// cannot be reached or refuses, or the tool failed.
-    pub async fn call(&self, permit: &Permit) -> Result<String, McpError> {
+    pub async fn call(&self, permit: &Permit) -> Result<Answer, McpError> {
         let Action::Tool {
             server,
             tool,
@@ -1256,7 +1297,11 @@ where
                     .insert(server.clone());
             }
             let permit = crew.act(&agent, action).await?;
-            mcp.call(&permit).await.map_err(|e| said(&e))
+            let answer = mcp.call(&permit).await.map_err(|e| said(&e))?;
+            for image in answer.images {
+                crew.show(&agent, image);
+            }
+            Ok(answer.text)
         })
     }
 }

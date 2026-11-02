@@ -37,6 +37,7 @@ mod watch;
 
 pub use action::{Action, Approver, Judged, Pending, Permit, Scope};
 pub use error::GateError;
+pub use files::Listed;
 pub use gate::{Gate, GateBuilder};
 pub use rules::{Decision, Rules};
 /// Whether `path` holds secrets, as its name or its folder says: a file of
@@ -60,5 +61,13 @@ pub fn holds_secrets(path: &std::path::Path, home: Option<&std::path::Path>) -> 
 }
 
 pub use sandbox::{
-    HELPER_FLAG, HOLD_FLAG, Helper, Ran, Sandbox, helper_failure, hold_network, sandboxed,
+    HELPER_FLAG, HOLD_FLAG, Helper, Live, Ran, Sandbox, helper_failure, hold_network, sandboxed,
 };
+
+/// Whether `text` holds a secret value: one of the environment's, or of the
+/// `.env` files of `workspace`, as a command's output is cleared of them.
+/// What would carry one away (a query sent to a search engine) is refused.
+#[must_use]
+pub fn holds_secret(text: &str, workspace: &std::path::Path) -> bool {
+    redact::Redactor::new(std::env::vars_os(), workspace).redact(text) != text
+}

@@ -1144,6 +1144,7 @@ async fn a_writer_and_its_reviewer_go_round_until_it_approves() {
         "make it work".into(),
         None,
         None,
+        Vec::new(),
     );
     for _ in 0..4 {
         f.settled().await;
@@ -1193,6 +1194,7 @@ async fn debaters_answer_alone_then_read_each_other_and_the_first_sums_up() {
         "how to store it".into(),
         None,
         None,
+        Vec::new(),
     );
     assert_eq!(first, "think");
     for _ in 0..4 {
@@ -1975,6 +1977,19 @@ async fn an_agent_waiting_for_those_it_started_waits_until_they_write() {
     let seen = f.model.seen_by("lead");
     assert!(seen.contains("Message from lead/2: done, slowly"), "{seen}");
     assert!(!seen.contains("No message came"), "{seen}");
+    // Whom it waited for was said, once.
+    let waits: Vec<Event> = f
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Waiting { .. }))
+        .collect();
+    assert_eq!(
+        waits,
+        [Event::Waiting {
+            agent: "lead".into(),
+            on: vec!["lead/2".into()],
+        }]
+    );
     // One call to wait, not one every second.
     assert_eq!(f.model.requests_of("lead").len(), 3);
 }
@@ -2126,5 +2141,139 @@ async fn a_provider_still_out_of_capacity_ends_the_turn_saying_what_to_do_and_ke
     assert!(
         seen.contains("fix it") && seen.contains("try again"),
         "{seen}"
+    );
+}
+
+#[tokio::test]
+async fn an_image_read_or_attached_is_shown_to_the_model_with_its_next_call() {
+    let png: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x01\0\0\0\x01";
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls("read_file", serde_json::json!({"path": "shot.png"})),
+                say("A red square."),
+            ],
+        )],
+        Settings::default(),
+    );
+    std::fs::write(f.root.join("shot.png"), png).unwrap();
+    f.crew.launch(
+        Pattern::Solo,
+        "lead",
+        &[model("cheap/model")],
+        "what is in it?".into(),
+        None,
+        None,
+        vec![Message::Image {
+            mime: "image/png".into(),
+            data: "aGk=".into(),
+        }],
+    );
+    f.settled().await;
+    let requests = f.model.requests_of("lead");
+    // Attached: shown with the task, its first call.
+    assert!(matches!(
+        &requests[0].messages[..],
+        [.., Message::User(task), Message::Image { data, .. }] if task.contains("what is in it?") && data == "aGk="
+    ));
+    // Read: shown after the tool's result, and the tool said so.
+    let [
+        ..,
+        Message::Tool { content, .. },
+        Message::Image { mime, .. },
+    ] = &requests[1].messages[..]
+    else {
+        panic!("{:#?}", requests[1].messages);
+    };
+    assert!(content.contains("is an image (image/png"), "{content}");
+    assert_eq!(mime, "image/png");
+}
+
+#[tokio::test]
+async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "ask_person",
+                    serde_json::json!({"question": "Which environment?", "choices": ["staging", "production"]}),
+                ),
+                say("On staging, then."),
+            ],
+        )],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "deploy".into(), PERSON);
+    let mut asked = None;
+    for _ in 0..200 {
+        asked = f.events().iter().find_map(|event| match event {
+            Event::Choose { id, choices, .. } => Some((*id, choices.clone())),
+            _ => None,
+        });
+        if asked.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (id, choices) = asked.expect("the person is asked");
+    assert_eq!(choices, ["staging", "production"]);
+    f.crew.choose(id, Some("staging".into()));
+    f.settled().await;
+    assert!(
+        f.model
+            .seen_by("lead")
+            .contains("The person chose: staging")
+    );
+    assert!(f.events().contains(&Event::Chosen {
+        id,
+        answer: Some("staging".into())
+    }));
+}
+
+#[tokio::test]
+async fn a_command_left_in_the_background_returns_at_once_and_its_end_wakes_its_agent() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "run",
+                    serde_json::json!({"command": "make test", "background": true}),
+                ),
+                say("It runs; I will look when it ends."),
+                // Woken by its end.
+                say("It could not run."),
+            ],
+        )],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "test it all".into(), PERSON);
+    for _ in 0..6 {
+        f.settled().await;
+    }
+    let seen = f.model.seen_by("lead");
+    assert!(
+        seen.contains("Job 1 runs `make test` in the background"),
+        "{seen}"
+    );
+    // Nothing here starts the sandbox: it ends at once, and says so.
+    assert!(
+        seen.contains("Message from iq: Job 1, `make test`, ended: it could not run"),
+        "{seen}"
+    );
+    let events = f.events();
+    assert!(events.contains(&Event::JobStarted {
+        agent: "lead".into(),
+        id: 1,
+        line: "make test".into(),
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::JobEnded { id: 1, .. }))
     );
 }

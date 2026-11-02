@@ -401,12 +401,12 @@ impl Gate {
         let workspace = &self.bounds.workspace;
         let (action, verdict) = match action {
             Action::Read { path } => {
-                let path = paths::resolve(&path, workspace);
+                let path = paths::resolve(&self.homed(&path), workspace);
                 let verdict = self.reading(&path);
                 (Action::Read { path }, verdict)
             }
             Action::Write { path } => {
-                let path = paths::resolve(&path, workspace);
+                let path = paths::resolve(&self.homed(&path), workspace);
                 let verdict = self.writing(&path);
                 (Action::Write { path }, verdict)
             }
@@ -428,11 +428,17 @@ impl Gate {
                     verdict,
                 )
             }
+            // No more than a command with the internet sends: given once the
+            // internet is open to every command, asked as it is until then.
             Action::Fetch { target } => (
                 Action::Fetch { target },
-                Verdict::Ask {
-                    reason: "it reaches the internet".to_owned(),
-                    scope: Scope::Internet,
+                if self.internet() {
+                    Verdict::Allow
+                } else {
+                    Verdict::Ask {
+                        reason: "it reaches the internet".to_owned(),
+                        scope: Scope::Internet,
+                    }
                 },
             ),
             Action::Tool {
@@ -528,6 +534,16 @@ impl Gate {
                 reason: format!("it reaches the server {server}"),
                 scope: Scope::Internet,
             }
+        }
+    }
+
+    /// `path` with a leading `~/` read as the home, when the gate knows it:
+    /// "the newest image on ~/Desktop" means the person's, never a folder
+    /// of the workspace named `~`.
+    fn homed(&self, path: &Path) -> PathBuf {
+        match (path.strip_prefix("~"), &self.bounds.home) {
+            (Ok(rest), Some(home)) => home.join(rest),
+            _ => path.to_path_buf(),
         }
     }
 
@@ -821,6 +837,15 @@ mod tests {
             reason(&fetch),
             ("asked", "it reaches the internet".to_owned(), true)
         );
+        // No more than a command with the internet sends, once it is open.
+        f.gate.set_internet(true);
+        let fetch = f
+            .gate
+            .judge(Action::Fetch {
+                target: "https://example.com".into(),
+            })
+            .unwrap();
+        assert_eq!(reason(&fetch).0, "allowed");
     }
 
     #[test]
@@ -858,6 +883,48 @@ mod tests {
         assert!(matches!(
             f.gate.approve(pending, Approver::Reviewer),
             Err(GateError::Widens)
+        ));
+    }
+
+    #[test]
+    fn a_path_under_the_home_is_read_there_and_a_folder_listed_under_a_permit() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join("Desktop")).unwrap();
+        std::fs::write(home.join("Desktop/old.png"), b"a").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(home.join("Desktop/new.png"), b"bb").unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let gate = Gate::builder(work.path())
+            .home(Some(home.clone()))
+            .build()
+            .unwrap();
+        let Judged::Asked { pending, .. } = gate
+            .judge(Action::Read {
+                path: "~/Desktop".into(),
+            })
+            .unwrap()
+        else {
+            panic!("a folder outside the workspace is asked");
+        };
+        assert_eq!(
+            pending.action(),
+            &Action::Read {
+                path: home.join("Desktop")
+            }
+        );
+        let permit = gate.approve(pending, Approver::Person).unwrap();
+        let listed = permit.list().unwrap();
+        let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["new.png", "old.png"]);
+        assert_eq!(listed[0].bytes, 2);
+        // Its folders of credentials are still refused.
+        assert!(matches!(
+            gate.judge(Action::Read {
+                path: "~/.ssh/id_ed25519".into()
+            })
+            .unwrap(),
+            Judged::Denied { .. }
         ));
     }
 

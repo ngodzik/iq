@@ -978,6 +978,7 @@ name = "iq"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "iq-agent",
  "iq-core",
@@ -990,6 +991,7 @@ dependencies = [
  "iq-sync",
  "iq-tui",
  "iq-ui",
+ "iq-web",
  "serde",
  "serde_json",
  "tempfile",
@@ -1003,6 +1005,7 @@ dependencies = [
 name = "iq-agent"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "iq-core",
  "iq-gate",
  "serde",
@@ -1135,6 +1138,20 @@ dependencies = [
  "iq-core",
  "jiff",
  "thiserror",
+]
+
+[[package]]
+name = "iq-web"
+version = "0.1.0"
+dependencies = [
+ "iq-agent",
+ "iq-core",
+ "iq-gate",
+ "reqwest",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
 ]
 
 [[package]]

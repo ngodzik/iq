@@ -148,6 +148,52 @@ pub enum Event {
         /// Its answer, or why it failed.
         outcome: Result<String, String>,
     },
+    /// An agent asks the person to choose among `choices`, or to answer in
+    /// their own words.
+    Choose {
+        /// The question's number, to answer it with.
+        id: u64,
+        /// The agent that asks.
+        agent: String,
+        /// The question.
+        question: String,
+        /// What it offers, two to four.
+        choices: Vec<String>,
+    },
+    /// The person answered a question with choices, or nobody did.
+    Chosen {
+        /// The question.
+        id: u64,
+        /// Their answer: a choice, or their own words; none when they gave
+        /// none.
+        answer: Option<String>,
+    },
+    /// A command an agent left to run in the background began.
+    JobStarted {
+        /// The agent.
+        agent: String,
+        /// Its number, as the agent names it.
+        id: u64,
+        /// The command line.
+        line: String,
+    },
+    /// A command run in the background ended, or was stopped.
+    JobEnded {
+        /// The agent.
+        agent: String,
+        /// Its number.
+        id: u64,
+        /// How it ended, in words: its status, or that it was stopped.
+        said: String,
+    },
+    /// An agent waits for the agents it started to write: none of them
+    /// has yet, and they work.
+    Waiting {
+        /// The agent that waits.
+        agent: String,
+        /// Those it waits for, at work.
+        on: Vec<String>,
+    },
     /// Something the person should know about how an agent works.
     Notice {
         /// The agent.
@@ -172,7 +218,10 @@ impl Event {
                 renamed(agent);
                 renamed(by);
             }
-            Event::Renamed { .. } | Event::Answered { .. } => {}
+            Event::Renamed { .. } | Event::Answered { .. } | Event::Chosen { .. } => {}
+            Event::Choose { agent, .. }
+            | Event::JobStarted { agent, .. }
+            | Event::JobEnded { agent, .. } => renamed(agent),
             Event::Posted {
                 from: writer,
                 to: reader,
@@ -193,6 +242,10 @@ impl Event {
             | Event::Reviewed { agent, .. }
             | Event::Done { agent, .. }
             | Event::Notice { agent, .. } => renamed(agent),
+            Event::Waiting { agent, on } => {
+                renamed(agent);
+                on.iter_mut().for_each(renamed);
+            }
         }
     }
 }

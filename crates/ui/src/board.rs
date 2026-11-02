@@ -3,6 +3,8 @@
 //! key the person presses is taken here, so that what it does is tested
 //! without a terminal.
 
+use std::collections::HashMap;
+
 use iq_agent::{Event, PERSON};
 
 use crate::command::{self, Command, Completion};
@@ -192,6 +194,55 @@ pub struct Board {
     recent: Vec<(String, u64)>,
     /// The chat chosen in the switcher, while it is open.
     switching: Option<usize>,
+    /// The images the person attached to what they write, by their paths,
+    /// sent with it.
+    attached: Vec<std::path::PathBuf>,
+    /// The choice picked in the question with choices shown.
+    picking: usize,
+    /// The images of the diagrams drawn in each chat's window, the latest
+    /// last: none for a new chat's.
+    diagrams: HashMap<Option<String>, Vec<std::path::PathBuf>>,
+    /// How the diagram page shows one of them.
+    picture: Picture,
+}
+
+/// How the diagram page shows a diagram: which, from the latest; how much
+/// it is enlarged; and how far it is moved, in tenths of what shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Picture {
+    /// Which diagram, from the latest: 0 for it.
+    pub back: usize,
+    /// How many times it is enlarged, from one.
+    pub zoom: u32,
+    /// How far it is moved right, then down.
+    pub moved: (i32, i32),
+}
+
+/// The most a diagram is enlarged.
+const ZOOM_MOST: u32 = 8;
+
+/// The image a paste is, when it is the path of one alone: a file dropped
+/// on the terminal pastes its path, quoted, escaped or as a `file://`
+/// address. Known by its name only: the program reads it as it is sent.
+fn image_path(text: &str) -> Option<std::path::PathBuf> {
+    let text = text.trim();
+    if text.is_empty() || text.contains('\n') {
+        return None;
+    }
+    let unquoted = ['\'', '"']
+        .iter()
+        .find_map(|q| text.strip_prefix(*q).and_then(|t| t.strip_suffix(*q)))
+        .unwrap_or(text);
+    let path = match unquoted.strip_prefix("file://") {
+        Some(address) => address.replace("%20", " "),
+        None => unquoted.replace("\\ ", " "),
+    };
+    let looks = path.starts_with('/') || path.starts_with("~/");
+    let lower = path.to_lowercase();
+    let image = [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+        .iter()
+        .any(|ending| lower.ends_with(ending));
+    (looks && image).then(|| path.into())
 }
 
 impl Default for Board {
@@ -227,7 +278,174 @@ impl Board {
             opening: None,
             recent: Vec::new(),
             switching: None,
+            attached: Vec::new(),
+            picking: 0,
+            diagrams: HashMap::new(),
+            picture: Picture::default(),
         }
+    }
+
+    /// The diagram drawn as the image at `image` was written in `chat`'s
+    /// window.
+    pub fn drawn_diagram(&mut self, chat: Option<String>, image: std::path::PathBuf) {
+        let drawn = self.diagrams.entry(chat).or_default();
+        if drawn.last() != Some(&image) {
+            drawn.retain(|seen| *seen != image);
+            drawn.push(image);
+        }
+    }
+
+    /// The diagram the page shows, and how: of the chat written to.
+    #[must_use]
+    pub fn picture(&self) -> Option<(&std::path::Path, Picture)> {
+        let window = self
+            .screen
+            .talking_to()
+            .and_then(|agent| self.crew.chat_of(agent));
+        let drawn = self.diagrams.get(&window)?;
+        let at = drawn.len().checked_sub(1 + self.picture.back)?;
+        Some((&drawn[at], self.picture))
+    }
+
+    /// What a key does on the diagram page: `+` and `-` enlarge it or less,
+    /// the arrows move it, `[` and `]` go to an earlier diagram or a later,
+    /// `0` shows it whole again, `o` opens it in the system's viewer.
+    fn diagram_key(&mut self, chord: &Chord, typed: Option<char>) -> Vec<Request> {
+        let count = self
+            .screen
+            .talking_to()
+            .and_then(|agent| self.crew.chat_of(agent))
+            .map_or_else(
+                || self.diagrams.get(&None),
+                |chat| self.diagrams.get(&Some(chat)),
+            )
+            .map_or(0, Vec::len);
+        let mut picture = self.picture;
+        let reach = |zoom: u32| (zoom as i32 - 1) * 5;
+        match (chord.key.as_str(), typed) {
+            (_, Some('+' | '=')) => picture.zoom = (picture.zoom.max(1) + 1).min(ZOOM_MOST),
+            (_, Some('-')) => picture.zoom = picture.zoom.max(2) - 1,
+            (_, Some('0')) => {
+                picture.zoom = 1;
+                picture.moved = (0, 0);
+            }
+            ("Left", _) => picture.moved.0 -= 1,
+            ("Right", _) => picture.moved.0 += 1,
+            ("Up", _) => picture.moved.1 -= 1,
+            ("Down", _) => picture.moved.1 += 1,
+            (_, Some('[')) if picture.back + 1 < count => {
+                picture = Picture {
+                    back: picture.back + 1,
+                    ..Picture::default()
+                };
+            }
+            (_, Some(']')) if picture.back > 0 => {
+                picture = Picture {
+                    back: picture.back - 1,
+                    ..Picture::default()
+                };
+            }
+            (_, Some('o')) => {
+                return self
+                    .picture()
+                    .map(|(path, _)| Request::Open {
+                        path: path.to_path_buf(),
+                    })
+                    .into_iter()
+                    .collect();
+            }
+            _ => {}
+        }
+        picture.zoom = picture.zoom.max(1);
+        let most = reach(picture.zoom);
+        picture.moved = (
+            picture.moved.0.clamp(-most, most),
+            picture.moved.1.clamp(-most, most),
+        );
+        self.picture = picture;
+        Vec::new()
+    }
+
+    /// The question with choices the person answers where they write: the
+    /// oldest of the chat written to's. Another chat's waits for them to go
+    /// there, so that a message to this one is never taken for its answer.
+    #[must_use]
+    pub fn choice(&self) -> Option<&crate::crew::Choice> {
+        let window = self
+            .screen
+            .talking_to()
+            .and_then(|agent| self.crew.chat_of(agent))?;
+        self.crew
+            .choices()
+            .iter()
+            .find(|c| self.crew.chat_of(&c.agent).as_ref() == Some(&window))
+    }
+
+    /// The choice picked in the question with choices shown.
+    #[must_use]
+    pub fn picking(&self) -> usize {
+        self.picking
+    }
+
+    /// What `chord` does to the question with choices shown: a digit picks
+    /// one, the arrows move among them and Enter picks the one chosen, or
+    /// answers with what the person wrote; Escape gives no answer. None
+    /// when the key is not one of those, or no question is shown.
+    fn choice_key(&mut self, chord: &Chord, typed: Option<char>) -> Option<Vec<Request>> {
+        let plain = !chord.ctrl && !chord.alt && !chord.cmd;
+        let choice = self.choice()?.clone();
+        if !plain {
+            return None;
+        }
+        let empty = self.screen.editor().is_empty();
+        let count = choice.choices.len();
+        let answered = |board: &mut Self, answer: Option<String>| {
+            board.picking = 0;
+            Some(vec![Request::Choose {
+                id: choice.id,
+                answer,
+            }])
+        };
+        match (chord.key.as_str(), typed) {
+            (_, Some(digit)) if empty && digit.is_ascii_digit() => {
+                let at = digit.to_digit(10).unwrap_or(0) as usize;
+                if (1..=count).contains(&at) {
+                    return answered(self, Some(choice.choices[at - 1].clone()));
+                }
+                None
+            }
+            ("Up", _) if empty => {
+                self.picking = self.picking.saturating_sub(1);
+                Some(Vec::new())
+            }
+            ("Down", _) if empty => {
+                self.picking = (self.picking + 1).min(count - 1);
+                Some(Vec::new())
+            }
+            ("Enter", _) if !chord.shift => {
+                let answer = if empty {
+                    choice.choices.get(self.picking.min(count - 1)).cloned()
+                } else {
+                    Some(self.screen.editor_mut().take().trim().to_owned())
+                };
+                answered(self, answer)
+            }
+            ("Escape", _) => answered(self, None),
+            _ => None,
+        }
+    }
+
+    /// Attaches the image at `path` to what the person writes.
+    pub fn attach(&mut self, path: std::path::PathBuf) {
+        if !self.attached.contains(&path) {
+            self.attached.push(path);
+        }
+    }
+
+    /// The images attached to what the person writes.
+    #[must_use]
+    pub fn attached(&self) -> &[std::path::PathBuf] {
+        &self.attached
     }
 
     /// The chat whose last exchanges the conversation writes again, once:
@@ -594,6 +812,9 @@ impl Board {
             }
             return self.page_key(chord, typed);
         }
+        if let Some(done) = self.choice_key(chord, typed) {
+            return done;
+        }
         let completions = self.completions();
         if !completions.is_empty() && plain {
             let count = completions.len();
@@ -676,7 +897,11 @@ impl Board {
     /// Takes a pasted text into what the person writes, its lines kept.
     pub fn paste(&mut self, text: &str) {
         if self.screen.page().is_none() {
-            self.screen.editor_mut().insert(text);
+            // A dropped image is attached, not written.
+            match image_path(text) {
+                Some(path) => self.attach(path),
+                None => self.screen.editor_mut().insert(text),
+            }
         }
     }
 
@@ -704,6 +929,9 @@ impl Board {
         let Some(page) = self.screen.page().cloned() else {
             return Vec::new();
         };
+        if page == Page::Diagram {
+            return self.diagram_key(chord, typed);
+        }
         let letter = typed.map(|c| c.to_ascii_lowercase());
         let step = self.screen.rows().saturating_sub(2).max(1) as isize;
         let agents = self.crew.agents().len();
@@ -781,7 +1009,7 @@ impl Board {
                 }
             }
             Page::Thread(_) if key == "Left" => self.screen.close(),
-            Page::Thread(_) | Page::Keys | Page::Changes | Page::Steps => {}
+            Page::Thread(_) | Page::Keys | Page::Changes | Page::Steps | Page::Diagram => {}
         }
         Vec::new()
     }
@@ -855,7 +1083,7 @@ impl Board {
     /// task that starts a new chat.
     pub fn send(&mut self, now: u64) -> Vec<Request> {
         let text = self.screen.editor().text().trim().to_owned();
-        if text.is_empty() {
+        if text.is_empty() && self.attached.is_empty() {
             return Vec::new();
         }
         if let Some(request) = self.plugin_request(&text) {
@@ -895,6 +1123,7 @@ impl Board {
                 to: name.to_owned(),
                 named: crate::named::named(&text, &self.models),
                 text,
+                images: std::mem::take(&mut self.attached),
             }];
         }
         self.chose = true;
@@ -910,6 +1139,7 @@ impl Board {
                     to: agent,
                     named: crate::named::named(&text, &self.models),
                     text,
+                    images: std::mem::take(&mut self.attached),
                 }
             }
             Talk::New(chat) => {
@@ -957,6 +1187,7 @@ impl Board {
                     named,
                     effort: chat.effort,
                     from_words,
+                    images: std::mem::take(&mut self.attached),
                 }
             }
         };
@@ -1054,6 +1285,39 @@ impl Board {
             Command::Autopilot => return self.act(Action::Autopilot, now).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet, now).into_iter().collect(),
             Command::Mcp => return vec![Request::Mcp],
+            Command::Diagram => {
+                if self.picture.zoom == 0 || self.picture().is_none() {
+                    self.picture = Picture {
+                        zoom: 1,
+                        ..Picture::default()
+                    };
+                }
+                if self.picture().is_some() {
+                    open(self, Page::Diagram);
+                } else {
+                    self.screen.notice(
+                        "no diagram is drawn in this chat: they are, in Kitty, once the settings' mermaid says so",
+                        now,
+                    );
+                }
+            }
+            Command::Image(None) => {
+                let said = match self.attached.len() {
+                    0 => "/image takes the path of an image to attach".to_owned(),
+                    n => format!(
+                        "{n} image{} no longer attached",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                };
+                self.attached.clear();
+                self.screen.notice(said, now);
+            }
+            Command::Image(Some(path)) => {
+                let path = path.trim().trim_matches(['\'', '"']).to_owned();
+                self.screen
+                    .notice(format!("{path} attached, sent with what you write"), now);
+                self.attach(path.into());
+            }
             Command::Theme(None) => self.look.next_theme(),
             Command::Theme(Some(theme)) => self.look.set_theme(theme),
             Command::Effort(effort) => return self.effort(effort, now),
@@ -1411,6 +1675,172 @@ fn from_words(request: &str, named: &[String]) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_last_diagram_of_the_chat_is_shown_alone_enlarged_moved_and_opened() {
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        board.update(Update::Crew(Event::Joined {
+            agent: "lead".into(),
+            model: "lab/lead".into(),
+            by: PERSON.into(),
+        }));
+        board.screen_mut().talk_to("lead");
+        board.run(Command::Diagram, 1);
+        assert_eq!(board.screen().page(), None, "no diagram yet");
+        for image in ["/cache/a/diagram.png", "/cache/b/diagram.png"] {
+            board.drawn_diagram(Some("lead".into()), image.into());
+        }
+        board.run(Command::Diagram, 2);
+        assert_eq!(board.screen().page(), Some(&Page::Diagram));
+        let shown = |board: &Board| {
+            board
+                .picture()
+                .map(|(path, view)| (path.to_path_buf(), view))
+        };
+        let (path, view) = shown(&board).unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/cache/b/diagram.png"));
+        assert_eq!((view.zoom, view.moved), (1, (0, 0)));
+        let press =
+            |board: &mut Board, c: char| board.press(&Chord::plain(&c.to_string()), Some(c), 3);
+        press(&mut board, '+');
+        press(&mut board, '+');
+        key(&mut board, "right");
+        assert_eq!(shown(&board).unwrap().1.zoom, 3);
+        assert_eq!(shown(&board).unwrap().1.moved, (1, 0));
+        // Moved no further than enlarged, nor smaller than whole.
+        for _ in 0..20 {
+            key(&mut board, "left");
+            press(&mut board, '-');
+        }
+        assert_eq!(shown(&board).unwrap().1.zoom, 1);
+        assert_eq!(shown(&board).unwrap().1.moved, (0, 0));
+        // An earlier one, then opened in the viewer.
+        press(&mut board, '[');
+        assert_eq!(
+            shown(&board).unwrap().0,
+            std::path::PathBuf::from("/cache/a/diagram.png")
+        );
+        assert_eq!(
+            press(&mut board, 'o'),
+            vec![Request::Open {
+                path: "/cache/a/diagram.png".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_question_with_choices_is_answered_with_a_digit_the_arrows_or_ones_own_words() {
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        for (agent, by) in [("lead", PERSON), ("other", PERSON)] {
+            board.update(Update::Crew(Event::Joined {
+                agent: agent.into(),
+                model: "lab/lead".into(),
+                by: by.into(),
+            }));
+        }
+        let ask = |board: &mut Board, id: u64, agent: &str| {
+            board.update(Update::Crew(Event::Choose {
+                id,
+                agent: agent.into(),
+                question: "Which one?".into(),
+                choices: vec!["a".into(), "b".into(), "c".into()],
+            }));
+        };
+        ask(&mut board, 1, "lead");
+        board.screen_mut().talk_to("lead");
+        // A digit picks.
+        assert_eq!(
+            board.press(&Chord::plain("2"), Some('2'), 100),
+            vec![Request::Choose {
+                id: 1,
+                answer: Some("b".into())
+            }]
+        );
+        board.update(Update::Crew(Event::Chosen {
+            id: 1,
+            answer: Some("b".into()),
+        }));
+        assert!(board.choice().is_none());
+        // The arrows move, and Enter picks.
+        ask(&mut board, 2, "lead");
+        key(&mut board, "down");
+        key(&mut board, "down");
+        assert_eq!(
+            key(&mut board, "enter"),
+            vec![Request::Choose {
+                id: 2,
+                answer: Some("c".into())
+            }]
+        );
+        board.update(Update::Crew(Event::Chosen {
+            id: 2,
+            answer: None,
+        }));
+        // What the person writes is their own answer.
+        ask(&mut board, 3, "lead");
+        write(&mut board, "neither, wait");
+        assert_eq!(
+            key(&mut board, "enter"),
+            vec![Request::Choose {
+                id: 3,
+                answer: Some("neither, wait".into())
+            }]
+        );
+        board.update(Update::Crew(Event::Chosen {
+            id: 3,
+            answer: None,
+        }));
+        // Another chat's question never takes what is written here.
+        ask(&mut board, 4, "other");
+        assert!(board.choice().is_none());
+        write(&mut board, "go on");
+        assert!(
+            matches!(&key(&mut board, "enter")[..], [Request::Tell { to, .. }] if to == "lead")
+        );
+    }
+
+    #[test]
+    fn a_dropped_image_is_attached_and_sent_with_the_message_and_text_is_written() {
+        assert_eq!(
+            image_path("'/Users/me/Desktop/Screen Shot.png'"),
+            Some("/Users/me/Desktop/Screen Shot.png".into())
+        );
+        assert_eq!(
+            image_path("/home/me/Pictures/a\\ b.JPG"),
+            Some("/home/me/Pictures/a b.JPG".into())
+        );
+        assert_eq!(
+            image_path("file:///home/me/shot%20one.webp"),
+            Some("/home/me/shot one.webp".into())
+        );
+        assert_eq!(
+            image_path("~/Desktop/x.gif"),
+            Some("~/Desktop/x.gif".into())
+        );
+        assert_eq!(image_path("see /tmp/a.png"), None);
+        assert_eq!(image_path("/tmp/notes.txt"), None);
+        assert_eq!(image_path("/tmp/a.png\n/tmp/b.png"), None);
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        board.paste("/home/me/Desktop/shot.png");
+        board.paste("what is wrong here?");
+        assert_eq!(
+            board.attached(),
+            [std::path::PathBuf::from("/home/me/Desktop/shot.png")]
+        );
+        let sent = board.send(1);
+        assert!(matches!(
+            &sent[..],
+            [Request::Start { task, images, .. }] if task == "what is wrong here?" && images.len() == 1
+        ));
+        assert!(board.attached().is_empty());
+        board.run(Command::Image(Some("~/a.png".into())), 2);
+        assert_eq!(board.attached().len(), 1);
+        board.run(Command::Image(None), 3);
+        assert!(board.attached().is_empty());
+    }
+
     fn joined(board: &mut Board, agent: &str, by: &str) {
         board.update(Update::Crew(Event::Joined {
             agent: agent.into(),
@@ -1482,6 +1912,7 @@ mod tests {
                 named: Vec::new(),
                 effort: None,
                 from_words: true,
+                images: Vec::new(),
             }]
         );
         assert_eq!(board.screen().talking_to(), Some("fix-build"));
@@ -1555,6 +1986,7 @@ mod tests {
                 to: "helper".into(),
                 text: "read the tests".into(),
                 named: Vec::new(),
+                images: Vec::new(),
             }]
         );
         // Shift-Enter and a trailing backslash go to a new line.
@@ -1570,6 +2002,7 @@ mod tests {
                 to: "lead".into(),
                 text: "one\ntwo\nthree".into(),
                 named: Vec::new(),
+                images: Vec::new(),
             }]
         );
         // An agent no one has is said so, and the message stays.

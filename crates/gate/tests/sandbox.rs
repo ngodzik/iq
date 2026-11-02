@@ -53,6 +53,36 @@ async fn run_in(f: &Fixture, line: &str, folder: &Path, network: bool) -> Ran {
 }
 
 #[tokio::test]
+async fn what_a_command_writes_is_read_as_it_runs() {
+    let f = fixture();
+    let action = Action::Run {
+        line: "echo started; sleep 2; echo done".to_owned(),
+        folder: f.root.clone(),
+        network: false,
+        host: false,
+    };
+    let Judged::Allowed(permit) = f.gate.judge(action).unwrap() else {
+        panic!("a plain command runs");
+    };
+    let live = iq_gate::Live::default();
+    let watched = live.clone();
+    let sandbox = f.sandbox.clone();
+    let running = tokio::spawn(async move { sandbox.run_live(permit, &watched).await });
+    let mut seen = String::new();
+    for _ in 0..100 {
+        seen = live.so_far(1000);
+        if seen.contains("started") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(seen, "started\n");
+    let ran = running.await.unwrap().unwrap();
+    assert_eq!(ran.status, Some(0));
+    assert_eq!(live.so_far(1000), "started\ndone\n");
+}
+
+#[tokio::test]
 async fn a_command_writes_the_workspace_and_nothing_else() {
     let f = fixture();
     let outside = f.outside.join("x");

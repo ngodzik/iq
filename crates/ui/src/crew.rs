@@ -32,6 +32,8 @@ pub enum Request {
         /// Whether its name was made from its task's first words, for a
         /// model to name it after what its work is about.
         from_words: bool,
+        /// The images the person attached to the task, by their paths.
+        images: Vec<std::path::PathBuf>,
     },
     /// Have an agent answered by this model from its next turn.
     Model {
@@ -56,6 +58,22 @@ pub enum Request {
         /// The models the person named in it, for the agent to use them:
         /// "with opus".
         named: Vec<String>,
+        /// The images the person attached to it, by their paths.
+        images: Vec<std::path::PathBuf>,
+    },
+    /// Open the image at `path`, a diagram drawn, in the system's viewer:
+    /// the person's own action.
+    Open {
+        /// The image.
+        path: std::path::PathBuf,
+    },
+    /// Answer a question with choices: a choice, or the person's own words;
+    /// none when they gave none.
+    Choose {
+        /// The question.
+        id: u64,
+        /// Their answer.
+        answer: Option<String>,
     },
     /// Answer a question.
     Answer {
@@ -159,6 +177,39 @@ pub enum Entry {
     Notice(String),
     /// Its turn ended: its answer, or why it failed.
     Done(Result<String, String>),
+    /// What it asked the person to choose, and what they answered.
+    Chose {
+        /// The question.
+        question: String,
+        /// Their answer; none when they gave none.
+        answer: Option<String>,
+    },
+}
+
+/// A command an agent left to run in the background, while it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobView {
+    /// The agent.
+    pub agent: String,
+    /// Its number.
+    pub id: u64,
+    /// The command line.
+    pub line: String,
+    /// Since when, in seconds since 1970.
+    pub since: u64,
+}
+
+/// A question with choices an agent asks the person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    /// Its number, to answer it with.
+    pub id: u64,
+    /// The agent that asks.
+    pub agent: String,
+    /// The question.
+    pub question: String,
+    /// What it offers.
+    pub choices: Vec<String>,
 }
 
 /// An agent of the crew, as shown.
@@ -189,6 +240,17 @@ pub struct AgentView {
     pub task: String,
     /// When it last worked, in seconds since 1970; never yet when none.
     pub worked: Option<u64>,
+    /// Whom it waits for, while it waits for the agents it started.
+    pub waiting: Option<Waiting>,
+}
+
+/// An agent waiting for the agents it started to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Waiting {
+    /// Those it waits for.
+    pub on: Vec<String>,
+    /// Since when, in seconds since 1970.
+    pub since: u64,
 }
 
 /// A chat of an earlier session, back on the board as it was kept.
@@ -298,6 +360,10 @@ pub struct Question {
 pub struct CrewView {
     agents: Vec<AgentView>,
     questions: Vec<Question>,
+    /// The questions with choices waiting for the person, the oldest first.
+    choices: Vec<Choice>,
+    /// The commands agents left to run in the background, while they run.
+    jobs: Vec<JobView>,
     autopilot: bool,
     internet: bool,
     /// The lead's model and the reviewer's, as the program starts them.
@@ -351,6 +417,34 @@ impl CrewView {
     #[must_use]
     pub fn agent(&self, name: &str) -> Option<&AgentView> {
         self.agents.iter().find(|a| a.name == name)
+    }
+
+    /// The questions with choices waiting for the person, the oldest
+    /// first.
+    #[must_use]
+    pub fn choices(&self) -> &[Choice] {
+        &self.choices
+    }
+
+    /// The commands agents left to run in the background, while they run.
+    #[must_use]
+    pub fn jobs(&self) -> &[JobView] {
+        &self.jobs
+    }
+
+    /// The person's chat `agent` is part of: itself when the person started
+    /// it, else its starter's.
+    #[must_use]
+    pub fn chat_of(&self, agent: &str) -> Option<String> {
+        let mut name = agent;
+        for _ in 0..self.agents.len() + 1 {
+            let view = self.agent(name)?;
+            if view.by == PERSON {
+                return Some(view.name.clone());
+            }
+            name = &view.by;
+        }
+        None
     }
 
     /// The chats the person started, in the order they joined: those they
@@ -464,6 +558,7 @@ impl CrewView {
                     place: None,
                     task: String::new(),
                     worked: None,
+                    waiting: None,
                 });
             }
             Event::Working { agent, prompt } => {
@@ -513,11 +608,50 @@ impl CrewView {
                 ok,
             } => {
                 if let Some(view) = self.agent_mut(&agent) {
+                    // Its wait, when it waited, ended with this call.
+                    view.waiting = None;
                     view.thread.push(Entry::Tool {
                         name,
                         input,
                         output,
                         ok,
+                    });
+                }
+            }
+            Event::JobStarted { agent, id, line } => self.jobs.push(JobView {
+                agent,
+                id,
+                line,
+                since: crate::now(),
+            }),
+            Event::JobEnded { id, .. } => self.jobs.retain(|job| job.id != id),
+            Event::Choose {
+                id,
+                agent,
+                question,
+                choices,
+            } => self.choices.push(Choice {
+                id,
+                agent,
+                question,
+                choices,
+            }),
+            Event::Chosen { id, answer } => {
+                if let Some(at) = self.choices.iter().position(|c| c.id == id) {
+                    let choice = self.choices.remove(at);
+                    if let Some(view) = self.agent_mut(&choice.agent) {
+                        view.thread.push(Entry::Chose {
+                            question: choice.question,
+                            answer,
+                        });
+                    }
+                }
+            }
+            Event::Waiting { agent, on } => {
+                if let Some(view) = self.agent_mut(&agent) {
+                    view.waiting = Some(Waiting {
+                        on,
+                        since: crate::now(),
                     });
                 }
             }
@@ -596,6 +730,7 @@ impl CrewView {
             Event::Done { agent, outcome } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.working = false;
+                    view.waiting = None;
                     view.worked = Some(crate::now());
                     view.thread.push(Entry::Done(outcome));
                 }
@@ -608,10 +743,25 @@ impl CrewView {
                     if view.by == from {
                         view.by.clone_from(&to);
                     }
+                    for name in view.waiting.iter_mut().flat_map(|w| w.on.iter_mut()) {
+                        if *name == from {
+                            name.clone_from(&to);
+                        }
+                    }
                 }
                 for question in &mut self.questions {
                     if question.agent == from {
                         question.agent.clone_from(&to);
+                    }
+                }
+                for choice in &mut self.choices {
+                    if choice.agent == from {
+                        choice.agent.clone_from(&to);
+                    }
+                }
+                for job in &mut self.jobs {
+                    if job.agent == from {
+                        job.agent.clone_from(&to);
                     }
                 }
             }

@@ -18,7 +18,7 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 18] = [
+pub const COMMANDS: [Spec; 20] = [
     Spec {
         name: "new",
         args: "[model]",
@@ -78,6 +78,16 @@ pub const COMMANDS: [Spec; 18] = [
         name: "internet",
         args: "",
         what: "the internet open to every command, or only to what fetches packages",
+    },
+    Spec {
+        name: "diagram",
+        args: "",
+        what: "the chat's last diagram alone, larger, in Kitty; o opens it in your viewer",
+    },
+    Spec {
+        name: "image",
+        args: "[path]",
+        what: "attach an image to what you write, wherever it is; alone, none attached",
     },
     Spec {
         name: "mcp",
@@ -158,6 +168,11 @@ pub enum Command {
     Internet,
     /// How each MCP server is.
     Mcp,
+    /// The chat's last diagram alone, on its page.
+    Diagram,
+    /// Attach the image at this path to what the person writes; none
+    /// attached when none is given.
+    Image(Option<String>),
     /// How hard the agent written to thinks, or the new chat's; none to
     /// be told.
     Effort(Option<iq_core::Effort>),
@@ -238,6 +253,10 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "autopilot" => bare(Command::Autopilot),
         "internet" => bare(Command::Internet),
         "mcp" => bare(Command::Mcp),
+        "diagram" => bare(Command::Diagram),
+        "image" => Ok(Command::Image(
+            Some(rest.trim().to_owned()).filter(|path| !path.is_empty()),
+        )),
         "sync" => match one("auto")?.as_deref() {
             None => Ok(Command::Sync(false)),
             Some("auto") => Ok(Command::Sync(true)),

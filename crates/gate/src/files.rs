@@ -8,6 +8,7 @@
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::action::{Action, Permit};
 use crate::error::GateError;
@@ -15,6 +16,22 @@ use crate::error::GateError;
 /// The largest file read whole: what a model reads is far smaller, and a
 /// file larger than this is not source.
 const LARGEST: u64 = 8 << 20;
+
+/// The most entries of a folder listed.
+const LISTED_MOST: usize = 500;
+
+/// One entry of a folder read under a permit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    /// Its name in the folder.
+    pub name: String,
+    /// Whether it is a folder.
+    pub folder: bool,
+    /// Its size, in bytes.
+    pub bytes: u64,
+    /// When it last changed, when the system says.
+    pub modified: Option<SystemTime>,
+}
 
 impl Permit {
     /// Reads the file this permit allows reading or writing: what may be
@@ -57,6 +74,44 @@ impl Permit {
             .read_to_end(&mut bytes)
             .map_err(failed)?;
         Ok(bytes)
+    }
+
+    /// The entries of the folder this permit allows reading, the latest
+    /// changed first, five hundred at most; none followed through a
+    /// link, which is listed as what it is.
+    ///
+    /// # Errors
+    ///
+    /// The permit is not one to read, or the folder cannot be read.
+    pub fn list(&self) -> Result<Vec<Listed>, GateError> {
+        let Action::Read { path } = &self.action else {
+            return Err(GateError::NotAFile);
+        };
+        let failed = |source| GateError::File {
+            path: path.clone(),
+            source,
+        };
+        still_there(path)?;
+        let mut listed: Vec<Listed> = std::fs::read_dir(path)
+            .map_err(failed)?
+            .flatten()
+            .filter_map(|entry| {
+                let meta = entry.path().symlink_metadata().ok()?;
+                Some(Listed {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    folder: meta.is_dir(),
+                    bytes: meta.len(),
+                    modified: meta.modified().ok(),
+                })
+            })
+            .collect();
+        listed.sort_by(|a, b| {
+            b.modified
+                .cmp(&a.modified)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        listed.truncate(LISTED_MOST);
+        Ok(listed)
     }
 
     /// Writes `contents` to the file this permit allows writing, its

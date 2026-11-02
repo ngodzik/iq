@@ -24,13 +24,16 @@ pub(crate) fn work() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read_file".into(),
-            description: "Reads a text file, its lines numbered. A file of secrets, such as \
-                          `.env`, is refused."
+            description: "Reads a text file, its lines numbered; an image (PNG, JPEG, GIF, \
+                          WebP) is shown to you after this step's results; a folder is listed, the \
+                          latest changed first. Outside the workspace (`~/Desktop`, where \
+                          screenshots go), the person is asked. A file of secrets, such as `.env`, \
+                          is refused."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "The file, relative to the workspace or absolute."},
+                    "path": {"type": "string", "description": "The file or folder, relative to the workspace, absolute, or under `~/`."},
                     "offset": {"type": "integer", "description": "The first line to read, from 1."},
                     "limit": {"type": "integer", "description": "How many lines, 2000 at most."},
                 },
@@ -78,7 +81,11 @@ pub(crate) fn work() -> Vec<ToolSpec> {
                           another command that needs the machine, as a make target starting \
                           containers, ask with `host`. Never get around a refusal by \
                           downloading or building a replacement. Its output comes back, errors \
-                          included."
+                          included. With `background`, a long command that needs no attention \
+                          meanwhile (a whole test suite, checks against several environments, a \
+                          CI run watched to its end) is judged the same and left to run, \
+                          for up to two hours: you get its number at once, `job` reads its \
+                          output so far or stops it, and you are woken when it ends."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -86,8 +93,41 @@ pub(crate) fn work() -> Vec<ToolSpec> {
                     "command": {"type": "string"},
                     "network": {"type": "boolean"},
                     "host": {"type": "boolean"},
+                    "background": {"type": "boolean"},
                 },
                 "required": ["command"],
+            }),
+        },
+        ToolSpec {
+            name: "job".into(),
+            description: "A command you left to run in the background, by its number: how long it \
+                          has run or how it ended, and the end of its output so far; with \
+                          `stop`, it is stopped."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "stop": {"type": "boolean"},
+                },
+                "required": ["id"],
+            }),
+        },
+        ToolSpec {
+            name: "wake_me".into(),
+            description:
+                "Wakes you after `seconds` (ten at least, an hour at most), with `why`: to \
+                          look again at something outside iq that takes its time, a deploy or a \
+                          CI run, rather than waiting in a command; three waiting at once, \
+                          twelve within an hour. End your turn after it."
+                    .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "seconds": {"type": "integer"},
+                    "why": {"type": "string"},
+                },
+                "required": ["seconds", "why"],
             }),
         },
     ]
@@ -187,6 +227,28 @@ pub fn board() -> Vec<ToolSpec> {
                 "properties": {
                     "seconds": {"type": "integer"},
                 },
+            }),
+        },
+        ToolSpec {
+            name: "ask_person".into(),
+            description: "Asks the person a question with two to four choices, which they pick \
+                          with a digit or the arrows, or answer in their own words; waits for \
+                          their answer. For a choice that is theirs to make: an option, an \
+                          environment, whether to start again. Not for leave to act, which the \
+                          tools ask themselves."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 2,
+                        "maxItems": 4,
+                    },
+                },
+                "required": ["question", "choices"],
             }),
         },
         ToolSpec {
