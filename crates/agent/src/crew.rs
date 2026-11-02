@@ -1499,6 +1499,40 @@ where
         self.moved(agent, &new);
     }
 
+    /// Asks the cheap model the settings give (`namer`) once, with
+    /// `instructions` and `prompt`, what it costs billed to `agent`, as any
+    /// call's: what a tool asks of a model rather than the agent's own,
+    /// such as a question on a page fetched.
+    ///
+    /// # Errors
+    ///
+    /// No cheap model is set, or its provider failed.
+    pub async fn ask_cheap(
+        &self,
+        agent: &str,
+        instructions: &str,
+        prompt: String,
+    ) -> Result<String, String> {
+        let model = self
+            .inner
+            .settings
+            .namer
+            .clone()
+            .ok_or("no cheap model is set")?;
+        crate::once::ask_once(
+            &self.inner.provider,
+            &model,
+            instructions,
+            prompt,
+            crate::once::Asked {
+                agent,
+                effort: Effort::Low,
+                costs: &self.inner.report,
+            },
+        )
+        .await
+    }
+
     /// Names the chat `chat` after what its work is about, as the namer's
     /// model reads it from its task, its cost reported as any call's: a
     /// name made of the first words of a request says little of it. Its

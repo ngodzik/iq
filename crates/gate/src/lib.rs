@@ -63,3 +63,11 @@ pub fn holds_secrets(path: &std::path::Path, home: Option<&std::path::Path>) -> 
 pub use sandbox::{
     HELPER_FLAG, HOLD_FLAG, Helper, Live, Ran, Sandbox, helper_failure, hold_network, sandboxed,
 };
+
+/// Whether `text` holds a secret value: one of the environment's, or of the
+/// `.env` files of `workspace`, as a command's output is cleared of them.
+/// What would carry one away (a query sent to a search engine) is refused.
+#[must_use]
+pub fn holds_secret(text: &str, workspace: &std::path::Path) -> bool {
+    redact::Redactor::new(std::env::vars_os(), workspace).redact(text) != text
+}

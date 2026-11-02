@@ -53,6 +53,9 @@
 //! command = "notes-mcp"
 //! args = ["--folder", "~/notes"]
 //!
+//! [web]                                  # the agents read pages with fetch, judged as a command with the internet
+//! search = "duckduckgo"                  # a search tool, off unless set: a fallback with no key, fine for moderate use; used often, its engine slows robots down and another would be needed
+//!
 //! [sync]                                 # iq's data kept in a private repository of yours, any name
 //! remote = "https://github.com/someone/any-name.git"
 //! branch = "main"                        # another when main must go through pull requests
@@ -173,6 +176,9 @@ pub(crate) struct Settings {
     /// Where iq's data is synced.
     #[serde(default)]
     sync: SyncFile,
+    /// How the agents search the web.
+    #[serde(default)]
+    web: WebFile,
     /// What the work goes to.
     #[serde(default)]
     observe: ObserveFile,
@@ -268,6 +274,14 @@ pub(crate) struct McpServer {
     pub(crate) line: Option<String>,
 }
 
+/// The web as the settings write it: the engine the agents search with,
+/// none unless set.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebFile {
+    search: Option<String>,
+}
+
 /// The sync as the settings write it.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -333,6 +347,18 @@ impl Settings {
         .zip(RETIRED)
         .filter_map(|(set, name)| set.then_some(name))
         .collect()
+    }
+
+    /// The engine the agents search the web with, none unless set: only
+    /// DuckDuckGo's page of plain HTML for now, a fallback for moderate use.
+    pub(crate) fn search(&self) -> Result<Option<iq_web::Engine>> {
+        match self.web.search.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some("duckduckgo") => Ok(Some(iq_web::Engine::DuckDuckGo)),
+            Some(other) => anyhow::bail!(
+                "[web] search = {other:?} is no engine iq knows: \"duckduckgo\", or none"
+            ),
+        }
     }
 
     /// The MCP servers the settings declare, their headers read from the

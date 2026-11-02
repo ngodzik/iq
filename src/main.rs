@@ -311,6 +311,8 @@ fn crew(
         skills = skills.with_reviewer(name, &workspace);
     }
     crew.extend(Arc::new(skills));
+    // And the web, read with tools of iq's own, judged by the gate.
+    crew.extend(Arc::new(iq_web::Web::new(settings.search()?)));
     Ok(crew)
 }
 

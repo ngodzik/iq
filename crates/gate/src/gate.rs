@@ -428,11 +428,17 @@ impl Gate {
                     verdict,
                 )
             }
+            // No more than a command with the internet sends: given once the
+            // internet is open to every command, asked as it is until then.
             Action::Fetch { target } => (
                 Action::Fetch { target },
-                Verdict::Ask {
-                    reason: "it reaches the internet".to_owned(),
-                    scope: Scope::Internet,
+                if self.internet() {
+                    Verdict::Allow
+                } else {
+                    Verdict::Ask {
+                        reason: "it reaches the internet".to_owned(),
+                        scope: Scope::Internet,
+                    }
                 },
             ),
             Action::Tool {
@@ -831,6 +837,15 @@ mod tests {
             reason(&fetch),
             ("asked", "it reaches the internet".to_owned(), true)
         );
+        // No more than a command with the internet sends, once it is open.
+        f.gate.set_internet(true);
+        let fetch = f
+            .gate
+            .judge(Action::Fetch {
+                target: "https://example.com".into(),
+            })
+            .unwrap();
+        assert_eq!(reason(&fetch).0, "allowed");
     }
 
     #[test]

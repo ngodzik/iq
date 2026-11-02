@@ -1,0 +1,20 @@
+[package]
+name    = "iq-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The web as iq's agents read it: a page as Markdown, its main content alone, and a search when the settings choose an engine, each judged by the gate."
+
+[dependencies]
+iq-core.workspace    = true
+iq-gate.workspace    = true
+iq-agent.workspace   = true
+serde_json.workspace = true
+reqwest.workspace    = true
+url.workspace        = true
+thiserror.workspace  = true
+tokio = { workspace = true, features = ["net", "time"] }
+
+[dev-dependencies]
+tokio.workspace = true
