@@ -978,6 +978,7 @@ name = "iq"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "iq-agent",
  "iq-core",
@@ -1003,6 +1004,7 @@ dependencies = [
 name = "iq-agent"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "iq-core",
  "iq-gate",
  "serde",

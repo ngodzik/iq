@@ -37,6 +37,7 @@ mod watch;
 
 pub use action::{Action, Approver, Judged, Pending, Permit, Scope};
 pub use error::GateError;
+pub use files::Listed;
 pub use gate::{Gate, GateBuilder};
 pub use rules::{Decision, Rules};
 /// Whether `path` holds secrets, as its name or its folder says: a file of

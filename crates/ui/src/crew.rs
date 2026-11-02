@@ -32,6 +32,8 @@ pub enum Request {
         /// Whether its name was made from its task's first words, for a
         /// model to name it after what its work is about.
         from_words: bool,
+        /// The images the person attached to the task, by their paths.
+        images: Vec<std::path::PathBuf>,
     },
     /// Have an agent answered by this model from its next turn.
     Model {
@@ -56,6 +58,8 @@ pub enum Request {
         /// The models the person named in it, for the agent to use them:
         /// "with opus".
         named: Vec<String>,
+        /// The images the person attached to it, by their paths.
+        images: Vec<std::path::PathBuf>,
     },
     /// Answer a question.
     Answer {

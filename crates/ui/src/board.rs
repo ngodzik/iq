@@ -192,6 +192,33 @@ pub struct Board {
     recent: Vec<(String, u64)>,
     /// The chat chosen in the switcher, while it is open.
     switching: Option<usize>,
+    /// The images the person attached to what they write, by their paths,
+    /// sent with it.
+    attached: Vec<std::path::PathBuf>,
+}
+
+/// The image a paste is, when it is the path of one alone: a file dropped
+/// on the terminal pastes its path, quoted, escaped or as a `file://`
+/// address. Known by its name only: the program reads it as it is sent.
+fn image_path(text: &str) -> Option<std::path::PathBuf> {
+    let text = text.trim();
+    if text.is_empty() || text.contains('\n') {
+        return None;
+    }
+    let unquoted = ['\'', '"']
+        .iter()
+        .find_map(|q| text.strip_prefix(*q).and_then(|t| t.strip_suffix(*q)))
+        .unwrap_or(text);
+    let path = match unquoted.strip_prefix("file://") {
+        Some(address) => address.replace("%20", " "),
+        None => unquoted.replace("\\ ", " "),
+    };
+    let looks = path.starts_with('/') || path.starts_with("~/");
+    let lower = path.to_lowercase();
+    let image = [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+        .iter()
+        .any(|ending| lower.ends_with(ending));
+    (looks && image).then(|| path.into())
 }
 
 impl Default for Board {
@@ -227,7 +254,21 @@ impl Board {
             opening: None,
             recent: Vec::new(),
             switching: None,
+            attached: Vec::new(),
         }
+    }
+
+    /// Attaches the image at `path` to what the person writes.
+    pub fn attach(&mut self, path: std::path::PathBuf) {
+        if !self.attached.contains(&path) {
+            self.attached.push(path);
+        }
+    }
+
+    /// The images attached to what the person writes.
+    #[must_use]
+    pub fn attached(&self) -> &[std::path::PathBuf] {
+        &self.attached
     }
 
     /// The chat whose last exchanges the conversation writes again, once:
@@ -676,7 +717,11 @@ impl Board {
     /// Takes a pasted text into what the person writes, its lines kept.
     pub fn paste(&mut self, text: &str) {
         if self.screen.page().is_none() {
-            self.screen.editor_mut().insert(text);
+            // A dropped image is attached, not written.
+            match image_path(text) {
+                Some(path) => self.attach(path),
+                None => self.screen.editor_mut().insert(text),
+            }
         }
     }
 
@@ -855,7 +900,7 @@ impl Board {
     /// task that starts a new chat.
     pub fn send(&mut self, now: u64) -> Vec<Request> {
         let text = self.screen.editor().text().trim().to_owned();
-        if text.is_empty() {
+        if text.is_empty() && self.attached.is_empty() {
             return Vec::new();
         }
         if let Some(request) = self.plugin_request(&text) {
@@ -895,6 +940,7 @@ impl Board {
                 to: name.to_owned(),
                 named: crate::named::named(&text, &self.models),
                 text,
+                images: std::mem::take(&mut self.attached),
             }];
         }
         self.chose = true;
@@ -910,6 +956,7 @@ impl Board {
                     to: agent,
                     named: crate::named::named(&text, &self.models),
                     text,
+                    images: std::mem::take(&mut self.attached),
                 }
             }
             Talk::New(chat) => {
@@ -957,6 +1004,7 @@ impl Board {
                     named,
                     effort: chat.effort,
                     from_words,
+                    images: std::mem::take(&mut self.attached),
                 }
             }
         };
@@ -1054,6 +1102,23 @@ impl Board {
             Command::Autopilot => return self.act(Action::Autopilot, now).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet, now).into_iter().collect(),
             Command::Mcp => return vec![Request::Mcp],
+            Command::Image(None) => {
+                let said = match self.attached.len() {
+                    0 => "/image takes the path of an image to attach".to_owned(),
+                    n => format!(
+                        "{n} image{} no longer attached",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                };
+                self.attached.clear();
+                self.screen.notice(said, now);
+            }
+            Command::Image(Some(path)) => {
+                let path = path.trim().trim_matches(['\'', '"']).to_owned();
+                self.screen
+                    .notice(format!("{path} attached, sent with what you write"), now);
+                self.attach(path.into());
+            }
             Command::Theme(None) => self.look.next_theme(),
             Command::Theme(Some(theme)) => self.look.set_theme(theme),
             Command::Effort(effort) => return self.effort(effort, now),
@@ -1411,6 +1476,47 @@ fn from_words(request: &str, named: &[String]) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_dropped_image_is_attached_and_sent_with_the_message_and_text_is_written() {
+        assert_eq!(
+            image_path("'/Users/me/Desktop/Screen Shot.png'"),
+            Some("/Users/me/Desktop/Screen Shot.png".into())
+        );
+        assert_eq!(
+            image_path("/home/me/Pictures/a\\ b.JPG"),
+            Some("/home/me/Pictures/a b.JPG".into())
+        );
+        assert_eq!(
+            image_path("file:///home/me/shot%20one.webp"),
+            Some("/home/me/shot one.webp".into())
+        );
+        assert_eq!(
+            image_path("~/Desktop/x.gif"),
+            Some("~/Desktop/x.gif".into())
+        );
+        assert_eq!(image_path("see /tmp/a.png"), None);
+        assert_eq!(image_path("/tmp/notes.txt"), None);
+        assert_eq!(image_path("/tmp/a.png\n/tmp/b.png"), None);
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        board.paste("/home/me/Desktop/shot.png");
+        board.paste("what is wrong here?");
+        assert_eq!(
+            board.attached(),
+            [std::path::PathBuf::from("/home/me/Desktop/shot.png")]
+        );
+        let sent = board.send(1);
+        assert!(matches!(
+            &sent[..],
+            [Request::Start { task, images, .. }] if task == "what is wrong here?" && images.len() == 1
+        ));
+        assert!(board.attached().is_empty());
+        board.run(Command::Image(Some("~/a.png".into())), 2);
+        assert_eq!(board.attached().len(), 1);
+        board.run(Command::Image(None), 3);
+        assert!(board.attached().is_empty());
+    }
+
     fn joined(board: &mut Board, agent: &str, by: &str) {
         board.update(Update::Crew(Event::Joined {
             agent: agent.into(),
@@ -1482,6 +1588,7 @@ mod tests {
                 named: Vec::new(),
                 effort: None,
                 from_words: true,
+                images: Vec::new(),
             }]
         );
         assert_eq!(board.screen().talking_to(), Some("fix-build"));
@@ -1555,6 +1662,7 @@ mod tests {
                 to: "helper".into(),
                 text: "read the tests".into(),
                 named: Vec::new(),
+                images: Vec::new(),
             }]
         );
         // Shift-Enter and a trailing backslash go to a new line.
@@ -1570,6 +1678,7 @@ mod tests {
                 to: "lead".into(),
                 text: "one\ntwo\nthree".into(),
                 named: Vec::new(),
+                images: Vec::new(),
             }]
         );
         // An agent no one has is said so, and the message stays.

@@ -1144,6 +1144,7 @@ async fn a_writer_and_its_reviewer_go_round_until_it_approves() {
         "make it work".into(),
         None,
         None,
+        Vec::new(),
     );
     for _ in 0..4 {
         f.settled().await;
@@ -1193,6 +1194,7 @@ async fn debaters_answer_alone_then_read_each_other_and_the_first_sums_up() {
         "how to store it".into(),
         None,
         None,
+        Vec::new(),
     );
     assert_eq!(first, "think");
     for _ in 0..4 {
@@ -2140,4 +2142,50 @@ async fn a_provider_still_out_of_capacity_ends_the_turn_saying_what_to_do_and_ke
         seen.contains("fix it") && seen.contains("try again"),
         "{seen}"
     );
+}
+
+#[tokio::test]
+async fn an_image_read_or_attached_is_shown_to_the_model_with_its_next_call() {
+    let png: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x01\0\0\0\x01";
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls("read_file", serde_json::json!({"path": "shot.png"})),
+                say("A red square."),
+            ],
+        )],
+        Settings::default(),
+    );
+    std::fs::write(f.root.join("shot.png"), png).unwrap();
+    f.crew.launch(
+        Pattern::Solo,
+        "lead",
+        &[model("cheap/model")],
+        "what is in it?".into(),
+        None,
+        None,
+        vec![Message::Image {
+            mime: "image/png".into(),
+            data: "aGk=".into(),
+        }],
+    );
+    f.settled().await;
+    let requests = f.model.requests_of("lead");
+    // Attached: shown with the task, its first call.
+    assert!(matches!(
+        &requests[0].messages[..],
+        [.., Message::User(task), Message::Image { data, .. }] if task.contains("what is in it?") && data == "aGk="
+    ));
+    // Read: shown after the tool's result, and the tool said so.
+    let [
+        ..,
+        Message::Tool { content, .. },
+        Message::Image { mime, .. },
+    ] = &requests[1].messages[..]
+    else {
+        panic!("{:#?}", requests[1].messages);
+    };
+    assert!(content.contains("is an image (image/png"), "{content}");
+    assert_eq!(mime, "image/png");
 }

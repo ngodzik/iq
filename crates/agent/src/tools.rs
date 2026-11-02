@@ -24,13 +24,16 @@ pub(crate) fn work() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read_file".into(),
-            description: "Reads a text file, its lines numbered. A file of secrets, such as \
-                          `.env`, is refused."
+            description: "Reads a text file, its lines numbered; an image (PNG, JPEG, GIF, \
+                          WebP) is shown to you after this step's results; a folder is listed, the \
+                          latest changed first. Outside the workspace (`~/Desktop`, where \
+                          screenshots go), the person is asked. A file of secrets, such as `.env`, \
+                          is refused."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "The file, relative to the workspace or absolute."},
+                    "path": {"type": "string", "description": "The file or folder, relative to the workspace, absolute, or under `~/`."},
                     "offset": {"type": "integer", "description": "The first line to read, from 1."},
                     "limit": {"type": "integer", "description": "How many lines, 2000 at most."},
                 },

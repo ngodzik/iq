@@ -8,7 +8,7 @@
 //! stays within the sandbox.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -225,6 +225,9 @@ struct Inner<M> {
     /// The project's rules for some of its files, as last read in each
     /// place, and when.
     scoped: Mutex<HashMap<PathBuf, (Instant, Vec<rules::Scoped>)>>,
+    /// The images each agent is shown with its next call: what the person
+    /// attached, what a file or a tool showed.
+    images: Mutex<HashMap<String, Vec<Message>>>,
 }
 
 /// Where agents work: the gate that judges their actions there, and the
@@ -405,6 +408,7 @@ where
                 questions: Mutex::new(HashMap::new()),
                 board: Mutex::new(Board::default()),
                 shown: Mutex::new(HashMap::new()),
+                images: Mutex::new(HashMap::new()),
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
                 peer_wakes: Mutex::new(Vec::new()),
@@ -711,6 +715,7 @@ where
     /// as models, two at the least; the first thinking with `effort`, as
     /// the settings say when `None`. Returns the first agent's name:
     /// `name`, made unique.
+    #[allow(clippy::too_many_arguments)]
     pub fn launch(
         &self,
         pattern: Pattern,
@@ -719,6 +724,7 @@ where
         task: String,
         role: Option<String>,
         effort: Option<Effort>,
+        images: Vec<Message>,
     ) -> String {
         let Some(first) = models.first() else {
             return String::new();
@@ -727,11 +733,11 @@ where
         // its team.
         let mut teams = lock(&self.inner.teams);
         match pattern {
-            Pattern::Solo => self.start_with(name, first, task, PERSON, role, effort),
+            Pattern::Solo => self.start_with(name, first, task, PERSON, role, effort, images),
             Pattern::Lead => {
                 let cheaper: Vec<String> = models[1..].iter().map(ToString::to_string).collect();
                 let role = Some(team::lead_role(&cheaper));
-                self.start_with(name, first, task, PERSON, role, effort)
+                self.start_with(name, first, task, PERSON, role, effort, images)
             }
             Pattern::Pair => {
                 let writer = self.start_with(
@@ -741,6 +747,7 @@ where
                     PERSON,
                     Some(team::WRITER_ROLE.to_owned()),
                     effort,
+                    images,
                 );
                 teams.push(Team::Pair {
                     writer: writer.clone(),
@@ -756,12 +763,14 @@ where
                 let count = models.len().max(2);
                 let members: Vec<String> = (0..count)
                     .map(|at| {
-                        self.start_as(
+                        self.start_with(
                             name,
                             &models[at % models.len()],
                             task.clone(),
                             PERSON,
                             Some(team::debater_role(count)),
+                            None,
+                            images.clone(),
                         )
                     })
                     .collect();
@@ -899,11 +908,12 @@ where
         by: &str,
         role: Option<String>,
     ) -> String {
-        self.start_with(name, model, task, by, role, None)
+        self.start_with(name, model, task, by, role, None, Vec::new())
     }
 
     /// Starts an agent as [`Self::start_as`] does, thinking with `effort`,
-    /// as the settings say when `None`.
+    /// as the settings say when `None`, shown `images` with its task.
+    #[allow(clippy::too_many_arguments)]
     fn start_with(
         &self,
         name: &str,
@@ -912,6 +922,7 @@ where
         by: &str,
         role: Option<String>,
         effort: Option<Effort>,
+        images: Vec<Message>,
     ) -> String {
         // The person's agent works in a place of its own when they want
         // one; an agent's works where it does, and is named after its
@@ -924,9 +935,57 @@ where
         };
         let (name, joined) = self.join(&name, model, task.clone(), by, role, effort, true, placing);
         if joined {
+            // Before its turn begins, so that its first call shows them.
+            for image in images {
+                self.show(&name, image);
+            }
             self.wake(&name, task);
         }
         name
+    }
+
+    /// Shows the image `bytes` of `path`, a `mime` image, to `agent` after
+    /// this step's results, and says so; one larger than a model is shown
+    /// is not, and it is told why.
+    fn shown_image(
+        &self,
+        agent: &str,
+        path: &Path,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<String, String> {
+        use base64::Engine;
+        let kb = bytes.len().div_ceil(1024);
+        if bytes.len() > iq_core::IMAGE_MOST {
+            return Err(format!(
+                "{} is an image of {kb} KB, more than the {} KB a model is shown: make a smaller \
+                 copy of it in the workspace with a command, and read that",
+                path.display(),
+                iq_core::IMAGE_MOST / 1024
+            ));
+        }
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        self.show(
+            agent,
+            Message::Image {
+                mime: mime.to_owned(),
+                data,
+            },
+        );
+        Ok(format!(
+            "{} is an image ({mime}, {kb} KB): it is shown to you after this step's results.",
+            path.display()
+        ))
+    }
+
+    /// Shows `image`, an image message, to `agent` with its next call to
+    /// its model: after the messages and the results of its tools that
+    /// came before.
+    pub fn show(&self, agent: &str, image: Message) {
+        lock(&self.inner.images)
+            .entry(agent.to_owned())
+            .or_default()
+            .push(image);
     }
 
     /// Puts an agent on the board, its name `name`, as the board writes
@@ -1960,6 +2019,10 @@ where
             if let Some(note) = self.context_note(name, model).await {
                 messages.push(Message::user(note));
             }
+            // What it is shown: after its prompt or its tools' results.
+            if let Some(images) = lock(&self.inner.images).remove(name) {
+                messages.extend(images);
+            }
             // Read at each call, so that a change reaches a turn under way.
             let effort = lock(&self.inner.board)
                 .members
@@ -2087,7 +2150,18 @@ where
             "read_file" => {
                 let path: std::path::PathBuf = args.text("path")?.into();
                 let permit = self.act(agent, Action::Read { path: path.clone() }).await?;
+                let judged = match permit.action() {
+                    Action::Read { path } => path.clone(),
+                    _ => path.clone(),
+                };
+                if judged.is_dir() {
+                    let listed = permit.list().map_err(|e| chain(&e))?;
+                    return Ok(listing(&judged, &listed));
+                }
                 let bytes = permit.read().map_err(|e| chain(&e))?;
+                if let Some(mime) = iq_core::image_type(&bytes) {
+                    return self.shown_image(agent, &judged, mime, &bytes);
+                }
                 let text = String::from_utf8(bytes)
                     .map_err(|_| "the file is not text: run a command to look into it")?;
                 Ok(
@@ -2166,6 +2240,7 @@ where
                     agent,
                     role,
                     effort,
+                    Vec::new(),
                 );
                 Ok(format!(
                     "{started} started on {model}. Its answer will come to you as a message."
@@ -3052,6 +3127,43 @@ fn describe(action: &Action) -> String {
 /// The most characters of a server's tool's arguments said as its call is
 /// asked: enough for what it writes to be read.
 const TOOL_SAID: usize = 2000;
+
+/// The entries of `folder` as a model reads them: each with its size and
+/// how long ago it changed, the latest first, a folder's name ending in `/`.
+fn listing(folder: &Path, listed: &[iq_gate::Listed]) -> String {
+    if listed.is_empty() {
+        return format!("{} is an empty folder.", folder.display());
+    }
+    let now = std::time::SystemTime::now();
+    let mut lines = vec![format!("{}, the latest changed first:", folder.display())];
+    for entry in listed {
+        let ago = entry
+            .modified
+            .and_then(|at| now.duration_since(at).ok())
+            .map(|d| format!(", changed {} ago", short_span(d.as_secs())))
+            .unwrap_or_default();
+        if entry.folder {
+            lines.push(format!("{}/{ago}", entry.name));
+        } else {
+            lines.push(format!(
+                "{} ({} KB{ago})",
+                entry.name,
+                entry.bytes.div_ceil(1024)
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// `seconds` as a short span: `42s`, `5m`, `3h`, `2d`.
+fn short_span(seconds: u64) -> String {
+    match seconds {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
 
 /// An error with its causes, as one line.
 /// The most characters of a provider's error said while it is waited for.

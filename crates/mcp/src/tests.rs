@@ -162,7 +162,7 @@ async fn a_servers_tools_are_offered_prefixed_judged_and_called_with_their_permi
     ));
     let (_dir, permit) = permitted(action);
     assert_eq!(
-        mcp.call(&permit).await.unwrap(),
+        mcp.call(&permit).await.unwrap().text,
         "\"get.issue\" \"ENG-1\"".to_owned()
     );
     // A permit for something else calls nothing.
@@ -424,7 +424,7 @@ async fn a_server_that_takes_oauth_only_gets_a_grant_kept_renewed_and_asked_agai
     assert!(told[0].starts_with("the MCP server docs waits for your consent"));
     assert_eq!(told[1], "the MCP server docs: 1 tool, 1 only reading");
     let (_gate, permit) = permitted(mcp.action("docs__fetch", &json!({})).unwrap());
-    assert_eq!(mcp.call(&permit).await.unwrap(), "a page");
+    assert_eq!(mcp.call(&permit).await.unwrap().text, "a page");
     let kept = Grants::new(grants.clone())
         .load("docs", &url(&base))
         .unwrap();
@@ -526,7 +526,7 @@ async fn a_server_over_stdio_is_answered_its_own_requests_and_called() {
     mcp.settled(Duration::from_secs(5)).await;
     assert_eq!(mcp.status()[0].1, "1 tool, 0 only reading");
     let (_gate, permit) = permitted(mcp.action("notes__note", &json!({"text": "hi"})).unwrap());
-    assert_eq!(mcp.call(&permit).await.unwrap(), "noted");
+    assert_eq!(mcp.call(&permit).await.unwrap().text, "noted");
     let sent: Vec<Value> = std::fs::read_to_string(&seen)
         .unwrap()
         .lines()
@@ -540,7 +540,7 @@ async fn a_server_over_stdio_is_answered_its_own_requests_and_called() {
     let failed = mcp.call(&permit).await.unwrap_err();
     assert_eq!(said(&failed), "the server stopped, saying: starting up");
     assert_eq!(mcp.status()[0].1, "1 tool, 0 only reading");
-    assert_eq!(mcp.call(&permit).await.unwrap(), "noted");
+    assert_eq!(mcp.call(&permit).await.unwrap().text, "noted");
     mcp.end().await;
 }
 
@@ -572,7 +572,9 @@ fn events_are_read_from_their_data_lines_and_names_made_plain() {
 #[test]
 fn an_answer_too_long_is_cut_and_one_that_failed_is_an_error() {
     let long = "a".repeat(ANSWER_CHARS + 10);
-    let text = call_text(&json!({"content": [{"type": "text", "text": long}]})).unwrap();
+    let text = call_text(&json!({"content": [{"type": "text", "text": long}]}))
+        .unwrap()
+        .text;
     assert!(text.starts_with(&"a".repeat(ANSWER_CHARS)));
     assert!(
         text.ends_with("ask it for less]"),
@@ -585,7 +587,31 @@ fn an_answer_too_long_is_cut_and_one_that_failed_is_an_error() {
     );
     assert!(matches!(failed, Err(McpError::Failed(said)) if said == "no such issue"));
     let structured = call_text(&json!({"structuredContent": {"n": 1}})).unwrap();
-    assert_eq!(structured, r#"{"n":1}"#);
+    assert_eq!(structured.text, r#"{"n":1}"#);
+}
+
+#[test]
+fn an_image_a_tool_answers_with_is_shown_when_it_is_one_a_model_reads() {
+    use base64::Engine;
+    let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR");
+    let svg = base64::engine::general_purpose::STANDARD.encode(b"<svg/>");
+    let answer = call_text(&json!({"content": [
+        {"type": "text", "text": "the frame:"},
+        {"type": "image", "data": png, "mimeType": "image/png"},
+        {"type": "image", "data": svg, "mimeType": "image/png"},
+    ]}))
+    .unwrap();
+    assert_eq!(
+        answer.text,
+        "the frame:\n[an image: it is shown to you after this step's results]\n[an image, not shown: it is no PNG, JPEG, GIF or WebP image]"
+    );
+    assert_eq!(
+        answer.images,
+        [iq_core::Message::Image {
+            mime: "image/png".into(),
+            data: png,
+        }]
+    );
 }
 
 #[test]

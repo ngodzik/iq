@@ -855,6 +855,22 @@ impl Live<'_> {
         };
         let inner = width.saturating_sub(4).max(1);
         let editor = screen.editor();
+        // The images attached, above what the person writes, sent with it.
+        let attached: Vec<Line<'static>> = self
+            .board
+            .attached()
+            .iter()
+            .map(|path| {
+                Line::from(vec![
+                    Span::styled("▣ ", p.fg(p.info)),
+                    Span::styled(
+                        cut(&short(&path.display().to_string()), inner.saturating_sub(2)),
+                        p.fg(p.dim),
+                    ),
+                ])
+            })
+            .collect();
+        let below = attached.len() as u16;
         if editor.is_empty() {
             let line = Line::from(vec![
                 Span::styled("› ", p.bold(p.accent)),
@@ -864,35 +880,38 @@ impl Live<'_> {
                     p.fg(p.faint).add_modifier(Modifier::DIM),
                 ),
             ]);
+            let mut lines = attached;
+            lines.push(line);
             return Part::Input {
                 title,
                 spent,
-                lines: vec![line],
-                cursor: Some((2, 0)),
+                lines,
+                cursor: Some((2, below)),
             };
         }
         let (rows, cursor) = fold(editor.text(), editor.cursor(), inner);
         let shown = rows.len().min(WRITTEN);
         let first = cursor.1.saturating_sub(shown - 1).min(rows.len() - shown);
-        let lines = rows
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take(shown)
-            .map(|(at, row)| {
-                let lead = if at == 0 {
-                    Span::styled("› ", p.bold(p.accent))
-                } else {
-                    Span::raw("  ")
-                };
-                Line::from(vec![lead, Span::styled(row.clone(), p.fg(p.text))])
-            })
-            .collect();
+        let mut lines = attached;
+        lines.extend(
+            rows.iter()
+                .enumerate()
+                .skip(first)
+                .take(shown)
+                .map(|(at, row)| {
+                    let lead = if at == 0 {
+                        Span::styled("› ", p.bold(p.accent))
+                    } else {
+                        Span::raw("  ")
+                    };
+                    Line::from(vec![lead, Span::styled(row.clone(), p.fg(p.text))])
+                }),
+        );
         Part::Input {
             title,
             spent,
             lines,
-            cursor: Some((cursor.0 as u16 + 2, (cursor.1 - first) as u16)),
+            cursor: Some((cursor.0 as u16 + 2, (cursor.1 - first) as u16 + below)),
         }
     }
 

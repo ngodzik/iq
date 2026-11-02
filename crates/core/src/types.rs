@@ -331,6 +331,34 @@ pub enum Message {
     },
 }
 
+/// The most bytes of an image shown to a model: past them, providers refuse
+/// it.
+pub const IMAGE_MOST: usize = 5 << 20;
+
+/// The media type of `bytes` when they are an image a model reads, known by
+/// their first bytes rather than by a file's name: PNG, JPEG, GIF or WebP.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(iq_core::image_type(b"\x89PNG\r\n\x1a\n...."), Some("image/png"));
+/// assert_eq!(iq_core::image_type(b"<svg/>"), None);
+/// ```
+#[must_use]
+pub fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 impl Message {
     /// A message from the user.
     pub fn user(content: impl Into<String>) -> Self {

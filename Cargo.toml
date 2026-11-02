@@ -106,6 +106,7 @@ iq-ui.workspace              = true
 iq-tui.workspace             = true
 iq-plugin.workspace          = true
 iq-mcp.workspace             = true
+base64.workspace             = true
 anyhow.workspace             = true
 clap.workspace               = true
 tokio = { workspace = true, features = ["sync", "signal", "process", "io-util", "time"] }
