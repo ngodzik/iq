@@ -26,6 +26,7 @@ mod live;
 mod markdown;
 mod motion;
 mod pages;
+mod summary;
 mod table;
 mod theme;
 mod tty;
@@ -50,6 +51,7 @@ use ratatui::text::Line;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 pub use crate::diagram::{Draw, Drawn};
+pub use crate::summary::Summarize;
 
 use crate::diagram::Image;
 use crate::graphics::Kitty;
@@ -72,9 +74,10 @@ const CLOCK: Duration = Duration::from_secs(1);
 /// Runs iq in the terminal until the person quits or iq is asked to stop:
 /// `board` as the settings made it, what `feed` brings, what the person
 /// asks of the crew sent on `requests`, the diagrams agents write drawn by
-/// `draw` when the settings give one and the terminal is Kitty. The
-/// terminal is given back as it was, the conversation left in its
-/// scrollback.
+/// `draw` when the settings give one and the terminal is Kitty, the
+/// messages between agents summed up by `summarize` when the settings give
+/// a model for it. The terminal is given back as it was, the conversation
+/// left in its scrollback.
 ///
 /// # Errors
 ///
@@ -84,6 +87,7 @@ pub fn run(
     requests: Sender<Request>,
     board: Board,
     draw: Option<Arc<dyn Draw>>,
+    summarize: Option<Arc<dyn Summarize>>,
 ) -> io::Result<()> {
     let tty = Tty::take()?;
     let (cols, rows) = terminal::size()?;
@@ -118,6 +122,7 @@ pub fn run(
     let mut history = History::default();
     history.set_links(link::supported(|name| std::env::var(name).ok()));
     history.pictures(screen.kitty.and(draw), cell());
+    history.summaries(summarize);
     let mut iq = Iq {
         screen,
         board,
@@ -301,6 +306,7 @@ impl Iq {
                 reviewer,
                 autopilot,
                 internet,
+                allowed,
             } => {
                 self.history.opening(&lead, &reviewer, &self.p);
                 self.board.update(Update::Started {
@@ -308,6 +314,7 @@ impl Iq {
                     reviewer,
                     autopilot,
                     internet,
+                    allowed,
                 });
             }
             Update::Said(text) => self.history.say(&text, &self.p),
@@ -397,12 +404,13 @@ impl Iq {
     fn draw(&mut self, now: u64) -> io::Result<()> {
         let screen = &mut self.screen;
         if screen.paged {
-            let (board, p) = (&mut self.board, &self.p);
+            let (board, p, history) = (&mut self.board, &self.p, &self.history);
             let images = screen.kitty.is_some();
             let mut body = Rect::default();
+            let summed = |id: usize| history.summed(id);
             screen
                 .terminal
-                .draw(|frame| body = pages::draw(frame, board, p, now, images))?;
+                .draw(|frame| body = pages::draw(frame, board, p, now, images, &summed))?;
             return self.picture(body);
         }
         if screen.placed.is_some() {

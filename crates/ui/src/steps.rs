@@ -3,9 +3,11 @@
 //! steps make one fold from its last line to its next: while it works, the
 //! last of them show as they come; once it writes again, or its turn ends,
 //! the fold closes and only its count is said, the steps kept to be
-//! unfolded on their page.
+//! unfolded on their page. And what the agents write to each other (the
+//! task one is started on, a message, an answer), which the conversation
+//! sums up and their page gives whole, numbered with the folds.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use iq_agent::{Event, PERSON};
 
@@ -106,12 +108,54 @@ impl Fold {
     }
 }
 
-/// The agents' steps, fold by fold.
+/// What one agent wrote to another: the task it started it on, a
+/// message, an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Said {
+    /// Its number, counted with the folds'.
+    pub id: usize,
+    /// Its writer.
+    pub from: String,
+    /// Its reader: an agent, or all.
+    pub to: String,
+    /// What it wrote, whole.
+    pub text: String,
+    /// Whether it is the task the reader was started on.
+    pub task: bool,
+}
+
+/// One of the steps' page's entries: a fold, or a message between agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry<'a> {
+    /// An agent's steps between two of its lines.
+    Fold(&'a Fold),
+    /// What one agent wrote to another.
+    Said(&'a Said),
+}
+
+impl Entry<'_> {
+    /// Its number.
+    #[must_use]
+    pub fn id(&self) -> usize {
+        match self {
+            Entry::Fold(fold) => fold.id,
+            Entry::Said(said) => said.id,
+        }
+    }
+}
+
+/// The agents' steps, fold by fold, and what they wrote to each other.
 #[derive(Debug, Clone, Default)]
 pub struct Steps {
     folds: VecDeque<Fold>,
-    /// The number of the last fold made.
+    /// What agents wrote to each other, the oldest first.
+    said: VecDeque<Said>,
+    /// The number of the last fold or message made.
     last: usize,
+    /// Who started each agent another started.
+    started: HashMap<String, String>,
+    /// The agents whose task was taken.
+    tasked: HashSet<String>,
     /// Each agent's fold being made, by its number.
     open: HashMap<String, usize>,
     /// What each question waiting asks, to keep it once answered.
@@ -168,8 +212,18 @@ impl Steps {
                     why: why.clone(),
                 },
             ),
-            Event::Working { agent, .. }
-            | Event::TextStart { agent }
+            Event::Working { agent, prompt } => {
+                self.close(agent);
+                // Its first is the task it was started on, unless a
+                // teammate's message woke it, taken as it was posted.
+                if self.tasked.insert(agent.clone())
+                    && !prompt.starts_with("Message from ")
+                    && let Some(by) = self.started.get(agent).cloned()
+                {
+                    self.said(&by, agent, prompt, true);
+                }
+            }
+            Event::TextStart { agent }
             | Event::Done { agent, .. }
             | Event::Notice { agent, .. } => self.close(agent),
             Event::Placed {
@@ -177,11 +231,14 @@ impl Steps {
                 said: Some(_),
                 ..
             } => self.close(agent),
-            Event::Posted { from, to, .. } => {
+            Event::Posted { from, to, text } => {
                 // What the person writes to an agent comes after what it
                 // did before.
                 let agent = if from == PERSON { to } else { from };
                 self.close(agent);
+                if from != PERSON && to != PERSON && from != to {
+                    self.said(from, to, text, false);
+                }
             }
             // It waits, for its agents or the person: what it did before
             // is still its fold.
@@ -196,6 +253,24 @@ impl Steps {
                         fold.agent.clone_from(to);
                     }
                 }
+                for said in &mut self.said {
+                    for name in [&mut said.from, &mut said.to] {
+                        if name == from {
+                            name.clone_from(to);
+                        }
+                    }
+                }
+                for by in self.started.values_mut() {
+                    if by == from {
+                        by.clone_from(to);
+                    }
+                }
+                if let Some(by) = self.started.remove(from) {
+                    self.started.insert(to.clone(), by);
+                }
+                if self.tasked.remove(from) {
+                    self.tasked.insert(to.clone());
+                }
                 if let Some(open) = self.open.remove(from) {
                     self.open.insert(to.clone(), open);
                 }
@@ -205,8 +280,12 @@ impl Steps {
                     }
                 }
             }
-            Event::Joined { .. }
-            | Event::Effort { .. }
+            Event::Joined { agent, by, .. } => {
+                if by != PERSON {
+                    self.started.insert(agent.clone(), by.clone());
+                }
+            }
+            Event::Effort { .. }
             | Event::Model { .. }
             | Event::Text { .. }
             | Event::Spent { .. }
@@ -248,10 +327,25 @@ impl Steps {
         }
     }
 
+    /// Keeps what `from` wrote to `to`, under the next number.
+    fn said(&mut self, from: &str, to: &str, text: &str, task: bool) {
+        self.last += 1;
+        self.said.push_back(Said {
+            id: self.last,
+            from: from.to_owned(),
+            to: to.to_owned(),
+            text: text.to_owned(),
+            task,
+        });
+        while self.said.len() > KEPT {
+            self.said.pop_front();
+        }
+    }
+
     fn fold_mut(&mut self, id: usize) -> Option<&mut Fold> {
-        // Numbered in order, none missing but the oldest forgotten.
-        let first = self.folds.front()?.id;
-        self.folds.get_mut(id.checked_sub(first)?)
+        // Numbered in order, the messages' numbers between them.
+        let at = self.folds.binary_search_by_key(&id, |fold| fold.id).ok()?;
+        self.folds.get_mut(at)
     }
 
     /// Every fold kept, the oldest first.
@@ -262,8 +356,40 @@ impl Steps {
     /// The fold numbered `id`, while it is kept.
     #[must_use]
     pub fn fold(&self, id: usize) -> Option<&Fold> {
-        let first = self.folds.front()?.id;
-        self.folds.get(id.checked_sub(first)?)
+        let at = self.folds.binary_search_by_key(&id, |fold| fold.id).ok()?;
+        self.folds.get(at)
+    }
+
+    /// What agents wrote to each other, kept, the oldest first.
+    pub fn said_all(&self) -> impl DoubleEndedIterator<Item = &Said> {
+        self.said.iter()
+    }
+
+    /// The message numbered `id`, while it is kept.
+    #[must_use]
+    pub fn said_by_id(&self, id: usize) -> Option<&Said> {
+        let at = self.said.binary_search_by_key(&id, |said| said.id).ok()?;
+        self.said.get(at)
+    }
+
+    /// The last message between agents kept: the one the event just taken
+    /// made, when it made one.
+    #[must_use]
+    pub fn latest_said(&self) -> Option<&Said> {
+        self.said.back()
+    }
+
+    /// Every fold and message kept, in the order they came.
+    #[must_use]
+    pub fn entries(&self) -> Vec<Entry<'_>> {
+        let mut entries: Vec<Entry<'_>> = self
+            .folds
+            .iter()
+            .map(Entry::Fold)
+            .chain(self.said.iter().map(Entry::Said))
+            .collect();
+        entries.sort_by_key(Entry::id);
+        entries
     }
 
     /// `agent`'s fold being made, while it works.
@@ -285,6 +411,57 @@ mod tests {
             output: String::new(),
             ok,
         }
+    }
+
+    #[test]
+    fn what_agents_write_each_other_is_kept_numbered_with_the_folds() {
+        let mut steps = Steps::default();
+        let joined = |agent: &str, by: &str| Event::Joined {
+            agent: agent.into(),
+            model: "lab/m".into(),
+            by: by.into(),
+        };
+        let working = |prompt: &str| Event::Working {
+            agent: "fix/tests".into(),
+            prompt: prompt.into(),
+        };
+        let posted = |from: &str, to: &str, text: &str| Event::Posted {
+            from: from.into(),
+            to: to.into(),
+            text: text.into(),
+        };
+        steps.event(&joined("fix", PERSON));
+        steps.event(&Event::Working {
+            agent: "fix".into(),
+            prompt: "fix the build".into(),
+        });
+        steps.event(&tool("fix", "read_file", true));
+        steps.event(&joined("fix/tests", "fix"));
+        steps.event(&working("write the tests"));
+        steps.event(&tool("fix/tests", "run_command", true));
+        steps.event(&posted("fix/tests", "fix", "3 pass"));
+        // A wake by a message, and what the person writes, are no more.
+        steps.event(&working("Message from fix: and the docs"));
+        steps.event(&posted(PERSON, "fix", "go on"));
+        let ids: Vec<usize> = steps.entries().iter().map(Entry::id).collect();
+        assert_eq!(ids, [1, 2, 3, 4]);
+        let task = steps.said_by_id(2).unwrap();
+        assert!(task.task);
+        assert_eq!(
+            (task.from.as_str(), task.to.as_str(), task.text.as_str()),
+            ("fix", "fix/tests", "write the tests")
+        );
+        assert!(!steps.said_by_id(4).unwrap().task);
+        assert_eq!(steps.latest_said().unwrap().id, 4);
+        assert_eq!(steps.fold(3).unwrap().agent, "fix/tests");
+        assert!(steps.fold(3).unwrap().closed);
+        // Renamed, its messages follow it.
+        steps.event(&Event::Renamed {
+            from: "fix".into(),
+            to: "fix-build".into(),
+        });
+        assert_eq!(steps.said_by_id(4).unwrap().to, "fix-build");
+        assert_eq!(steps.said_by_id(2).unwrap().from, "fix-build");
     }
 
     #[test]

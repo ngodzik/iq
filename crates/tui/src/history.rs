@@ -6,6 +6,13 @@
 //! line. What it does between two lines of text (its tools, what was
 //! allowed or refused it) shows in the live part as it comes; once it goes
 //! on, only their count is written, the steps unfolded on their page.
+//!
+//! What agents write to each other (the task one starts another on, a
+//! message, an answer) is written as a few lines, numbered as their page
+//! numbers it, where it is given whole: summed up by a cheap model when
+//! the settings give one, else its first lines. An agent another started
+//! writes in its pane while it works, not here, unless the person wrote to
+//! it: what it answers comes as a message.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -22,12 +29,18 @@ use ratatui::text::{Line, Span};
 
 use crate::diagram::{Diagram, Draw, Image, Shown};
 use crate::markdown::{Markdown, Out, Styled, code, inline};
+use crate::summary::{Summarize, Summary};
 use crate::table::Table;
 use crate::theme::Palette;
 use crate::wrap::{cut, wrap};
 
-/// How many lines of a message between agents are written.
+/// How many lines of a message between agents are written, when no model
+/// sums it up.
 const MESSAGE_LINES: usize = 4;
+
+/// The longest line of a message written, in characters: a paragraph
+/// written as one line is cut there.
+const LINE_CHARS: usize = 200;
 
 /// How many of a chat's last exchanges of an earlier session are written
 /// again as the person comes back to it: as far back as a scrollback is
@@ -100,6 +113,14 @@ enum Block {
         said: Style,
         failed: Style,
     },
+    /// A message between agents summed up, under `indent`, in `style`; its
+    /// first lines, `instead`, until it is, or when it cannot be.
+    Summed {
+        summary: Arc<Summary>,
+        instead: Vec<Para>,
+        indent: String,
+        style: Style,
+    },
 }
 
 impl Block {
@@ -122,7 +143,11 @@ impl Block {
     /// Whether it is a diagram being drawn, which what comes after it waits
     /// for.
     fn drawing(&self) -> bool {
-        matches!(self, Block::Diagram { diagram, .. } if diagram.drawing())
+        match self {
+            Block::Diagram { diagram, .. } => diagram.drawing(),
+            Block::Summed { summary, .. } => summary.making(),
+            Block::Para(_) | Block::Whole(_) | Block::Table(_) => false,
+        }
     }
 
     /// Its lines within `width` columns, on cells of `cell` pixels, the
@@ -133,6 +158,25 @@ impl Block {
             Block::Para(para) => wrap(&para.body, width, &para.first, &para.rest),
             Block::Whole(line) => vec![line.clone()],
             Block::Table(table) => table.lines(width, &indent),
+            Block::Summed {
+                summary,
+                instead,
+                indent,
+                style,
+            } => match summary.text() {
+                Some(said) => said
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .flat_map(|line| {
+                        let at = [Span::raw(indent.clone())];
+                        wrap(&[Span::styled(line.to_owned(), *style)], width, &at, &at)
+                    })
+                    .collect(),
+                None => instead
+                    .iter()
+                    .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest))
+                    .collect(),
+            },
             Block::Diagram {
                 diagram,
                 code,
@@ -168,6 +212,21 @@ struct Drawer(Option<Arc<dyn Draw>>);
 impl fmt::Debug for Drawer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(if self.0.is_some() { "Drawer" } else { "None" })
+    }
+}
+
+/// What sums up the messages between agents, when the settings give a
+/// model for it.
+#[derive(Clone, Default)]
+struct Summarizer(Option<Arc<dyn Summarize>>);
+
+impl fmt::Debug for Summarizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Summarizer"
+        } else {
+            "None"
+        })
     }
 }
 
@@ -257,6 +316,13 @@ pub(crate) struct History {
     /// The images of the diagrams shown, by their files: their ids with
     /// the terminal, their PNGs and their sizes in pixels.
     pictures: HashMap<std::path::PathBuf, crate::diagram::Shot>,
+    /// What sums up the messages between agents.
+    summarizer: Summarizer,
+    /// The summaries of the messages between agents, by their numbers.
+    summaries: HashMap<usize, Arc<Summary>>,
+    /// The agents another started that the person wrote to: what they
+    /// write until their turn ends is theirs to read.
+    woken: HashSet<String>,
 }
 
 impl History {
@@ -279,6 +345,17 @@ impl History {
                 d.subsec_nanos() ^ u32::try_from(d.as_secs() & 0xff_ffff).unwrap_or(1)
             });
         self.next_image = now & 0x00ff_ffff;
+    }
+
+    /// Sums up the messages between agents with `summarize`, when given;
+    /// else their first lines are written.
+    pub(crate) fn summaries(&mut self, summarize: Option<Arc<dyn Summarize>>) {
+        self.summarizer = Summarizer(summarize);
+    }
+
+    /// The summary of the message numbered `id`, once made.
+    pub(crate) fn summed(&self, id: usize) -> Option<String> {
+        self.summaries.get(&id).and_then(|summary| summary.text())
     }
 
     /// The size of a cell is now `cell` pixels, as the terminal says; one
@@ -359,8 +436,26 @@ impl History {
                 ));
             }
             // The box where the person writes says how hard its agent
-            // thinks, and on which model.
-            Event::Joined { .. } | Event::Effort { .. } | Event::Model { .. } => {}
+            // thinks, and on which model; a model changed is said where it
+            // happens too, as a choice the conversation keeps.
+            Event::Joined { .. } | Event::Effort { .. } => {}
+            Event::Model { agent, model } => {
+                self.set_speaker(None);
+                let tint = agent_tint(board, agent, p);
+                self.push(Para::indented(
+                    "",
+                    vec![
+                        Span::styled("◦ ", p.fg(tint)),
+                        Span::styled(self.shown_name(board, agent), p.fg(tint)),
+                        Span::styled(
+                            format!(
+                                " answers on {model} from its next turn, as you chose with /model"
+                            ),
+                            p.fg(p.dim),
+                        ),
+                    ],
+                ));
+            }
             Event::Working { agent, prompt } => {
                 self.turns.insert(
                     agent.clone(),
@@ -374,15 +469,27 @@ impl History {
                 if !self.tasked.insert(agent.clone()) {
                     return;
                 }
-                let by = board.crew().agent(agent).map(|a| a.by.as_str());
-                if by == Some(PERSON) || by.is_none() {
-                    self.person(prompt, agent, board, p);
-                } else {
-                    self.header(agent, board, p);
-                    self.lines_of(prompt, "  ↳ its task: ", p, MESSAGE_LINES);
+                let by = board.crew().agent(agent).map(|a| a.by.clone());
+                match by {
+                    Some(by) if by != PERSON => {
+                        self.header(agent, board, p);
+                        let id = board
+                            .steps()
+                            .latest_said()
+                            .filter(|said| said.task && said.to == *agent)
+                            .map(|said| said.id);
+                        let mut head = vec![Span::styled("↳ its task", p.fg(p.info))];
+                        head.extend(numbered(id, p));
+                        self.push(Para::indented("  ", head));
+                        self.message(&by, agent, prompt, id, p);
+                    }
+                    _ => self.person(prompt, agent, board, p),
                 }
             }
             Event::TextStart { agent } => self.finish(agent, board, p),
+            // An agent another started writes in its pane, unless the
+            // person wrote to it: what it answers comes as a message.
+            Event::Text { agent, .. } if self.in_pane(agent, board) => {}
             Event::Text { agent, text } => {
                 let links = self.links;
                 let stream = self.streams.entry(agent.clone()).or_insert_with(|| Stream {
@@ -417,6 +524,9 @@ impl History {
             Event::Asked { .. } | Event::Answered { .. } => {}
             Event::Posted { from, to, text } => {
                 if from == PERSON {
+                    if board.crew().agent(to).is_some_and(|view| view.by != PERSON) {
+                        self.woken.insert(to.clone());
+                    }
                     self.person(text, to, board, p);
                 } else if to == PERSON {
                     self.finish(from, board, p);
@@ -438,19 +548,24 @@ impl History {
                     self.set_speaker(None);
                     let (writer, reader) =
                         (self.shown_name(board, from), self.shown_name(board, to));
-                    self.push(Para::indented(
-                        "  ",
-                        vec![
-                            Span::styled("✉ ", p.fg(p.info)),
-                            Span::styled(writer, p.fg(agent_tint(board, from, p))),
-                            Span::styled(" → ", p.fg(p.faint)),
-                            Span::styled(reader, p.fg(agent_tint(board, to, p))),
-                        ],
-                    ));
-                    self.lines_of(text, "    ", p, MESSAGE_LINES);
+                    let id = board
+                        .steps()
+                        .latest_said()
+                        .filter(|said| !said.task && said.from == *from && said.to == *to)
+                        .map(|said| said.id);
+                    let mut head = vec![
+                        Span::styled("✉ ", p.fg(p.info)),
+                        Span::styled(writer, p.fg(agent_tint(board, from, p))),
+                        Span::styled(" → ", p.fg(p.faint)),
+                        Span::styled(reader, p.fg(agent_tint(board, to, p))),
+                    ];
+                    head.extend(numbered(id, p));
+                    self.push(Para::indented("  ", head));
+                    self.message(from, to, text, id, p);
                 }
             }
             Event::Done { agent, outcome } => {
+                self.woken.remove(agent);
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
                 self.blank();
@@ -981,24 +1096,44 @@ impl History {
 
     /// The first lines of `text`, dimmed, after `first`.
     fn lines_of(&mut self, text: &str, first: &str, p: &Palette, most: usize) {
-        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        for (at, line) in lines.iter().take(most).enumerate() {
-            let lead = if at == 0 {
-                Span::styled(first.to_owned(), p.fg(p.info))
-            } else {
-                Span::raw(" ".repeat(crate::wrap::width(first)))
-            };
-            let more = if at + 1 == most && lines.len() > most {
-                format!("{line} …")
-            } else {
-                (*line).to_owned()
-            };
-            self.push(Para {
-                first: vec![lead],
-                rest: vec![Span::raw(" ".repeat(crate::wrap::width(first)))],
-                body: vec![Span::styled(more, p.fg(p.dim))],
-            });
+        for para in first_lines(text, first, p, most) {
+            self.push(para);
         }
+    }
+
+    /// What `from` wrote to `to`, numbered `id` on the steps' page, under
+    /// its head: whole when it is short; else summed up, when a model sums
+    /// messages up, what comes after it waiting a little for it; else its
+    /// first lines.
+    fn message(&mut self, from: &str, to: &str, text: &str, id: Option<usize>, p: &Palette) {
+        const INDENT: &str = "    ";
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let short = lines.len() <= MESSAGE_LINES
+            && lines.iter().all(|line| line.chars().count() <= LINE_CHARS);
+        match (&self.summarizer.0, id) {
+            (Some(summarize), Some(id)) if !short => {
+                let summary = Summary::new(from, to, text, Arc::clone(summarize));
+                self.summaries.insert(id, Arc::clone(&summary));
+                self.push_block(Block::Summed {
+                    summary,
+                    instead: first_lines(text, INDENT, p, MESSAGE_LINES),
+                    indent: INDENT.to_owned(),
+                    style: p.fg(p.dim),
+                });
+            }
+            _ => self.lines_of(text, INDENT, p, MESSAGE_LINES),
+        }
+    }
+
+    /// Whether `agent`'s text goes in its pane rather than its chat's
+    /// window: another agent started it, and the person did not write to
+    /// it.
+    fn in_pane(&self, agent: &str, board: &Board) -> bool {
+        board
+            .crew()
+            .agent(agent)
+            .is_some_and(|view| view.by != PERSON)
+            && !self.woken.contains(agent)
     }
 
     /// `agent`'s name and model, when another spoke last; then what it
@@ -1056,7 +1191,7 @@ impl History {
                         {
                             self.push_step(Para::indented(
                                 "    ",
-                                vec![Span::styled(short(line), p.fg(p.faint))],
+                                vec![Span::styled(cut(&short(line), LINE_CHARS), p.fg(p.faint))],
                             ));
                         }
                     }
@@ -1392,6 +1527,42 @@ impl History {
             None => self.speakers.remove(&self.at),
         };
     }
+}
+
+/// The first `most` lines of `text` that say something, dimmed, after
+/// `first`, each cut within [`LINE_CHARS`]: a paragraph written as one line
+/// would fill the screen.
+fn first_lines(text: &str, first: &str, p: &Palette, most: usize) -> Vec<Para> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let under = || Span::raw(" ".repeat(crate::wrap::width(first)));
+    lines
+        .iter()
+        .take(most)
+        .enumerate()
+        .map(|(at, line)| {
+            let lead = if at == 0 {
+                Span::styled(first.to_owned(), p.fg(p.info))
+            } else {
+                under()
+            };
+            let mut said = cut(line, LINE_CHARS);
+            if at + 1 == most && lines.len() > most && !said.ends_with('…') {
+                said.push_str(" …");
+            }
+            Para {
+                first: vec![lead],
+                rest: vec![under()],
+                body: vec![Span::styled(said, p.fg(p.dim))],
+            }
+        })
+        .collect()
+}
+
+/// The number a message has on the steps' page, as its head ends: the
+/// way to it whole.
+fn numbered(id: Option<usize>, p: &Palette) -> Vec<Span<'static>> {
+    id.map(|id| vec![Span::styled(format!("  #{id}"), p.fg(p.faint))])
+        .unwrap_or_default()
 }
 
 /// The agent `event` is of, when it is of one.
@@ -2198,9 +2369,10 @@ mod tests {
         assert_eq!(
             lines,
             [
-                // In the chat's window, its own agent goes by its model.
+                // In the chat's window, its own agent goes by its model;
+                // a message by its number on the steps' page too.
                 "◦ helper joins, on m, started by m",
-                "  ✉ m → helper",
+                "  ✉ m → helper  #1",
                 "    1",
                 "    2",
                 "    3",
@@ -2213,5 +2385,137 @@ mod tests {
                 "› @helper thanks",
             ]
         );
+    }
+
+    /// Sums a message up as who wrote to whom, in a line.
+    struct Sums;
+
+    impl Summarize for Sums {
+        fn summarize(&self, from: &str, to: &str, text: &str) -> Option<String> {
+            Some(format!(
+                "{from} asks {to} for {} lines",
+                text.lines().count()
+            ))
+        }
+    }
+
+    /// What `history` writes in `window` once nothing waits any more.
+    fn settled(history: &mut History, window: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        for _ in 0..400 {
+            lines.extend(
+                history
+                    .take(80, Some(window))
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            if !history.waiting() {
+                return lines;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("still waiting: {lines:?}");
+    }
+
+    #[test]
+    fn long_messages_between_agents_are_summed_up_and_a_started_agent_writes_in_its_pane() {
+        let p = Palette::new(Theme::Ink, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        history.summaries(Some(Arc::new(Sums)));
+        let joined = |agent: &str, by: &str| Event::Joined {
+            agent: agent.into(),
+            model: "m".into(),
+            by: by.into(),
+        };
+        let text = |agent: &str, text: &str| Event::Text {
+            agent: agent.into(),
+            text: text.into(),
+        };
+        for event in [
+            joined("lead", PERSON),
+            joined("lead/tests", "lead"),
+            Event::Working {
+                agent: "lead/tests".into(),
+                prompt: "1\n2\n3\n4\n5\n6".into(),
+            },
+            // What it writes while it works is in its pane.
+            text("lead/tests", "Reading the module.\n"),
+            Event::Posted {
+                from: "lead/tests".into(),
+                to: "lead".into(),
+                text: "word ".repeat(80),
+            },
+            // Written to by the person, it answers them here.
+            Event::Posted {
+                from: PERSON.into(),
+                to: "lead/tests".into(),
+                text: "and the docs?".into(),
+            },
+            text("lead/tests", "Docs too.\n"),
+            Event::Done {
+                agent: "lead/tests".into(),
+                outcome: Ok("Docs too.".into()),
+            },
+            text("lead/tests", "Not this.\n"),
+        ] {
+            crew(&mut board, &mut history, event, &p);
+        }
+        let lines = settled(&mut history, "lead");
+        let at = |line: &str| lines.iter().position(|l| l == line);
+        assert!(at("  ↳ its task  #1").is_some(), "{lines:#?}");
+        assert!(
+            at("    lead asks lead/tests for 6 lines").is_some(),
+            "{lines:#?}"
+        );
+        // Each by its name in the chat's window: its part, and the lead its
+        // model.
+        assert!(at("  ✉ tests → m  #2").is_some(), "{lines:#?}");
+        assert!(
+            at("    lead/tests asks lead for 1 lines").is_some(),
+            "{lines:#?}"
+        );
+        assert!(at("  Docs too.").is_some(), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("Reading the module")));
+        assert!(!lines.iter().any(|l| l.contains("Not this")));
+        // Its summary is the page's too.
+        assert_eq!(
+            history.summed(2).as_deref(),
+            Some("lead/tests asks lead for 1 lines")
+        );
+    }
+
+    #[test]
+    fn without_a_model_to_sum_up_a_message_its_first_lines_are_cut() {
+        let p = Palette::new(Theme::Ink, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        for (agent, by) in [("lead", PERSON), ("lead/tests", "lead")] {
+            crew(
+                &mut board,
+                &mut history,
+                Event::Joined {
+                    agent: agent.into(),
+                    model: "m".into(),
+                    by: by.into(),
+                },
+                &p,
+            );
+        }
+        crew(
+            &mut board,
+            &mut history,
+            Event::Posted {
+                from: "lead".into(),
+                to: "lead/tests".into(),
+                text: format!("{}\nthe rest", "x".repeat(500)),
+            },
+            &p,
+        );
+        let lines = settled(&mut history, "lead");
+        let kept: usize = lines.iter().map(|l| l.matches('x').count()).sum();
+        assert!(kept < LINE_CHARS, "{lines:#?}");
+        assert!(lines.iter().any(|l| l.ends_with('…')), "{lines:#?}");
+        assert!(lines.contains(&"    the rest".to_owned()), "{lines:#?}");
     }
 }

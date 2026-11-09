@@ -2,6 +2,7 @@
 //! the rules, written down before it is taken.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +57,14 @@ enum Event<'a> {
         folder: &'a Path,
         by: &'a str,
     },
+    /// The model an agent was started on, or answers on from now, and who
+    /// chose it, how.
+    Model {
+        agent: &'a str,
+        model: &'a str,
+        by: &'a str,
+        how: &'a str,
+    },
 }
 
 /// Programs that cannot send anything over a network, whatever they are
@@ -94,6 +103,7 @@ pub struct GateBuilder {
     audit: Option<PathBuf>,
     readable: Vec<PathBuf>,
     writable: Vec<PathBuf>,
+    scratch: Option<PathBuf>,
     internet: bool,
     reviewer_internet: bool,
     reviewer_host: bool,
@@ -164,7 +174,23 @@ impl GateBuilder {
         self
     }
 
+    /// The agents' folder of scratch, outside the workspace: what they
+    /// keep from one command to the next (a long output to read in parts,
+    /// a snapshot to compare with) goes there rather than among the
+    /// project's files. Commands write there, and files are read and
+    /// written there, without asking. It is made, readable by its owner
+    /// only, when it is not there.
+    #[must_use]
+    pub fn scratch(mut self, folder: impl Into<PathBuf>) -> Self {
+        self.scratch = Some(folder.into());
+        self
+    }
+
     /// The gate, its workspace resolved.
+    ///
+    /// # Errors
+    ///
+    /// The workspace cannot be resolved, or the folder of scratch made.
     pub fn build(self) -> Result<Gate, GateError> {
         let workspace = self
             .workspace
@@ -173,16 +199,31 @@ impl GateBuilder {
                 path: self.workspace.clone(),
                 source,
             })?;
+        // The home resolved as the paths judged are: a link on its way, as
+        // macOS' /home is, would keep its folders of credentials from being
+        // known.
+        let mut bounds = Bounds::new(
+            workspace,
+            self.home.map(|home| paths::resolve(&home, Path::new("/"))),
+            self.readable,
+            self.writable,
+        );
+        if let Some(scratch) = self.scratch {
+            let made = |source| GateError::File {
+                path: scratch.clone(),
+                source,
+            };
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&scratch)
+                .map_err(made)?;
+            let resolved = scratch.canonicalize().map_err(made)?;
+            bounds.writable.push(resolved.clone());
+            bounds.scratch = Some(resolved);
+        }
         Ok(Gate {
-            // The home resolved as the paths judged are: a link on its way,
-            // as macOS' /home is, would keep its folders of credentials
-            // from being known.
-            bounds: Bounds::new(
-                workspace,
-                self.home.map(|home| paths::resolve(&home, Path::new("/"))),
-                self.readable,
-                self.writable,
-            ),
+            bounds,
             rules: self.rules,
             audit: self.audit.map(Audit::new),
             internet: Arc::new(AtomicBool::new(self.internet)),
@@ -203,6 +244,7 @@ impl Gate {
             audit: None,
             readable: Vec::new(),
             writable: Vec::new(),
+            scratch: None,
             internet: false,
             reviewer_internet: false,
             reviewer_host: false,
@@ -316,6 +358,22 @@ impl Gate {
         self.record(&Event::Outside { line, folder, by })
     }
 
+    /// Writes to the audit log that `agent` runs on `model` from now on,
+    /// as `by` (the person, or the agent that started it) chose it, `how`:
+    /// the command, the tool or the setting that named it.
+    ///
+    /// # Errors
+    ///
+    /// The audit log cannot be written.
+    pub fn chose(&self, agent: &str, model: &str, by: &str, how: &str) -> Result<(), GateError> {
+        self.record(&Event::Model {
+            agent,
+            model,
+            by,
+            how,
+        })
+    }
+
     /// Writes `event` to the audit log, when there is one.
     fn record(&self, event: &Event<'_>) -> Result<(), GateError> {
         match &self.audit {
@@ -358,6 +416,11 @@ impl Gate {
     /// The workspace, resolved.
     pub fn workspace(&self) -> &Path {
         &self.bounds.workspace
+    }
+
+    /// The agents' folder of scratch, resolved, when it has one.
+    pub fn scratch(&self) -> Option<&Path> {
+        self.bounds.scratch.as_deref()
     }
 
     /// The audit log's file, when there is one.
@@ -566,6 +629,14 @@ impl Gate {
                 reason: "it is a file of secrets".to_owned(),
                 scope: Scope::Beyond,
             };
+        }
+        if self
+            .bounds
+            .scratch
+            .as_ref()
+            .is_some_and(|scratch| path.starts_with(scratch))
+        {
+            return Verdict::Allow;
         }
         match path.strip_prefix(&self.bounds.workspace) {
             Ok(within) if paths::runs_later(within) => Verdict::Ask {
@@ -1128,5 +1199,69 @@ mod tests {
         assert_eq!(events[6]["by"], "reviewer");
         assert_eq!(events[6]["reason"], "the task does not ask to lose work");
         assert_eq!(events[6]["action"]["line"], "git reset --hard");
+    }
+
+    #[test]
+    fn the_folder_of_scratch_is_written_and_read_without_asking() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let workspace = root.join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let scratch = root.join("scratch/project");
+        let gate = Gate::builder(&workspace)
+            .home(Some(PathBuf::from("/home/me")))
+            .scratch(&scratch)
+            .build()
+            .unwrap();
+        // Made, for its owner alone.
+        assert_eq!(gate.scratch(), Some(scratch.as_path()));
+        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let log = scratch.join("fix/check.log");
+        assert!(matches!(
+            gate.judge(Action::Write { path: log.clone() }).unwrap(),
+            Judged::Allowed(_)
+        ));
+        assert!(matches!(
+            gate.judge(Action::Read { path: log }).unwrap(),
+            Judged::Allowed(_)
+        ));
+        // Beside it is outside the workspace, as before.
+        assert!(matches!(
+            gate.judge(Action::Write {
+                path: root.join("scratch/other.log")
+            })
+            .unwrap(),
+            Judged::Asked { .. }
+        ));
+        // A worktree's gate keeps it.
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let within = gate.within(&worktree, Vec::new()).unwrap();
+        assert_eq!(within.scratch(), Some(scratch.as_path()));
+    }
+
+    #[test]
+    fn the_log_keeps_who_chose_each_model_and_how() {
+        let f = fixture("");
+        f.gate.chose("fix", "lab/sage-5", "person", "/new").unwrap();
+        f.gate
+            .chose("fix/tests", "lab/quick-2", "fix", "start_agent")
+            .unwrap();
+        let log = std::fs::read_to_string(f.root.join("audit.log")).unwrap();
+        let events: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "model");
+        assert_eq!(events[0]["agent"], "fix");
+        assert_eq!(events[0]["model"], "lab/sage-5");
+        assert_eq!(events[0]["by"], "person");
+        assert_eq!(events[0]["how"], "/new");
+        assert_eq!(events[1]["by"], "fix");
+        assert_eq!(events[1]["how"], "start_agent");
+        assert!(events[1]["at"].is_u64());
     }
 }

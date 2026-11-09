@@ -1,11 +1,12 @@
-//! The person's skills: what they wrote for the agents they start to
-//! follow in a kind of work, such as which team to start for code and how
-//! it works, each a Markdown file with its name and a line on when it
-//! serves, as `.claude/skills` holds them: a folder with its `SKILL.md`, or a file of
-//! its own. An agent the person started is told which there are, reads one
-//! whole with `skill` before the work it is for, and gives the agents it
-//! starts what they need of it. The person changes a skill, and the next
-//! agent reads it as it is.
+//! The person's skills: what they wrote for the agents to follow in a
+//! kind of work, such as which team to start for code and how it works,
+//! each a Markdown file with its name and a line on when it serves, as
+//! `.claude/skills` holds them: a folder with its `SKILL.md`, or a file of
+//! its own. Every agent is told which there are and reads one whole with
+//! `skill` before the work it is for: one another agent started, which may
+//! start agents in turn, chooses their models as the person's skills say,
+//! not as it guesses. The person changes a skill, and the next agent reads
+//! it as it is.
 
 use std::path::{Path, PathBuf};
 
@@ -246,10 +247,6 @@ where
         }]
     }
 
-    fn leads_only(&self) -> bool {
-        true
-    }
-
     fn instructions(&self, _agent: &str) -> Option<String> {
         self.told()
     }
@@ -270,6 +267,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_agent_is_given_the_skills_not_only_the_persons() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("code-work.md"),
+            "---\nname: code-work\ndescription: how code is written\n---\nOne writer.",
+        )
+        .unwrap();
+        let skills = Skills::new(vec![home.path().into()]);
+        // An agent another started may start agents in turn: it reads how
+        // the person has them chosen.
+        assert!(!<Skills as Extension<()>>::leads_only(&skills));
+        let tools = <Skills as Extension<()>>::tools(&skills, "fix/writer");
+        assert_eq!(tools[0].name, "skill");
+        let told = <Skills as Extension<()>>::instructions(&skills, "fix/writer").unwrap();
+        assert!(told.contains("code-work: how code is written"), "{told}");
+    }
 
     #[test]
     fn review_skills_reload_and_fail_closed() {

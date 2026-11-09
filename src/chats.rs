@@ -164,6 +164,12 @@ mod tests {
             effort: None,
             folder: Some(PathBuf::from("/place/lead")),
             context: 1200,
+            models_chosen: vec![iq_agent::ModelChoice {
+                model: "lab/model".to_owned(),
+                by: "person".to_owned(),
+                how: "/new".to_owned(),
+                at: 1,
+            }],
             messages: vec![Message::system("be brief"), Message::user("fix it")],
         }
     }

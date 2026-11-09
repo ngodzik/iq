@@ -27,6 +27,9 @@ pub struct NewChat {
     /// Its name, as the person gave it: empty for one made from its first
     /// request.
     pub name: String,
+    /// How its model was chosen: `/new` or `/model`; empty for the
+    /// settings' lead.
+    pub how: String,
 }
 
 /// Where what the person writes goes.
@@ -53,7 +56,8 @@ pub enum Page {
     Keys,
     /// What a sync would send, line by line.
     Changes,
-    /// Every step the agents took, fold by fold, the latest last.
+    /// Every step the agents took, fold by fold, and what they wrote to
+    /// each other, the latest last.
     Steps,
     /// A diagram of the chat alone, at its whole size, zoomed and moved.
     Diagram,
@@ -70,7 +74,7 @@ impl Page {
             Page::Observations => "Observations".to_owned(),
             Page::Keys => "Keys and commands".to_owned(),
             Page::Changes => "What a sync would send".to_owned(),
-            Page::Steps => "Steps".to_owned(),
+            Page::Steps => "Steps and messages".to_owned(),
             Page::Diagram => "Diagram".to_owned(),
         }
     }
@@ -97,8 +101,19 @@ pub struct Screen {
     chosen: usize,
     /// The completion picked in the list, by its place.
     picked: usize,
+    /// Whether the person moved among the completions since they last
+    /// wrote: until then none is picked where a command waits for what it
+    /// takes.
+    moved: bool,
     /// Whether the person sent the list away for what is written now.
     unlisted: bool,
+    /// The entry chosen on the steps' page, by its number: the latest
+    /// when none.
+    step: Option<usize>,
+    /// Whether the steps' page is to scroll to the entry chosen.
+    follow: bool,
+    /// The entries of the steps' page shown whole, by their numbers.
+    unfolded: std::collections::BTreeSet<usize>,
     /// The names asked for agents that have not joined yet.
     starting: Vec<String>,
     /// A word to the person, and when it was said.
@@ -117,7 +132,11 @@ impl Default for Screen {
             rows: 0,
             chosen: 0,
             picked: 0,
+            moved: false,
             unlisted: false,
+            step: None,
+            follow: false,
+            unfolded: std::collections::BTreeSet::new(),
             starting: Vec::new(),
             notice: None,
             quit_asked: None,
@@ -183,6 +202,7 @@ impl Screen {
     pub fn editor_mut(&mut self) -> &mut Editor {
         self.unlisted = false;
         self.picked = 0;
+        self.moved = false;
         &mut self.editor
     }
 
@@ -272,7 +292,48 @@ impl Screen {
     pub fn pick(&mut self, at: isize, count: usize) {
         if count > 0 {
             self.picked = at.rem_euclid(count as isize) as usize;
+            self.moved = true;
         }
+    }
+
+    /// Whether the person moved among the completions since they last
+    /// wrote.
+    #[must_use]
+    pub fn moved(&self) -> bool {
+        self.moved
+    }
+
+    /// The entry chosen on the steps' page, by its number: the latest
+    /// when none.
+    #[must_use]
+    pub fn step(&self) -> Option<usize> {
+        self.step
+    }
+
+    /// Chooses the entry `id` on the steps' page, the latest when none,
+    /// and has the page scroll to it.
+    pub fn choose_step(&mut self, id: Option<usize>) {
+        self.step = id;
+        self.follow = true;
+    }
+
+    /// Whether the steps' page is to scroll to the entry chosen, once.
+    pub fn take_follow(&mut self) -> bool {
+        std::mem::take(&mut self.follow)
+    }
+
+    /// Shows the entry `id` of the steps' page whole, or folds it again.
+    pub fn unfold(&mut self, id: usize) {
+        if !self.unfolded.remove(&id) {
+            self.unfolded.insert(id);
+        }
+        self.follow = true;
+    }
+
+    /// Whether the entry `id` of the steps' page shows whole.
+    #[must_use]
+    pub fn unfolded(&self, id: usize) -> bool {
+        self.unfolded.contains(&id)
     }
 
     /// Whether the person sent the list of completions away.

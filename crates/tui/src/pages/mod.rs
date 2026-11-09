@@ -32,6 +32,8 @@ pub(crate) struct Seen<'a> {
     pub(crate) width: usize,
     /// Whether the terminal shows images, Kitty.
     pub(crate) images: bool,
+    /// The summary of the message between agents of a number, once made.
+    pub(crate) summed: &'a dyn Fn(usize) -> Option<String>,
 }
 
 impl Seen<'_> {
@@ -67,8 +69,14 @@ impl Seen<'_> {
     }
 }
 
-/// The page's lines, and the keys it takes.
-fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String) {
+/// The page's lines, the keys it takes, and the line it is to show when
+/// it shows a chosen entry.
+fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String, Option<usize>) {
+    if *page == Page::Steps {
+        let (lines, focus) = steps::lines(seen);
+        let foot = "↑↓ choose · Enter whole, or folded again · the latest last";
+        return (lines, foot.to_owned(), focus);
+    }
     let (lines, foot) = match page {
         Page::Team => (
             team::lines(seen),
@@ -81,14 +89,14 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String) {
             "← → earlier, later · s the span · b by · n now · ↑↓ scroll",
         ),
         Page::Keys => (keys::lines(seen), "↑↓ scroll"),
-        Page::Changes => return (changes::lines(seen), changes::foot(seen)),
-        Page::Steps => (steps::lines(seen), "↑↓ scroll · the latest last"),
+        Page::Changes => return (changes::lines(seen), changes::foot(seen), None),
+        Page::Steps => (Vec::new(), ""),
         Page::Diagram => (
             diagram(seen),
             "+ − enlarge · ← → ↑ ↓ move · 0 whole · [ ] an earlier, a later · o your viewer",
         ),
     };
-    (lines, foot.to_owned())
+    (lines, foot.to_owned(), None)
 }
 
 /// What the diagram page says beside the image: what it is, and, where
@@ -121,6 +129,7 @@ pub(crate) fn draw(
     p: &Palette,
     now: u64,
     images: bool,
+    summed: &dyn Fn(usize) -> Option<String>,
 ) -> Rect {
     let Some(page) = board.screen().page().cloned() else {
         return Rect::default();
@@ -132,8 +141,9 @@ pub(crate) fn draw(
         now,
         width: usize::from(area.width),
         images,
+        summed,
     };
-    let (lines, foot) = content(&page, &seen);
+    let (lines, foot, focus) = content(&page, &seen);
     let mut top: Vec<Line<'static>> = vec![title(&page, &seen)];
     if let Some(question) = board.questions().first() {
         top.push(Line::from(vec![
@@ -155,6 +165,22 @@ pub(crate) fn draw(
     top.push(rule(area.width, p));
     let body_rows = area.height.saturating_sub(top.len() as u16 + 2);
     let most = lines.len().saturating_sub(usize::from(body_rows));
+    // The entry just chosen, or shown whole, comes into sight: its head
+    // at the top when it was out of it, or when it grew past the bottom.
+    if let Some(focus) = focus
+        && board.screen_mut().take_follow()
+    {
+        let scroll = board.screen().scroll().min(most);
+        let rows = usize::from(body_rows);
+        let next = lines[focus..]
+            .iter()
+            .skip(1)
+            .position(|line| line.spans.is_empty())
+            .map_or(lines.len(), |end| focus + 1 + end);
+        if focus < scroll || next > scroll + rows {
+            board.screen_mut().scroll_to(focus.saturating_sub(1));
+        }
+    }
     let scroll = board.screen().scroll().min(most);
     let shown: Vec<Line<'static>> = lines
         .iter()

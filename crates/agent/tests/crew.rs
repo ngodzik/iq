@@ -1145,6 +1145,7 @@ async fn a_writer_and_its_reviewer_go_round_until_it_approves() {
         None,
         None,
         Vec::new(),
+        "/new",
     );
     for _ in 0..4 {
         f.settled().await;
@@ -1195,6 +1196,7 @@ async fn debaters_answer_alone_then_read_each_other_and_the_first_sums_up() {
         None,
         None,
         Vec::new(),
+        "/new",
     );
     assert_eq!(first, "think");
     for _ in 0..4 {
@@ -1369,6 +1371,255 @@ async fn the_lead_starts_its_agents_on_the_models_it_chooses() {
     f.settled().await;
     // iq holds it to nothing: what it starts is its choice.
     assert_eq!(f.model.models_of("lead/helper"), ["cheap/other"]);
+}
+
+#[tokio::test]
+async fn a_model_the_person_does_not_allow_is_refused_with_those_they_do() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "start_agent",
+                    serde_json::json!({"role": "frontend", "model": "coder-5", "task": "build the page"}),
+                ),
+                calls(
+                    "start_team",
+                    serde_json::json!({"task": "fix it", "members": [
+                        {"role": "writer", "model": "lab/sage@eu", "does": "writes"},
+                        {"role": "tests", "model": "lab/dear", "does": "tests"},
+                    ]}),
+                ),
+                calls(
+                    "start_agent",
+                    serde_json::json!({"role": "frontend", "model": "lab/sage@eu", "task": "build the page"}),
+                ),
+                say("Started."),
+            ],
+        )],
+        Settings {
+            allowed: vec![model("lab/sage@eu"), model("lab/quill")],
+            ..Settings::default()
+        },
+    );
+    f.crew
+        .start("lead", &model("lab/sage@eu"), "go".into(), PERSON);
+    f.settled().await;
+    // Told which there are before it chooses, and again when it chose
+    // another, so that it chooses again rather than stop.
+    assert!(
+        f.model
+            .instructions_of("lead")
+            .contains("The person allows these models only, for any agent: lab/sage@eu, lab/quill")
+    );
+    let seen = f.model.seen_by("lead");
+    assert!(
+        seen.contains(
+            "coder-5 is not among the models the person allows: lab/sage@eu, lab/quill. Choose \
+             one of them, by its whole name."
+        ),
+        "{seen}"
+    );
+    // A team with one member on another is not started at all.
+    assert!(seen.contains("lab/dear is not among the models"), "{seen}");
+    assert!(f.model.models_of("lead/writer").is_empty());
+    assert_eq!(f.model.models_of("lead/frontend"), ["lab/sage@eu"]);
+    // The person's own chat on another is not started, and they are told.
+    f.crew
+        .start("other", &model("lab/dear"), "go".into(), PERSON);
+    f.settled().await;
+    assert!(f.events().iter().any(|event| matches!(
+        event,
+        Event::Notice { agent, text }
+            if agent == "other" && text.starts_with("other is not started: lab/dear is not among")
+    )));
+    assert!(f.model.models_of("other").is_empty());
+    // Nor is a chat given one.
+    let refused = f.crew.set_model("lead", &model("lab/dear")).unwrap_err();
+    assert!(
+        refused.contains("not among the models the person allows"),
+        "{refused}"
+    );
+    assert!(f.crew.set_model("lead", &model("lab/quill")).is_ok());
+}
+
+#[tokio::test]
+async fn an_agent_names_a_model_whole_as_the_provider_lists_it() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "start_agent",
+                    serde_json::json!({"role": "tests", "model": "coder-5", "task": "write tests"}),
+                ),
+                calls(
+                    "start_agent",
+                    serde_json::json!({"role": "tests", "model": "cloud/coder-5@north", "task": "write tests"}),
+                ),
+                say("Started."),
+            ],
+        )],
+        Settings::default(),
+    );
+    // Before the provider's list is read, nothing is held back.
+    f.crew.set_listed(vec![
+        "cloud/coder-5@north".into(),
+        "cloud/coder-5-mini@north".into(),
+        "lab/quill".into(),
+    ]);
+    f.crew
+        .start("lead", &model("lab/quill"), "go".into(), PERSON);
+    f.settled().await;
+    let seen = f.model.seen_by("lead");
+    assert!(
+        seen.contains(
+            "the provider lists no model coder-5: give one by its whole name, as it lists it, \
+             such as cloud/coder-5@north, cloud/coder-5-mini@north"
+        ),
+        "{seen}"
+    );
+    assert_eq!(f.model.models_of("lead/tests"), ["cloud/coder-5@north"]);
+}
+
+#[tokio::test]
+async fn each_choice_of_a_model_is_kept_with_its_chat_and_written_to_the_audit_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let log = root.join("audit.log");
+    let gate = Gate::builder(&root).audit(&log).build().unwrap();
+    let scripted = Scripted::new(&[(
+        "lead",
+        vec![
+            calls(
+                "start_agent",
+                serde_json::json!({"role": "tests", "model": "lab/quick", "task": "test it"}),
+            ),
+            say("Started."),
+        ],
+    )]);
+    let crew = Crew::new(
+        Model(Arc::clone(&scripted)),
+        gate,
+        Helper::new("/nonexistent", Vec::<String>::new()),
+        Settings::default(),
+        Arc::new(|_| {}),
+    );
+    let kept = Arc::new(Kept::default());
+    crew.set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
+    crew.launch(
+        Pattern::Solo,
+        "lead",
+        &[model("lab/sage")],
+        "go".into(),
+        None,
+        None,
+        Vec::new(),
+        "named in the message",
+    );
+    tokio::time::timeout(Duration::from_secs(10), crew.settled())
+        .await
+        .unwrap();
+    crew.set_model("lead", &model("lab/quill")).unwrap();
+    let chosen = |agent: &str| -> Vec<(String, String, String)> {
+        kept.0.lock().unwrap()[agent]
+            .models_chosen
+            .iter()
+            .map(|c| (c.model.clone(), c.by.clone(), c.how.clone()))
+            .collect()
+    };
+    let triple =
+        |model: &str, by: &str, how: &str| (model.to_owned(), by.to_owned(), how.to_owned());
+    assert_eq!(
+        chosen("lead"),
+        [
+            triple("lab/sage", PERSON, "named in the message"),
+            triple("lab/quill", PERSON, "/model"),
+        ]
+    );
+    assert_eq!(
+        chosen("lead/tests"),
+        [triple("lab/quick", "lead", "start_agent")]
+    );
+    let written = std::fs::read_to_string(&log).unwrap();
+    let models: Vec<serde_json::Value> = written
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "model")
+        .collect();
+    assert_eq!(models.len(), 3, "{written}");
+    assert_eq!(models[0]["agent"], "lead");
+    assert_eq!(models[0]["how"], "named in the message");
+    assert_eq!(models[1]["agent"], "lead/tests");
+    assert_eq!(models[1]["by"], "lead");
+    assert_eq!(models[2]["model"], "lab/quill");
+    assert_eq!(models[2]["how"], "/model");
+}
+
+#[tokio::test]
+async fn a_chat_keeps_its_scratch_outside_the_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let scratch = dir.path().canonicalize().unwrap().join("scratch");
+    let gate = Gate::builder(&root).scratch(&scratch).build().unwrap();
+    let log = scratch.join("fix/check.log");
+    let scripted = Scripted::new(&[
+        (
+            "fix",
+            vec![
+                calls(
+                    "start_agent",
+                    serde_json::json!({"role": "tests", "model": "lab/quick", "task": "test it"}),
+                ),
+                say("Started."),
+            ],
+        ),
+        (
+            "fix/tests",
+            vec![
+                calls(
+                    "write_file",
+                    serde_json::json!({"path": log, "content": "3 passed\n"}),
+                ),
+                calls("read_file", serde_json::json!({"path": log})),
+                say("Done."),
+            ],
+        ),
+    ]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&events);
+    let crew = Crew::new(
+        Model(Arc::clone(&scripted)),
+        gate,
+        Helper::new("/nonexistent", Vec::<String>::new()),
+        Settings::default(),
+        Arc::new(move |event| seen.lock().unwrap().push(event)),
+    );
+    crew.start("fix", &model("lab/sage"), "fix it".into(), PERSON);
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(10), crew.settled())
+            .await
+            .unwrap();
+    }
+    // Every agent of the chat is told its folder, the same one.
+    let told = format!(
+        "your chat's folder of scratch, {}",
+        scratch.join("fix").display()
+    );
+    assert!(scripted.instructions_of("fix").contains(&told));
+    assert!(scripted.instructions_of("fix/tests").contains(&told));
+    // Written and read there without asking, and nothing in the workspace.
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "3 passed\n");
+    assert!(scripted.seen_by("fix/tests").contains("3 passed"));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event, Event::Asked { .. }))
+    );
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
 }
 
 #[tokio::test]
@@ -2169,6 +2420,7 @@ async fn an_image_read_or_attached_is_shown_to_the_model_with_its_next_call() {
             mime: "image/png".into(),
             data: "aGk=".into(),
         }],
+        "/new",
     );
     f.settled().await;
     let requests = f.model.requests_of("lead");

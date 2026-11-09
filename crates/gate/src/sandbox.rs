@@ -7,6 +7,7 @@
 
 use std::ffi::OsString;
 use std::io::BufRead;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -161,6 +162,8 @@ pub(crate) struct Bounds {
     pub(crate) home: Option<PathBuf>,
     pub(crate) readable: Vec<PathBuf>,
     pub(crate) writable: Vec<PathBuf>,
+    /// The agents' folder of scratch, also among `writable`.
+    pub(crate) scratch: Option<PathBuf>,
 }
 
 impl Bounds {
@@ -187,6 +190,7 @@ impl Bounds {
             home,
             readable: read,
             writable: write,
+            scratch: None,
         }
     }
 
@@ -258,6 +262,9 @@ pub struct Ran {
     /// What it changed where code runs later and was left, for the person
     /// to see: CI, the editor's tasks, direnv's file.
     pub touched: Vec<PathBuf>,
+    /// The files of its folder of scratch taken away after it, the oldest
+    /// first, so that the folder keeps within its size.
+    pub cleared: Vec<PathBuf>,
 }
 
 /// Runs the commands a [`Permit`] allows, held by the operating system.
@@ -279,6 +286,9 @@ pub struct Sandbox {
     leftovers: Arc<Mutex<Vec<u32>>>,
     /// The variables the person's programs gave each place's commands.
     given: Given,
+    /// The folder of scratch its commands are given, within the gate's,
+    /// and the most it holds, in bytes.
+    scratch: Option<(PathBuf, u64)>,
 }
 
 /// The process holding a network of the sandbox's own: it lets it go when
@@ -321,6 +331,7 @@ impl Sandbox {
             holder: Arc::default(),
             leftovers: Arc::default(),
             given,
+            scratch: None,
         }
     }
 
@@ -387,6 +398,26 @@ impl Sandbox {
     #[must_use]
     pub fn with_quiet(mut self, quiet: Duration) -> Self {
         self.quiet = quiet;
+        self
+    }
+
+    /// The same sandbox, its commands given `folder` as `IQ_SCRATCH`: the
+    /// folder of scratch of their chat, within the gate's (see
+    /// [`GateBuilder::scratch`]), made when it is not there. Once a command
+    /// ends, the oldest files there are taken away until it holds no more
+    /// than `most` bytes. A folder outside the gate's is not given.
+    ///
+    /// [`GateBuilder::scratch`]: crate::GateBuilder::scratch
+    #[must_use]
+    pub fn with_scratch(mut self, folder: impl Into<PathBuf>, most: u64) -> Self {
+        let folder: PathBuf = folder.into();
+        let within = self.bounds.scratch.as_ref().is_some_and(|scratch| {
+            folder.starts_with(scratch)
+                && folder
+                    .components()
+                    .all(|part| !matches!(part, std::path::Component::ParentDir))
+        });
+        self.scratch = within.then_some((folder, most));
         self
     }
 
@@ -485,6 +516,15 @@ impl Sandbox {
         // What the person's programs gave this place, the plugin that keeps
         // its containers apart among them, either way.
         command.envs(self.given.of(workspace));
+        if let Some((scratch, _)) = &self.scratch
+            && std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(scratch)
+                .is_ok()
+        {
+            command.env("IQ_SCRATCH", scratch);
+        }
         command
             .current_dir(&folder)
             .stdin(Stdio::null())
@@ -548,12 +588,17 @@ impl Sandbox {
             }
         };
         let redactor = Redactor::new(std::env::vars_os(), workspace);
+        let cleared = match &self.scratch {
+            Some((scratch, most)) => clear(scratch, *most),
+            None => Vec::new(),
+        };
         let ran = Ran {
             status,
             output: tail(&redactor.redact(&output), OUTPUT_BYTES),
             timed_out,
             restored: settled.restored,
             touched: settled.touched,
+            cleared,
         };
         if let Some(audit) = &self.audit {
             audit.write(&Event::Ran {
@@ -565,6 +610,43 @@ impl Sandbox {
         }
         Ok(ran)
     }
+}
+
+/// Takes the oldest files of `folder` away until it holds no more than
+/// `most` bytes, and says which went. Links are taken as files, never
+/// followed.
+fn clear(folder: &Path, most: u64) -> Vec<PathBuf> {
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut folders = vec![folder.to_path_buf()];
+    while let Some(at) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.path().symlink_metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                folders.push(entry.path());
+            } else {
+                let changed = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                files.push((changed, meta.len(), entry.path()));
+            }
+        }
+    }
+    let mut held: u64 = files.iter().map(|(_, size, _)| size).sum();
+    files.sort();
+    let mut cleared = Vec::new();
+    for (_, size, path) in files {
+        if held <= most {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            held = held.saturating_sub(size);
+            cleared.push(path);
+        }
+    }
+    cleared
 }
 
 /// What a command run in the background has written so far, readable as

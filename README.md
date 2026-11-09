@@ -14,14 +14,14 @@ Three principles hold it together:
 
 - **Security is the foundation, not a layer.** Everything an agent does goes through one gate, and every command runs in the operating system's sandbox.
 - **Your skills say how the work is done.** iq ships no method of its own. Which team to start for a kind of work, with which roles and models, how its agents work together and review each other: you write it in your skills, and you find your own formula. iq makes it easy to follow: agents that start others, messages between them, a worktree per chat, every step in view.
-- **Every cost is in view.** Each call to a model says what it cost, summed by model, by kind of work and over time. iq never holds an agent back to save money: you see what it spends, and you decide.
+- **Every cost is in view.** Each call to a model says what it cost, summed by model, by kind of work and over time. iq never holds an agent back to save money: you see what it spends, and you decide, down to the only models iq may start, for you and every agent. Each choice of a model, yours or an agent's, is written down with who made it and how.
 
 ## Security
 
 This is how iq is designed to hold, and which part of its code holds what: the code is split into crates, libraries each with one responsibility. It is a design, not a guarantee.
 
 - **One gate** (the `iq-gate` crate). Reading or writing a file, running a command, reaching the network: every action an agent asks for is judged there, then allowed, asked of you, or refused. Only the gate can issue the permit an action needs, so the compiler itself refuses a way around it. Every decision is written to an audit log before the action is taken, and the rules that judge commands live in iq's own folder, never in the project, which commands can write.
-- **The operating system's sandbox** (the `iq-gate` crate). Commands run confined by the kernel: Landlock and seccomp on Linux, Seatbelt on macOS; other systems refuse commands until their sandbox is written. A command writes only where the work is, always reaches localhost (on Linux, through a network of the sandbox's own), and reaches the internet only when a rule gives it (fetching packages and sources), when you allow it, or once you opened it for every command. A command waiting for an answer nobody can give is stopped, and the git hooks a command leaves behind are put back.
+- **The operating system's sandbox** (the `iq-gate` crate). Commands run confined by the kernel: Landlock and seccomp on Linux, Seatbelt on macOS; other systems refuse commands until their sandbox is written. A command writes only where the work is (and in its chat's folder of scratch, outside the project, for its logs and snapshots), always reaches localhost (on Linux, through a network of the sandbox's own), and reaches the internet only when a rule gives it (fetching packages and sources), when you allow it, or once you opened it for every command. A command waiting for an answer nobody can give is stopped, and the git hooks a command leaves behind are put back.
 - **Secrets never reach a model.** Files that hold secrets are refused, the secrets of your environment are kept out of commands, and what commands print is cleared of the project's own. API keys come from the environment only.
 - **The machine itself.** What needs your machine outside the sandbox (the container daemon, a cluster, a forge's or a cloud's command line, with your credentials) runs there only once approved, as you would run it yourself.
 - **What others share waits for you.** Publishing, or anything that changes what other people see, is always yours to approve.
@@ -42,10 +42,10 @@ Rules and the reviewer only spare you questions: they widen nothing you did not 
 ## Rules, skills, notes and sync
 
 - **Rules.** The agents follow the project's own rules (its `AGENTS.md`, and the rule files many projects already keep for their agents) and the rules you give every project.
-- **Skills.** Markdown files of yours, each for a kind of work: an agent reads one before the work it serves, and gives the agents it starts what their part needs of it. The autopilot's policy is one of them, kept for the reviewer alone.
+- **Skills.** Markdown files of yours, each for a kind of work: every agent, one another agent started too, reads one before the work it serves, so that an agent starting others chooses them as you wrote. The autopilot's policy is one of them, kept for the reviewer alone.
 - **Notes.** Each project has notes the agents keep for themselves, found again from the same repository on another machine.
 - **Sync.** Your settings, your command rules, the rules and skills kept in iq's own folder (the autopilot's policy among them), the projects' notes, and any file of your home you list can be kept in a private git repository of yours, on GitHub or any other git host, and are put back on a new machine. What a sync would send is shown line by line for you to approve, unless you let it go on its own. What holds secrets is never kept, and a new machine takes what is there before it sends anything. Git does it with the machine's own credentials: nothing goes anywhere but the repository you named.
-- **What stays on the machine.** The chats, the journal of tasks and costs, the observations and the audit log: they are not synced.
+- **What stays on the machine.** The chats and their folders of scratch, the journal of tasks and costs, the observations and the audit log: they are not synced.
 
 ## Plugins
 

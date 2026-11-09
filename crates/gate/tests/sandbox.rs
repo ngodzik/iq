@@ -558,3 +558,58 @@ async fn what_a_program_of_the_persons_gives_a_place_its_commands_get_and_no_oth
     assert!(given.contains(r#""by":"ports""#), "{given}");
     assert!(!written.contains("/x"));
 }
+
+#[tokio::test]
+async fn a_chat_keeps_its_scratch_outside_the_workspace_within_its_size() {
+    let workspace = tempfile::tempdir().unwrap();
+    let kept = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let scratch = kept.path().canonicalize().unwrap().join("project");
+    let gate = Gate::builder(&root).scratch(&scratch).build().unwrap();
+    let helper = || Helper::new(env!("CARGO_BIN_EXE_iq-sandbox"), Vec::<String>::new());
+    let f = Fixture {
+        root: root.clone(),
+        outside: kept.path().canonicalize().unwrap(),
+        sandbox: gate.sandbox(helper()),
+        gate: gate.clone(),
+        _dirs: (workspace, kept),
+    };
+    let chat = scratch.join("fix");
+    let sandbox = gate.sandbox(helper()).with_scratch(&chat, 1000);
+    // A command keeps its log there, and the next reads it.
+    let ran = run_with(&f, &sandbox, r#"echo checked > "$IQ_SCRATCH/check.log""#).await;
+    assert_eq!(ran.status, Some(0), "{}", ran.output);
+    assert_eq!(
+        std::fs::read_to_string(chat.join("check.log")).unwrap(),
+        "checked\n"
+    );
+    let ran = run_with(&f, &sandbox, r#"cat "$IQ_SCRATCH/check.log""#).await;
+    assert_eq!(ran.output, "checked\n");
+    assert!(ran.cleared.is_empty());
+    // Past its size, the oldest files go first.
+    run_with(
+        &f,
+        &sandbox,
+        r#"head -c 800 /dev/zero > "$IQ_SCRATCH/old.bin""#,
+    )
+    .await;
+    let ran = run_with(
+        &f,
+        &sandbox,
+        r#"mkdir -p "$IQ_SCRATCH/snap" && head -c 800 /dev/zero > "$IQ_SCRATCH/snap/new.bin""#,
+    )
+    .await;
+    assert_eq!(ran.cleared, [chat.join("check.log"), chat.join("old.bin")]);
+    assert!(chat.join("snap/new.bin").is_file());
+    // Nothing of it lands in the workspace.
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    // A folder outside the gate's is not given, and commands of a sandbox
+    // without one get none.
+    let beside = gate
+        .sandbox(helper())
+        .with_scratch(f.outside.join("elsewhere"), 1000);
+    let ran = run_with(&f, &beside, r#"echo "[$IQ_SCRATCH]""#).await;
+    assert_eq!(ran.output, "[]\n");
+    let ran = run_with(&f, &f.sandbox, r#"echo "[$IQ_SCRATCH]""#).await;
+    assert_eq!(ran.output, "[]\n");
+}
