@@ -1307,7 +1307,7 @@ mod tests {
         });
         for (agent, model, by) in [
             ("fix", "lab/lead", PERSON),
-            ("fix/writer", "lab/sol", "fix"),
+            ("fix/writer", "lab/sage", "fix"),
             ("fix/tests", "lab/quick", "fix/writer"),
             ("docs", "lab/lead", PERSON),
         ] {
@@ -1329,7 +1329,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{rows:#?}"));
         assert_eq!(
             listed.trim_end(),
-            "  ◦ tests quick by writer resting · writer sol by fix at work"
+            "  ◦ tests quick by writer resting · writer sage by fix at work"
         );
         // Another chat's agents are not this one's.
         board.screen_mut().talk_to("docs");
