@@ -5,7 +5,9 @@
 //! base_url = "https://router.requesty.ai/v1"  # the provider: another region's router, any OpenAI compatible endpoint
 //! model = "anthropic/claude-opus-5-5"    # the lead, which decides who does what
 //! reviewer = "anthropic/claude-haiku-5-5"  # answers for the person when the autopilot is on
+//! allowed_models = ["anthropic/claude-opus-5-5", "anthropic/claude-haiku-5-5"]  # the only models iq starts, for you and every agent, by their whole names; any other is refused, the agent told which there are; unset, any the provider lists, by its whole name
 //! reviewer_effort = "low"                # how hard it thinks
+//! summarizer = "anthropic/claude-haiku-5-5"  # sums up in a few lines what agents write to each other, in the conversation; Ctrl-X gives it whole; unset, their first lines
 //! effort = "high"                        # how hard the models think; /effort changes an agent's
 //! context_every = 25000                  # tokens an agent's conversation grows between two words to it of its size; 0 never
 //! autopilot = false
@@ -21,6 +23,7 @@
 //! worktree_copy = [".env"]               # files of your checkout git does not keep, copied into a worktree as it is made, where it has their folder, never over one; a name alone is looked for in every folder
 //! worktree_setup = ["uv sync"]           # commands run in a worktree as it is made, on your machine, to give it the project's environment
 //! chat_keep = 30                         # days a chat may go untouched before iq forgets it as it starts, its worktree with it when nothing there is uncommitted; 0 never
+//! scratch_mb = 500                       # most a chat's folder of scratch holds (~/.cache/iq/scratch), where its agents keep logs and snapshots outside the repository; past it, its oldest files go
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //! steps = 5                              # an agent's latest steps (tools, what was allowed) shown as it works; once it writes again only their count, Ctrl-X unfolds them; 0 none
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
@@ -109,6 +112,15 @@ pub(crate) struct Settings {
     base_url: Option<String>,
     model: Option<String>,
     reviewer: Option<String>,
+    /// The only models iq starts, for the person and every agent; any the
+    /// provider lists when empty.
+    #[serde(default)]
+    allowed_models: Vec<String>,
+    /// The most a chat's folder of scratch holds, in megabytes.
+    scratch_mb: Option<u64>,
+    /// The model that sums up what agents write to each other, for the
+    /// person; none unless set.
+    summarizer: Option<String>,
     /// How hard the reviewer thinks; low unless set.
     reviewer_effort: Option<Effort>,
     effort: Option<Effort>,
@@ -513,6 +525,45 @@ impl Settings {
         Ok(iq_ui::look::Look::new(theme).showing(self.steps.unwrap_or(iq_ui::steps::SHOWN)))
     }
 
+    /// The model that sums up what agents write to each other, when set.
+    pub(crate) fn summarizer(&self) -> Result<Option<ModelId>> {
+        match self.summarizer.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(model) => Ok(Some(ModelId::new(model)?)),
+        }
+    }
+
+    /// The only models iq starts, as set: any the provider lists when
+    /// none is.
+    pub(crate) fn allowed_models(&self) -> Result<Vec<ModelId>> {
+        self.allowed_models
+            .iter()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
+            .map(|model| Ok(ModelId::new(model)?))
+            .collect()
+    }
+
+    /// What iq says of each model in use, `in_use` as the setting that
+    /// names it and the model, that the allowed models leave out: the
+    /// person set both, and only they can make them agree.
+    pub(crate) fn disallowed(&self, in_use: &[(&str, String)]) -> Result<Vec<String>> {
+        let allowed = self.allowed_models()?;
+        if allowed.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(in_use
+            .iter()
+            .filter(|(_, model)| !allowed.iter().any(|a| a.as_str() == model))
+            .map(|(key, model)| {
+                format!(
+                    "allowed_models leaves out {model}, which iq uses for `{key}`: allow it, or \
+                     set `{key}` to one of them, in ~/.iq/settings.toml"
+                )
+            })
+            .collect())
+    }
+
     /// What a worktree starts from: as set, else `HEAD`.
     pub(crate) fn worktree_from(&self) -> &str {
         self.worktree_from.as_deref().map_or("HEAD", str::trim)
@@ -632,6 +683,10 @@ impl Settings {
             busy_tries: self.provider_retries.unwrap_or(iq_agent::BUSY_TRIES),
             // The cheap model that places the tasks names the chats.
             namer: Some(self.observing()?.model),
+            allowed: self.allowed_models()?,
+            scratch_most: self
+                .scratch_mb
+                .map_or(iq_agent::SCRATCH_MOST, |mb| mb.saturating_mul(1024 * 1024)),
             ..iq_agent::Settings::default()
         })
     }
@@ -658,6 +713,44 @@ fn placed(path: &str, home: &Path, base: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_allowed_models_hold_the_crew_and_what_the_settings_use_beyond_them_is_said() {
+        let set: Settings = toml::from_str(
+            "model = \"lab/sage@eu\"\nallowed_models = [\"lab/sage@eu\", \" lab/quill \", \"\"]\nscratch_mb = 20",
+        )
+        .unwrap();
+        let crew = set.crew().unwrap();
+        let allowed: Vec<&str> = crew.allowed.iter().map(ModelId::as_str).collect();
+        assert_eq!(allowed, ["lab/sage@eu", "lab/quill"]);
+        assert_eq!(crew.scratch_most, 20 * 1024 * 1024);
+        let said = set
+            .disallowed(&[
+                ("model", "lab/sage@eu".into()),
+                ("reviewer", "anthropic/claude-haiku-5-5".into()),
+            ])
+            .unwrap();
+        assert_eq!(said.len(), 1);
+        assert!(
+            said[0].starts_with(
+                "allowed_models leaves out anthropic/claude-haiku-5-5, which iq uses for `reviewer`"
+            ),
+            "{}",
+            said[0]
+        );
+        // Unset: any model, and the folder of scratch at its usual size.
+        let any = Settings::default();
+        assert!(any.summarizer().unwrap().is_none());
+        let summed: Settings = toml::from_str("summarizer = \" lab/quick \"").unwrap();
+        assert_eq!(summed.summarizer().unwrap().unwrap().as_str(), "lab/quick");
+        assert!(any.crew().unwrap().allowed.is_empty());
+        assert!(
+            any.disallowed(&[("model", "x/y".into())])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(any.crew().unwrap().scratch_most, iq_agent::SCRATCH_MOST);
+    }
 
     #[test]
     fn without_settings_opus_leads_and_haiku_reviews() {

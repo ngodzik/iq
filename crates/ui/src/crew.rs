@@ -34,6 +34,9 @@ pub enum Request {
         from_words: bool,
         /// The images the person attached to the task, by their paths.
         images: Vec<std::path::PathBuf>,
+        /// How its model was chosen, as the audit log and the chat keep
+        /// it: named in the task, by `/new` or `/model`, or the settings'.
+        how: String,
     },
     /// Have an agent answered by this model from its next turn.
     Model {

@@ -98,6 +98,9 @@ pub enum Update {
         autopilot: bool,
         /// Whether the internet is open to every command.
         internet: bool,
+        /// The only models the person's settings allow; empty for any the
+        /// provider lists.
+        allowed: Vec<String>,
     },
 }
 
@@ -126,6 +129,13 @@ pub struct SyncAsk {
 
 /// The most of the provider's models a command being written is offered.
 const OFFERED: usize = 8;
+
+/// How a new chat's model was chosen when the person named it in its
+/// first message, as the audit log and the chat keep it.
+const NAMED_IN_MESSAGE: &str = "named in the message";
+
+/// The same, when it is the settings' lead.
+const SETTINGS_MODEL: &str = "the settings' model";
 
 /// How many of the person's chats the switcher shows at once.
 pub const SWITCH_ROWS: usize = 5;
@@ -178,6 +188,8 @@ pub struct Board {
     lens: crate::observations::Lens,
     /// The provider's models, as it lists them.
     models: Vec<String>,
+    /// The only models the person's settings allow, empty for any.
+    allowed: Vec<String>,
     /// What the person's plugins show.
     plugins: crate::plugins::Plugins,
     /// The chat whose last exchanges are to be written again.
@@ -271,6 +283,7 @@ impl Board {
             steps: crate::steps::Steps::default(),
             lens: crate::observations::Lens::default(),
             models: Vec::new(),
+            allowed: Vec::new(),
             plugins: crate::plugins::Plugins::default(),
             recall: None,
             unrecalled: std::collections::HashSet::new(),
@@ -666,10 +679,49 @@ impl Board {
     /// The models a new chat is offered: the lead's.
     #[must_use]
     pub fn models_offered(&self) -> Vec<String> {
-        Some(self.crew.lead().to_owned())
+        let mut offered: Vec<String> = Some(self.crew.lead().to_owned())
             .filter(|lead| !lead.is_empty())
             .into_iter()
-            .collect()
+            .collect();
+        for model in &self.allowed {
+            if !offered.contains(model) {
+                offered.push(model.clone());
+            }
+        }
+        offered
+    }
+
+    /// The models the person may name: those their settings allow, else
+    /// the provider's.
+    fn choosable(&self) -> &[String] {
+        if self.allowed.is_empty() {
+            &self.models
+        } else {
+            &self.allowed
+        }
+    }
+
+    /// The completion picked, by its place, when one is: none while
+    /// `/new` or `/model` waits for its model and the person has not moved
+    /// to one, so that Enter runs what they wrote (`/new` on the settings'
+    /// model) rather than take a model they did not choose.
+    #[must_use]
+    pub fn picked_completion(&self) -> Option<usize> {
+        let count = self.completions().len();
+        if count == 0 {
+            return None;
+        }
+        let waiting = self
+            .screen
+            .editor()
+            .text()
+            .strip_prefix('/')
+            .and_then(|written| written.split_once(' '))
+            .is_some_and(|(name, taken)| matches!(name, "new" | "model") && taken.is_empty());
+        if waiting && !self.screen.moved() {
+            return None;
+        }
+        Some(self.screen.picked().min(count - 1))
     }
 
     /// What completes what the person writes, while it is a command or an
@@ -703,7 +755,7 @@ impl Board {
         {
             let begun = begun.to_lowercase();
             models.extend(
-                self.models
+                self.choosable()
                     .iter()
                     .filter(|model| {
                         model.starts_with(&begun)
@@ -818,27 +870,32 @@ impl Board {
         let completions = self.completions();
         if !completions.is_empty() && plain {
             let count = completions.len();
-            let picked = completions[self.screen.picked().min(count - 1)].clone();
+            let at = self.picked_completion();
             match chord.key.as_str() {
                 "Up" => {
-                    self.screen.pick(self.screen.picked() as isize - 1, count);
+                    let to = at.map_or(count as isize - 1, |at| at as isize - 1);
+                    self.screen.pick(to, count);
                     return Vec::new();
                 }
                 "Down" => {
-                    self.screen.pick(self.screen.picked() as isize + 1, count);
+                    self.screen.pick(at.map_or(0, |at| at as isize + 1), count);
                     return Vec::new();
                 }
                 "Tab" => {
-                    self.screen.editor_mut().set(&picked.line);
+                    match at {
+                        Some(at) => self.screen.editor_mut().set(&completions[at].line),
+                        // None picked: the first is, for the next key to take.
+                        None => self.screen.pick(0, count),
+                    }
                     return Vec::new();
                 }
                 "Escape" => {
                     self.screen.unlist();
                     return Vec::new();
                 }
-                "Enter" if !chord.shift => {
+                "Enter" if !chord.shift && at.is_some() => {
                     // What takes more stays to be written; the rest runs.
-                    let line = picked.line.clone();
+                    let line = completions[at.unwrap_or_default()].line.clone();
                     self.screen.editor_mut().set(&line);
                     if line.ends_with(' ') {
                         return Vec::new();
@@ -936,6 +993,11 @@ impl Board {
         let step = self.screen.rows().saturating_sub(2).max(1) as isize;
         let agents = self.crew.agents().len();
         let chosen = self.screen.chosen();
+        if page == Page::Steps
+            && let Some(done) = self.steps_key(chord.key.as_str(), letter)
+        {
+            return done;
+        }
         match (chord.key.as_str(), letter) {
             (_, Some('q')) => self.screen.close(),
             ("Up", _) | (_, Some('k')) if page == Page::Team => {
@@ -953,6 +1015,34 @@ impl Board {
             _ => return self.page_choice(&page, chord, letter),
         }
         Vec::new()
+    }
+
+    /// What the steps' page's own keys do: ↑↓ choose a fold or a message,
+    /// Enter shows it whole or folds it again. None for the keys every
+    /// page takes.
+    fn steps_key(&mut self, key: &str, letter: Option<char>) -> Option<Vec<Request>> {
+        let ids: Vec<usize> = self.steps.entries().iter().map(|e| e.id()).collect();
+        let last = *ids.last()?;
+        let chosen = self
+            .screen
+            .step()
+            .and_then(|id| ids.iter().position(|at| *at == id))
+            .unwrap_or(ids.len() - 1);
+        match (key, letter) {
+            ("Up", _) | (_, Some('k')) => {
+                self.screen.choose_step(Some(ids[chosen.saturating_sub(1)]));
+            }
+            ("Down", _) | (_, Some('j')) => {
+                // The latest chosen follows those to come.
+                let next = ids[(chosen + 1).min(ids.len() - 1)];
+                self.screen.choose_step((next != last).then_some(next));
+            }
+            ("Enter", _) => self.screen.unfold(ids[chosen]),
+            ("Home", _) | (_, Some('g')) => self.screen.choose_step(Some(ids[0])),
+            ("End", _) => self.screen.choose_step(None),
+            _ => return None,
+        }
+        Some(Vec::new())
     }
 
     /// What a page's own keys choose.
@@ -1029,18 +1119,21 @@ impl Board {
             Action::Switch => self.switch(now),
             Action::NewChat => {
                 self.chose = true;
-                self.screen.new_chat(self.crew.lead());
+                let lead = self.crew.lead().to_owned();
+                self.screen.new_chat(&lead);
                 self.screen.close();
+                self.new_chat_said(&lead, "", now);
             }
             Action::Team => self.screen.toggle(Page::Team),
             Action::Costs => self.screen.toggle(Page::Costs),
             Action::Observations => self.screen.toggle(Page::Observations),
             Action::Keys => self.screen.toggle(Page::Keys),
             Action::Steps => {
-                // The latest last, where the page opens.
+                // The latest last, where the page opens, chosen.
                 self.screen.toggle(Page::Steps);
                 if self.screen.page() == Some(&Page::Steps) {
                     self.screen.scroll_to(usize::MAX);
+                    self.screen.choose_step(None);
                 }
             }
             Action::Theme => self.look.next_theme(),
@@ -1121,7 +1214,7 @@ impl Board {
             let text = message.trim().to_owned();
             return vec![Request::Tell {
                 to: name.to_owned(),
-                named: crate::named::named(&text, &self.models),
+                named: crate::named::named(&text, self.choosable()),
                 text,
                 images: std::mem::take(&mut self.attached),
             }];
@@ -1137,7 +1230,7 @@ impl Board {
                 self.visit(&agent, now);
                 Request::Tell {
                     to: agent,
-                    named: crate::named::named(&text, &self.models),
+                    named: crate::named::named(&text, self.choosable()),
                     text,
                     images: std::mem::take(&mut self.attached),
                 }
@@ -1151,11 +1244,14 @@ impl Board {
                 let role = Some(chat.role.trim().to_owned()).filter(|r| !r.is_empty());
                 // A model named in the task is the one it starts on, else
                 // the chat's: the lead's unless the person chose another.
-                let named = crate::named::named(&text, &self.models);
-                let model = named
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| chat.model.trim().to_owned());
+                let named = crate::named::named(&text, self.choosable());
+                let (model, how) = match named.first() {
+                    Some(model) => (model.clone(), NAMED_IN_MESSAGE.to_owned()),
+                    None if chat.how.is_empty() => {
+                        (chat.model.trim().to_owned(), SETTINGS_MODEL.to_owned())
+                    }
+                    None => (chat.model.trim().to_owned(), chat.how.clone()),
+                };
                 // The name the person gave it, else a one-word role, else
                 // the first words of its task until a model names it after
                 // what its work is about, else its model.
@@ -1188,6 +1284,7 @@ impl Board {
                     effort: chat.effort,
                     from_words,
                     images: std::mem::take(&mut self.attached),
+                    how,
                 }
             }
         };
@@ -1200,10 +1297,10 @@ impl Board {
         let open = |board: &mut Self, page: Page| board.screen.open(page);
         match command {
             Command::New(model) => {
-                let model = match model {
-                    None => self.crew.lead().to_owned(),
+                let (model, how) = match model {
+                    None => (self.crew.lead().to_owned(), ""),
                     Some(word) => match self.model_named(&word) {
-                        Ok(model) => model,
+                        Ok(model) => (model, "/new"),
                         Err(why) => {
                             self.screen.notice(why, now);
                             return Vec::new();
@@ -1212,6 +1309,10 @@ impl Board {
                 };
                 self.chose = true;
                 self.screen.new_chat(&model);
+                if let Some(chat) = self.screen.new_chat_mut() {
+                    how.clone_into(&mut chat.how);
+                }
+                self.new_chat_said(&model, how, now);
             }
             Command::Model(word) => {
                 let model = match self.model_named(&word) {
@@ -1231,8 +1332,10 @@ impl Board {
                     }
                     Talk::New(_) => {
                         if let Some(chat) = self.screen.new_chat_mut() {
-                            chat.model = model;
+                            chat.model.clone_from(&model);
+                            "/model".clone_into(&mut chat.how);
                         }
+                        self.new_chat_said(&model, "/model", now);
                     }
                 }
             }
@@ -1390,6 +1493,14 @@ impl Board {
     /// It names none, said with what `/name` is for, as a word after
     /// `/new` is often meant as the chat's name.
     fn model_named(&self, word: &str) -> Result<String, String> {
+        if !self.allowed.is_empty() {
+            return crate::named::model(word, &self.allowed).ok_or_else(|| {
+                format!(
+                    "{word} is not among the models your settings allow: {}",
+                    self.allowed.join(", ")
+                )
+            });
+        }
         if self.models.is_empty() {
             // The provider's list not read yet: a whole name is taken as
             // it is.
@@ -1407,6 +1518,20 @@ impl Board {
                 "The provider has no model {word}: /new and /model take one; /name names a chat"
             )
         })
+    }
+
+    /// Says which model the new chat starts on, and why, before the
+    /// first message: a wrong one is seen while it can still be changed.
+    fn new_chat_said(&mut self, model: &str, how: &str, now: u64) {
+        let why = if how.is_empty() {
+            " (the settings' model)".to_owned()
+        } else {
+            String::new()
+        };
+        self.screen.notice(
+            format!("A new chat, on {model}{why}: your first message starts it"),
+            now,
+        );
     }
 
     /// What the person is told when no agent is named `name`.
@@ -1615,9 +1740,11 @@ impl Board {
                 reviewer,
                 autopilot,
                 internet,
+                allowed,
             } => {
                 self.screen.new_chats_on(&lead);
                 self.crew.started(lead, reviewer, autopilot, internet);
+                self.allowed = allowed;
             }
         }
     }
@@ -1873,6 +2000,7 @@ mod tests {
             reviewer: "r".into(),
             autopilot: false,
             internet: false,
+            allowed: Vec::new(),
         });
     }
 
@@ -1913,6 +2041,7 @@ mod tests {
                 effort: None,
                 from_words: true,
                 images: Vec::new(),
+                how: "the settings' model".into(),
             }]
         );
         assert_eq!(board.screen().talking_to(), Some("fix-build"));
@@ -2143,6 +2272,145 @@ mod tests {
                 .iter()
                 .any(|c| c.line == "/model lab/sage-5-5")
         );
+    }
+
+    fn starts(requests: &[Request]) -> (String, String) {
+        match requests {
+            [Request::Start { model, how, .. }] => (model.clone(), how.clone()),
+            other => panic!("no chat started: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_new_chat_takes_a_model_only_as_the_person_chooses_it_and_says_which() {
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        board.update(Update::Models(vec!["lab/lead".into(), "lab/sage-5".into()]));
+        // Enter on what /new lists picks nothing: it runs as written, on the
+        // settings' model, and says so before the first message.
+        write(&mut board, "/new ");
+        assert!(!board.completions().is_empty());
+        assert_eq!(board.picked_completion(), None);
+        assert!(key(&mut board, "enter").is_empty());
+        let said = board.screen().noticed(100).unwrap().to_owned();
+        assert_eq!(
+            said,
+            "A new chat, on lab/lead (the settings' model): your first message starts it"
+        );
+        write(&mut board, "fix the build");
+        assert_eq!(
+            starts(&key(&mut board, "enter")),
+            ("lab/lead".into(), "the settings' model".into())
+        );
+        // Tab picks the first for the next key to take: chosen, it is the
+        // person's choice.
+        write(&mut board, "/new ");
+        key(&mut board, "tab");
+        assert_eq!(board.picked_completion(), Some(0));
+        key(&mut board, "enter");
+        assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.how == "/new"));
+        // A model begun is completed, and taken as written.
+        write(&mut board, "/new sa");
+        assert_eq!(board.picked_completion(), Some(0));
+        key(&mut board, "enter");
+        assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "lab/sage-5"));
+        assert_eq!(
+            board.screen().noticed(100),
+            Some("A new chat, on lab/sage-5: your first message starts it")
+        );
+        write(&mut board, "fix the tests");
+        assert_eq!(
+            starts(&key(&mut board, "enter")),
+            ("lab/sage-5".into(), "/new".into())
+        );
+        // A model named in the first message, and how it was.
+        key(&mut board, "ctrl+n");
+        write(&mut board, "fix the docs with sage");
+        assert_eq!(
+            starts(&key(&mut board, "enter")),
+            ("lab/sage-5".into(), "named in the message".into())
+        );
+    }
+
+    #[test]
+    fn only_the_models_the_settings_allow_are_offered_and_taken() {
+        let mut board = Board::default();
+        board.update(Update::Started {
+            lead: "lab/lead".into(),
+            reviewer: "r".into(),
+            autopilot: false,
+            internet: false,
+            allowed: vec!["lab/lead".into(), "lab/quill@eu".into()],
+        });
+        board.update(Update::Models(vec![
+            "lab/lead".into(),
+            "lab/quill@eu".into(),
+            "lab/dear-5".into(),
+        ]));
+        board.screen_mut().editor_mut().set("/new ");
+        let offered: Vec<String> = board.completions().into_iter().map(|c| c.line).collect();
+        assert_eq!(offered, ["/new lab/lead", "/new lab/quill@eu"]);
+        board.screen_mut().editor_mut().set("/new d");
+        assert!(board.completions().is_empty());
+        assert!(board.run(Command::New(Some("dear".into())), 100).is_empty());
+        assert_eq!(
+            board.screen().noticed(100),
+            Some("dear is not among the models your settings allow: lab/lead, lab/quill@eu")
+        );
+        board.run(Command::New(Some("quill".into())), 100);
+        assert!(matches!(board.screen().talk(), Talk::New(chat) if chat.model == "lab/quill@eu"));
+        // A model the settings leave out, named in a message, is no choice.
+        board.screen_mut().editor_mut().set("");
+        key(&mut board, "ctrl+n");
+        write(&mut board, "review it with dear");
+        assert_eq!(
+            starts(&key(&mut board, "enter")),
+            ("lab/lead".into(), "the settings' model".into())
+        );
+    }
+
+    #[test]
+    fn the_steps_page_shows_whole_the_entry_chosen() {
+        let mut board = Board::default();
+        started(&mut board, "lab/lead");
+        joined(&mut board, "fix", PERSON);
+        joined(&mut board, "fix/tests", "fix");
+        for event in [
+            Event::Tool {
+                agent: "fix".into(),
+                name: "read_file".into(),
+                input: "src/main.rs".into(),
+                output: "fn main() {}".into(),
+                ok: true,
+            },
+            Event::Working {
+                agent: "fix/tests".into(),
+                prompt: "write the tests".into(),
+            },
+            Event::Posted {
+                from: "fix/tests".into(),
+                to: "fix".into(),
+                text: "3 pass".into(),
+            },
+        ] {
+            board.update(Update::Crew(event));
+        }
+        key(&mut board, "ctrl+x");
+        assert_eq!(board.screen().page(), Some(&Page::Steps));
+        // It opens on the latest, which those to come take after it.
+        assert_eq!(board.screen().step(), None);
+        key(&mut board, "up");
+        assert_eq!(board.screen().step(), Some(2));
+        key(&mut board, "enter");
+        assert!(board.screen().unfolded(2));
+        key(&mut board, "enter");
+        assert!(!board.screen().unfolded(2));
+        key(&mut board, "down");
+        assert_eq!(board.screen().step(), None);
+        key(&mut board, "home");
+        assert_eq!(board.screen().step(), Some(1));
+        assert!(board.screen_mut().take_follow());
+        assert!(!board.screen_mut().take_follow());
     }
 
     fn back(board: &mut Board, agent: &str, worked: u64, written: Option<u64>) {

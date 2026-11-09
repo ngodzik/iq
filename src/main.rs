@@ -8,7 +8,9 @@ mod journal;
 mod ledger;
 mod lock;
 mod plugins;
+mod scratch;
 mod settings;
+mod summaries;
 mod sync;
 mod terminal;
 mod worktree;
@@ -368,9 +370,16 @@ fn resume_chats(
         if now.is_empty() {
             break;
         }
+        let allowed = settings.allowed_models().unwrap_or_default();
         for mut found in now {
             if let Some(by) = names.get(&found.chat.by) {
                 found.chat.by.clone_from(by);
+            }
+            if !allowed.is_empty() && !allowed.iter().any(|a| a.as_str() == found.chat.model) {
+                said.push(format!(
+                    "{} runs on {}, which allowed_models leaves out: /model gives it another",
+                    found.chat.name, found.chat.model
+                ));
             }
             let kept = found.chat.name.clone();
             if let Some(name) = resume_one(found, crew, worktrees.as_ref(), tell, &mut said) {
@@ -407,6 +416,14 @@ fn resume_chats(
     if let (Some(keep), Some(worktrees)) = (settings.chat_keep(), &worktrees) {
         said.extend(worktrees.prune(keep, &chats.places()));
     }
+    // The folders of scratch of the chats forgotten or let go go with them.
+    let kept: Vec<String> = chats
+        .list()
+        .into_iter()
+        .map(|found| found.chat.name)
+        .filter(|name| !name.contains('/'))
+        .collect();
+    scratch::prune(&scratch::folder(&cache_folder(&home), &project()), &kept);
     said
 }
 
@@ -719,6 +736,25 @@ fn in_use(settings: &Settings, lead: &ModelId) -> Result<Vec<(&'static str, Stri
         models.push(("reviewer", reviewer.to_string()));
     }
     models.push(("[observe] model", settings.observing()?.model.to_string()));
+    if let Some(summarizer) = settings.summarizer()? {
+        models.push(("summarizer", summarizer.to_string()));
+    }
+    Ok(models)
+}
+
+/// `in_use`, with the models the settings allow, each as `allowed_models`
+/// names it: those the provider does not list are said as the others are.
+fn with_allowed(
+    settings: &Settings,
+    in_use: &[(&'static str, String)],
+) -> Result<Vec<(&'static str, String)>> {
+    let mut models = in_use.to_vec();
+    for model in settings.allowed_models()? {
+        let model = model.to_string();
+        if !models.iter().any(|(_, used)| *used == model) {
+            models.push(("allowed_models", model));
+        }
+    }
     Ok(models)
 }
 
@@ -818,9 +854,14 @@ async fn work(
     // at once waits for them a little, as it would for a person.
     servers.settled(MCP_SETTLING).await;
     let listed = listed(&provider(cli), cli.api_key.is_some()).await;
-    for said in unlisted(cli.endpoint(), &in_use(&settings, &lead)?, &listed) {
+    let in_use = in_use(&settings, &lead)?;
+    for said in unlisted(cli.endpoint(), &with_allowed(&settings, &in_use)?, &listed)
+        .into_iter()
+        .chain(settings.disallowed(&in_use)?)
+    {
         eprintln!("iq: {said}");
     }
+    crew.set_listed(listed);
     let mut models = vec![lead];
     if let Some(partner) = partner {
         models.push(ModelId::new(partner)?);
@@ -833,6 +874,11 @@ async fn work(
         None,
         None,
         Vec::new(),
+        if cli.model.is_some() {
+            "--model"
+        } else {
+            "the settings' model"
+        },
     );
     let mut tally = terminal::Tally::default();
     let handle = |event: Event, tally: &mut terminal::Tally| {
@@ -964,6 +1010,11 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         },
         autopilot: settings.autopilot,
         internet: settings.internet,
+        allowed: settings
+            .allowed_models()?
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
     });
     for note in notes {
         let _ = send.send(Update::Said(note));
@@ -1060,6 +1111,32 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     // The person's plugins, before the crew: the chats put back as it
     // starts are told to them as they come.
     let gate = settings_gate(&settings)?;
+    // What sums up for the person what agents write to each other, when the
+    // settings name a model for it: what it spends is counted as any call.
+    let summarize: Option<Arc<dyn iq_tui::Summarize>> = match settings.summarizer()? {
+        Some(model) => {
+            let costs: Report = {
+                let send = send.clone();
+                let ledger = Arc::clone(&ledger);
+                Arc::new(move |event: Event| {
+                    if let Event::Spent {
+                        agent, model, cost, ..
+                    } = &event
+                    {
+                        ledger.bill(agent, model, *cost);
+                    }
+                    let _ = send.send(Update::Crew(event));
+                })
+            };
+            Some(Arc::new(summaries::Summaries::new(
+                provider(cli),
+                model,
+                runtime.handle().clone(),
+                costs,
+            )))
+        }
+        None => None,
+    };
     // What draws the diagrams agents write, when the settings say: its runs
     // judged and written down as the crew's are.
     let draw: Option<Arc<dyn iq_tui::Draw>> = match &settings.mermaid {
@@ -1094,12 +1171,17 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         let journal = Arc::clone(&journal);
         let observer = observer.clone();
         let plugins = Arc::clone(&plugins);
+        let scratch = gate.scratch().map(Path::to_path_buf);
         Arc::new(move |event: Event| {
             if let Some(task) = keep(&ledger, &journal, &event) {
                 observer.done(task);
             }
             if let Event::Placed { agent, folder, .. } = &event {
                 plugins.placed(agent, folder);
+            }
+            // What a chat's agents kept follows it as it is renamed.
+            if let (Event::Renamed { from, to }, Some(scratch)) = (&event, &scratch) {
+                scratch::renamed(scratch, from, to);
             }
             let _ = send.send(Update::Crew(event));
         })
@@ -1127,13 +1209,20 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         let send = send.clone();
         let endpoint = cli.endpoint().to_owned();
         let in_use = in_use(&settings, &lead)?;
+        for said in settings.disallowed(&in_use)? {
+            let _ = send.send(Update::Said(said));
+        }
+        let in_use = with_allowed(&settings, &in_use)?;
+        let crew = crew.clone();
         runtime.spawn(async move {
-            // The models the person may name in what they write; and those
-            // in use the provider does not have, said before a call fails.
+            // The models the person may name in what they write, and the
+            // only ones agents are started on; and those in use the
+            // provider does not have, said before a call fails.
             let models = listed(&provider, keyed).await;
             for said in unlisted(&endpoint, &in_use, &models) {
                 let _ = send.send(Update::Said(said));
             }
+            crew.set_listed(models.clone());
             let _ = send.send(Update::Models(models));
         });
     }
@@ -1193,14 +1282,15 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     effort,
                     from_words,
                     images,
+                    how,
                 } => match ModelId::new(&model) {
                     Ok(model) => {
                         let mut models = vec![model];
                         models.extend(partner.and_then(|p| ModelId::new(&p).ok()));
                         let task = with_named(task, &named[named.len().min(1)..]);
                         let shown = attached(working.gate(), &images, &told);
-                        let started =
-                            working.launch(pattern, &name, &models, task, role, effort, shown);
+                        let started = working
+                            .launch(pattern, &name, &models, task, role, effort, shown, &how);
                         // A debate's chats are named alike, apart only by
                         // their numbers: they keep the name they share.
                         if from_words && pattern != iq_agent::Pattern::Debate {
@@ -1313,7 +1403,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     });
 
     let board = iq_ui::Board::new(settings.keymap()?, settings.look()?);
-    let ran = iq_tui::run(feed, ask, board, draw).context("running in the terminal");
+    let ran = iq_tui::run(feed, ask, board, draw, summarize).context("running in the terminal");
     runtime.block_on(async {
         crew.end().await;
         servers.end().await;
@@ -1448,6 +1538,7 @@ fn gate_in(
     let folder = home_folder()?;
     let mut gate = Gate::builder(workspace)
         .audit(folder.join("audit.log"))
+        .scratch(scratch::folder(&cache_folder(&home_dir()?), &project()))
         .internet(internet)
         .reviewer_internet(reviewer_internet)
         .reviewer_host(reviewer_host);

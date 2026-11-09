@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::event::{Event, PERSON};
 use crate::extension::Extension;
-use crate::keep::{Keeper, Saved};
+use crate::keep::{Keeper, ModelChoice, Saved};
 use crate::place::{Placed, Placer};
 use crate::review;
 use crate::rules::{self, RulesFile};
@@ -124,6 +124,34 @@ pub const BUSY_MOST: Duration = Duration::from_secs(300);
 /// out.
 pub const COMMAND_QUIET: Duration = Duration::from_secs(180);
 
+/// The most a chat's folder of scratch holds, in bytes, unless the
+/// settings say: past it, the oldest files go first.
+pub const SCRATCH_MOST: u64 = 500 * 1024 * 1024;
+
+/// How a model was chosen, as the audit log and the chats keep it: by
+/// the tool an agent started another with.
+const START_AGENT: &str = "start_agent";
+
+/// The same, a team's member.
+const START_TEAM: &str = "start_team";
+
+/// The same, by the person's `/model`.
+const SET_MODEL: &str = "/model";
+
+/// The same, a pattern's agent on its other model: a pair's reviewer, a
+/// debater.
+const PATTERN_MODEL: &str = "the pattern's other model";
+
+/// The same, by a caller of [`Crew::start`].
+const STARTED: &str = "start";
+
+/// How many models the provider lists are offered for a name it does not.
+const LIKE_LISTED: usize = 6;
+
+/// How many of the files taken from a folder of scratch an agent is told
+/// by name.
+const CLEARED_NAMED: usize = 5;
+
 /// What the crew starts with.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -164,6 +192,13 @@ pub struct Settings {
     /// their work is about: none, and they keep the name they started
     /// with.
     pub namer: Option<ModelId>,
+    /// The only models an agent is started on or given, the person's and
+    /// every agent's, as the person's settings list them: any other is
+    /// refused, the agent told which there are. Empty: any the provider
+    /// lists.
+    pub allowed: Vec<ModelId>,
+    /// The most a chat's folder of scratch holds, in bytes.
+    pub scratch_most: u64,
 }
 
 impl Default for Settings {
@@ -183,6 +218,8 @@ impl Default for Settings {
             busy_wait: BUSY_WAIT,
             busy_most: BUSY_MOST,
             namer: None,
+            allowed: Vec::new(),
+            scratch_most: SCRATCH_MOST,
         }
     }
 }
@@ -254,6 +291,9 @@ struct Inner<M> {
     next_job: AtomicU64,
     /// The wakes agents asked for, each agent's.
     wakes: Mutex<HashMap<String, Wakes>>,
+    /// The models the provider lists, once read: an agent is started only
+    /// on one of them, by its whole name.
+    listed: Mutex<Vec<String>>,
 }
 
 /// The wakes an agent asked for: how many wait, and when it asked those of
@@ -427,6 +467,8 @@ struct Member {
     renaming: Option<String>,
     /// Whether the person named it: iq names it no more.
     chosen: bool,
+    /// Each choice of its model, the latest last.
+    models_chosen: Vec<ModelChoice>,
 }
 
 /// An agent of the crew, as listed.
@@ -484,6 +526,7 @@ where
                 jobs: Mutex::new(HashMap::new()),
                 next_job: AtomicU64::new(1),
                 wakes: Mutex::new(HashMap::new()),
+                listed: Mutex::new(Vec::new()),
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
                 peer_wakes: Mutex::new(Vec::new()),
@@ -608,6 +651,7 @@ where
                 folder: (!Arc::ptr_eq(&member.place, &self.inner.place))
                     .then(|| member.place.gate.workspace().to_path_buf()),
                 context: member.context,
+                models_chosen: member.models_chosen.clone(),
                 messages,
             }
         };
@@ -684,6 +728,7 @@ where
                 place,
                 renaming: None,
                 chosen: false,
+                models_chosen: saved.models_chosen,
             },
         );
         drop(board);
@@ -712,6 +757,20 @@ where
             .members
             .get(agent)
             .map_or_else(|| Arc::clone(&self.inner.place), |m| Arc::clone(&m.place))
+    }
+
+    /// The sandbox `agent`'s commands run in: its place's, given its chat's
+    /// folder of scratch when the gate has one.
+    fn sandbox_of(&self, agent: &str) -> Sandbox {
+        let place = self.place_of(agent);
+        let sandbox = place.sandbox.clone();
+        match place.gate.scratch() {
+            Some(root) => {
+                let chat = lock(&self.inner.board).chat_of(agent);
+                sandbox.with_scratch(root.join(chat), self.inner.settings.scratch_most)
+            }
+            None => sandbox,
+        }
     }
 
     /// A place of its own for `name`, from the placer when the person set
@@ -796,8 +855,9 @@ where
     /// on the first of `models`, a lead that may give its agents the
     /// others, a writer with a reviewer on the second, or as many debaters
     /// as models, two at the least; the first thinking with `effort`, as
-    /// the settings say when `None`. Returns the first agent's name:
-    /// `name`, made unique.
+    /// the settings say when `None`. `how` says how the person chose the
+    /// first model, as the audit log and the chat keep it. Returns the
+    /// first agent's name: `name`, made unique.
     #[allow(clippy::too_many_arguments)]
     pub fn launch(
         &self,
@@ -808,6 +868,7 @@ where
         role: Option<String>,
         effort: Option<Effort>,
         images: Vec<Message>,
+        how: &str,
     ) -> String {
         let Some(first) = models.first() else {
             return String::new();
@@ -816,11 +877,11 @@ where
         // its team.
         let mut teams = lock(&self.inner.teams);
         match pattern {
-            Pattern::Solo => self.start_with(name, first, task, PERSON, role, effort, images),
+            Pattern::Solo => self.start_with(name, first, task, PERSON, role, effort, images, how),
             Pattern::Lead => {
                 let cheaper: Vec<String> = models[1..].iter().map(ToString::to_string).collect();
                 let role = Some(team::lead_role(&cheaper));
-                self.start_with(name, first, task, PERSON, role, effort, images)
+                self.start_with(name, first, task, PERSON, role, effort, images, how)
             }
             Pattern::Pair => {
                 let writer = self.start_with(
@@ -831,6 +892,7 @@ where
                     Some(team::WRITER_ROLE.to_owned()),
                     effort,
                     images,
+                    how,
                 );
                 teams.push(Team::Pair {
                     writer: writer.clone(),
@@ -854,6 +916,11 @@ where
                             Some(team::debater_role(count)),
                             None,
                             images.clone(),
+                            if at % models.len() == 0 {
+                                how
+                            } else {
+                                PATTERN_MODEL
+                            },
                         )
                     })
                     .collect();
@@ -894,12 +961,15 @@ where
                         match reviewer {
                             Some(reviewer) => self.wake(reviewer, prompt),
                             None => {
-                                let started = self.start_as(
+                                let started = self.start_with(
                                     "review",
                                     reviewer_model,
                                     prompt,
                                     writer,
                                     Some(team::REVIEWER_ROLE.to_owned()),
+                                    None,
+                                    Vec::new(),
+                                    PATTERN_MODEL,
                                 );
                                 *reviewer = Some(started);
                             }
@@ -991,11 +1061,12 @@ where
         by: &str,
         role: Option<String>,
     ) -> String {
-        self.start_with(name, model, task, by, role, None, Vec::new())
+        self.start_with(name, model, task, by, role, None, Vec::new(), STARTED)
     }
 
     /// Starts an agent as [`Self::start_as`] does, thinking with `effort`,
-    /// as the settings say when `None`, shown `images` with its task.
+    /// as the settings say when `None`, shown `images` with its task, its
+    /// model chosen by `by` as `how` says.
     #[allow(clippy::too_many_arguments)]
     fn start_with(
         &self,
@@ -1006,6 +1077,7 @@ where
         role: Option<String>,
         effort: Option<Effort>,
         images: Vec<Message>,
+        how: &str,
     ) -> String {
         // The person's agent works in a place of its own when they want
         // one; an agent's works where it does, and is named after its
@@ -1016,7 +1088,17 @@ where
             let name = agent_name(&lock(&self.inner.board), by, name, &[]);
             (name, Placing::Given(self.place_of(by)))
         };
-        let (name, joined) = self.join(&name, model, task.clone(), by, role, effort, true, placing);
+        let (name, joined) = self.join(
+            &name,
+            model,
+            task.clone(),
+            by,
+            role,
+            effort,
+            true,
+            placing,
+            how,
+        );
         if joined {
             // Before its turn begins, so that its first call shows them.
             for image in images {
@@ -1072,10 +1154,12 @@ where
     }
 
     /// Puts an agent on the board, its name `name`, as the board writes
-    /// names, made unique, in the place `placing` says. One that `works` is
-    /// about to be woken on `task`; another holds its task and waits until
-    /// it is written to. Whether it joined: one that could not be given a place
-    /// of its own is not on the board, and the person is told why.
+    /// names, made unique, in the place `placing` says, on `model`, which
+    /// `by` chose as `how` says, written to the audit log and kept with the
+    /// chat. One that `works` is about to be woken on `task`; another holds
+    /// its task and waits until it is written to. Whether it joined: one on
+    /// a model the person does not allow, or that could not be given a
+    /// place of its own, is not on the board, and the person is told why.
     #[allow(clippy::too_many_arguments)]
     fn join(
         &self,
@@ -1087,9 +1171,15 @@ where
         effort: Option<Effort>,
         works: bool,
         placing: Placing,
+        how: &str,
     ) -> (String, bool) {
         let mut board = lock(&self.inner.board);
         let name = free_name(&board, &board_name(name), &[]);
+        if let Some(why) = self.refused_model(model) {
+            drop(board);
+            self.not_started(&name, model, by, &why, "its model is not one it may run on");
+            return (name, false);
+        }
         let (place, said) = match placing {
             Placing::Given(place) => (place, None),
             Placing::Own => match self.own_place(&name) {
@@ -1097,19 +1187,13 @@ where
                 Ok(None) => (Arc::clone(&self.inner.place), None),
                 Err(why) => {
                     drop(board);
-                    self.report(Event::Joined {
-                        agent: name.clone(),
-                        model: model.to_string(),
-                        by: by.to_owned(),
-                    });
-                    self.report(Event::Notice {
-                        agent: name.clone(),
-                        text: format!("{name} is not started: no place of its own for it, {why}"),
-                    });
-                    self.report(Event::Done {
-                        agent: name.clone(),
-                        outcome: Err("it has no place to work in".into()),
-                    });
+                    self.not_started(
+                        &name,
+                        model,
+                        by,
+                        &format!("no place of its own for it, {why}"),
+                        "it has no place to work in",
+                    );
                     return (name, false);
                 }
             },
@@ -1146,9 +1230,15 @@ where
                 told: 0,
                 compacted: None,
                 rules_given: Vec::new(),
-                place,
+                place: Arc::clone(&place),
                 renaming: None,
                 chosen: false,
+                models_chosen: vec![ModelChoice {
+                    model: model.to_string(),
+                    by: by.to_owned(),
+                    how: how.to_owned(),
+                    at: now(),
+                }],
             },
         );
         drop(board);
@@ -1157,6 +1247,7 @@ where
             model: model.to_string(),
             by: by.to_owned(),
         });
+        self.audit_choice(&place.gate, &name, model, by, how);
         if own {
             self.report(Event::Placed {
                 agent: name.clone(),
@@ -1170,6 +1261,87 @@ where
         });
         self.keep(&name);
         (name, true)
+    }
+
+    /// Says that `name`, on `model`, which `by` asked for, is not started,
+    /// and `why`: it joins and ends at once, its turn failed as `ended`
+    /// says.
+    fn not_started(&self, name: &str, model: &ModelId, by: &str, why: &str, ended: &str) {
+        self.report(Event::Joined {
+            agent: name.to_owned(),
+            model: model.to_string(),
+            by: by.to_owned(),
+        });
+        self.report(Event::Notice {
+            agent: name.to_owned(),
+            text: format!("{name} is not started: {why}"),
+        });
+        self.report(Event::Done {
+            agent: name.to_owned(),
+            outcome: Err(ended.to_owned()),
+        });
+    }
+
+    /// Writes to the audit log that `agent` runs on `model`, as `by` chose
+    /// it, `how`; a line that cannot be written is said.
+    fn audit_choice(&self, gate: &Gate, agent: &str, model: &ModelId, by: &str, how: &str) {
+        if let Err(error) = gate.chose(agent, model.as_str(), by, how) {
+            self.report(Event::Notice {
+                agent: agent.to_owned(),
+                text: format!("the audit log misses a choice of model: {}", chain(&error)),
+            });
+        }
+    }
+
+    /// The models the provider lists, as read: from now on an agent is
+    /// started only on one of them, by its whole name, unless the person's
+    /// settings allow others. An empty list, when it could not be read,
+    /// holds none back.
+    pub fn set_listed(&self, models: Vec<String>) {
+        *lock(&self.inner.listed) = models;
+    }
+
+    /// Why no agent may run on `model`, if none may: the person's settings
+    /// allow others only, said with them, so that the agent that asked
+    /// chooses again; or the provider lists no model of that name, which
+    /// is never left to the provider to guess, said with those it lists
+    /// that look like it.
+    fn refused_model(&self, model: &ModelId) -> Option<String> {
+        let allowed = &self.inner.settings.allowed;
+        if !allowed.is_empty() {
+            if allowed.contains(model) {
+                return None;
+            }
+            let names: Vec<String> = allowed.iter().map(ToString::to_string).collect();
+            return Some(format!(
+                "{model} is not among the models the person allows: {}. Choose one of them, by \
+                 its whole name.",
+                names.join(", ")
+            ));
+        }
+        let listed = lock(&self.inner.listed);
+        if listed.is_empty() || listed.iter().any(|known| known == model.as_str()) {
+            return None;
+        }
+        let last = model.as_str().rsplit('/').next().unwrap_or(model.as_str());
+        let base = last.split(['@', ':']).next().unwrap_or(last).to_lowercase();
+        let like: Vec<&str> = listed
+            .iter()
+            .filter(|known| !base.is_empty() && known.to_lowercase().contains(&base))
+            .take(LIKE_LISTED)
+            .map(String::as_str)
+            .collect();
+        Some(if like.is_empty() {
+            format!(
+                "the provider lists no model {model}: give one by its whole name, as it lists it"
+            )
+        } else {
+            format!(
+                "the provider lists no model {model}: give one by its whole name, as it lists it, \
+                 such as {}",
+                like.join(", ")
+            )
+        })
     }
 
     /// Starts a team on `task` for `by`: one agent for each seat, named
@@ -1209,6 +1381,7 @@ where
                 seat.effort,
                 false,
                 Placing::Given(Arc::clone(&place)),
+                START_TEAM,
             );
         }
         let first = &seats[0];
@@ -1221,6 +1394,7 @@ where
             first.effort,
             true,
             Placing::Given(Arc::clone(&place)),
+            START_TEAM,
         );
         if joined {
             self.wake(&lead, brief(0));
@@ -1274,14 +1448,28 @@ where
     ///
     /// No agent of that name.
     pub fn set_model(&self, agent: &str, model: &ModelId) -> Result<(), String> {
+        if let Some(why) = self.refused_model(model) {
+            return Err(why);
+        }
         let mut board = lock(&self.inner.board);
         let name = board
             .named(agent)
             .ok_or_else(|| format!("no agent is named {agent:?}"))?;
+        let mut place = None;
         if let Some(member) = board.members.get_mut(&name) {
             member.model = model.clone();
+            member.models_chosen.push(ModelChoice {
+                model: model.to_string(),
+                by: PERSON.to_owned(),
+                how: SET_MODEL.to_owned(),
+                at: now(),
+            });
+            place = Some(Arc::clone(&member.place));
         }
         drop(board);
+        if let Some(place) = place {
+            self.audit_choice(&place.gate, &name, model, PERSON, SET_MODEL);
+        }
         self.report(Event::Model {
             agent: name.clone(),
             model: model.to_string(),
@@ -2344,6 +2532,9 @@ where
         match name {
             "start_agent" => {
                 let model = ModelId::new(args.text("model")?).map_err(|e| e.to_string())?;
+                if let Some(why) = self.refused_model(&model) {
+                    return Err(why);
+                }
                 let role = args
                     .text("role")
                     .ok()
@@ -2364,6 +2555,7 @@ where
                     role,
                     effort,
                     Vec::new(),
+                    START_AGENT,
                 );
                 Ok(format!(
                     "{started} started on {model}. Its answer will come to you as a message."
@@ -2371,6 +2563,12 @@ where
             }
             "start_team" => {
                 let seats = team::seats(&args.value()["members"])?;
+                if let Some(why) = seats
+                    .iter()
+                    .find_map(|seat| self.refused_model(&seat.model))
+                {
+                    return Err(why);
+                }
                 Ok(self.start_team(agent, args.text("task")?, &seats))
             }
             "compact" => {
@@ -2479,8 +2677,7 @@ where
             }
         );
         let ran = self
-            .place_of(agent)
-            .sandbox
+            .sandbox_of(agent)
             .run(permit)
             .await
             .map_err(|e| chain(&e))?;
@@ -2498,6 +2695,24 @@ where
             out.push_str(&format!(
                 "[{} changed: code there runs later; the person will see it]\n",
                 path.display()
+            ));
+        }
+        if !ran.cleared.is_empty() {
+            let named: Vec<String> = ran
+                .cleared
+                .iter()
+                .take(CLEARED_NAMED)
+                .map(|path| path.display().to_string())
+                .collect();
+            let more = ran.cleared.len().saturating_sub(CLEARED_NAMED);
+            out.push_str(&format!(
+                "[your folder of scratch grew past its size: its oldest files went, {}{}]\n",
+                named.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
             ));
         }
         match (ran.timed_out, ran.status) {
@@ -2644,9 +2859,7 @@ where
         let id = self.inner.next_job.fetch_add(1, Ordering::Relaxed);
         let live = iq_gate::Live::default();
         let sandbox = self
-            .place_of(agent)
-            .sandbox
-            .clone()
+            .sandbox_of(agent)
             .with_timeout(BACKGROUND_MOST)
             .with_quiet(BACKGROUND_QUIET);
         let crew = self.clone();
@@ -3006,6 +3219,36 @@ where
             let chat = name.split('/').next().unwrap_or(name);
             format!("the name of your part in the chat {chat}, which iq gave it")
         };
+        // Its chat's folder of scratch, by the name the chat has now.
+        let scratch = place
+            .gate
+            .scratch()
+            .map(|root| {
+                let chat = name.split('/').next().unwrap_or(name);
+                format!(
+                    "\n\nKeep what outlives one command (a long output to read in parts, a \
+                     snapshot to compare with, notes of your own) in your chat's folder of \
+                     scratch, {}, which commands find as $IQ_SCRATCH: they write there, and you \
+                     read and write its files without asking. Never leave such files in the \
+                     workspace, where they would be committed with the work: `make check > \
+                     \"$IQ_SCRATCH/check.log\" 2>&1`, then read what you need of it. Its oldest \
+                     files go once it grows past {} MB.",
+                    root.join(chat).display(),
+                    self.inner.settings.scratch_most / (1024 * 1024)
+                )
+            })
+            .unwrap_or_default();
+        let allowed = &self.inner.settings.allowed;
+        let models = if allowed.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = allowed.iter().map(ToString::to_string).collect();
+            format!(
+                " The person allows these models only, for any agent: {}; start_agent and \
+                 start_team refuse any other.",
+                names.join(", ")
+            )
+        };
         format!(
             "You are a coding agent of iq, a coding harness, working in {workspace}. On iq's board, \
              where the person and the agents write to each other, you are listed as {name}: \
@@ -3018,10 +3261,10 @@ where
              git fetch), and asked of the person for others with `network: true`, unless the \
              person opened it to every command. What the gate holds waits for the person, or for \
              a reviewer acting for them; when it is refused, you are told why: find another way, \
-             or say what you need.\n\n\
+             or say what you need.{scratch}\n\n\
              Other agents may work beside you. start_agent hands a task to a new one, \
              send_message writes to one, to all, or to the person, and wait_for_messages waits \
-             for an answer. Messages to you also arrive between your calls.\n\n\
+             for an answer. Messages to you also arrive between your calls.{models}\n\n\
              Read before you change, check your work with the project's own tools (its build, \
              tests, linters), and be brief. When the task is done, answer with what you did and \
              call no tool.{}{}",

@@ -330,14 +330,62 @@ impl Live<'_> {
                 width,
             )]));
         }
-        let more = self.started().len().saturating_sub(PANES);
-        if more > 0 {
-            parts.push(Part::Lines(vec![Line::from(Span::styled(
-                format!("  and {more} more of this chat at work"),
-                p.fg(p.faint),
-            ))]));
-        }
+        parts.extend(self.crew_line(width));
         parts
+    }
+
+    /// Every agent the chat written to started, at work or resting, each
+    /// with its model and who started it, in a line or two: those the
+    /// panes leave out, and those at rest, are seen too.
+    fn crew_line(&self, width: usize) -> Option<Part> {
+        let p = self.p;
+        let window = self.window()?;
+        let mut agents: Vec<&iq_ui::crew::AgentView> = self
+            .board
+            .crew()
+            .agents()
+            .iter()
+            .filter(|a| a.name != window)
+            .filter(|a| chat_of(self.board, &a.name).as_ref() == Some(&window))
+            .collect();
+        if agents.is_empty() {
+            return None;
+        }
+        agents.sort_by_key(|a| a.name.clone());
+        let part = |name: &str| {
+            name.split_once('/')
+                .map_or(name, |(_, part)| part)
+                .to_owned()
+        };
+        let mut spans = Vec::new();
+        for (at, agent) in agents.iter().enumerate() {
+            if at > 0 {
+                spans.push(Span::styled(" · ", p.fg(p.faint)));
+            }
+            let model = agent.serving();
+            spans.extend([
+                Span::styled(
+                    part(&agent.name),
+                    p.fg(agent_tint(self.board, &agent.name, p)),
+                ),
+                Span::styled(
+                    format!(" {}", model.rsplit('/').next().unwrap_or(model)),
+                    p.fg(p.dim),
+                ),
+                Span::styled(format!(" by {}", part(&agent.by)), p.fg(p.faint)),
+                if agent.working {
+                    Span::styled(" at work", p.fg(p.accent))
+                } else {
+                    Span::styled(" resting", p.fg(p.faint))
+                },
+            ]);
+        }
+        Some(Part::Lines(wrap(
+            &spans,
+            width.saturating_sub(1),
+            &[Span::styled("  ◦ ", p.fg(p.faint))],
+            &[Span::raw("    ")],
+        )))
     }
 
     /// How `agent` is said at work: its spinner, its name in its chat's
@@ -711,15 +759,17 @@ impl Live<'_> {
         if all.is_empty() {
             return Vec::new();
         }
-        let picked = self.board.screen().picked().min(all.len() - 1);
-        let first = picked.saturating_sub(LISTED - 1);
+        // None is picked while /new or /model waits for its model and the
+        // person has not moved to one: Enter runs what they wrote.
+        let picked = self.board.picked_completion();
+        let first = picked.unwrap_or(0).saturating_sub(LISTED - 1);
         let label_width = all.iter().map(|c| text_width(&c.label)).max().unwrap_or(0) + 2;
         all.iter()
             .enumerate()
             .skip(first)
             .take(LISTED)
             .map(|(at, completion)| {
-                let on = at == picked;
+                let on = Some(at) == picked;
                 let mark = if on { "▸ " } else { "  " };
                 let label = format!("{:<label_width$}", completion.label);
                 let room = width.saturating_sub(label_width + 4);
@@ -1244,6 +1294,52 @@ mod tests {
     }
 
     /// The rows the live part draws, as text.
+    #[test]
+    fn every_agent_of_the_chat_is_listed_with_its_model_and_who_started_it() {
+        let mut board = Board::default();
+        let history = History::default();
+        board.update(Update::Started {
+            lead: "lab/lead".into(),
+            reviewer: "r".into(),
+            autopilot: false,
+            internet: false,
+            allowed: Vec::new(),
+        });
+        for (agent, model, by) in [
+            ("fix", "lab/lead", PERSON),
+            ("fix/writer", "lab/sol", "fix"),
+            ("fix/tests", "lab/quick", "fix/writer"),
+            ("docs", "lab/lead", PERSON),
+        ] {
+            board.update(Update::Crew(Event::Joined {
+                agent: agent.into(),
+                model: model.into(),
+                by: by.into(),
+            }));
+        }
+        board.update(Update::Crew(Event::Working {
+            agent: "fix/writer".into(),
+            prompt: "go".into(),
+        }));
+        board.screen_mut().talk_to("fix");
+        let rows = drawn(&board, &history, 100);
+        let listed = rows
+            .iter()
+            .find(|row| row.contains("◦ tests"))
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        assert_eq!(
+            listed.trim_end(),
+            "  ◦ tests quick by writer resting · writer sol by fix at work"
+        );
+        // Another chat's agents are not this one's.
+        board.screen_mut().talk_to("docs");
+        assert!(
+            !drawn(&board, &history, 100)
+                .iter()
+                .any(|row| row.contains("◦ "))
+        );
+    }
+
     fn drawn(board: &Board, history: &History, width: u16) -> Vec<String> {
         let p = Palette::new(Theme::Graphite, Depth::True);
         let mut motion = Motion::default();
@@ -1289,6 +1385,7 @@ mod tests {
             reviewer: "r".into(),
             autopilot: true,
             internet: false,
+            allowed: Vec::new(),
         });
         let rows = drawn(&board, &history, 60);
         assert_eq!(rows.len(), 4);

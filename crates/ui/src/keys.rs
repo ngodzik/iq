@@ -110,7 +110,7 @@ impl Action {
             Action::Allow => "allow what an agent asks",
             Action::Refuse => "refuse it",
             Action::Changes => "what a sync would send, line by line",
-            Action::Steps => "every step the agents took, unfolded",
+            Action::Steps => "every step the agents took and what they wrote each other, unfolded",
             Action::Stop => "stop the agent you write to",
             Action::Quit => "quit",
         }

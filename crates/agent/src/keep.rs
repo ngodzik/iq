@@ -36,8 +36,26 @@ pub struct Saved {
     /// The tokens its last call read.
     #[serde(default)]
     pub context: u64,
+    /// Each choice of its model, the latest last: the one it was started
+    /// on, then each the person gave it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models_chosen: Vec<ModelChoice>,
     /// Its conversation, the standing instructions first.
     pub messages: Vec<Message>,
+}
+
+/// A choice of the model an agent runs on: which, by whom, how and when,
+/// so that how a chat came to run on a model can always be told.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    /// The model chosen.
+    pub model: String,
+    /// Who chose it: the person, or the agent that started this one.
+    pub by: String,
+    /// How: the command, the tool or the setting that named it.
+    pub how: String,
+    /// When, in seconds since 1970.
+    pub at: u64,
 }
 
 /// Keeps the chats between sessions.
