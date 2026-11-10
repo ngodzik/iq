@@ -112,6 +112,7 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
         Event::Notice { agent, text } => writeln!(out, "\n! {agent}: {text}"),
         // Its turn's end says it, with the facts.
         Event::Failed { .. } => Ok(()),
+        Event::Retired { agent } => writeln!(out, "  ◦ {agent} is done, and retired"),
         Event::Waiting { agent, on } => writeln!(out, "  ⧗ {agent} waits for {}", on.join(", ")),
         Event::JobStarted { agent, id, line } => {
             writeln!(out, "  ⚙ {agent} runs job {id} in the background: {line}")

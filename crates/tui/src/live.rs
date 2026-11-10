@@ -348,10 +348,19 @@ impl Live<'_> {
             .filter(|a| a.name != window)
             .filter(|a| chat_of(self.board, &a.name).as_ref() == Some(&window))
             .collect();
-        if agents.is_empty() {
+        // Those done with their task, retired: counted, not listed.
+        let finished = self
+            .board
+            .crew()
+            .finished()
+            .iter()
+            .filter(|a| a.name.split('/').next() == Some(window.as_str()))
+            .count();
+        if agents.is_empty() && finished == 0 {
             return None;
         }
-        agents.sort_by_key(|a| a.name.clone());
+        // At work first, then those resting that may still be written to.
+        agents.sort_by_key(|a| (!a.working, a.name.clone()));
         let part = |name: &str| {
             name.split_once('/')
                 .map_or(name, |(_, part)| part)
@@ -379,6 +388,21 @@ impl Live<'_> {
                     Span::styled(" resting", p.fg(p.faint))
                 },
             ]);
+        }
+        if finished > 0 {
+            if !agents.is_empty() {
+                spans.push(Span::styled(" · ", p.fg(p.faint)));
+            }
+            let see = self
+                .board
+                .keys()
+                .chord(Action::Team)
+                .map(|chord| format!(", {chord} lists them"))
+                .unwrap_or_default();
+            spans.push(Span::styled(
+                format!("{finished} finished{see}"),
+                p.fg(p.faint),
+            ));
         }
         Some(Part::Lines(wrap(
             &spans,
@@ -1056,10 +1080,7 @@ impl Live<'_> {
             left.push(sep());
             left.push(Span::styled("internet open", p.fg(p.warn)));
         }
-        let mut spent = iq_core::Usd(0.0);
-        for agent in crew.agents() {
-            spent += agent.billed;
-        }
+        let spent = crew.billed();
         if spent.0 > 0.0 {
             left.push(sep());
             left.push(Span::styled(format!("{spent} spent"), p.fg(p.dim)));
@@ -1325,11 +1346,25 @@ mod tests {
         let rows = drawn(&board, &history, 100);
         let listed = rows
             .iter()
-            .find(|row| row.contains("◦ tests"))
+            .find(|row| row.contains("◦ writer"))
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        // At work first.
+        assert_eq!(
+            listed.trim_end(),
+            "  ◦ writer sage by fix at work · tests quick by writer resting"
+        );
+        // Done with its task, it is counted at the end, not listed.
+        board.update(Update::Crew(Event::Retired {
+            agent: "fix/tests".into(),
+        }));
+        let rows = drawn(&board, &history, 100);
+        let listed = rows
+            .iter()
+            .find(|row| row.contains("◦ writer"))
             .unwrap_or_else(|| panic!("{rows:#?}"));
         assert_eq!(
             listed.trim_end(),
-            "  ◦ tests quick by writer resting · writer sage by fix at work"
+            "  ◦ writer sage by fix at work · 1 finished, Ctrl-T lists them"
         );
         // Another chat's agents are not this one's.
         board.screen_mut().talk_to("docs");

@@ -194,6 +194,13 @@ pub enum Event {
         /// Those it waits for, at work.
         on: Vec<String>,
     },
+    /// An agent another started is done with its task: its answer reached
+    /// who started it, and nothing more is asked of it. It is off the
+    /// board, its name free again for the next.
+    Retired {
+        /// The agent.
+        agent: String,
+    },
     /// A call to the provider failed, and an agent's turn with it: what
     /// the provider said, and where the agent stood.
     Failed {
@@ -261,6 +268,7 @@ impl Event {
             | Event::Reviewed { agent, .. }
             | Event::Done { agent, .. }
             | Event::Failed { agent, .. }
+            | Event::Retired { agent }
             | Event::Notice { agent, .. } => renamed(agent),
             Event::Waiting { agent, on } => {
                 renamed(agent);

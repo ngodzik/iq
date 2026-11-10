@@ -303,6 +303,9 @@ struct Inner<M> {
     writers: Mutex<Writers>,
 }
 
+/// The most of a retired agent's last answer given to who writes to it.
+const RETIRED_ANSWER: usize = 4_000;
+
 /// The tools that write where their agent works, as far as iq can tell: a
 /// command may write too.
 const WRITERS: [&str; 3] = ["write_file", "edit_file", "run"];
@@ -416,6 +419,17 @@ struct Board {
     /// what an agent writes to an old one reaches it. A name given to an
     /// agent at work leads to the one it works under until its turn ends.
     aliases: HashMap<String, String>,
+    /// The agents retired, the latest last: done with their task, their
+    /// names free again.
+    retired: Vec<Retired>,
+}
+
+/// An agent retired: done with the task another gave it, it is off the
+/// board and its name free again. What writes to it by its name is told it
+/// finished, with its last answer.
+struct Retired {
+    name: String,
+    answer: String,
 }
 
 impl Board {
@@ -499,6 +513,11 @@ struct Member {
     calls: u64,
     /// What those cost, as far as their prices are known.
     spent: Usd,
+    /// The team it works in, its first member first, which answers who
+    /// started the team; empty when it works alone.
+    team: Vec<String>,
+    /// Whether its answer reached who started it: done with its task.
+    answered: bool,
     /// The first message it has not read.
     read: usize,
     /// Its turn under way, when it works.
@@ -786,6 +805,8 @@ where
                 reason: None,
                 calls: saved.calls,
                 spent: saved.spent,
+                team: Vec::new(),
+                answered: false,
                 read,
                 turn: None,
                 turns: 0,
@@ -1305,6 +1326,8 @@ where
                 reason: None,
                 calls: 0,
                 spent: Usd(0.0),
+                team: Vec::new(),
+                answered: false,
                 read,
                 turn: None,
                 turns: 0,
@@ -1480,6 +1503,15 @@ where
             Placing::Given(Arc::clone(&place)),
             START_TEAM,
         );
+        // Each knows its team, which is done once its first answered.
+        {
+            let mut board = lock(&self.inner.board);
+            for name in &names {
+                if let Some(member) = board.members.get_mut(name) {
+                    member.team.clone_from(&names);
+                }
+            }
+        }
         if joined {
             self.wake(&lead, brief(0));
         }
@@ -1771,6 +1803,11 @@ where
             aside.insert(new.to_owned(), kept);
         }
         drop(aside);
+        let mut wakes = lock(&self.inner.wakes);
+        if let Some(waiting) = wakes.remove(agent) {
+            wakes.insert(new.to_owned(), waiting);
+        }
+        drop(wakes);
         for team in lock(&self.inner.teams).iter_mut() {
             team.rename(agent, new);
         }
@@ -2005,6 +2042,17 @@ where
         let to = renamed.as_deref().unwrap_or(to);
         let wakes = {
             let mut board = lock(&self.inner.board);
+            if to != ALL
+                && to != PERSON
+                && !board.members.contains_key(to)
+                && let Some(retired) = board.retired.iter().rev().find(|r| r.name == to)
+            {
+                return Err(format!(
+                    "{to} finished its task and was retired: a message no longer reaches it. For \
+                     more, start a new agent, which may take its name. Its last answer:\n{}",
+                    cut_to(&retired.answer, RETIRED_ANSWER)
+                ));
+            }
             if to != ALL && to != PERSON && !board.members.contains_key(to) {
                 let names: Vec<&str> = board.members.keys().map(String::as_str).collect();
                 return Err(format!(
@@ -2283,6 +2331,7 @@ where
             .get(posted_before..)
             .is_some_and(|new| new.iter().any(|m| m.from == name && m.to == by));
         let handled = self.after_turn(&name, &outcome);
+        let answered = by != PERSON && !handled && outcome.is_ok();
         if by != PERSON && !handled && !(wrote_back && outcome.is_ok()) {
             let text = match outcome {
                 Ok(text) => text,
@@ -2294,12 +2343,112 @@ where
             };
             let _ = self.post(&name, &by, text);
         }
+        if answered {
+            if let Some(member) = lock(&self.inner.board).members.get_mut(&name) {
+                member.answered = true;
+            }
+            self.retire_done(&name);
+        }
         // What the person wrote after its last look at the board.
         if self.person_waits(&name)
             && let Some(news) = self.unread(&name)
         {
             self.wake(&name, news);
         }
+    }
+
+    /// Retires `agent`, and its team with it, once done: the first of its
+    /// team (or itself, alone) answered who started it, and none of them
+    /// works, has a command running or a wake waiting, has a message it
+    /// did not read, was written to by the person, or started an agent
+    /// still on the board. Its starter may be done then too.
+    fn retire_done(&self, agent: &str) {
+        let (group, by) = {
+            let board = lock(&self.inner.board);
+            let Some(member) = board.members.get(agent) else {
+                return;
+            };
+            let group = if member.team.is_empty() {
+                vec![agent.to_owned()]
+            } else {
+                member.team.clone()
+            };
+            let Some(first) = board.members.get(&group[0]) else {
+                return;
+            };
+            if first.by == PERSON || !first.answered {
+                return;
+            }
+            let rests = |name: &String| {
+                board.members.get(name).is_some_and(|member| {
+                    member.turn.as_ref().is_none_or(JoinHandle::is_finished)
+                        && member.written.is_none()
+                        && !board.messages[member.read..]
+                            .iter()
+                            .any(|m| m.from != *name && (m.to == *name || m.to == ALL))
+                })
+            };
+            let starts_others = board
+                .members
+                .iter()
+                .any(|(name, member)| group.contains(&member.by) && !group.contains(name));
+            if starts_others || !group.iter().all(rests) {
+                return;
+            }
+            (group, first.by.clone())
+        };
+        let running = lock(&self.inner.jobs)
+            .values()
+            .any(|job| group.contains(&job.agent) && job.ended.is_none());
+        let waking = lock(&self.inner.wakes)
+            .iter()
+            .any(|(name, wakes)| group.contains(name) && wakes.waiting > 0);
+        if running || waking {
+            return;
+        }
+        for name in &group {
+            self.retire(name);
+        }
+        if by != PERSON {
+            self.retire_done(&by);
+        }
+    }
+
+    /// Takes `agent` off the board, done: its name free again, its chat
+    /// file kept apart, as long as its chat's.
+    fn retire(&self, agent: &str) {
+        {
+            let mut board = lock(&self.inner.board);
+            let Some(member) = board.members.remove(agent) else {
+                return;
+            };
+            let answer = member
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::Assistant {
+                        content: Some(text),
+                        ..
+                    } if !text.trim().is_empty() => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            board.aliases.retain(|_, to| to != agent);
+            board.retired.push(Retired {
+                name: agent.to_owned(),
+                answer,
+            });
+        }
+        if let Some(keeper) = lock(&self.inner.keeper).clone() {
+            keeper.retire(agent);
+        }
+        lock(&self.inner.aside).remove(agent);
+        lock(&self.inner.refused).remove(agent);
+        lock(&self.inner.wakes).remove(agent);
+        self.report(Event::Retired {
+            agent: agent.to_owned(),
+        });
     }
 
     /// Notes that `agent` wrote where it works, and tells the person, once
@@ -3212,6 +3361,8 @@ where
         let name = agent.to_owned();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(seconds)).await;
+            // Under the name it has now, if it was given another.
+            let name = lock(&crew.inner.board).named(&name).unwrap_or(name);
             if let Some(wakes) = lock(&crew.inner.wakes).get_mut(&name) {
                 wakes.waiting = wakes.waiting.saturating_sub(1);
             }

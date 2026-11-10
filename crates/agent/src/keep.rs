@@ -160,4 +160,9 @@ pub trait Keeper: Send + Sync {
 
     /// Forgets what was kept of the chat `name`: it goes on under another.
     fn forget(&self, _name: &str) {}
+
+    /// Keeps what was kept of the agent `name` apart, as it retires: it
+    /// comes back no more, and another may take its name, but what it did
+    /// stays readable as long as its chat.
+    fn retire(&self, _name: &str) {}
 }

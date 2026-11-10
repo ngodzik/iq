@@ -57,6 +57,8 @@ pub enum Update {
     Crew(Event),
     /// A chat of an earlier session came back, as it was kept.
     Back(Back),
+    /// An agent retired in an earlier session, shown with its chat.
+    Finished(crate::crew::Finished),
     /// The calls iq kept of earlier sessions, oldest first.
     Kept(Vec<Spent>),
     /// iq is asked to stop: the terminal is given back, the agents
@@ -971,7 +973,7 @@ impl Board {
         } else if self.screen.page() == Some(&Page::Team) {
             let chosen = self.screen.chosen() as isize + lines.signum();
             self.screen
-                .choose(chosen.max(0) as usize, self.crew.agents().len());
+                .choose(chosen.max(0) as usize, self.crew.listed().len());
         } else {
             self.screen.scroll_by(lines);
         }
@@ -991,7 +993,7 @@ impl Board {
         }
         let letter = typed.map(|c| c.to_ascii_lowercase());
         let step = self.screen.rows().saturating_sub(2).max(1) as isize;
-        let agents = self.crew.agents().len();
+        let agents = self.crew.listed().len();
         let chosen = self.screen.chosen();
         if page == Page::Steps
             && let Some(done) = self.steps_key(chord.key.as_str(), letter)
@@ -1077,12 +1079,18 @@ impl Board {
                 self.lens = lens;
             }
             Page::Team => {
-                let agent = self
+                let (agent, retired) = self
                     .crew
                     .listed()
                     .get(self.screen.chosen())
-                    .map(|(_, a)| a.name.clone());
+                    .map_or((None, false), |(_, a)| (Some(a.name.clone()), a.retired));
                 match (key, letter, agent) {
+                    // One retired is read, never written to.
+                    ("Enter" | "Right", _, Some(agent)) | (_, Some('w' | 'v'), Some(agent))
+                        if retired =>
+                    {
+                        self.screen.open(Page::Thread(agent));
+                    }
                     ("Enter", _, Some(agent)) | (_, Some('w'), Some(agent)) => {
                         self.chose_to(&agent);
                         self.screen.close();
@@ -1716,6 +1724,7 @@ impl Board {
                     }
                 }
             }
+            Update::Finished(finished) => self.crew.finished_back(finished),
             Update::Kept(kept) => {
                 for spent in kept {
                     self.costs.add(spent);

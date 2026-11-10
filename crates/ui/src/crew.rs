@@ -245,6 +245,9 @@ pub struct AgentView {
     pub worked: Option<u64>,
     /// Whom it waits for, while it waits for the agents it started.
     pub waiting: Option<Waiting>,
+    /// Whether it is done with the task another gave it: off the board,
+    /// its name free for the next, what it did still read here.
+    pub retired: bool,
 }
 
 /// An agent waiting for the agents it started to write.
@@ -254,6 +257,24 @@ pub struct Waiting {
     pub on: Vec<String>,
     /// Since when, in seconds since 1970.
     pub since: u64,
+}
+
+/// An agent retired in an earlier session, shown again with its chat:
+/// what it did, read only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Finished {
+    /// Its name as it retired.
+    pub agent: String,
+    /// Its model.
+    pub model: String,
+    /// Who started it, by the name it has now.
+    pub by: String,
+    /// What it was asked.
+    pub task: String,
+    /// When it last worked, in seconds since 1970.
+    pub worked: u64,
+    /// What it was given, said and did, oldest first.
+    pub thread: Vec<Entry>,
 }
 
 /// A chat of an earlier session, back on the board as it was kept.
@@ -439,6 +460,8 @@ pub struct Question {
 #[derive(Debug, Clone, Default)]
 pub struct CrewView {
     agents: Vec<AgentView>,
+    /// The agents retired, the latest last.
+    finished: Vec<AgentView>,
     questions: Vec<Question>,
     /// The questions with choices waiting for the person, the oldest first.
     choices: Vec<Choice>,
@@ -493,6 +516,24 @@ impl CrewView {
         &self.agents
     }
 
+    /// What every agent's calls were billed this session, those retired
+    /// with the others.
+    #[must_use]
+    pub fn billed(&self) -> Usd {
+        let mut billed = Usd(0.0);
+        for agent in self.agents.iter().chain(&self.finished) {
+            billed += agent.billed;
+        }
+        billed
+    }
+
+    /// The agents retired, done with the task another gave them, the
+    /// latest last.
+    #[must_use]
+    pub fn finished(&self) -> &[AgentView] {
+        &self.finished
+    }
+
     /// The agent named `name`.
     #[must_use]
     pub fn agent(&self, name: &str) -> Option<&AgentView> {
@@ -540,25 +581,32 @@ impl CrewView {
     #[must_use]
     pub fn listed(&self) -> Vec<(usize, &AgentView)> {
         fn under<'a>(
-            agents: &'a [AgentView],
+            agents: &[&'a AgentView],
             by: &str,
             depth: usize,
             listed: &mut Vec<(usize, &'a AgentView)>,
         ) {
-            for agent in agents.iter().filter(|a| a.by == by) {
-                if listed.iter().any(|(_, seen)| seen.name == agent.name) {
+            for &agent in agents.iter().filter(|a| a.by == by) {
+                if listed.iter().any(|(_, seen)| std::ptr::eq(*seen, agent)) {
                     continue;
                 }
                 listed.push((depth, agent));
-                under(agents, &agent.name, depth + 1, listed);
+                // A retired agent's name may be another's now.
+                if !agent.retired {
+                    under(agents, &agent.name, depth + 1, listed);
+                }
             }
         }
+        // Those at work or resting first, then those retired.
+        let all: Vec<&AgentView> = self.agents.iter().chain(&self.finished).collect();
         let mut listed = Vec::new();
-        under(&self.agents, PERSON, 0, &mut listed);
-        for agent in &self.agents {
-            if !listed.iter().any(|(_, seen)| seen.name == agent.name) {
+        under(&all, PERSON, 0, &mut listed);
+        for &agent in &all {
+            if !listed.iter().any(|(_, seen)| std::ptr::eq(*seen, agent)) {
                 listed.push((0, agent));
-                under(&self.agents, &agent.name, 1, &mut listed);
+                if !agent.retired {
+                    under(&all, &agent.name, 1, &mut listed);
+                }
             }
         }
         listed
@@ -572,6 +620,27 @@ impl CrewView {
             view.worked = Some(back.worked);
             view.thread = back.thread;
         }
+    }
+
+    /// An agent retired in an earlier session, shown with its chat.
+    pub fn finished_back(&mut self, finished: Finished) {
+        self.finished.push(AgentView {
+            name: finished.agent,
+            model: finished.model,
+            answered: String::new(),
+            by: finished.by,
+            working: false,
+            thread: finished.thread,
+            // Billed in an earlier session, not this one's.
+            billed: Usd(0.0),
+            reads: Vec::new(),
+            effort: None,
+            place: None,
+            task: finished.task,
+            worked: Some(finished.worked),
+            waiting: None,
+            retired: true,
+        });
     }
 
     /// The questions waiting for the person, oldest first.
@@ -639,8 +708,20 @@ impl CrewView {
                     task: String::new(),
                     worked: None,
                     waiting: None,
+                    retired: false,
                 });
             }
+            Event::Retired { agent } => {
+                if let Some(at) = self.agents.iter().position(|a| a.name == agent) {
+                    let mut view = self.agents.remove(at);
+                    view.retired = true;
+                    view.working = false;
+                    view.waiting = None;
+                    self.finished.push(view);
+                }
+            }
+            // Its turn's end says it, with the facts.
+            Event::Failed { .. } => {}
             Event::Working { agent, prompt } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.working = true;
@@ -816,6 +897,11 @@ impl CrewView {
                 }
             }
             Event::Renamed { from, to } => {
+                for view in &mut self.finished {
+                    if view.by == from {
+                        view.by.clone_from(&to);
+                    }
+                }
                 for view in &mut self.agents {
                     if view.name == from {
                         view.name.clone_from(&to);
@@ -850,8 +936,6 @@ impl CrewView {
                     view.thread.push(Entry::Notice(text));
                 }
             }
-            // Its turn's end says it, with the facts.
-            Event::Failed { .. } => {}
             Event::Placed {
                 agent,
                 folder,
@@ -881,6 +965,13 @@ impl CrewView {
 
     fn agent_mut(&mut self, name: &str) -> Option<&mut AgentView> {
         self.agents.iter_mut().find(|a| a.name == name)
+    }
+
+    /// A retired agent of that name, the latest, to read what it did once
+    /// another took its name.
+    #[must_use]
+    pub fn retired(&self, name: &str) -> Option<&AgentView> {
+        self.finished.iter().rev().find(|a| a.name == name)
     }
 }
 

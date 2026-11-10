@@ -3,7 +3,10 @@
 //! is: an agent and its conversation as they last stood, written at each
 //! turn's end, readable by their owner only. When iq starts, the chats of
 //! the project come back on the board, resting, and those untouched for as
-//! long as the settings say are forgotten.
+//! long as the settings say are forgotten. An agent another started that
+//! is done with its task is retired: its file goes to `retired/`, read
+//! back never on the board, only shown with its chat, and forgotten with
+//! it.
 
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -43,7 +46,12 @@ impl Chats {
 
     /// The chats kept, oldest first.
     pub(crate) fn list(&self) -> Vec<Found> {
-        let Ok(entries) = std::fs::read_dir(&self.folder) else {
+        Self::read(&self.folder)
+    }
+
+    /// The chats kept in `folder`, oldest first.
+    fn read(folder: &Path) -> Vec<Found> {
+        let Ok(entries) = std::fs::read_dir(folder) else {
             return Vec::new();
         };
         let mut found: Vec<Found> = entries
@@ -63,8 +71,42 @@ impl Chats {
         found
     }
 
-    /// Forgets the chats untouched for `keep`, and says which.
+    /// The agents retired, oldest first: what they did, to be shown with
+    /// their chats.
+    pub(crate) fn retired(&self) -> Vec<Found> {
+        Self::read(&self.folder.join(RETIRED))
+    }
+
+    /// Forgets the chats untouched for `keep`, and says which; and the
+    /// agents retired whose chat is forgotten, or as old.
     pub(crate) fn prune(&self, keep: Duration) -> Vec<String> {
+        let said = self.prune_chats(keep);
+        let kept: Vec<String> = self
+            .list()
+            .into_iter()
+            .map(|found| found.chat.name)
+            .collect();
+        let now = now();
+        if let Ok(entries) = std::fs::read_dir(self.folder.join(RETIRED)) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let chat = name.split(['+', '@', '.']).next().unwrap_or_default();
+                let old = entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+                    .is_some_and(|at| now.saturating_sub(at.as_secs()) >= keep.as_secs());
+                if old || !kept.iter().any(|kept| kept == chat) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        said
+    }
+
+    /// Forgets the chats untouched for `keep`, and says which.
+    fn prune_chats(&self, keep: Duration) -> Vec<String> {
         let now = now();
         let mut said = Vec::new();
         for found in self.list() {
@@ -106,6 +148,21 @@ impl Keeper for Chats {
         let _ = std::fs::remove_file(self.file(name));
     }
 
+    fn retire(&self, name: &str) {
+        let folder = self.folder.join(RETIRED);
+        if std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&folder)
+            .is_err()
+        {
+            return;
+        }
+        // Apart from the next to take its name: when it retired.
+        let file = folder.join(format!("{}@{}.json", name.replace('/', "+"), now_nanos()));
+        let _ = std::fs::rename(self.file(name), file);
+    }
+
     fn keep(&self, chat: &Saved) {
         let Ok(text) = serde_json::to_string(&Kept {
             at: now(),
@@ -138,6 +195,16 @@ impl Keeper for Chats {
             let _ = std::fs::rename(&part, &file);
         }
     }
+}
+
+/// Where the agents retired are kept, under a project's chats.
+const RETIRED: &str = "retired";
+
+/// Nanoseconds since 1970: apart for two agents retired in one second.
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
 }
 
 /// Seconds since 1970.
@@ -225,12 +292,22 @@ mod tests {
                 .join("chats/github.com-org-repo/.lead.part")
                 .exists()
         );
+        // A retired agent, kept apart, never listed among the chats.
+        chats.retire("lead/helper");
+        assert_eq!(chats.list().len(), 1);
+        let retired = chats.retired();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].chat.name, "lead/helper");
+        chats.keep(&saved("lead/helper"));
         // Nothing is old yet; everything is, given no time at all.
         assert!(chats.prune(Duration::from_secs(60)).is_empty());
+        assert_eq!(chats.retired().len(), 1);
         let said = chats.prune(Duration::ZERO);
         assert_eq!(said.len(), 2, "{said:?}");
         assert!(said[0].contains("is forgotten"));
         assert!(chats.list().is_empty());
         assert!(!file.exists());
+        // Gone with its chat.
+        assert!(chats.retired().is_empty());
     }
 }

@@ -226,6 +226,7 @@ impl Steps {
             Event::TextStart { agent }
             | Event::Done { agent, .. }
             | Event::Failed { agent, .. }
+            | Event::Retired { agent }
             | Event::Notice { agent, .. } => self.close(agent),
             Event::Placed {
                 agent,

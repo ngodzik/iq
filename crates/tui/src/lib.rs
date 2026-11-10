@@ -38,7 +38,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use iq_core::Usd;
 use iq_ui::crew::Request;
 use iq_ui::{Board, Update};
 use ratatui::backend::CrosstermBackend;
@@ -674,10 +673,7 @@ impl Iq {
             let lines = self.history.window(width, window.as_deref());
             screen.insert(self.history.take_images(), &lines)?;
         }
-        let mut billed = Usd(0.0);
-        for agent in self.board.crew().agents() {
-            billed += agent.billed;
-        }
+        let billed = self.board.crew().billed();
         let said = if billed.0 > 0.0 {
             format!("iq ends: {billed} billed to the provider.")
         } else {

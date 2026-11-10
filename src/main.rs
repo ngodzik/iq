@@ -404,6 +404,22 @@ fn resume_chats(
             }
         }
     }
+    // Those retired, read only, with the chats that came back.
+    for found in chats.retired() {
+        let by = names
+            .get(&found.chat.by)
+            .cloned()
+            .unwrap_or_else(|| found.chat.by.clone());
+        let thread = iq_ui::crew::past_with(&found.chat.messages, &found.chat.aside);
+        let _ = tell.send(Update::Finished(iq_ui::crew::Finished {
+            agent: found.chat.name,
+            model: found.chat.model,
+            by,
+            task: found.chat.task,
+            worked: found.at,
+            thread,
+        }));
+    }
     for found in waiting {
         chats.forget(&found.chat.name);
         said.push(format!(

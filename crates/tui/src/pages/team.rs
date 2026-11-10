@@ -48,7 +48,9 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         let on = at == chosen;
         let depth = *depth;
         let nested = "  ".repeat(depth);
-        let state = if agent.working {
+        let state = if agent.retired {
+            ("finished".to_owned(), p.faint)
+        } else if agent.working {
             ("working".to_owned(), p.accent)
         } else {
             match agent.thread.last() {
@@ -75,7 +77,7 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
                 if on { p.bold(tint) } else { p.fg(p.text) },
             ),
             Span::styled(format!("{:<model_width$}", agent.model), p.fg(p.dim)),
-            Span::styled(format!("{:<9}", state.0), p.fg(state.1)),
+            Span::styled(format!("{:<10}", state.0), p.fg(state.1)),
             Span::styled(format!("{spent:<22}"), p.fg(p.text)),
             Span::styled(by, p.fg(p.faint)),
         ];
@@ -207,7 +209,11 @@ pub(super) fn thread(seen: &Seen<'_>, agent: &str) -> Vec<Line<'static>> {
     let p = seen.p;
     let board = seen.board;
     let mut lines = Vec::new();
-    let Some(view) = board.crew().agent(agent) else {
+    let Some(view) = board
+        .crew()
+        .agent(agent)
+        .or_else(|| board.crew().retired(agent))
+    else {
         seen.said(&mut lines, "This agent is gone.", p.dim);
         return lines;
     };
