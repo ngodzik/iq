@@ -51,6 +51,10 @@ pub struct Saved {
     /// and the autopilot answered, its errors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aside: Vec<Aside>,
+    /// The results of its tool calls set apart to keep its conversation
+    /// light, whole, by their ids from 1: what `reread` reads again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub set_apart: Vec<String>,
     /// Its conversation, the standing instructions first.
     pub messages: Vec<Message>,
 }

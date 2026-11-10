@@ -114,6 +114,19 @@ pub(crate) fn work() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "reread".into(),
+            description: "Reads again, whole, a result of one of your earlier tool calls that iq \
+                          set apart to keep your conversation light, by the id its line gives."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                },
+                "required": ["id"],
+            }),
+        },
+        ToolSpec {
             name: "wake_me".into(),
             description:
                 "Wakes you after `seconds` (ten at least, an hour at most), with `why`: to \

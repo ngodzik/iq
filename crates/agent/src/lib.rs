@@ -31,7 +31,7 @@ mod tools;
 
 pub use crew::{
     ALL, BUSY_MOST, BUSY_TRIES, BUSY_WAIT, COMMAND_QUIET, COMMAND_TIMEOUT, CONTEXT_EVERY, Crew,
-    Listed, Posted, REFUSALS, Report, SCRATCH_MOST, Settings,
+    LIGHT_FROM, Listed, Posted, REFUSALS, Report, SCRATCH_MOST, Settings,
 };
 pub use event::{Event, PERSON};
 pub use extension::{Called, Extension};

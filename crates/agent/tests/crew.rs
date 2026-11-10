@@ -2913,6 +2913,66 @@ async fn a_turn_past_what_it_may_spend_asks_the_person_once_and_goes_on_or_stops
 }
 
 #[tokio::test]
+async fn old_tool_results_are_set_apart_at_once_and_recalled_whole() {
+    let read = || {
+        reading(
+            1_500,
+            calls("read_file", serde_json::json!({"path": "big.txt"})),
+        )
+    };
+    let mut script: Vec<ChatResponse> = (0..8).map(|_| read()).collect();
+    script.push(calls("reread", serde_json::json!({"id": 1})));
+    script.push(say("Read."));
+    let f = fixture(
+        &[("lead", script)],
+        Settings {
+            light_from: 1_000,
+            ..Settings::default()
+        },
+    );
+    let big: String = (1..=100)
+        .map(|n| format!("line {n} of the file\n"))
+        .collect();
+    std::fs::write(f.root.join("big.txt"), &big).unwrap();
+    f.crew
+        .start("lead", &model("cheap/model"), "read it".into(), PERSON);
+    f.settled().await;
+    let said: Vec<String> = f
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Notice { text, .. } if text.starts_with("set apart") => Some(text),
+            _ => None,
+        })
+        .collect();
+    // Once, as the seventh came, the oldest: the latest six kept whole;
+    // not again until what the calls read grew as much.
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].starts_with("set apart 1 of its old tool results"),
+        "{}",
+        said[0]
+    );
+    let last = f.model.requests_of("lead").last().unwrap().clone();
+    let results: Vec<&str> = last
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(results[0].starts_with(
+        "(iq: set apart to keep your conversation light: read big.txt, lines 1 to 100,"
+    ));
+    assert!(results[0].ends_with("`reread` with id 1 reads it again whole.)"));
+    assert!(results[1].contains("line 50 of the file"));
+    // Recalled whole.
+    assert!(results.last().unwrap().contains("line 99 of the file"));
+    assert!(!results.last().unwrap().starts_with("(iq:"));
+}
+
+#[tokio::test]
 async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
     let f = fixture(
         &[(

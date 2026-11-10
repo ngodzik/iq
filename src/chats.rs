@@ -251,6 +251,7 @@ mod tests {
                     answer: Some("b".to_owned()),
                 },
             }],
+            set_apart: vec!["the whole of an old result".to_owned()],
             messages: vec![Message::system("be brief"), Message::user("fix it")],
         }
     }

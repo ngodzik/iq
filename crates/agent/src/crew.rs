@@ -195,6 +195,9 @@ pub struct Settings {
     /// What a chat's turn may spend before the person is asked whether it
     /// goes on, and each time it spends as much again; none never asks.
     pub turn_ask: Option<Usd>,
+    /// The tokens an agent's calls read past which its old tool results
+    /// are set apart, and again each time they grow as much; 0 never.
+    pub light_from: u64,
     /// The only models an agent is started on or given, the person's and
     /// every agent's, as the person's settings list them: any other is
     /// refused, the agent told which there are. Empty: any the provider
@@ -222,6 +225,7 @@ impl Default for Settings {
             busy_most: BUSY_MOST,
             namer: None,
             turn_ask: None,
+            light_from: LIGHT_FROM,
             allowed: Vec::new(),
             scratch_most: SCRATCH_MOST,
         }
@@ -363,6 +367,45 @@ fn pair_of(one: &str, other: &str) -> (String, String) {
         (one.to_owned(), other.to_owned())
     } else {
         (other.to_owned(), one.to_owned())
+    }
+}
+
+/// The tokens an agent's calls read past which its old tool results are
+/// set apart, unless the settings say otherwise.
+pub const LIGHT_FROM: u64 = 40_000;
+
+/// How many of an agent's latest tool results are never set apart.
+const LIGHT_KEPT: usize = 6;
+
+/// The shortest result set apart: one shorter costs less than its line.
+const LIGHT_LEAST: usize = 800;
+
+/// How the line that stands for a result set apart begins.
+const SET_APART: &str = "(iq: set apart to keep your conversation light:";
+
+/// What a tool call's result was, said in a line: the tool, what it was
+/// called on, and for a command the last line it wrote.
+fn what_it_was(name: &str, arguments: &str, output: &str) -> String {
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    let input = tools::summary(&args);
+    match name {
+        "read_file" => {
+            let from = args["offset"].as_u64().unwrap_or(1);
+            let lines = output.lines().count() as u64;
+            format!(
+                "read {input}, lines {from} to {}",
+                from + lines.saturating_sub(1)
+            )
+        }
+        "run" => {
+            let last = output
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty() && !line.starts_with('['))
+                .unwrap_or("");
+            format!("ran `{input}`: {}", cut_to(last.trim(), 120))
+        }
+        _ => format!("{name} {input}"),
     }
 }
 
@@ -616,6 +659,10 @@ struct Member {
     answered: bool,
     /// Whether what its conversation is measured against was said.
     measured: bool,
+    /// The results of its tool calls set apart, whole, by their ids from 1.
+    set_apart: Vec<String>,
+    /// What its calls read when its old tool results were last set apart.
+    lightened: u64,
     /// The first message it has not read.
     read: usize,
     /// Its turn under way, when it works.
@@ -834,6 +881,7 @@ where
                 models_chosen: member.models_chosen.clone(),
                 calls: member.calls,
                 spent: member.spent,
+                set_apart: member.set_apart.clone(),
                 aside: lock(&self.inner.aside)
                     .get(agent)
                     .map(|log| log.kept.clone())
@@ -908,6 +956,8 @@ where
                 team: Vec::new(),
                 answered: false,
                 measured: false,
+                set_apart: saved.set_apart,
+                lightened: saved.context,
                 read,
                 turn: None,
                 turns: 0,
@@ -1434,6 +1484,8 @@ where
                 team: Vec::new(),
                 answered: false,
                 measured: false,
+                set_apart: Vec::new(),
+                lightened: 0,
                 read,
                 turn: None,
                 turns: 0,
@@ -2710,6 +2762,73 @@ where
         }
     }
 
+    /// Sets apart `agent`'s old tool results in `messages`, once its calls
+    /// read past what the settings say, and again each time they grew as
+    /// much: all but the latest few, and those long enough to matter, each
+    /// replaced by a line that says what it was and the id `reread` reads
+    /// it again under. At once rather than a few at each call, so that the
+    /// start of the conversation, which the provider caches, changes
+    /// seldom. Gives what the person is told of it, when it did.
+    fn lighten(&self, agent: &str, messages: &mut [Message]) -> Option<String> {
+        let step = self.inner.settings.light_from;
+        let mut board = lock(&self.inner.board);
+        let member = board.members.get_mut(agent)?;
+        if step == 0 || member.context < step || member.context < member.lightened + step {
+            return None;
+        }
+        let results: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| matches!(message, Message::Tool { .. }))
+            .map(|(at, _)| at)
+            .collect();
+        let older = &results[..results.len().saturating_sub(LIGHT_KEPT)];
+        let (mut count, mut chars) = (0, 0);
+        for &at in older {
+            let Message::Tool { call_id, content } = &messages[at] else {
+                continue;
+            };
+            if content.chars().count() < LIGHT_LEAST || content.starts_with(SET_APART) {
+                continue;
+            }
+            let call = messages[..at]
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::Assistant { tool_calls, .. } => {
+                        tool_calls.iter().find(|call| call.id == *call_id)
+                    }
+                    _ => None,
+                });
+            let what = call.map_or_else(
+                || "a tool's result".to_owned(),
+                |call| what_it_was(&call.name, &call.arguments, content),
+            );
+            member.set_apart.push(content.clone());
+            let id = member.set_apart.len();
+            let size = content.chars().count();
+            let line = format!(
+                "{SET_APART} {what}, {size} characters. `reread` with id {id} reads it again \
+                 whole.)"
+            );
+            count += 1;
+            chars += size;
+            if let Message::Tool { content, .. } = &mut messages[at] {
+                *content = line;
+            }
+        }
+        if count > 0 {
+            member.lightened = member.context;
+        }
+        (count > 0).then(|| {
+            format!(
+                "set apart {count} of its old tool results, about {} tokens, to keep its \
+                 conversation light: a line says what each was, and `reread` reads it again",
+                TokenCount(u64::try_from(chars / 4).unwrap_or(u64::MAX))
+            )
+        })
+    }
+
     /// What `agent` on `model` is told of its conversation's size, once it
     /// grew by the settings' step since it was last told: how much each
     /// call reads, and where its model's price rises, when the provider
@@ -2842,6 +2961,12 @@ where
             }
             if let Some(note) = self.context_note(name, model).await {
                 messages.push(Message::user(note));
+            }
+            if let Some(said) = self.lighten(name, &mut messages) {
+                self.report(Event::Notice {
+                    agent: name.to_owned(),
+                    text: said,
+                });
             }
             // What it is shown: after its prompt or its tools' results.
             if let Some(images) = lock(&self.inner.images).remove(name) {
@@ -3138,6 +3263,19 @@ where
             "job" => {
                 let id = args.number("id").ok_or("`id` names the job")?;
                 Ok(self.job(agent, id, args.flag("stop")))
+            }
+            "reread" => {
+                let id = args.number("id").ok_or("`id` names the result")?;
+                lock(&self.inner.board)
+                    .members
+                    .get(agent)
+                    .and_then(|member| {
+                        member
+                            .set_apart
+                            .get(usize::try_from(id).ok()?.checked_sub(1)?)
+                            .cloned()
+                    })
+                    .ok_or_else(|| format!("no result was set apart under the id {id}"))
             }
             "wake_me" => {
                 let seconds = args.number("seconds").unwrap_or(60).clamp(10, 3600);

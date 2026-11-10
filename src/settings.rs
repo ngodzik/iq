@@ -12,6 +12,7 @@
 //! turn_cost_ask = 1.0                    # dollars a chat's turn may spend (its agents, those they started, the autopilot, the summaries) before you are asked whether it goes on, then as much again each time; unset, never asked
 //! effort = "high"                        # how hard the models think; /effort changes an agent's
 //! context_every = 25000                  # tokens an agent's conversation grows between two words to it of its size; 0 never
+//! light_from = 40000                     # tokens an agent's calls read past which its old tool results (all but the latest six, the long ones) are set apart, each replaced by a line saying what it was, `reread` reading it again; again each time they grow as much, so that the provider's cache breaks seldom; 0 never
 //! autopilot = false
 //! autopilot_internet = true              # the reviewer also answers what only reaches the internet
 //! autopilot_host = true                  # the reviewer also answers what runs on the machine itself (containers, clusters, the forge), as your skill says; true once a skill is set
@@ -149,6 +150,9 @@ pub(crate) struct Settings {
     /// How many tokens an agent's conversation grows between two words to
     /// it of its size.
     context_every: Option<u64>,
+    /// The tokens an agent's calls read past which its old tool results
+    /// are set apart; 0 never.
+    light_from: Option<u64>,
     #[serde(default)]
     pub(crate) autopilot: bool,
     /// Whether the autopilot's reviewer also answers what only reaches the
@@ -737,6 +741,7 @@ impl Settings {
             busy_tries: self.provider_retries.unwrap_or(iq_agent::BUSY_TRIES),
             // The cheap model that places the tasks names the chats.
             namer: Some(self.observing()?.model),
+            light_from: self.light_from.unwrap_or(iq_agent::LIGHT_FROM),
             turn_ask: self
                 .turn_cost_ask
                 .filter(|dollars| *dollars > 0.0)

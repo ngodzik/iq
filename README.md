@@ -14,6 +14,7 @@ Three principles hold it together:
 
 - **Security is the foundation, not a layer.** Everything an agent does goes through one gate, and every command runs in the operating system's sandbox.
 - **Your skills say how the work is done.** iq ships no method of its own. Which team to start for a kind of work, with which roles and models, how its agents work together and review each other: you write it in your skills, and you find your own formula. iq makes it easy to follow: agents that start others, messages between them, a worktree per chat, every step in view.
+- **Conversations kept light.** Past a size the settings give, an agent's old tool results (files read, test output) are set apart at once, each replaced by a line saying what it was, which the agent may read again whole; you see when it happens.
 - **Every cost is in view.** Each call to a model says what it cost, summed by model, by kind of work and over time, and while a turn runs, what each of its agents spent in it. iq never holds an agent back to save money: you see what it spends, and you decide, down to the only models iq may start, for you and every agent, and, when you set it, how much a turn may spend before you are asked whether it goes on. Each choice of a model, yours or an agent's, is written down with who made it and how.
 
 ## Security
