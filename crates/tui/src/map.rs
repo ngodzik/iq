@@ -214,7 +214,11 @@ impl Map<'_> {
             format!("{model:<width$} ", width = columns.model),
             p.fg(p.dim),
         ));
-        let spent = turn.and_then(|turn| turn.by.iter().find(|spent| spent.who == agent.name));
+        // One retired before the turn began, of an earlier session, spent
+        // nothing in it: another may have its name now.
+        let spent = turn
+            .filter(|turn| !agent.retired || agent.worked.is_some_and(|at| at >= turn.since))
+            .and_then(|turn| turn.by.iter().find(|spent| spent.who == agent.name));
         let (cost, calls) = spent.map_or((String::new(), 0), |spent| {
             (spent.spent.to_string(), spent.calls)
         });

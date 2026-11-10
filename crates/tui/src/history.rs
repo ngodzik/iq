@@ -421,7 +421,7 @@ impl History {
                 Span::styled("q", p.bold(p.accent.mix(p.info, 0.6))),
                 Span::styled("  experimental", p.fg(p.dim)),
                 Span::styled(
-                    format!(" · lead {lead} · reviewer {reviewer}"),
+                    format!(" · lead {lead} · autopilot {reviewer}"),
                     p.fg(p.faint),
                 ),
             ],
@@ -551,6 +551,9 @@ impl History {
                 self.finish(agent, board, p);
             }
             Event::Asked { .. } | Event::Answered { .. } => {}
+            // A job's end, told its agent by iq: the job's own line says it,
+            // never its whole command.
+            Event::Posted { from, text, .. } if from == IQ && text.starts_with("Job ") => {}
             Event::Posted { from, to, text } => {
                 if from == PERSON {
                     if board.crew().agent(to).is_some_and(|view| view.by != PERSON) {
@@ -893,6 +896,8 @@ impl History {
                         .and_then(|rest| rest.split_once(": "))
                     {
                         Some((PERSON, said)) => self.person(said, agent, board, p),
+                        // A job's end: its own line said it.
+                        Some((IQ, said)) if said.starts_with("Job ") => {}
                         Some((from, said)) => {
                             self.set_speaker(None);
                             self.push(Para::indented(
@@ -1853,6 +1858,9 @@ pub(crate) fn short(text: &str) -> String {
     })
 }
 
+/// Who writes iq's own messages to an agent: a job that ended, a wake.
+const IQ: &str = "iq";
+
 /// The longest of the few words a job is said in.
 const LABEL_CHARS: usize = 72;
 
@@ -2663,6 +2671,12 @@ mod tests {
                     id: 12,
                     said: "exit status 0".into(),
                     output: "test result: ok".into(),
+                },
+                // What iq tells the agent of it, its command whole.
+                Event::Posted {
+                    from: "iq".into(),
+                    to: "lead".into(),
+                    text: format!("Job 12, `{script}`, ended: exit status 0."),
                 },
             ] {
                 crew(&mut board, &mut history, event, &p);
