@@ -200,6 +200,8 @@ pub struct JobView {
     pub line: String,
     /// Since when, in seconds since 1970.
     pub since: u64,
+    /// The latest lines it wrote, the latest last.
+    pub tail: Vec<String>,
 }
 
 /// A question with choices an agent asks the person.
@@ -784,7 +786,13 @@ impl CrewView {
                 id,
                 line,
                 since: crate::now(),
+                tail: Vec::new(),
             }),
+            Event::JobOutput { id, tail, .. } => {
+                if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
+                    job.tail = tail;
+                }
+            }
             Event::JobEnded { id, .. } => self.jobs.retain(|job| job.id != id),
             Event::Choose {
                 id,

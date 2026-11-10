@@ -303,6 +303,33 @@ struct Inner<M> {
     writers: Mutex<Writers>,
 }
 
+/// How often a job's latest lines are looked at, to be said when they
+/// changed.
+const JOB_FOLLOWED: Duration = Duration::from_millis(500);
+
+/// How many of a job's latest lines are said as it runs.
+const JOB_TAIL: usize = 10;
+
+/// The longest of a job's lines said as it runs.
+const JOB_LINE_CHARS: usize = 300;
+
+/// The last `most` lines of `text` that hold something, each cut; a line a
+/// carriage return rewrote, as a progress bar does, as it stands last.
+fn last_lines(text: &str, most: usize) -> Vec<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            line.rsplit('\r')
+                .find(|part| !part.trim().is_empty())
+                .unwrap_or("")
+        })
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| cut_to(line.trim_end(), JOB_LINE_CHARS))
+        .collect();
+    let from = lines.len().saturating_sub(most);
+    lines[from..].to_vec()
+}
+
 /// The most of a retired agent's last answer given to who writes to it.
 const RETIRED_ANSWER: usize = 4_000;
 
@@ -3264,10 +3291,40 @@ where
             id,
             line: line.clone(),
         });
+        self.follow_job(agent, id);
         format!(
             "Job {id} runs `{line}` in the background. `job` with id {id} reads its output so \
              far or stops it; you are woken when it ends."
         )
+    }
+
+    /// Says the latest lines the job `id` of `agent`'s wrote, as they
+    /// change, at most twice a second, until it ends.
+    fn follow_job(&self, agent: &str, id: u64) {
+        let crew = self.clone();
+        let agent = agent.to_owned();
+        tokio::spawn(async move {
+            let mut said: Vec<String> = Vec::new();
+            loop {
+                tokio::time::sleep(JOB_FOLLOWED).await;
+                let tail = {
+                    let jobs = lock(&crew.inner.jobs);
+                    match jobs.get(&id) {
+                        Some(job) if job.ended.is_none() => job.live.so_far(JOB_SHOWN),
+                        _ => return,
+                    }
+                };
+                let tail = last_lines(&tail, JOB_TAIL);
+                if tail != said {
+                    said.clone_from(&tail);
+                    crew.report(Event::JobOutput {
+                        agent: agent.clone(),
+                        id,
+                        tail,
+                    });
+                }
+            }
+        });
     }
 
     /// Writes down how the job `id` of `agent`'s ended, and wakes it with
@@ -3289,6 +3346,7 @@ where
             agent: agent.to_owned(),
             id,
             said: said.clone(),
+            output: last.clone(),
         });
         self.iq_says(
             agent,
@@ -4369,6 +4427,15 @@ mod tests {
         assert!(wakes.ask(at).unwrap_err().contains("within the hour"));
         // An hour on, it may again.
         assert!(wakes.ask(at + Duration::from_secs(3600)).is_ok());
+    }
+
+    #[test]
+    fn a_job_s_latest_lines_are_those_that_hold_something_as_they_stand() {
+        let text = "build\n\n  10%\r  50%\r 100%\nok\n   \n";
+        assert_eq!(last_lines(text, 10), ["build", " 100%", "ok"]);
+        assert_eq!(last_lines(text, 2), [" 100%", "ok"]);
+        let long = "x".repeat(JOB_LINE_CHARS + 50);
+        assert_eq!(last_lines(&long, 1)[0].chars().count(), JOB_LINE_CHARS);
     }
 
     #[test]

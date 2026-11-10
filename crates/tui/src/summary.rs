@@ -14,6 +14,14 @@ pub trait Summarize: Send + Sync {
     /// Sums up `text`, written by `from` to `to`, in a few lines; waits
     /// for it. None when it could not.
     fn summarize(&self, from: &str, to: &str, text: &str) -> Option<String>;
+
+    /// Says what the command line `line` does in a few words, for its
+    /// one line in the conversation; waits for it. None when it could
+    /// not, or by default: the line's own programs and files say it then.
+    fn label(&self, line: &str) -> Option<String> {
+        let _ = line;
+        None
+    }
 }
 
 /// How long a summary is waited for before the message's first lines are
@@ -43,13 +51,25 @@ impl Summary {
         text: &str,
         summarize: Arc<dyn Summarize>,
     ) -> Arc<Summary> {
+        let (from, to, text) = (from.to_owned(), to.to_owned(), text.to_owned());
+        Summary::made(move || summarize.summarize(&from, &to, &text))
+    }
+
+    /// The few words that say what the command line `line` does, which
+    /// `summarize` gives on a thread of its own.
+    pub(crate) fn labelled(line: &str, summarize: Arc<dyn Summarize>) -> Arc<Summary> {
+        let line = line.to_owned();
+        Summary::made(move || summarize.label(&line))
+    }
+
+    /// What `make` gives, made on a thread of its own.
+    fn made(make: impl FnOnce() -> Option<String> + Send + 'static) -> Arc<Summary> {
         let summary = Arc::new(Summary {
             state: Mutex::new(State::Making(Instant::now())),
         });
         let shared = Arc::clone(&summary);
-        let (from, to, text) = (from.to_owned(), to.to_owned(), text.to_owned());
         std::thread::spawn(move || {
-            let state = match summarize.summarize(&from, &to, &text) {
+            let state = match make() {
                 Some(said) if !said.trim().is_empty() => State::Made(said.trim().to_owned()),
                 _ => State::Failed,
             };

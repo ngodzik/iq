@@ -26,6 +26,7 @@
 //! scratch_mb = 500                       # most a chat's folder of scratch holds (~/.cache/iq/scratch), where its agents keep logs and snapshots outside the repository; past it, its oldest files go
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //! steps = 5                              # an agent's latest steps (tools, what was allowed) shown as it works; once it writes again only their count, Ctrl-X unfolds them; 0 none
+//! job_lines = 3                          # a background job's latest lines shown under its line while it runs, cut to the screen's width; 0 none
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set; the project's .claude/skills are read after them, yours winning a name both hold
@@ -175,6 +176,8 @@ pub(crate) struct Settings {
     theme: Option<String>,
     /// How many of an agent's latest steps show as it works.
     steps: Option<usize>,
+    /// How many of a job's latest lines show while it runs.
+    job_lines: Option<usize>,
     /// The person's rules for every project, files of their home.
     rules: Option<Vec<String>>,
     /// The folders of the person's skills.
@@ -543,7 +546,9 @@ impl Settings {
             Some(name) => name.parse()?,
             None => iq_ui::look::Theme::default(),
         };
-        Ok(iq_ui::look::Look::new(theme).showing(self.steps.unwrap_or(iq_ui::steps::SHOWN)))
+        Ok(iq_ui::look::Look::new(theme)
+            .showing(self.steps.unwrap_or(iq_ui::steps::SHOWN))
+            .with_job_lines(self.job_lines.unwrap_or(iq_ui::look::JOB_LINES)))
     }
 
     /// The model that sums up what agents write to each other, when set.

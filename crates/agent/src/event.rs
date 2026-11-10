@@ -177,6 +177,17 @@ pub enum Event {
         /// The command line.
         line: String,
     },
+    /// The latest lines a command run in the background wrote, as it
+    /// runs: said at most twice a second, when they changed.
+    JobOutput {
+        /// The agent.
+        agent: String,
+        /// Its number.
+        id: u64,
+        /// Its last lines, the latest last, each cut, its secrets taken
+        /// out.
+        tail: Vec<String>,
+    },
     /// A command run in the background ended, or was stopped.
     JobEnded {
         /// The agent.
@@ -185,6 +196,8 @@ pub enum Event {
         id: u64,
         /// How it ended, in words: its status, or that it was stopped.
         said: String,
+        /// The end of what it wrote, its secrets taken out.
+        output: String,
     },
     /// An agent waits for the agents it started to write: none of them
     /// has yet, and they work.
@@ -247,6 +260,7 @@ impl Event {
             Event::Renamed { .. } | Event::Answered { .. } | Event::Chosen { .. } => {}
             Event::Choose { agent, .. }
             | Event::JobStarted { agent, .. }
+            | Event::JobOutput { agent, .. }
             | Event::JobEnded { agent, .. } => renamed(agent),
             Event::Posted {
                 from: writer,

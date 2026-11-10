@@ -155,6 +155,26 @@ fn push(line: Option<&mut Vec<Span<'static>>>, text: String, style: Style) {
     }
 }
 
+/// `spans` cut to `room` columns, never folded.
+pub(crate) fn fit(spans: Vec<Span<'static>>, room: usize) -> Line<'static> {
+    let mut used = 0;
+    let mut kept = Vec::new();
+    for span in spans {
+        let w = span.content.width();
+        if used + w <= room {
+            used += w;
+            kept.push(span);
+        } else {
+            let left = room.saturating_sub(used);
+            if left > 1 {
+                kept.push(Span::styled(cut(&span.content, left), span.style));
+            }
+            break;
+        }
+    }
+    Line::from(kept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

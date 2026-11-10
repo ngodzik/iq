@@ -573,7 +573,9 @@ fn transcript(events: &[Event]) -> String {
             Event::JobStarted { agent, id, line } => {
                 out.push_str(&format!("- {agent} left `{line}` running, as job {id}\n"));
             }
-            Event::JobEnded { agent, id, said } => {
+            Event::JobEnded {
+                agent, id, said, ..
+            } => {
                 out.push_str(&format!("- {agent}'s job {id} ended: {said}\n"));
             }
             Event::Posted { from, to, text } => {

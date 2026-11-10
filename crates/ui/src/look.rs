@@ -68,7 +68,13 @@ pub struct Look {
     theme: Theme,
     /// How many of an agent's latest steps show while it works.
     steps: usize,
+    /// How many of a job's latest lines show while it runs.
+    job_lines: usize,
 }
+
+/// How many of a job's latest lines show while it runs, unless the
+/// settings say otherwise.
+pub const JOB_LINES: usize = 3;
 
 impl Default for Look {
     fn default() -> Self {
@@ -84,7 +90,21 @@ impl Look {
         Self {
             theme,
             steps: crate::steps::SHOWN,
+            job_lines: JOB_LINES,
         }
+    }
+
+    /// With the latest `lines` of a job shown while it runs; none for 0.
+    #[must_use]
+    pub fn with_job_lines(mut self, lines: usize) -> Self {
+        self.job_lines = lines;
+        self
+    }
+
+    /// How many of a job's latest lines show while it runs.
+    #[must_use]
+    pub fn job_lines(&self) -> usize {
+        self.job_lines
     }
 
     /// With the latest `steps` of an agent shown while it works; none

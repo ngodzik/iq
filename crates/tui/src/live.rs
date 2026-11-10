@@ -23,7 +23,7 @@ use crate::history::{History, agent_tint, chat_of, label, seconds, short, step_l
 use crate::markdown::inline;
 use crate::motion::{Motion, YOU};
 use crate::theme::Palette;
-use crate::wrap::{cut, spans_width, width as text_width, wrap};
+use crate::wrap::{cut, fit, spans_width, width as text_width, wrap};
 
 /// The most agents the chat written to started given a pane each, as they
 /// work.
@@ -308,8 +308,11 @@ impl Live<'_> {
         if let Some(own) = self.own() {
             parts.push(Part::Lines(self.alone(own, motion, width)));
         }
-        // What the chat's agents left to run in the background.
+        // What the chat's agents left to run in the background: a line
+        // each, what it does in a few words, and its latest lines under
+        // it, cut, never folded, the oldest scrolling away.
         let window = self.window();
+        let shown = self.board.look().job_lines();
         for job in self
             .board
             .crew()
@@ -317,18 +320,33 @@ impl Live<'_> {
             .iter()
             .filter(|job| window.is_some() && self.board.crew().chat_of(&job.agent) == window)
         {
-            parts.push(Part::Lines(vec![fit(
+            let label = self
+                .history
+                .job_label(job.id)
+                .unwrap_or_else(|| iq_ui::shell::few_words(&job.line, width));
+            let mut lines = vec![fit(
                 vec![
                     Span::styled(format!("  {} ", motion.spinner()), p.fg(p.info)),
-                    Span::styled(format!("job {} ", job.id), p.fg(p.dim)),
-                    Span::styled(short(&job.line), p.fg(p.text)),
+                    Span::styled(format!("job {} · ", job.id), p.fg(p.dim)),
+                    Span::styled(label, p.fg(p.text)),
                     Span::styled(
                         format!(" · {}", seconds(self.now.saturating_sub(job.since))),
                         p.fg(p.faint),
                     ),
                 ],
                 width,
-            )]));
+            )];
+            let from = job.tail.len().saturating_sub(shown);
+            for line in &job.tail[from..] {
+                lines.push(fit(
+                    vec![
+                        Span::styled("    │ ", p.fg(p.faint)),
+                        Span::styled(short(line), p.fg(p.dim)),
+                    ],
+                    width,
+                ));
+            }
+            parts.push(Part::Lines(lines));
         }
         parts.extend(self.crew_line(width));
         parts
@@ -1193,26 +1211,6 @@ pub(crate) fn hint(key: &str) -> String {
     key.replace("Escape", "Esc")
 }
 
-/// `spans` cut to `room` columns.
-fn fit(spans: Vec<Span<'static>>, room: usize) -> Line<'static> {
-    let mut used = 0;
-    let mut kept = Vec::new();
-    for span in spans {
-        let w = text_width(&span.content);
-        if used + w <= room {
-            used += w;
-            kept.push(span);
-        } else {
-            let left = room.saturating_sub(used);
-            if left > 1 {
-                kept.push(Span::styled(cut(&span.content, left), span.style));
-            }
-            break;
-        }
-    }
-    Line::from(kept)
-}
-
 /// `text` folded into rows of `width` columns at its new lines and where
 /// it is full, and where `cursor`, a byte in it, falls: its column and row.
 pub(crate) fn fold(text: &str, cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
@@ -1373,6 +1371,56 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("◦ "))
         );
+    }
+
+    #[test]
+    fn a_running_job_shows_its_latest_lines_cut_never_folded() {
+        let mut board = Board::default();
+        let history = History::default();
+        board.update(Update::Started {
+            lead: "lab/lead".into(),
+            reviewer: "r".into(),
+            autopilot: false,
+            internet: false,
+            allowed: Vec::new(),
+        });
+        for event in [
+            Event::Joined {
+                agent: "fix".into(),
+                model: "lab/lead".into(),
+                by: PERSON.into(),
+            },
+            Event::JobStarted {
+                agent: "fix".into(),
+                id: 7,
+                line: "cd crates && cargo test -q".into(),
+            },
+            Event::JobOutput {
+                agent: "fix".into(),
+                id: 7,
+                tail: vec![
+                    "one".into(),
+                    "two".into(),
+                    "three".into(),
+                    format!("four {}", "x".repeat(200)),
+                    "five".into(),
+                ],
+            },
+        ] {
+            board.update(Update::Crew(event));
+        }
+        board.screen_mut().talk_to("fix");
+        let rows = drawn(&board, &history, 60);
+        let at = rows
+            .iter()
+            .position(|row| row.contains("job 7 · cargo test"))
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        let window: Vec<&str> = rows[at + 1..at + 4].iter().map(|r| r.trim_end()).collect();
+        assert_eq!(window[0], "    │ three");
+        assert!(window[1].starts_with("    │ four xxx") && window[1].ends_with('…'));
+        assert!(window[1].chars().count() <= 60);
+        assert_eq!(window[2], "    │ five");
+        assert!(!rows.iter().any(|row| row.contains("│ two")));
     }
 
     fn drawn(board: &Board, history: &History, width: u16) -> Vec<String> {

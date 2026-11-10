@@ -21,6 +21,15 @@ const SUMMING: &str = "You sum up for a person what one agent of a coding harnes
     Write in the message's own language, plainly, with no preamble and no heading. The message \
     follows, after who wrote it to whom.";
 
+/// What the summarizer's model is told to say what a command does.
+const LABELLING: &str = "You say in a few words what a shell command line of a coding agent \
+    does, for a person who follows its work: at most ten words, verbs first, plainly, no quotes, \
+    no full stop, in English. Say what it does (patches a hook and its tests, then runs the \
+    checks), never how. The command line follows.";
+
+/// The longest command line given whole to the summarizer to label.
+const LABELLED_MOST: usize = 8_000;
+
 /// Sums up the messages between agents with one model of the provider.
 pub(crate) struct Summaries {
     provider: OpenAiCompatible,
@@ -55,6 +64,21 @@ impl iq_tui::Summarize for Summaries {
             &self.model,
             SUMMING,
             asked,
+            Asked {
+                agent: SUMMARIZER,
+                effort: Effort::Low,
+                costs: &self.costs,
+            },
+        ));
+        answer.ok().filter(|said| !said.trim().is_empty())
+    }
+
+    fn label(&self, line: &str) -> Option<String> {
+        let answer = self.handle.block_on(ask_once(
+            &self.provider,
+            &self.model,
+            LABELLING,
+            within(line, LABELLED_MOST),
             Asked {
                 agent: SUMMARIZER,
                 effort: Effort::Low,

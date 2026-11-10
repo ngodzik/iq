@@ -114,10 +114,15 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
         Event::Failed { .. } => Ok(()),
         Event::Retired { agent } => writeln!(out, "  ◦ {agent} is done, and retired"),
         Event::Waiting { agent, on } => writeln!(out, "  ⧗ {agent} waits for {}", on.join(", ")),
-        Event::JobStarted { agent, id, line } => {
-            writeln!(out, "  ⚙ {agent} runs job {id} in the background: {line}")
-        }
-        Event::JobEnded { agent, id, said } => {
+        Event::JobStarted { agent, id, line } => writeln!(
+            out,
+            "  ⚙ {agent} runs job {id} in the background: {}",
+            iq_ui::shell::few_words(line, 72)
+        ),
+        Event::JobOutput { .. } => Ok(()),
+        Event::JobEnded {
+            agent, id, said, ..
+        } => {
             writeln!(out, "  ⚙ job {id} of {agent} ended: {said}")
         }
         // Asked where `iq do` reads its answers: see [`choose`].
