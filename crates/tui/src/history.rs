@@ -666,7 +666,7 @@ impl History {
             Event::JobStarted { agent, id, line } => {
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
-                let label = Label::new(line, self.summarizer.0.as_ref(), p);
+                let label = Label::new(agent, line, self.summarizer.0.as_ref(), p);
                 self.jobs.insert(*id, (label.clone(), Instant::now()));
                 self.push_job(Block::Job {
                     head: vec![
@@ -686,7 +686,7 @@ impl History {
                 let (label, since) = self
                     .jobs
                     .remove(id)
-                    .unwrap_or_else(|| (Label::new("", None, p), Instant::now()));
+                    .unwrap_or_else(|| (Label::new(agent, "", None, p), Instant::now()));
                 let (ended, colour) = match said.strip_prefix("exit status ") {
                     Some("0") => ("ended 0".to_owned(), p.ok),
                     Some(code) => (format!("ended {code}"), p.warn),
@@ -734,7 +734,7 @@ impl History {
             }
             // Its turn's end says it, with the facts; the agents line
             // counts those retired.
-            Event::Failed { .. } | Event::Retired { .. } => {}
+            Event::Failed { .. } | Event::Retired { .. } | Event::Turn { .. } => {}
             Event::Notice { agent, text } => {
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
@@ -1663,6 +1663,7 @@ fn agent_of(event: &Event) -> Option<&str> {
         Event::Posted { from, .. } => Some(from),
         Event::Renamed { to, .. } => Some(to),
         Event::Answered { .. } | Event::Chosen { .. } => None,
+        Event::Turn { chat, .. } => Some(chat),
     }
 }
 
@@ -1864,15 +1865,15 @@ pub(crate) struct Label {
 }
 
 impl Label {
-    /// What `line` does, asked of `summarize` when there is one and the
-    /// line is long enough to need it.
-    fn new(line: &str, summarize: Option<&Arc<dyn Summarize>>, p: &Palette) -> Label {
+    /// What `agent`'s `line` does, asked of `summarize` when there is one
+    /// and the line is long enough to need it.
+    fn new(agent: &str, line: &str, summarize: Option<&Arc<dyn Summarize>>, p: &Palette) -> Label {
         let instead = iq_ui::shell::few_words(line, LABEL_CHARS);
         let long = line.contains('\n') || line.chars().count() > LABEL_CHARS;
         Label {
             summary: summarize
                 .filter(|_| long)
-                .map(|summarize| Summary::labelled(line, Arc::clone(summarize))),
+                .map(|summarize| Summary::labelled(agent, line, Arc::clone(summarize))),
             instead: if instead.is_empty() {
                 cut(&short(line).replace('\n', " "), LABEL_CHARS)
             } else {
@@ -2618,7 +2619,8 @@ mod tests {
             ))
         }
 
-        fn label(&self, line: &str) -> Option<String> {
+        fn label(&self, agent: &str, line: &str) -> Option<String> {
+            assert_eq!(agent, "lead");
             Some(format!(
                 "patches {} lines, then checks",
                 line.lines().count()

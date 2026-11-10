@@ -192,6 +192,9 @@ pub struct Settings {
     /// their work is about: none, and they keep the name they started
     /// with.
     pub namer: Option<ModelId>,
+    /// What a chat's turn may spend before the person is asked whether it
+    /// goes on, and each time it spends as much again; none never asks.
+    pub turn_ask: Option<Usd>,
     /// The only models an agent is started on or given, the person's and
     /// every agent's, as the person's settings list them: any other is
     /// refused, the agent told which there are. Empty: any the provider
@@ -218,6 +221,7 @@ impl Default for Settings {
             busy_wait: BUSY_WAIT,
             busy_most: BUSY_MOST,
             namer: None,
+            turn_ask: None,
             allowed: Vec::new(),
             scratch_most: SCRATCH_MOST,
         }
@@ -301,6 +305,11 @@ struct Inner<M> {
     /// Which chats wrote in each folder lately, and when; and the pairs
     /// of chats the person was told wrote in the same one.
     writers: Mutex<Writers>,
+    /// What each chat's turn spent so far, by its chat.
+    turns: Mutex<HashMap<String, TurnSpend>>,
+    /// Held while the person is asked whether a chat's turn goes on, so
+    /// that its agents ask once.
+    asking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// How often a job's latest lines are looked at, to be said when they
@@ -354,6 +363,66 @@ fn pair_of(one: &str, other: &str) -> (String, String) {
         (one.to_owned(), other.to_owned())
     } else {
         (other.to_owned(), one.to_owned())
+    }
+}
+
+/// What the person answers to go on with a turn past what it may spend.
+const GO_ON: &str = "Go on";
+
+/// What the person answers to stop it.
+const STOP_TURN: &str = "Stop this turn";
+
+/// What a chat's turn spent so far.
+#[derive(Default)]
+struct TurnSpend {
+    /// Its number, from 1, in this session.
+    number: u64,
+    /// What it spent, as far as prices are known.
+    total: Usd,
+    /// What each who spent in it spent: its agents, the reviewer, the
+    /// summaries.
+    by: BTreeMap<String, Spending>,
+    /// What it may spend before the person is asked again; none never.
+    ask_at: Option<Usd>,
+    /// Whether the person stopped it.
+    stopped: bool,
+}
+
+/// What one spent in a turn.
+#[derive(Default)]
+struct Spending {
+    model: String,
+    calls: u64,
+    spent: Usd,
+}
+
+impl TurnSpend {
+    /// What the person is asked once the turn of `chat` spent past what
+    /// it may: what each spent, on what, in how many calls, and the sum;
+    /// going on lets it spend `step` more.
+    fn question(&self, chat: &str, step: Usd) -> String {
+        let mut by: Vec<(&String, &Spending)> = self.by.iter().collect();
+        by.sort_by(|a, b| b.1.spent.0.total_cmp(&a.1.spent.0));
+        let detail: Vec<String> = by
+            .iter()
+            .map(|(who, spending)| {
+                let model = spending.model.rsplit('/').next().unwrap_or(&spending.model);
+                let calls = if spending.calls == 1 {
+                    "1 call".to_owned()
+                } else {
+                    format!("{} calls", spending.calls)
+                };
+                format!("{who} on {model}: {}, {calls}", spending.spent)
+            })
+            .collect();
+        format!(
+            "This turn of {chat}'s spent {}, past the {} it may before you are asked \
+             (turn_cost_ask). {}. Go on, until {}?",
+            self.total,
+            self.ask_at.unwrap_or_default(),
+            detail.join("; "),
+            self.total + step,
+        )
     }
 }
 
@@ -634,6 +703,8 @@ where
                 listed: Mutex::new(Vec::new()),
                 aside: Mutex::new(HashMap::new()),
                 writers: Mutex::new(Writers::default()),
+                turns: Mutex::new(HashMap::new()),
+                asking: Mutex::new(HashMap::new()),
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
                 peer_wakes: Mutex::new(Vec::new()),
@@ -1232,6 +1303,10 @@ where
             // Before its turn begins, so that its first call shows them.
             for image in images {
                 self.show(&name, image);
+            }
+            // A chat the person starts begins its first turn.
+            if by == PERSON {
+                self.new_turn(&name);
             }
             self.wake(&name, task);
         }
@@ -2130,9 +2205,24 @@ where
             (true, false, false) => false,
         };
         // Kept as the person writes, so that iq opens again on the chat
-        // they wrote to last.
+        // they wrote to last; a chat none of whose agents works begins a
+        // turn.
         if from == PERSON && to != ALL {
             self.keep(to);
+            let idle = {
+                let board = lock(&self.inner.board);
+                let chat = board.chat_of(to);
+                (
+                    chat.clone(),
+                    !board.members.iter().any(|(name, member)| {
+                        member.turn.as_ref().is_some_and(|turn| !turn.is_finished())
+                            && board.chat_of(name) == chat
+                    }),
+                )
+            };
+            if idle.1 {
+                self.new_turn(&idle.0);
+            }
         }
         self.inner.posted.send_modify(|count| *count += 1);
         self.report(Event::Posted {
@@ -2729,6 +2819,9 @@ where
                 effort,
             };
             self.set_length(name, messages.len());
+            if let Err(stopped) = self.within_turn(name).await {
+                return (messages, Err(stopped));
+            }
             let response = match self.ask_model(name, &request).await {
                 Ok(response) => response,
                 Err(failed) => {
@@ -2746,7 +2839,7 @@ where
                     .await
                     .map(|pricing| pricing.cost(&response.usage)),
             };
-            self.spent(name, model.as_str(), response.usage, cost);
+            self.spent(name, name, model.as_str(), &response, cost);
             if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
                 member.context = response.usage.input.0;
                 member.calls += 1;
@@ -3462,27 +3555,9 @@ where
     /// kept with what they asked of `agent`, so that the reviewer reads a
     /// "yes" with the question it answered.
     async fn ask_person(&self, agent: &str, question: String, choices: Vec<String>) -> String {
-        let id = self.inner.next_question.fetch_add(1, Ordering::Relaxed);
-        let (reply, answer) = oneshot::channel();
-        lock(&self.inner.choices).insert(id, reply);
-        self.report(Event::Choose {
-            id,
-            agent: agent.to_owned(),
-            question: question.clone(),
-            choices: choices.clone(),
-        });
-        let answer = tokio::time::timeout(self.inner.settings.patience, answer)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
-            .map(|a| a.trim().to_owned())
-            .filter(|a| !a.is_empty());
-        lock(&self.inner.choices).remove(&id);
-        self.report(Event::Chosen {
-            id,
-            answer: answer.clone(),
-        });
+        let answer = self
+            .choose_of(agent, question.clone(), choices.clone())
+            .await;
         match answer {
             Some(answer) => {
                 if let Some(member) = lock(&self.inner.board).members.get_mut(agent) {
@@ -3500,6 +3575,39 @@ where
                      needed to know."
                 .to_owned(),
         }
+    }
+
+    /// Asks the person, for `agent`, to choose among `choices` or answer in
+    /// their own words, and gives their answer; none when they gave none in
+    /// time.
+    async fn choose_of(
+        &self,
+        agent: &str,
+        question: String,
+        choices: Vec<String>,
+    ) -> Option<String> {
+        let id = self.inner.next_question.fetch_add(1, Ordering::Relaxed);
+        let (reply, answer) = oneshot::channel();
+        lock(&self.inner.choices).insert(id, reply);
+        self.report(Event::Choose {
+            id,
+            agent: agent.to_owned(),
+            question,
+            choices,
+        });
+        let answer = tokio::time::timeout(self.inner.settings.patience, answer)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .map(|a| a.trim().to_owned())
+            .filter(|a| !a.is_empty());
+        lock(&self.inner.choices).remove(&id);
+        self.report(Event::Chosen {
+            id,
+            answer: answer.clone(),
+        });
+        answer
     }
 
     /// Writes a refusal of `agent`'s action to the audit log; one that
@@ -3599,7 +3707,7 @@ where
                 .await
                 .map(|pricing| pricing.cost(&response.usage)),
         };
-        self.spent("reviewer", model.as_str(), response.usage, cost);
+        self.spent(agent, "reviewer", model.as_str(), &response, cost);
         let answer = response.content.unwrap_or_default();
         Ok(review::verdict(&answer))
     }
@@ -3619,16 +3727,126 @@ where
         self.inner.place.gate.set_reviewer_host(may);
     }
 
-    fn spent(&self, agent: &str, model: &str, usage: iq_core::Usage, cost: Option<Usd>) {
+    /// Reports a call of `agent`'s (or the reviewer's for it, as `who`)
+    /// to `model`, counted in its chat's turn.
+    fn spent(
+        &self,
+        agent: &str,
+        who: &str,
+        model: &str,
+        response: &iq_core::ChatResponse,
+        cost: Option<Usd>,
+    ) {
         if let Some(cost) = cost {
             *lock(&self.inner.billed) += cost;
         }
-        self.report(Event::Spent {
-            agent: agent.to_owned(),
+        let chat = lock(&self.inner.board).chat_of(agent);
+        let event = Event::Spent {
+            agent: who.to_owned(),
             model: model.to_owned(),
-            usage,
+            usage: response.usage,
             cost,
+            cache: response.cache,
+            chat: Some(chat),
+        };
+        self.count(&event);
+        self.report(event);
+    }
+
+    /// Counts a call that served a chat in its turn: one of the crew's, or
+    /// one made beside it, as the summaries of the agents' messages are.
+    pub fn count(&self, event: &Event) {
+        let Event::Spent {
+            agent,
+            model,
+            cost,
+            chat: Some(chat),
+            ..
+        } = event
+        else {
+            return;
+        };
+        let mut turns = lock(&self.inner.turns);
+        let turn = turns.entry(chat.clone()).or_default();
+        let spending = turn.by.entry(agent.clone()).or_default();
+        spending.model.clone_from(model);
+        spending.calls += 1;
+        if let Some(cost) = cost {
+            spending.spent += *cost;
+            turn.total += *cost;
+        }
+    }
+
+    /// Begins a turn of `chat`'s: the person wrote to it while none of its
+    /// agents worked. What it spends is counted from here, and the person
+    /// asked again once it reaches the settings' sum.
+    fn new_turn(&self, chat: &str) {
+        let number = {
+            let mut turns = lock(&self.inner.turns);
+            let turn = turns.entry(chat.to_owned()).or_default();
+            let number = turn.number + 1;
+            *turn = TurnSpend {
+                number,
+                ask_at: self.inner.settings.turn_ask,
+                ..TurnSpend::default()
+            };
+            number
+        };
+        self.report(Event::Turn {
+            chat: chat.to_owned(),
+            number,
         });
+    }
+
+    /// Whether `agent` may call its model again in its chat's turn: past
+    /// what the settings let a turn spend, the person is asked first, once
+    /// for all the chat's agents, with what each spent. Gone on, they are
+    /// asked again once it spends as much more; stopped, every agent of
+    /// the chat stops at its next call, until the person writes again.
+    async fn within_turn(&self, agent: &str) -> Result<(), String> {
+        let Some(step) = self.inner.settings.turn_ask else {
+            return Ok(());
+        };
+        let chat = lock(&self.inner.board).chat_of(agent);
+        let asking = Arc::clone(lock(&self.inner.asking).entry(chat.clone()).or_default());
+        let _asking = asking.lock().await;
+        let (question, total) = {
+            let turns = lock(&self.inner.turns);
+            let Some(turn) = turns.get(&chat) else {
+                return Ok(());
+            };
+            if turn.stopped {
+                return Err(format!(
+                    "the person stopped this turn of {chat}'s once it spent {}",
+                    turn.total
+                ));
+            }
+            match turn.ask_at {
+                Some(at) if turn.total.0 >= at.0 => (turn.question(&chat, step), turn.total),
+                _ => return Ok(()),
+            }
+        };
+        let answer = self
+            .choose_of(
+                &chat,
+                question,
+                vec![GO_ON.to_owned(), STOP_TURN.to_owned()],
+            )
+            .await;
+        let go_on = answer
+            .as_deref()
+            .is_some_and(|said| said == GO_ON || said.to_lowercase().starts_with("go"));
+        let mut turns = lock(&self.inner.turns);
+        let turn = turns.entry(chat.clone()).or_default();
+        if go_on {
+            turn.ask_at = Some(total + step);
+            Ok(())
+        } else {
+            turn.stopped = true;
+            Err(format!(
+                "the person stopped this turn of {chat}'s once it spent {total}"
+            ))
+        }
     }
 
     fn report(&self, mut event: Event) {

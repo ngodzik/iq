@@ -8,6 +8,7 @@
 //! allowed_models = ["anthropic/claude-opus-5-5", "anthropic/claude-haiku-5-5"]  # the only models iq starts, for you and every agent, by their whole names; any other is refused, the agent told which there are; unset, any the provider lists, by its whole name
 //! autopilot_effort = "low"               # how hard it thinks (once `reviewer_effort`)
 //! summarizer = "anthropic/claude-haiku-5-5"  # sums up in a few lines what agents write to each other, in the conversation; Ctrl-X gives it whole; unset, their first lines
+//! turn_cost_ask = 1.0                    # dollars a chat's turn may spend (its agents, those they started, the autopilot, the summaries) before you are asked whether it goes on, then as much again each time; unset, never asked
 //! effort = "high"                        # how hard the models think; /effort changes an agent's
 //! context_every = 25000                  # tokens an agent's conversation grows between two words to it of its size; 0 never
 //! autopilot = false
@@ -126,6 +127,9 @@ pub(crate) struct Settings {
     /// The model that sums up what agents write to each other, for the
     /// person; none unless set.
     summarizer: Option<String>,
+    /// What a chat's turn may spend before the person is asked whether it
+    /// goes on, in dollars; never asked unless set.
+    turn_cost_ask: Option<f64>,
     /// How hard the autopilot's model thinks; low unless set.
     autopilot_effort: Option<Effort>,
     /// `autopilot_effort`'s old name, read until the next release.
@@ -717,6 +721,10 @@ impl Settings {
             busy_tries: self.provider_retries.unwrap_or(iq_agent::BUSY_TRIES),
             // The cheap model that places the tasks names the chats.
             namer: Some(self.observing()?.model),
+            turn_ask: self
+                .turn_cost_ask
+                .filter(|dollars| *dollars > 0.0)
+                .map(iq_core::Usd),
             allowed: self.allowed_models()?,
             scratch_most: self
                 .scratch_mb

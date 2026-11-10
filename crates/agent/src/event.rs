@@ -1,7 +1,7 @@
 //! What the crew reports as it works, for the window or the terminal to
 //! show.
 
-use iq_core::{Effort, Usage, Usd};
+use iq_core::{CacheUse, Effort, Usage, Usd};
 
 /// Who the person is on the board: they write to agents and agents to
 /// them under this name.
@@ -84,6 +84,21 @@ pub enum Event {
         usage: Usage,
         /// What it cost; `None` when the price is unknown.
         cost: Option<Usd>,
+        /// What it read from the provider's cache and wrote to it, when
+        /// told.
+        cache: Option<CacheUse>,
+        /// The chat whose turn it served, and is counted in: its agents',
+        /// the autopilot's for one of them, the summaries of their
+        /// messages; none for what serves no chat.
+        chat: Option<String>,
+    },
+    /// A chat's turn begins: the person wrote to it while none of its
+    /// agents worked. What it spends is counted from here.
+    Turn {
+        /// The chat.
+        chat: String,
+        /// Its number, from 1, in this session.
+        number: u64,
     },
     /// A tool call ended.
     Tool {
@@ -257,7 +272,10 @@ impl Event {
                 renamed(agent);
                 renamed(by);
             }
-            Event::Renamed { .. } | Event::Answered { .. } | Event::Chosen { .. } => {}
+            Event::Renamed { .. }
+            | Event::Answered { .. }
+            | Event::Chosen { .. }
+            | Event::Turn { .. } => {}
             Event::Choose { agent, .. }
             | Event::JobStarted { agent, .. }
             | Event::JobOutput { agent, .. }
@@ -270,13 +288,18 @@ impl Event {
                 renamed(writer);
                 renamed(reader);
             }
+            Event::Spent { agent, chat, .. } => {
+                renamed(agent);
+                if let Some(chat) = chat {
+                    renamed(chat);
+                }
+            }
             Event::Placed { agent, .. }
             | Event::Model { agent, .. }
             | Event::Effort { agent, .. }
             | Event::Working { agent, .. }
             | Event::TextStart { agent }
             | Event::Text { agent, .. }
-            | Event::Spent { agent, .. }
             | Event::Tool { agent, .. }
             | Event::Asked { agent, .. }
             | Event::Reviewed { agent, .. }

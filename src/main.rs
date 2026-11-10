@@ -1170,17 +1170,25 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let gate = settings_gate(&settings)?;
     // What sums up for the person what agents write to each other, when the
     // settings name a model for it: what it spends is counted as any call.
+    // The crew, once made, counts what the summaries spend in the turns of
+    // the chats they serve.
+    let counting: Arc<std::sync::OnceLock<Crew<OpenAiCompatible>>> =
+        Arc::new(std::sync::OnceLock::new());
     let summarize: Option<Arc<dyn iq_tui::Summarize>> = match settings.summarizer()? {
         Some(model) => {
             let costs: Report = {
                 let send = send.clone();
                 let ledger = Arc::clone(&ledger);
+                let counting = Arc::clone(&counting);
                 Arc::new(move |event: Event| {
                     if let Event::Spent {
                         agent, model, cost, ..
                     } = &event
                     {
                         ledger.bill(agent, model, *cost);
+                    }
+                    if let Some(crew) = counting.get() {
+                        crew.count(&event);
                     }
                     let _ = send.send(Update::Crew(event));
                 })
@@ -1255,6 +1263,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
             }),
         )?;
         let crew = crew(cli, &settings, report, gate)?;
+        let _ = counting.set(crew.clone());
         crew.extend(Arc::new(servers.clone()));
         (crew, servers)
     };

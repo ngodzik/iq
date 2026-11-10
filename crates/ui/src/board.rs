@@ -2862,6 +2862,8 @@ mod tests {
             model: "openai/gpt-5-mini".into(),
             usage: iq_core::Usage::default(),
             cost: Some(iq_core::Usd(0.25)),
+            cache: None,
+            chat: None,
         }));
         let totals = board.costs().totals(0);
         assert_eq!(totals.len(), 1);

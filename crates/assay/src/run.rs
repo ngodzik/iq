@@ -256,6 +256,8 @@ where
                             model: model.clone(),
                             usage: *usage,
                             cost: *cost,
+                            cache: None,
+                            chat: None,
                         });
                         if budget.is_some_and(|most| kept.spent.billed.0 >= most) {
                             spent_all.notify_one();

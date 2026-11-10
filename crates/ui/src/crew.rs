@@ -2,6 +2,8 @@
 //! the questions waiting for the person, the messages on the board, and
 //! what the person writes.
 
+use std::collections::HashMap;
+
 use iq_agent::{Event, PERSON, Pattern};
 use iq_core::{Effort, Message, TokenCount, Usd};
 
@@ -187,6 +189,37 @@ pub enum Entry {
         /// Their answer; none when they gave none.
         answer: Option<String>,
     },
+}
+
+/// What a chat's turn spent so far, from when the person wrote to it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TurnView {
+    /// Its number, from 1, in this session.
+    pub number: u64,
+    /// When it began, in seconds since 1970.
+    pub since: u64,
+    /// What it spent, as far as prices are known.
+    pub total: Usd,
+    /// What each who spent in it spent, in the order they first did: its
+    /// agents, the autopilot's model, the summaries.
+    pub by: Vec<TurnSpending>,
+}
+
+/// What one spent in a chat's turn.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TurnSpending {
+    /// Who: an agent, `reviewer`, `summaries`.
+    pub who: String,
+    /// The model it called last.
+    pub model: String,
+    /// Its calls.
+    pub calls: u64,
+    /// What they cost.
+    pub spent: Usd,
+    /// The tokens they read.
+    pub read: u64,
+    /// Of those, what came from the provider's cache, as far as told.
+    pub cached: u64,
 }
 
 /// A command an agent left to run in the background, while it runs.
@@ -464,6 +497,8 @@ pub struct CrewView {
     agents: Vec<AgentView>,
     /// The agents retired, the latest last.
     finished: Vec<AgentView>,
+    /// Each chat's turn, the one under way or its last, by its chat.
+    turns: HashMap<String, TurnView>,
     questions: Vec<Question>,
     /// The questions with choices waiting for the person, the oldest first.
     choices: Vec<Choice>,
@@ -516,6 +551,12 @@ impl CrewView {
     #[must_use]
     pub fn agents(&self) -> &[AgentView] {
         &self.agents
+    }
+
+    /// The turn of `chat` under way, or its last.
+    #[must_use]
+    pub fn turn(&self, chat: &str) -> Option<&TurnView> {
+        self.turns.get(chat)
     }
 
     /// What every agent's calls were billed this session, those retired
@@ -747,12 +788,45 @@ impl CrewView {
                     }
                 }
             }
+            Event::Turn { chat, number } => {
+                self.turns.insert(
+                    chat,
+                    TurnView {
+                        number,
+                        since: crate::now(),
+                        ..TurnView::default()
+                    },
+                );
+            }
             Event::Spent {
                 agent,
                 model,
                 cost,
                 usage,
+                cache,
+                chat,
             } => {
+                if let Some(turn) = chat.and_then(|chat| self.turns.get_mut(&chat)) {
+                    let at = match turn.by.iter().position(|spent| spent.who == agent) {
+                        Some(at) => at,
+                        None => {
+                            turn.by.push(TurnSpending {
+                                who: agent.clone(),
+                                ..TurnSpending::default()
+                            });
+                            turn.by.len() - 1
+                        }
+                    };
+                    let spending = &mut turn.by[at];
+                    spending.model.clone_from(&model);
+                    spending.calls += 1;
+                    spending.read += usage.input.0;
+                    spending.cached += cache.map_or(0, |cache| cache.read.0);
+                    if let Some(cost) = cost {
+                        spending.spent += cost;
+                        turn.total += cost;
+                    }
+                }
                 if let Some(view) = self.agent_mut(&agent) {
                     if !model.is_empty() {
                         view.answered = model;
@@ -1030,6 +1104,10 @@ mod tests {
             id: 7,
             approved: true,
         });
+        crew.event(Event::Turn {
+            chat: "lead".into(),
+            number: 1,
+        });
         for (cost, read) in [(0.25, 1200), (1.0, 1800)] {
             crew.event(Event::Spent {
                 agent: "lead".into(),
@@ -1039,8 +1117,32 @@ mod tests {
                     output: TokenCount(300),
                 },
                 cost: Some(Usd(cost)),
+                cache: Some(iq_core::CacheUse {
+                    read: TokenCount(1000),
+                    written: None,
+                    rewrite_extra: None,
+                }),
+                chat: Some("lead".into()),
             });
         }
+        // The reviewer's call for it, counted in its chat's turn.
+        crew.event(Event::Spent {
+            agent: "reviewer".into(),
+            model: "lab/quick".into(),
+            usage: iq_core::Usage::default(),
+            cost: Some(Usd(0.01)),
+            cache: None,
+            chat: Some("lead".into()),
+        });
+        let turn = crew.turn("lead").unwrap();
+        assert_eq!(turn.number, 1);
+        assert_eq!(turn.total, Usd(1.26));
+        let by: Vec<(&str, u64, u64, u64)> = turn
+            .by
+            .iter()
+            .map(|spent| (spent.who.as_str(), spent.calls, spent.read, spent.cached))
+            .collect();
+        assert_eq!(by, [("lead", 2, 3000, 2000), ("reviewer", 1, 0, 0)]);
         let lead = crew.agent("lead").unwrap();
         assert!(lead.working);
         assert_eq!(lead.thread[1], Entry::Text("Hello".into()));

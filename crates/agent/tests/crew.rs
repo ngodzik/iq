@@ -2823,6 +2823,95 @@ async fn a_team_rests_until_its_first_answered_then_retires_whole() {
     assert_eq!(retired, ["lead/writer", "lead/checker"]);
 }
 
+/// Waits for the person to be asked to choose, and gives the question's
+/// number and text.
+async fn choice(f: &Fixture, after: usize) -> (u64, String) {
+    for _ in 0..300 {
+        if let Some(asked) = f
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Choose { id, question, .. } => Some((*id, question.clone())),
+                _ => None,
+            })
+            .nth(after)
+        {
+            return asked;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("nothing was asked: {:#?}", f.events());
+}
+
+#[tokio::test]
+async fn a_turn_past_what_it_may_spend_asks_the_person_once_and_goes_on_or_stops() {
+    let read = || calls("read_file", serde_json::json!({"path": "a.txt"}));
+    for go_on in [true, false] {
+        let f = fixture(
+            &[(
+                "lead",
+                vec![read(), read(), read(), say("Done."), say("Again.")],
+            )],
+            Settings {
+                turn_ask: Some(Usd(0.002)),
+                ..Settings::default()
+            },
+        );
+        f.crew
+            .start("lead", &model("cheap/model"), "read it".into(), PERSON);
+        let (id, question) = choice(&f, 0).await;
+        assert!(
+            question.starts_with(
+                "This turn of lead's spent $0.002, past the $0.002 it may before you are asked \
+                 (turn_cost_ask). lead on model: $0.002, 2 calls."
+            ),
+            "{question}"
+        );
+        assert!(question.ends_with("Go on, until $0.004?"), "{question}");
+        let answer = if go_on { "Go on" } else { "Stop this turn" };
+        f.crew.choose(id, Some(answer.into()));
+        f.settled().await;
+        let ended = f
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                Event::Done { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .unwrap();
+        let asked = f
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Event::Choose { .. }))
+            .count();
+        if go_on {
+            assert_eq!(ended, Ok("Done.".to_owned()));
+            assert_eq!(asked, 1);
+        } else {
+            assert_eq!(
+                ended,
+                Err("the person stopped this turn of lead's once it spent $0.002".to_owned())
+            );
+            // Written to again, it begins another turn, counted afresh.
+            f.crew.tell("lead", "go on now".into()).unwrap();
+            f.settled().await;
+            let turns: Vec<u64> = f
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Turn { number, .. } => Some(*number),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(turns, [1, 2]);
+            assert!(f.events().iter().any(|event| matches!(
+                event,
+                Event::Done { outcome: Ok(said), .. } if said == "Done."
+            )));
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
     let f = fixture(

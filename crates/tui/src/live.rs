@@ -349,7 +349,55 @@ impl Live<'_> {
             parts.push(Part::Lines(lines));
         }
         parts.extend(self.crew_line(width));
+        parts.extend(self.turn_line(width));
         parts
+    }
+
+    /// While a turn of the chat written to runs: what it spent so far, and
+    /// what each spent in it, the dearest first: its agents, the
+    /// autopilot's model, the summaries.
+    fn turn_line(&self, width: usize) -> Option<Part> {
+        let p = self.p;
+        let window = self.window()?;
+        let crew = self.board.crew();
+        let at_work = crew
+            .agents()
+            .iter()
+            .any(|a| a.working && chat_of(self.board, &a.name).as_ref() == Some(&window));
+        let turn = crew.turn(&window).filter(|_| at_work)?;
+        if turn.total.0 <= 0.0 {
+            return None;
+        }
+        let mut by: Vec<&iq_ui::crew::TurnSpending> =
+            turn.by.iter().filter(|spent| spent.spent.0 > 0.0).collect();
+        by.sort_by(|a, b| b.spent.0.total_cmp(&a.spent.0));
+        let part = |name: &str| {
+            name.split_once('/')
+                .map_or(name, |(_, part)| part)
+                .to_owned()
+        };
+        let mut spans = vec![
+            Span::styled(format!("turn {} ", turn.number), p.fg(p.dim)),
+            Span::styled(turn.total.to_string(), p.fg(p.text)),
+        ];
+        for spent in by {
+            let who = match spent.who.as_str() {
+                "reviewer" => "autopilot".to_owned(),
+                who => part(who),
+            };
+            spans.push(Span::styled(" · ", p.fg(p.faint)));
+            spans.push(Span::styled(
+                who.clone(),
+                p.fg(agent_tint(self.board, &spent.who, p)),
+            ));
+            spans.push(Span::styled(format!(" {}", spent.spent), p.fg(p.dim)));
+        }
+        Some(Part::Lines(wrap(
+            &spans,
+            width.saturating_sub(1),
+            &[Span::styled("  $ ", p.fg(p.faint))],
+            &[Span::raw("    ")],
+        )))
     }
 
     /// Every agent the chat written to started, at work or resting, each
@@ -1370,6 +1418,63 @@ mod tests {
             !drawn(&board, &history, 100)
                 .iter()
                 .any(|row| row.contains("◦ "))
+        );
+    }
+
+    #[test]
+    fn a_turn_under_way_says_what_each_spent_in_it() {
+        let mut board = Board::default();
+        let history = History::default();
+        board.update(Update::Started {
+            lead: "lab/lead".into(),
+            reviewer: "r".into(),
+            autopilot: false,
+            internet: false,
+            allowed: Vec::new(),
+        });
+        let spent = |agent: &str, cost: f64| Event::Spent {
+            agent: agent.into(),
+            model: "lab/m".into(),
+            usage: iq_core::Usage::default(),
+            cost: Some(iq_core::Usd(cost)),
+            cache: None,
+            chat: Some("fix".into()),
+        };
+        for event in [
+            Event::Joined {
+                agent: "fix".into(),
+                model: "lab/lead".into(),
+                by: PERSON.into(),
+            },
+            Event::Joined {
+                agent: "fix/review".into(),
+                model: "lab/m".into(),
+                by: "fix".into(),
+            },
+            Event::Turn {
+                chat: "fix".into(),
+                number: 3,
+            },
+            Event::Working {
+                agent: "fix".into(),
+                prompt: "go".into(),
+            },
+            spent("fix", 0.5),
+            spent("fix/review", 0.04),
+            spent("reviewer", 0.02),
+            spent("fix", 0.21),
+        ] {
+            board.update(Update::Crew(event));
+        }
+        board.screen_mut().talk_to("fix");
+        let rows = drawn(&board, &history, 100);
+        let line = rows
+            .iter()
+            .find(|row| row.contains("turn 3"))
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        assert_eq!(
+            line.trim_end(),
+            "  $ turn 3 $0.77 · fix $0.71 · review $0.04 · autopilot $0.02"
         );
     }
 

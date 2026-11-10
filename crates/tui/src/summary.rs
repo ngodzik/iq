@@ -15,11 +15,12 @@ pub trait Summarize: Send + Sync {
     /// for it. None when it could not.
     fn summarize(&self, from: &str, to: &str, text: &str) -> Option<String>;
 
-    /// Says what the command line `line` does in a few words, for its
-    /// one line in the conversation; waits for it. None when it could
-    /// not, or by default: the line's own programs and files say it then.
-    fn label(&self, line: &str) -> Option<String> {
-        let _ = line;
+    /// Says what the command line `line` of `agent`'s does in a few
+    /// words, for its one line in the conversation; waits for it. None
+    /// when it could not, or by default: the line's own programs and
+    /// files say it then.
+    fn label(&self, agent: &str, line: &str) -> Option<String> {
+        let _ = (agent, line);
         None
     }
 }
@@ -55,11 +56,12 @@ impl Summary {
         Summary::made(move || summarize.summarize(&from, &to, &text))
     }
 
-    /// The few words that say what the command line `line` does, which
+    /// The few words that say what the command line `line` of `agent`'s
+    /// does, which
     /// `summarize` gives on a thread of its own.
-    pub(crate) fn labelled(line: &str, summarize: Arc<dyn Summarize>) -> Arc<Summary> {
-        let line = line.to_owned();
-        Summary::made(move || summarize.label(&line))
+    pub(crate) fn labelled(agent: &str, line: &str, summarize: Arc<dyn Summarize>) -> Arc<Summary> {
+        let (agent, line) = (agent.to_owned(), line.to_owned());
+        Summary::made(move || summarize.label(&agent, &line))
     }
 
     /// What `make` gives, made on a thread of its own.
