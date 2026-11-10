@@ -213,6 +213,22 @@ pub struct TurnView {
     pub ask_at: Option<Usd>,
 }
 
+/// What a model read this session, and how much of it came from the
+/// provider's cache: what tells whether the cache serves it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CacheView {
+    /// The model.
+    pub model: String,
+    /// Its calls.
+    pub calls: u64,
+    /// The tokens they read.
+    pub read: u64,
+    /// Of those, what came from the cache, as far as told.
+    pub cached: u64,
+    /// Whether the provider told what came from the cache at all.
+    pub told: bool,
+}
+
 /// What one spent in a chat's turn.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TurnSpending {
@@ -511,6 +527,9 @@ pub struct CrewView {
     finished: Vec<AgentView>,
     /// Each chat's turn, the one under way or its last, by its chat.
     turns: HashMap<String, TurnView>,
+    /// What each model read this session, and from the cache, in the order
+    /// they were first called.
+    cached: Vec<CacheView>,
     questions: Vec<Question>,
     /// The questions with choices waiting for the person, the oldest first.
     choices: Vec<Choice>,
@@ -563,6 +582,12 @@ impl CrewView {
     #[must_use]
     pub fn agents(&self) -> &[AgentView] {
         &self.agents
+    }
+
+    /// What each model read this session, and from the cache.
+    #[must_use]
+    pub fn cached(&self) -> &[CacheView] {
+        &self.cached
     }
 
     /// The turn of `chat` under way, or its last.
@@ -837,6 +862,21 @@ impl CrewView {
                 cache,
                 chat,
             } => {
+                let at = match self.cached.iter().position(|seen| seen.model == model) {
+                    Some(at) => at,
+                    None => {
+                        self.cached.push(CacheView {
+                            model: model.clone(),
+                            ..CacheView::default()
+                        });
+                        self.cached.len() - 1
+                    }
+                };
+                let seen = &mut self.cached[at];
+                seen.calls += 1;
+                seen.read += usage.input.0;
+                seen.cached += cache.map_or(0, |cache| cache.read.0);
+                seen.told |= cache.is_some();
                 if let Some(turn) = chat.and_then(|chat| self.turns.get_mut(&chat)) {
                     let at = match turn.by.iter().position(|spent| spent.who == agent) {
                         Some(at) => at,
@@ -1175,6 +1215,16 @@ mod tests {
             .map(|spent| (spent.who.as_str(), spent.calls, spent.read, spent.cached))
             .collect();
         assert_eq!(by, [("lead", 2, 3000, 2000), ("reviewer", 1, 0, 0)]);
+        // What each model read, and from the cache, over the session.
+        let cached: Vec<(&str, u64, u64, bool)> = crew
+            .cached()
+            .iter()
+            .map(|seen| (seen.model.as_str(), seen.read, seen.cached, seen.told))
+            .collect();
+        assert_eq!(
+            cached,
+            [("m", 3000, 2000, true), ("lab/quick", 0, 0, false)]
+        );
         let lead = crew.agent("lead").unwrap();
         assert!(lead.working);
         assert_eq!(lead.thread[1], Entry::Text("Hello".into()));

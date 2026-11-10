@@ -40,6 +40,9 @@ pub struct OpenAiCompatible {
     known: Arc<Mutex<Option<HashMap<String, Known>>>>,
     /// How long what Claude's marks write stays in the cache.
     cache_ttl: CacheTtl,
+    /// The models iq marks for the cache itself, by words of their names:
+    /// Claude's unless told otherwise; the others are left to the router.
+    marked: Vec<String>,
 }
 
 impl fmt::Debug for OpenAiCompatible {
@@ -49,6 +52,7 @@ impl fmt::Debug for OpenAiCompatible {
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
             .field("cache_ttl", &self.cache_ttl)
+            .field("marked", &self.marked)
             .finish()
     }
 }
@@ -72,7 +76,27 @@ impl OpenAiCompatible {
             api_key,
             known: Arc::new(Mutex::new(None)),
             cache_ttl: CacheTtl::default(),
+            marked: vec![CLAUDE.to_owned()],
         }
+    }
+
+    /// The same provider, marking for the cache itself the models whose
+    /// names hold one of `words` (`claude`, `gemini`, `glm`), the others
+    /// left to the router's own caching; none for none.
+    #[must_use]
+    pub fn with_cache_marks(mut self, words: Vec<String>) -> Self {
+        self.marked = words
+            .into_iter()
+            .map(|word| word.trim().to_lowercase())
+            .filter(|word| !word.is_empty())
+            .collect();
+        self
+    }
+
+    /// Whether iq marks `model`'s requests for the cache itself.
+    fn marks(&self, model: &ModelId) -> bool {
+        let name = model.as_str().to_lowercase();
+        self.marked.iter().any(|word| name.contains(word.as_str()))
     }
 
     /// The same provider, keeping what Claude's cache marks write for
@@ -180,12 +204,14 @@ impl ChatModel for OpenAiCompatible {
             // Claude caches only what is marked, at its provider (Bedrock,
             // Vertex): Requesty's own marks go on the largest blocks and can
             // leave the end of a growing conversation out, so iq
-            // places them. Other models are left to Requesty.
-            let claude = is_claude(&request.model);
-            if claude {
+            // places them. Other models are left to Requesty, unless the
+            // settings name them too: Gemini on Vertex, whose explicit
+            // cache Requesty also makes on the largest blocks.
+            let marked = self.marks(&request.model);
+            if marked {
                 mark_cache(&mut payload, self.cache_ttl);
             }
-            payload["requesty"] = json!({"auto_cache": !claude});
+            payload["requesty"] = json!({"auto_cache": !marked});
         }
         // A connection that could not be made is tried again, twice, after a
         // pause: the request never left, so it cannot be billed twice. Any
@@ -404,11 +430,9 @@ fn try_again_in(body: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs_f64(seconds))
 }
 
-/// Whether `model` is one of Anthropic's, whatever route serves it, such
-/// as `bedrock/claude-opus-5-5`.
-fn is_claude(model: &ModelId) -> bool {
-    model.as_str().contains("claude")
-}
+/// What Claude's models' names hold, which iq marks for the cache unless
+/// told otherwise.
+const CLAUDE: &str = "claude";
 
 /// Marks the system message and the last message with text as cached
 /// until there, for a provider that caches only what is marked: the system
@@ -981,8 +1005,20 @@ mod tests {
     #[test]
     fn claude_gets_marks_on_its_system_message_and_last_text() {
         let model = ModelId::new("bedrock/claude-opus-5-5").unwrap();
-        assert!(is_claude(&model));
-        assert!(!is_claude(&ModelId::new("deepseek/deepseek-chat").unwrap()));
+        let provider = OpenAiCompatible::without_key(URL);
+        assert!(provider.marks(&model));
+        let gemini = ModelId::new("vertex/google/gemini-pro").unwrap();
+        assert!(!provider.marks(&gemini));
+        // As the settings ask, Gemini's too, by a word of their names.
+        let marking =
+            provider.with_cache_marks(vec![" Gemini".into(), "claude".into(), String::new()]);
+        assert!(marking.marks(&gemini) && marking.marks(&model));
+        assert!(!marking.marks(&ModelId::new("z-ai/glm-5").unwrap()));
+        assert!(
+            !OpenAiCompatible::without_key(URL)
+                .with_cache_marks(Vec::new())
+                .marks(&model)
+        );
         let request = ChatRequest {
             model,
             messages: vec![

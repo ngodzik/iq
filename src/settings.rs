@@ -8,6 +8,7 @@
 //! allowed_models = ["anthropic/claude-opus-5-5", "anthropic/claude-haiku-5-5"]  # the only models iq starts, for you and every agent, by their whole names; any other is refused, the agent told which there are; unset, any the provider lists, by its whole name
 //! autopilot_effort = "low"               # how hard it thinks (once `reviewer_effort`)
 //! summarizer = "anthropic/claude-haiku-5-5"  # sums up in a few lines what agents write to each other, in the conversation; Ctrl-X gives it whole; unset, their first lines
+//! cache_marks = ["claude"]              # the models iq marks for the provider's cache itself, by a word of their names; the others are left to Requesty's auto_cache; add "gemini" to try it on Gemini (Vertex), and compare on the costs page what each model read from the cache
 //! turn_cost_ask = 1.0                    # dollars a chat's turn may spend (its agents, those they started, the autopilot, the summaries) before you are asked whether it goes on, then as much again each time; unset, never asked
 //! effort = "high"                        # how hard the models think; /effort changes an agent's
 //! context_every = 25000                  # tokens an agent's conversation grows between two words to it of its size; 0 never
@@ -131,6 +132,9 @@ pub(crate) struct Settings {
     /// What a chat's turn may spend before the person is asked whether it
     /// goes on, in dollars; never asked unless set.
     turn_cost_ask: Option<f64>,
+    /// The models iq marks for the provider's cache itself, by words of
+    /// their names; Claude's unless set.
+    cache_marks: Option<Vec<String>>,
     /// How hard the autopilot's model thinks; low unless set.
     autopilot_effort: Option<Effort>,
     /// `autopilot_effort`'s old name, read until the next release.
@@ -346,6 +350,11 @@ impl Settings {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error).with_context(|| format!("reading {}", file.display())),
         }
+    }
+
+    /// The models iq marks for the provider's cache itself, as set.
+    pub(crate) fn cache_marks(&self) -> Option<Vec<String>> {
+        self.cache_marks.clone()
     }
 
     /// The provider's address, as set.

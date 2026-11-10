@@ -53,6 +53,11 @@ struct Cli {
     #[arg(long, env = "IQ_BASE_URL", global = true)]
     base_url: Option<String>,
 
+    /// The models iq marks for the provider's cache itself, as the
+    /// settings' `cache_marks` say: Claude's unless they say otherwise.
+    #[arg(skip)]
+    cache_marks: Option<Vec<String>>,
+
     /// API key for that endpoint. Read from the environment so that it never
     /// lands in the shell history.
     #[arg(long, env = "REQUESTY_API_KEY", hide_env_values = true, global = true)]
@@ -156,12 +161,13 @@ fn main() -> Result<()> {
     }
     // The provider's address: as the command line or the environment
     // names it, else the settings, else Requesty's router.
+    let read = home_folder()
+        .ok()
+        .and_then(|folder| Settings::load(&folder).ok());
     if cli.base_url.is_none() {
-        cli.base_url = home_folder()
-            .ok()
-            .and_then(|folder| Settings::load(&folder).ok())
-            .and_then(|settings| settings.base_url());
+        cli.base_url = read.as_ref().and_then(Settings::base_url);
     }
+    cli.cache_marks = read.as_ref().and_then(Settings::cache_marks);
     // In the terminal, what is logged would write over what iq draws: it
     // goes to iq's folder instead.
     let logged = cli
@@ -710,9 +716,13 @@ fn synced(result: &Result<iq_sync::Outcome, iq_sync::SyncError>) -> iq_ui::Synce
 
 /// The provider's models, with its key when there is one.
 fn provider(cli: &Cli) -> OpenAiCompatible {
-    match &cli.api_key {
+    let provider = match &cli.api_key {
         Some(key) => OpenAiCompatible::new(cli.endpoint(), key),
         None => OpenAiCompatible::without_key(cli.endpoint()),
+    };
+    match &cli.cache_marks {
+        Some(marks) => provider.with_cache_marks(marks.clone()),
+        None => provider,
     }
 }
 

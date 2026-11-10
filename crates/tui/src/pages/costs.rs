@@ -43,7 +43,51 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
     }
     by_kind(seen, since, &mut lines);
     contexts(seen, &mut lines);
+    cached(seen, &mut lines);
     lines
+}
+
+/// What each model read again from the provider's cache this session: a
+/// conversation resent whole at each call costs a fraction of its price
+/// when it does, which the settings' `cache_marks` may help.
+fn cached(seen: &Seen<'_>, lines: &mut Vec<Line<'static>>) {
+    let p = seen.p;
+    let models = seen.board.crew().cached();
+    if models.iter().all(|seen| seen.read == 0) {
+        return;
+    }
+    seen.heading(
+        lines,
+        "Cache",
+        "what each model read from the provider's cache, this session",
+    );
+    let width = models
+        .iter()
+        .map(|m| m.model.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    for model in models.iter().filter(|seen| seen.read > 0) {
+        let said = if model.told {
+            let share = model.cached as f64 / model.read as f64;
+            format!(
+                "{:>3}% of {} read, {} calls",
+                (share * 100.0).round() as u64,
+                iq_core::TokenCount(model.read),
+                model.calls
+            )
+        } else {
+            format!(
+                "not told, {} read, {} calls",
+                iq_core::TokenCount(model.read),
+                model.calls
+            )
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<width$}", model.model), p.fg(p.text)),
+            Span::styled(said, p.fg(if model.told { p.dim } else { p.faint })),
+        ]));
+    }
 }
 
 /// The provider's bill over the period, in large.
