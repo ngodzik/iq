@@ -677,6 +677,8 @@ impl History {
                     ],
                 ));
             }
+            // Its turn's end says it, with the facts.
+            Event::Failed { .. } => {}
             Event::Notice { agent, text } => {
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
@@ -1584,6 +1586,7 @@ fn agent_of(event: &Event) -> Option<&str> {
         | Event::Choose { agent, .. }
         | Event::JobStarted { agent, .. }
         | Event::JobEnded { agent, .. }
+        | Event::Failed { agent, .. }
         | Event::Notice { agent, .. } => Some(agent),
         Event::Posted { from, .. } => Some(from),
         Event::Renamed { to, .. } => Some(to),

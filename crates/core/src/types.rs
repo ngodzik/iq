@@ -460,6 +460,17 @@ impl std::str::FromStr for Effort {
     }
 }
 
+/// What a provider said as it refused a call: its status and its own
+/// words, for the person and the agents to be told as they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The HTTP status it answered with.
+    pub status: u16,
+    /// What it said, as it said it: the message of its error, else its
+    /// answer, cut.
+    pub message: String,
+}
+
 /// A model's answer and what it cost.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatResponse {

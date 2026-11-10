@@ -194,6 +194,25 @@ pub enum Event {
         /// Those it waits for, at work.
         on: Vec<String>,
     },
+    /// A call to the provider failed, and an agent's turn with it: what
+    /// the provider said, and where the agent stood.
+    Failed {
+        /// The agent.
+        agent: String,
+        /// The model called.
+        model: String,
+        /// The status the provider answered with, none when it was not
+        /// reached.
+        status: Option<u16>,
+        /// What it said, or why it could not be reached.
+        message: String,
+        /// About how many tokens the call held.
+        context: u64,
+        /// The calls the agent made before it.
+        calls: u64,
+        /// What those cost, as far as their prices are known.
+        spent: Usd,
+    },
     /// Something the person should know about how an agent works.
     Notice {
         /// The agent.
@@ -241,6 +260,7 @@ impl Event {
             | Event::Asked { agent, .. }
             | Event::Reviewed { agent, .. }
             | Event::Done { agent, .. }
+            | Event::Failed { agent, .. }
             | Event::Notice { agent, .. } => renamed(agent),
             Event::Waiting { agent, on } => {
                 renamed(agent);

@@ -170,6 +170,20 @@ mod tests {
                 how: "/new".to_owned(),
                 at: 1,
             }],
+            calls: 3,
+            spent: iq_core::Usd(0.25),
+            aside: vec![iq_agent::Aside {
+                at: 2,
+                turn: 1,
+                after: 2,
+                shown: iq_agent::Shown::Question {
+                    id: 4,
+                    question: "which one?".to_owned(),
+                    choices: vec!["a".to_owned(), "b".to_owned()],
+                    answered: true,
+                    answer: Some("b".to_owned()),
+                },
+            }],
             messages: vec![Message::system("be brief"), Message::user("fix it")],
         }
     }

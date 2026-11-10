@@ -20,6 +20,9 @@ struct Scripted {
     /// How many of each agent's next calls its provider is out of
     /// capacity for.
     busy: Mutex<HashMap<String, usize>>,
+    /// How many of each agent's calls are answered before its provider
+    /// refuses the others.
+    refused: Mutex<HashMap<String, usize>>,
 }
 
 /// What the scripted provider fails with.
@@ -27,12 +30,15 @@ struct Scripted {
 enum Failed {
     /// Out of capacity for now.
     Busy,
+    /// Refused, whatever is tried again.
+    Refused,
 }
 
 impl std::fmt::Display for Failed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Failed::Busy => f.write_str("HTTP 429: TPM quota exhausted, please try again later"),
+            Failed::Refused => f.write_str("HTTP 400: Request contains an invalid argument."),
         }
     }
 }
@@ -50,7 +56,14 @@ impl Scripted {
             ),
             requests: Mutex::default(),
             busy: Mutex::default(),
+            refused: Mutex::default(),
         })
+    }
+
+    /// The provider answers `agent`'s first `calls`, then refuses the
+    /// others.
+    fn refuses_after(&self, agent: &str, calls: usize) {
+        self.refused.lock().unwrap().insert(agent.to_owned(), calls);
     }
 
     /// The provider is out of capacity for `agent`'s next `calls`.
@@ -155,6 +168,12 @@ impl ChatModel for Model {
             *left -= 1;
             return Err(Failed::Busy);
         }
+        if let Some(left) = self.refused.lock().unwrap().get_mut(&name) {
+            if *left == 0 {
+                return Err(Failed::Refused);
+            }
+            *left -= 1;
+        }
         let next = self
             .scripts
             .lock()
@@ -168,6 +187,17 @@ impl ChatModel for Model {
         match error {
             Failed::Busy => Some(Busy {
                 after: Some(Duration::from_millis(1)),
+            }),
+            Failed::Refused => None,
+        }
+    }
+
+    fn refusal(&self, error: &Failed) -> Option<iq_core::Refusal> {
+        match error {
+            Failed::Busy => None,
+            Failed::Refused => Some(iq_core::Refusal {
+                status: 400,
+                message: "Request contains an invalid argument.".into(),
             }),
         }
     }
@@ -2403,9 +2433,9 @@ async fn a_provider_still_out_of_capacity_ends_the_turn_saying_what_to_do_and_ke
     );
     assert!(failed.contains("through 3 tries (HTTP 429"), "{failed}");
     assert!(
-        failed.ends_with(
+        failed.contains(
             "The conversation is kept: write to the agent to try again later, or give the task \
-             to an agent on another model"
+             to an agent on another model. The call held about"
         ),
         "{failed}"
     );
@@ -2472,6 +2502,88 @@ async fn an_image_read_or_attached_is_shown_to_the_model_with_its_next_call() {
 }
 
 #[tokio::test]
+async fn a_provider_s_refusal_is_kept_and_told_to_the_starter_as_iq_s_facts() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"role": "review", "model": "lab/quill", "task": "review the parser"}),
+                    ),
+                    say("Started."),
+                    say("The review stopped on the provider's refusal."),
+                ],
+            ),
+            (
+                "lead/review",
+                vec![calls("read_file", serde_json::json!({"path": "parser.rs"}))],
+            ),
+        ],
+        Settings::default(),
+    );
+    let kept = Arc::new(Kept::default());
+    f.crew
+        .set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
+    f.model.refuses_after("lead/review", 1);
+    f.crew
+        .start("lead", &model("cheap/model"), "review it".into(), PERSON);
+    f.settled().await;
+    let failed = f
+        .events()
+        .into_iter()
+        .find_map(|event| match event {
+            Event::Failed {
+                agent,
+                status,
+                message,
+                calls,
+                context,
+                ..
+            } => Some((agent, status, message, calls, context)),
+            _ => None,
+        })
+        .expect("the failure is reported");
+    assert_eq!(
+        (failed.0.as_str(), failed.1, failed.2.as_str(), failed.3),
+        (
+            "lead/review",
+            Some(400),
+            "Request contains an invalid argument.",
+            1
+        )
+    );
+    assert!(failed.4 >= 100, "about what its last call read, and more");
+    // The lead is told the facts as iq's.
+    let told = f.model.seen_by("lead");
+    assert!(
+        told.contains(
+            "(iq: lead/review stopped without answering: the provider refused its call to \
+             lab/quill, answering HTTP 400: \\\"Request contains an invalid argument.\\\". The call \
+             held about"
+        ),
+        "{told}"
+    );
+    assert!(
+        told.contains("lead/review had made 1 call before it, for $0.001."),
+        "{told}"
+    );
+    assert!(
+        told.contains("This is iq's account of what happened"),
+        "{told}"
+    );
+    // Kept with its chat, once.
+    let saved = kept.0.lock().unwrap()["lead/review"].clone();
+    assert_eq!(saved.aside.len(), 1, "{:?}", saved.aside);
+    assert!(matches!(
+        &saved.aside[0].shown,
+        iq_agent::Shown::Failed { status: Some(400), model, calls: 1, .. } if model == "lab/quill"
+    ));
+    assert_eq!((saved.calls, saved.spent), (1, Usd(0.001)));
+}
+
+#[tokio::test]
 async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
     let f = fixture(
         &[(
@@ -2486,6 +2598,9 @@ async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
         )],
         Settings::default(),
     );
+    let kept = Arc::new(Kept::default());
+    f.crew
+        .set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
     f.crew
         .start("lead", &model("cheap/model"), "deploy".into(), PERSON);
     let mut asked = None;
@@ -2503,6 +2618,25 @@ async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
     assert_eq!(choices, ["staging", "production"]);
     f.crew.choose(id, Some("staging".into()));
     f.settled().await;
+    // Kept with the chat, its answer with it.
+    let shown: Vec<iq_agent::Shown> = kept.0.lock().unwrap()["lead"]
+        .aside
+        .iter()
+        .map(|aside| aside.shown.clone())
+        .collect();
+    assert_eq!(
+        shown,
+        [iq_agent::Shown::Question {
+            id,
+            question: "Which environment?".into(),
+            choices: vec!["staging".into(), "production".into()],
+            answered: true,
+            answer: Some("staging".into()),
+        }]
+    );
+    let aside = &kept.0.lock().unwrap()["lead"].aside[0];
+    // In its first turn, after its call to ask.
+    assert_eq!((aside.turn, aside.after), (1, 3));
     assert!(
         f.model
             .seen_by("lead")

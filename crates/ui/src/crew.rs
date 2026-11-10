@@ -298,42 +298,114 @@ pub struct Back {
 /// ```
 #[must_use]
 pub fn past(messages: &[Message]) -> Vec<Entry> {
-    let returned: std::collections::HashMap<&str, &str> = messages
+    past_with(messages, &[])
+}
+
+/// What each tool call of `messages` returned, by the call's id.
+fn returned(messages: &[Message]) -> std::collections::HashMap<&str, &str> {
+    messages
         .iter()
         .filter_map(|message| match message {
             Message::Tool { call_id, content } => Some((call_id.as_str(), content.as_str())),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+/// What `message` puts in the thread, the tools' calls with what they
+/// `returned`.
+fn entries(message: &Message, returned: &std::collections::HashMap<&str, &str>) -> Vec<Entry> {
     let mut thread = Vec::new();
-    for message in messages {
-        match message {
-            Message::User(text) if !text.starts_with("(iq: ") && !text.starts_with(URGED) => {
-                thread.push(Entry::Prompt(text.clone()));
-            }
-            Message::Assistant {
-                content,
-                tool_calls,
-                ..
-            } => {
-                if let Some(text) = content.as_ref().filter(|t| !t.trim().is_empty()) {
-                    thread.push(Entry::Text(text.clone()));
-                }
-                for call in tool_calls {
-                    let output = returned.get(call.id.as_str()).copied().unwrap_or_default();
-                    let input = iq_agent::tool_input(&call.arguments);
-                    thread.push(Entry::Tool {
-                        name: call.name.clone(),
-                        input,
-                        output: output.to_owned(),
-                        ok: !output.starts_with("Error: "),
-                    });
-                }
-            }
-            _ => {}
+    match message {
+        Message::User(text) if !text.starts_with("(iq: ") && !text.starts_with(URGED) => {
+            thread.push(Entry::Prompt(text.clone()));
         }
+        Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
+            if let Some(text) = content.as_ref().filter(|t| !t.trim().is_empty()) {
+                thread.push(Entry::Text(text.clone()));
+            }
+            for call in tool_calls {
+                let output = returned.get(call.id.as_str()).copied().unwrap_or_default();
+                let input = iq_agent::tool_input(&call.arguments);
+                thread.push(Entry::Tool {
+                    name: call.name.clone(),
+                    input,
+                    output: output.to_owned(),
+                    ok: !output.starts_with("Error: "),
+                });
+            }
+        }
+        _ => {}
     }
     thread
+}
+
+/// The same, with what the person was shown beside it (iq's notices, the
+/// questions and their answers, what the gate asked and the autopilot
+/// answered, the errors), each where it came among the messages.
+#[must_use]
+pub fn past_with(messages: &[Message], aside: &[iq_agent::Aside]) -> Vec<Entry> {
+    let returned = returned(messages);
+    let mut thread = Vec::new();
+    let mut aside = aside.iter().peekable();
+    for at in 0..=messages.len() {
+        while let Some(shown) = aside.next_if(|shown| shown.after <= at) {
+            thread.push(set_aside(&shown.shown));
+        }
+        if let Some(message) = messages.get(at) {
+            thread.extend(entries(message, &returned));
+        }
+    }
+    thread.extend(aside.map(|shown| set_aside(&shown.shown)));
+    thread
+}
+
+/// What was set aside, as the thread shows it.
+fn set_aside(shown: &iq_agent::Shown) -> Entry {
+    use iq_agent::Shown;
+    match shown {
+        Shown::Notice { text } => Entry::Notice(text.clone()),
+        Shown::Question {
+            question, answer, ..
+        } => Entry::Chose {
+            question: question.clone(),
+            answer: answer.clone(),
+        },
+        Shown::Asked {
+            id,
+            action,
+            reason,
+            approved,
+        } => Entry::Asked {
+            id: *id,
+            action: action.clone(),
+            reason: reason.clone(),
+            answer: *approved,
+        },
+        Shown::Reviewed {
+            action,
+            approved,
+            why,
+        } => Entry::Reviewed {
+            action: action.clone(),
+            approved: *approved,
+            why: why.clone(),
+        },
+        Shown::Failed {
+            model,
+            status,
+            message,
+            ..
+        } => Entry::Done(Err(match status {
+            Some(status) => format!("{model} answered HTTP {status}: {message}"),
+            None => format!("{model} could not be reached: {message}"),
+        })),
+        Shown::Error { text } => Entry::Done(Err(text.clone())),
+    }
 }
 
 /// How iq urges on an agent that answered with nothing.
@@ -778,6 +850,8 @@ impl CrewView {
                     view.thread.push(Entry::Notice(text));
                 }
             }
+            // Its turn's end says it, with the facts.
+            Event::Failed { .. } => {}
             Event::Placed {
                 agent,
                 folder,
@@ -944,6 +1018,65 @@ mod tests {
             ("fix the build", Some(100))
         );
         assert_eq!(fix.thread.len(), 1);
+    }
+
+    #[test]
+    fn what_was_set_aside_comes_back_where_it_stood() {
+        let kept = [
+            Message::system("You are lead"),
+            Message::user("deploy"),
+            Message::Assistant {
+                content: Some("Asking.".into()),
+                tool_calls: Vec::new(),
+                reasoning_signature: None,
+            },
+        ];
+        let aside = |after: usize, shown: iq_agent::Shown| iq_agent::Aside {
+            at: 1,
+            turn: 1,
+            after,
+            shown,
+        };
+        let thread = past_with(
+            &kept,
+            &[
+                aside(
+                    2,
+                    iq_agent::Shown::Question {
+                        id: 1,
+                        question: "Which one?".into(),
+                        choices: vec!["a".into(), "b".into()],
+                        answered: true,
+                        answer: Some("b".into()),
+                    },
+                ),
+                aside(
+                    9,
+                    iq_agent::Shown::Failed {
+                        model: "lab/quill".into(),
+                        status: Some(400),
+                        message: "Request contains an invalid argument.".into(),
+                        context: 190_000,
+                        calls: 8,
+                        spent: iq_core::Usd(0.78),
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            thread,
+            [
+                Entry::Prompt("deploy".into()),
+                Entry::Chose {
+                    question: "Which one?".into(),
+                    answer: Some("b".into())
+                },
+                Entry::Text("Asking.".into()),
+                Entry::Done(Err(
+                    "lab/quill answered HTTP 400: Request contains an invalid argument.".into()
+                )),
+            ]
+        );
     }
 
     #[test]

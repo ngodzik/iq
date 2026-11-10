@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use crate::types::{Busy, ChatRequest, ChatResponse, ModelId, Pricing};
+use crate::types::{Busy, ChatRequest, ChatResponse, ModelId, Pricing, Refusal};
 
 /// Something that can answer a chat request.
 ///
@@ -35,6 +35,13 @@ pub trait ChatModel: Send + Sync {
     /// rather than refusing the call, which is then worth sending again;
     /// `None`, the default, for an error that would come again.
     fn busy(&self, error: &Self::Error) -> Option<Busy> {
+        let _ = error;
+        None
+    }
+
+    /// What the provider said, when `error` is its refusal of the call
+    /// rather than a failure to reach it; `None`, the default, otherwise.
+    fn refusal(&self, error: &Self::Error) -> Option<Refusal> {
         let _ = error;
         None
     }

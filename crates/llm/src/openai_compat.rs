@@ -224,6 +224,10 @@ impl ChatModel for OpenAiCompatible {
     fn busy(&self, error: &LlmError) -> Option<iq_core::Busy> {
         error.busy()
     }
+
+    fn refusal(&self, error: &LlmError) -> Option<iq_core::Refusal> {
+        error.refusal()
+    }
 }
 
 /// What the model list says of one model.
@@ -811,6 +815,34 @@ mod tests {
         assert_eq!(response.tool_calls[0].name, "read_file");
         assert_eq!(response.tool_calls[0].arguments, r#"{"path": "a.rs"}"#);
         assert_eq!(response.cost, Some(Usd(0.00042)));
+    }
+
+    #[test]
+    fn a_refusal_is_told_in_the_provider_s_own_words() {
+        let refused = |body: &str| {
+            LlmError::Status {
+                url: URL.into(),
+                status: 400,
+                body: body.into(),
+                after: None,
+            }
+            .refusal()
+            .unwrap()
+        };
+        let said = refused(
+            r#"{"error": {"code": 400, "message": "Request contains an invalid argument.", "status": "INVALID_ARGUMENT"}}"#,
+        );
+        assert_eq!(said.status, 400);
+        assert_eq!(said.message, "Request contains an invalid argument.");
+        assert_eq!(
+            refused(r#"{"error": "no such model"}"#).message,
+            "no such model"
+        );
+        assert_eq!(refused("  Bad Gateway\n").message, "Bad Gateway");
+        let long = refused(&"x".repeat(2_000)).message;
+        assert_eq!(long.chars().count(), crate::error::SAID_CHARS + 1);
+        let unreached = LlmError::NoKey { url: URL.into() };
+        assert!(unreached.refusal().is_none());
     }
 
     #[test]

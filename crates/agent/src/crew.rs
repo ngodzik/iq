@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::event::{Event, PERSON};
 use crate::extension::Extension;
-use crate::keep::{Keeper, ModelChoice, Saved};
+use crate::keep::{Aside, Keeper, ModelChoice, Saved, Shown};
 use crate::place::{Placed, Placer};
 use crate::review;
 use crate::rules::{self, RulesFile};
@@ -294,6 +294,31 @@ struct Inner<M> {
     /// The models the provider lists, once read: an agent is started only
     /// on one of them, by its whole name.
     listed: Mutex<Vec<String>>,
+    /// What the person was shown of each agent beside its conversation,
+    /// with the number of its turn under way or last. Never locked before
+    /// the board.
+    aside: Mutex<HashMap<String, AsideLog>>,
+}
+
+/// What was set aside of one agent, with where its conversation stands.
+#[derive(Default)]
+struct AsideLog {
+    /// Its turn under way, or its last.
+    turn: u64,
+    /// How many messages its conversation holds, as far as told.
+    messages: usize,
+    /// What was set aside, in order.
+    kept: Vec<Aside>,
+}
+
+/// A call to the provider that failed: why, in words, and what the
+/// provider said when it refused it.
+struct Failure {
+    said: String,
+    refusal: Option<iq_core::Refusal>,
+    /// Whether the provider stayed out of capacity through every try,
+    /// which `said` tells whole.
+    busy: bool,
 }
 
 /// The wakes an agent asked for: how many wait, and when it asked those of
@@ -443,6 +468,10 @@ struct Member {
     /// What it wrote last in its turn under way, for the reviewer: its own
     /// reason for the actions it calls after.
     reason: Option<String>,
+    /// The calls to its model it made, over all its turns.
+    calls: u64,
+    /// What those cost, as far as their prices are known.
+    spent: Usd,
     /// The first message it has not read.
     read: usize,
     /// Its turn under way, when it works.
@@ -530,6 +559,7 @@ where
                 next_job: AtomicU64::new(1),
                 wakes: Mutex::new(HashMap::new()),
                 listed: Mutex::new(Vec::new()),
+                aside: Mutex::new(HashMap::new()),
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
                 peer_wakes: Mutex::new(Vec::new()),
@@ -655,6 +685,12 @@ where
                     .then(|| member.place.gate.workspace().to_path_buf()),
                 context: member.context,
                 models_chosen: member.models_chosen.clone(),
+                calls: member.calls,
+                spent: member.spent,
+                aside: lock(&self.inner.aside)
+                    .get(agent)
+                    .map(|log| log.kept.clone())
+                    .unwrap_or_default(),
                 messages,
             }
         };
@@ -720,6 +756,8 @@ where
                 prompt: None,
                 done: VecDeque::new(),
                 reason: None,
+                calls: saved.calls,
+                spent: saved.spent,
                 read,
                 turn: None,
                 turns: 0,
@@ -736,6 +774,17 @@ where
             },
         );
         drop(board);
+        let log = AsideLog {
+            turn: saved
+                .aside
+                .iter()
+                .map(|aside| aside.turn)
+                .max()
+                .unwrap_or(0),
+            messages: 0,
+            kept: saved.aside,
+        };
+        lock(&self.inner.aside).insert(name.clone(), log);
         self.report(Event::Joined {
             agent: name.clone(),
             model: model.to_string(),
@@ -1226,6 +1275,8 @@ where
                 prompt: None,
                 done: VecDeque::new(),
                 reason: None,
+                calls: 0,
+                spent: Usd(0.0),
                 read,
                 turn: None,
                 turns: 0,
@@ -1687,6 +1738,11 @@ where
     /// those it started, under the new name.
     fn moved(&self, agent: &str, new: &str) {
         lock(&self.inner.shown).remove(agent);
+        let mut aside = lock(&self.inner.aside);
+        if let Some(kept) = aside.remove(agent) {
+            aside.insert(new.to_owned(), kept);
+        }
+        drop(aside);
         for team in lock(&self.inner.teams).iter_mut() {
             team.rename(agent, new);
         }
@@ -2202,7 +2258,11 @@ where
         if by != PERSON && !handled && !(wrote_back && outcome.is_ok()) {
             let text = match outcome {
                 Ok(text) => text,
-                Err(error) => format!("I stopped: {error}"),
+                // Told by iq: the agent that failed did not write it.
+                Err(error) => format!(
+                    "(iq: {name} stopped without answering: {error}. This is iq's account of \
+                     what happened, not {name}'s.)"
+                ),
             };
             let _ = self.post(&name, &by, text);
         }
@@ -2212,6 +2272,56 @@ where
         {
             self.wake(&name, news);
         }
+    }
+
+    /// Reports the call of `agent`'s to `model` that `failed`, its turn
+    /// with it, with where it stood (its last call's size and `added`
+    /// since, what it spent until then), and gives what iq says of it: the
+    /// facts, to be told as iq's, not left to an agent to tell.
+    fn failed(&self, agent: &str, model: &ModelId, failed: Failure, added: &[Message]) -> String {
+        let (context, calls, spent) = lock(&self.inner.board)
+            .members
+            .get(agent)
+            .map_or((0, 0, Usd(0.0)), |member| {
+                (member.context, member.calls, member.spent)
+            });
+        // About four characters a token: what was added since the last
+        // call that answered, which said how much it read.
+        let added: usize = added
+            .iter()
+            .map(|message| serde_json::to_string(message).map_or(0, |text| text.len()))
+            .sum();
+        let context = context + u64::try_from(added / 4).unwrap_or(u64::MAX);
+        let (status, message) = match &failed.refusal {
+            Some(refusal) => (Some(refusal.status), refusal.message.clone()),
+            None => (None, failed.said.clone()),
+        };
+        let said = match &failed.refusal {
+            _ if failed.busy => failed.said.clone(),
+            Some(refusal) => format!(
+                "the provider refused its call to {model}, answering HTTP {}: \"{}\"",
+                refusal.status, refusal.message
+            ),
+            None => format!("its call to {model} failed: {}", failed.said),
+        };
+        self.report(Event::Failed {
+            agent: agent.to_owned(),
+            model: model.to_string(),
+            status,
+            message,
+            context,
+            calls,
+            spent,
+        });
+        let made = if calls == 1 {
+            "1 call".to_owned()
+        } else {
+            format!("{calls} calls")
+        };
+        format!(
+            "{said}. The call held about {} tokens; {agent} had made {made} before it, for {spent}",
+            TokenCount(context)
+        )
     }
 
     /// What `agent` on `model` is told of its conversation's size, once it
@@ -2250,7 +2360,7 @@ where
         &self,
         agent: &str,
         request: &ChatRequest,
-    ) -> Result<iq_core::ChatResponse, String> {
+    ) -> Result<iq_core::ChatResponse, Failure> {
         let settings = &self.inner.settings;
         let started = Instant::now();
         let mut wait = settings.busy_wait;
@@ -2269,18 +2379,27 @@ where
                 Err(error) => error,
             };
             let Some(busy) = self.inner.provider.busy(&error) else {
-                return Err(chain(&error));
+                return Err(Failure {
+                    said: chain(&error),
+                    refusal: self.inner.provider.refusal(&error),
+                    busy: false,
+                });
             };
             let said = cut_to(&chain(&error), BUSY_SAID);
             if tries >= settings.busy_tries {
-                return Err(format!(
-                    "the provider of {} stayed out of capacity for {}, through {} tries ({said}). \
+                let refusal = self.inner.provider.refusal(&error);
+                return Err(Failure {
+                    refusal,
+                    busy: true,
+                    said: format!(
+                        "the provider of {} stayed out of capacity for {}, through {} tries ({said}). \
                      The conversation is kept: write to the agent to try again later, or give \
                      the task to an agent on another model",
-                    request.model,
-                    lasted(started.elapsed()),
-                    tries + 1,
-                ));
+                        request.model,
+                        lasted(started.elapsed()),
+                        tries + 1,
+                    ),
+                });
             }
             tries += 1;
             let delay = busy
@@ -2323,6 +2442,9 @@ where
         prompt: String,
         number: u64,
     ) -> (Vec<Message>, Result<String, String>) {
+        // What the last call that answered read: all but the answer it
+        // gave, which is read from the next.
+        let mut counted = messages.len().saturating_sub(1);
         messages.push(Message::user(prompt));
         if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
             member.reason = None;
@@ -2355,10 +2477,15 @@ where
                 tools,
                 effort,
             };
+            self.set_length(name, messages.len());
             let response = match self.ask_model(name, &request).await {
                 Ok(response) => response,
-                Err(error) => return (messages, Err(error)),
+                Err(failed) => {
+                    let said = self.failed(name, model, failed, &messages[counted..]);
+                    return (messages, Err(said));
+                }
             };
+            counted = messages.len();
             let cost = match response.cost {
                 Some(cost) => Some(cost),
                 None => self
@@ -2371,6 +2498,10 @@ where
             self.spent(name, model.as_str(), response.usage, cost);
             if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
                 member.context = response.usage.input.0;
+                member.calls += 1;
+                if let Some(cost) = cost {
+                    member.spent += cost;
+                }
             }
             let said = response
                 .content
@@ -2415,6 +2546,7 @@ where
             if response.tool_calls.is_empty() {
                 return (messages, Ok(response.content.unwrap_or_default()));
             }
+            self.set_length(name, messages.len());
             for call in &response.tool_calls {
                 let content = self.call(name, call).await;
                 messages.push(Message::Tool {
@@ -2422,6 +2554,7 @@ where
                     content,
                 });
             }
+            self.set_length(name, messages.len());
             // Its calls answered, the turn is kept as it stands.
             self.keep_turn(name, number, &messages);
         }
@@ -3166,7 +3299,10 @@ where
             tools: Vec::new(),
             effort: Some(self.inner.settings.reviewer_effort),
         };
-        let response = self.ask_model(agent, &request).await?;
+        let response = self
+            .ask_model(agent, &request)
+            .await
+            .map_err(|failed| failed.said)?;
         let cost = match response.cost {
             Some(cost) => Some(cost),
             None => self
@@ -3209,10 +3345,156 @@ where
     }
 
     fn report(&self, mut event: Event) {
+        self.set_aside(&event);
         for (name, shown) in lock(&self.inner.shown).iter() {
             event.rename(name, shown);
         }
         (self.inner.report)(event);
+    }
+
+    /// Keeps what `event` shows the person of an agent beside its
+    /// conversation, to be kept with its chat: a notice, a question, an
+    /// action asked or answered for them, an error; and the answers to
+    /// those asked before. Counts its turns.
+    fn set_aside(&self, event: &Event) {
+        let mut aside = lock(&self.inner.aside);
+        let (agent, shown) = match event {
+            Event::Working { agent, .. } => {
+                aside.entry(agent.clone()).or_default().turn += 1;
+                return;
+            }
+            Event::Chosen { id, answer } => {
+                for log in aside.values_mut() {
+                    for kept in log.kept.iter_mut().rev() {
+                        if let Shown::Question {
+                            id: asked,
+                            answered,
+                            answer: given,
+                            ..
+                        } = &mut kept.shown
+                            && asked == id
+                        {
+                            *answered = true;
+                            given.clone_from(answer);
+                            return;
+                        }
+                    }
+                }
+                return;
+            }
+            Event::Answered { id, approved } => {
+                for log in aside.values_mut() {
+                    for kept in log.kept.iter_mut().rev() {
+                        if let Shown::Asked {
+                            id: asked,
+                            approved: given,
+                            ..
+                        } = &mut kept.shown
+                            && asked == id
+                        {
+                            *given = Some(*approved);
+                            return;
+                        }
+                    }
+                }
+                return;
+            }
+            Event::Notice { agent, text } => (agent, Shown::Notice { text: text.clone() }),
+            Event::Choose {
+                id,
+                agent,
+                question,
+                choices,
+            } => (
+                agent,
+                Shown::Question {
+                    id: *id,
+                    question: question.clone(),
+                    choices: choices.clone(),
+                    answered: false,
+                    answer: None,
+                },
+            ),
+            Event::Asked {
+                id,
+                agent,
+                action,
+                reason,
+                ..
+            } => (
+                agent,
+                Shown::Asked {
+                    id: *id,
+                    action: action.clone(),
+                    reason: reason.clone(),
+                    approved: None,
+                },
+            ),
+            Event::Reviewed {
+                agent,
+                action,
+                approved,
+                why,
+                ..
+            } => (
+                agent,
+                Shown::Reviewed {
+                    action: action.clone(),
+                    approved: *approved,
+                    why: why.clone(),
+                },
+            ),
+            Event::Failed {
+                agent,
+                model,
+                status,
+                message,
+                context,
+                calls,
+                spent,
+            } => (
+                agent,
+                Shown::Failed {
+                    model: model.clone(),
+                    status: *status,
+                    message: message.clone(),
+                    context: *context,
+                    calls: *calls,
+                    spent: *spent,
+                },
+            ),
+            Event::Done {
+                agent,
+                outcome: Err(text),
+            } => {
+                // A failed call was kept already, with what it said.
+                let log = aside.entry(agent.clone()).or_default();
+                if log.kept.last().is_some_and(|last| {
+                    last.turn == log.turn && matches!(last.shown, Shown::Failed { .. })
+                }) {
+                    return;
+                }
+                (agent, Shown::Error { text: text.clone() })
+            }
+            _ => return,
+        };
+        let log = aside.entry(agent.clone()).or_default();
+        let (turn, after) = (log.turn, log.messages);
+        log.kept.push(Aside {
+            at: now(),
+            turn,
+            after,
+            shown,
+        });
+    }
+
+    /// Says that `agent`'s conversation holds `messages` now, for what is
+    /// set aside next to stand after them.
+    fn set_length(&self, agent: &str, messages: usize) {
+        lock(&self.inner.aside)
+            .entry(agent.to_owned())
+            .or_default()
+            .messages = messages;
     }
 
     /// The standing instructions of one of iq's agents, working in

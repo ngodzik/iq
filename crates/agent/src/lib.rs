@@ -35,7 +35,7 @@ pub use crew::{
 };
 pub use event::{Event, PERSON};
 pub use extension::{Called, Extension};
-pub use keep::{Keeper, ModelChoice, Saved};
+pub use keep::{Aside, Keeper, ModelChoice, Saved, Shown};
 pub use once::{Asked, ask_once};
 pub use place::{Placed, Placer};
 pub use rules::{RulesFile, with_imports};

@@ -453,7 +453,7 @@ fn resume_one(
         }
         (None, _) => None,
     };
-    let thread = iq_ui::crew::past(&found.chat.messages);
+    let thread = iq_ui::crew::past_with(&found.chat.messages, &found.chat.aside);
     let (task, written, by) = (
         found.chat.task.clone(),
         found.chat.written,
@@ -770,6 +770,31 @@ fn keep(ledger: &Ledger, journal: &Journal, event: &Event) -> Option<iq_observe:
         ledger.bill(agent, model, *cost);
     }
     ended
+}
+
+/// Writes a call the provider refused or that could not reach it to iq's
+/// log, whole: what the conversation shows of it may be cut.
+fn failed(event: &Event) {
+    if let Event::Failed {
+        agent,
+        model,
+        status,
+        message,
+        context,
+        calls,
+        spent,
+    } = event
+    {
+        tracing::warn!(
+            agent,
+            model,
+            status = status.map(i64::from).unwrap_or(-1),
+            context,
+            calls,
+            spent = spent.0,
+            "a call to the provider failed: {message}"
+        );
+    }
 }
 
 /// The project iq works in, as its memory and its tasks are kept under.
@@ -1179,6 +1204,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
             if let Event::Placed { agent, folder, .. } = &event {
                 plugins.placed(agent, folder);
             }
+            failed(&event);
             // What a chat's agents kept follows it as it is renamed.
             if let (Event::Renamed { from, to }, Some(scratch)) = (&event, &scratch) {
                 scratch::renamed(scratch, from, to);
