@@ -26,6 +26,49 @@ pub(crate) struct Styled {
     /// selection copies it as the model wrote it, the terminal folding it
     /// where it must.
     pub(crate) whole: bool,
+    /// The kind of block it belongs to.
+    pub(crate) shape: Shape,
+}
+
+/// The kind of block a line belongs to, which says whether an empty row
+/// stands between it and the line before: one between two blocks, none
+/// within one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shape {
+    /// An empty line: what the model wrote between two blocks.
+    Empty,
+    /// A paragraph's line.
+    Text,
+    /// A list's item, or a line of one, indented under it.
+    Item,
+    /// A heading.
+    Heading,
+    /// A quote's line.
+    Quote,
+    /// A line across, between two parts.
+    Rule,
+    /// The mark above a block of code.
+    Opening,
+    /// A line of code, or the mark below it.
+    Code,
+    /// A table or a diagram, whole.
+    Whole,
+}
+
+impl Shape {
+    /// Whether an empty row stands between a line of `self` and one of
+    /// `next`, `parted` when the model left an empty line between them: one
+    /// between two blocks, whatever the model left, and none within a list
+    /// or a block of code; two lines of text or of a quote are one
+    /// paragraph unless parted.
+    fn parts(self, next: Shape, parted: bool) -> bool {
+        match (self, next) {
+            (_, Shape::Opening) => true,
+            (Shape::Opening | Shape::Code, Shape::Code) | (Shape::Item, Shape::Item) => false,
+            (Shape::Heading, _) | (_, Shape::Heading) => true,
+            (before, next) => before != next || parted,
+        }
+    }
 }
 
 impl Styled {
@@ -35,7 +78,12 @@ impl Styled {
             rest: Vec::new(),
             body,
             whole: false,
+            shape: Shape::Text,
         }
+    }
+
+    fn shaped(self, shape: Shape) -> Styled {
+        Styled { shape, ..self }
     }
 
     fn under(prefix: Span<'static>, hang: Span<'static>, body: Vec<Span<'static>>) -> Styled {
@@ -44,14 +92,21 @@ impl Styled {
             rest: vec![hang],
             body,
             whole: false,
+            shape: Shape::Quote,
         }
     }
 
     fn whole(body: Vec<Span<'static>>) -> Styled {
         Styled {
             whole: true,
+            shape: Shape::Code,
             ..Styled::plain(body)
         }
+    }
+
+    /// An empty row between two blocks.
+    fn gap() -> Styled {
+        Styled::plain(Vec::new()).shaped(Shape::Empty)
     }
 
     /// Whether it is an empty line of text, not of code.
@@ -83,6 +138,13 @@ pub(crate) struct Markdown {
     /// The lines of the Mermaid diagram being written, while its fence is
     /// open.
     diagram: Option<Vec<String>>,
+    /// The kind of block of the last line given, none at the text's start.
+    last: Option<Shape>,
+    /// Whether the model left an empty line since.
+    parted: bool,
+    /// Whether the last line given was within a list, for the lines
+    /// indented under its item.
+    listing: bool,
 }
 
 /// The fence that opens a block of code in `trimmed`, with its language.
@@ -118,7 +180,7 @@ fn above(language: &str, p: &Palette) -> Styled {
     } else {
         format!("╭ {language}")
     };
-    Styled::whole(vec![Span::styled(mark, p.fg(p.faint))])
+    Styled::whole(vec![Span::styled(mark, p.fg(p.faint))]).shaped(Shape::Opening)
 }
 
 /// The mark below a block of code.
@@ -143,8 +205,15 @@ impl Markdown {
 
     /// What `line` gives to write: itself styled, unless it only opens or
     /// closes a block of code; a table it ends; nothing while a table or a
-    /// diagram is held.
+    /// diagram is held. An empty row comes before a line that starts a
+    /// block, one whatever the model left, and none within a block.
     pub(crate) fn line(&mut self, line: &str, p: &Palette) -> Vec<Out> {
+        let out = self.read(line, p);
+        self.laid_out(out)
+    }
+
+    /// The same, not yet laid out in blocks.
+    fn read(&mut self, line: &str, p: &Palette) -> Vec<Out> {
         let trimmed = line.trim_start();
         if let Some(lines) = &mut self.diagram {
             if self.fence.as_ref().is_some_and(|fence| {
@@ -190,7 +259,38 @@ impl Markdown {
         } else if self.fence.take().is_some() {
             out.push(Out::Line(below(p)));
         }
+        let out = self.laid_out(out);
+        // The next text starts afresh, under its own name or steps.
+        self.last = None;
+        self.parted = false;
+        self.listing = false;
         out
+    }
+
+    /// `out` laid out in blocks: an empty line of the model's kept only as
+    /// a mark that the next block is parted from the last, and an empty
+    /// row put before each line that starts a block.
+    fn laid_out(&mut self, out: Vec<Out>) -> Vec<Out> {
+        let mut laid = Vec::with_capacity(out.len() + 1);
+        for out in out {
+            let shape = match &out {
+                Out::Line(styled) if styled.is_empty() => {
+                    self.parted = self.last.is_some();
+                    continue;
+                }
+                Out::Line(styled) => styled.shape,
+                Out::Table(_) | Out::Diagram(_) => Shape::Whole,
+            };
+            if let Some(last) = self.last
+                && last.parts(shape, self.parted)
+            {
+                laid.push(Out::Line(Styled::gap()));
+            }
+            self.last = Some(shape);
+            self.parted = false;
+            laid.push(out);
+        }
+        laid
     }
 
     /// The table held, when one is.
@@ -223,8 +323,9 @@ impl Markdown {
         }
         let indent: String = line.chars().take_while(|c| *c == ' ').collect();
         if trimmed.is_empty() {
-            return Some(Styled::plain(Vec::new()));
+            return Some(Styled::plain(Vec::new()).shaped(Shape::Empty));
         }
+        let listing = std::mem::take(&mut self.listing);
         let hashes = trimmed.chars().take_while(|c| *c == '#').count();
         if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
             let style = if hashes <= 2 {
@@ -232,21 +333,19 @@ impl Markdown {
             } else {
                 p.bold(p.text)
             };
-            return Some(Styled::plain(inline(
-                trimmed[hashes..].trim(),
-                style,
-                p,
-                self.links,
-            )));
+            return Some(
+                Styled::plain(inline(trimmed[hashes..].trim(), style, p, self.links))
+                    .shaped(Shape::Heading),
+            );
         }
         if trimmed.chars().all(|c| c == '-' || c == ' ') && trimmed.matches('-').count() >= 3
             || trimmed.chars().all(|c| c == '*' || c == ' ') && trimmed.matches('*').count() >= 3
             || trimmed.chars().all(|c| c == '_') && trimmed.len() >= 3
         {
-            return Some(Styled::plain(vec![Span::styled(
-                "─".repeat(32),
-                p.fg(p.faint),
-            )]));
+            return Some(
+                Styled::plain(vec![Span::styled("─".repeat(32), p.fg(p.faint))])
+                    .shaped(Shape::Rule),
+            );
         }
         for bullet in ["- ", "* ", "+ "] {
             if let Some(item) = trimmed.strip_prefix(bullet) {
@@ -260,6 +359,7 @@ impl Markdown {
                         None => ("• ", item),
                     },
                 };
+                self.listing = true;
                 return Some(Styled {
                     first: vec![
                         Span::raw(indent.clone()),
@@ -268,6 +368,7 @@ impl Markdown {
                     rest: vec![Span::raw(format!("{indent}  "))],
                     body: inline(item, p.fg(p.text), p, self.links),
                     whole: false,
+                    shape: Shape::Item,
                 });
             }
         }
@@ -276,6 +377,7 @@ impl Markdown {
             && let Some(item) = trimmed[digits..].strip_prefix(". ")
         {
             let number = &trimmed[..digits + 1];
+            self.listing = true;
             return Some(Styled {
                 first: vec![
                     Span::raw(indent.clone()),
@@ -284,6 +386,7 @@ impl Markdown {
                 rest: vec![Span::raw(format!("{indent}{}", " ".repeat(digits + 2)))],
                 body: inline(item, p.fg(p.text), p, self.links),
                 whole: false,
+                shape: Shape::Item,
             });
         }
         if let Some(quote) = trimmed.strip_prefix('>') {
@@ -293,6 +396,13 @@ impl Markdown {
                 Span::styled("▎ ", p.fg(p.faint)),
                 inline(quote.trim_start(), style, p, self.links),
             ));
+        }
+        // A line indented under a list's item is the item's.
+        if listing && indent.len() >= 2 {
+            self.listing = true;
+            return Some(
+                Styled::plain(inline(line, p.fg(p.text), p, self.links)).shaped(Shape::Item),
+            );
         }
         Some(Styled::plain(inline(line, p.fg(p.text), p, self.links)))
     }
@@ -410,9 +520,17 @@ mod tests {
             .collect()
     }
 
-    /// The one line `out` holds, as text; none when it holds none.
+    /// `out` without the empty rows between its blocks.
+    fn unparted(out: Vec<Out>) -> Vec<Out> {
+        out.into_iter()
+            .filter(|out| !matches!(out, Out::Line(styled) if styled.shape == Shape::Empty))
+            .collect()
+    }
+
+    /// The one line `out` holds, as text, the empty rows between blocks
+    /// aside; none when it holds none.
     fn one(out: Vec<Out>) -> Option<String> {
-        match out.as_slice() {
+        match unparted(out).as_slice() {
             [Out::Line(styled)] => Some(text(styled)),
             [] => None,
             other => panic!("{other:?}"),
@@ -432,7 +550,7 @@ mod tests {
         assert_eq!(shown("12. then").as_deref(), Some("12. then"));
         assert_eq!(shown("```rust").as_deref(), Some("╭ rust"));
         // Code as it is written, nothing before it, whole.
-        let [Out::Line(code)] = &md.line("    let x = *a * b;", &p)[..] else {
+        let [Out::Line(code)] = &unparted(md.line("    let x = *a * b;", &p))[..] else {
             panic!("one line of code")
         };
         assert_eq!(text(code), "    let x = *a * b;");
@@ -465,13 +583,13 @@ mod tests {
         assert!(md.line("| a | b |", &p).is_empty());
         assert!(md.line("|---|---|", &p).is_empty());
         assert!(md.line("| 1 | 2 |", &p).is_empty());
-        let out = md.line("after", &p);
+        let out = unparted(md.line("after", &p));
         assert!(matches!(&out[..], [Out::Table(_), Out::Line(after)] if text(after) == "after"));
         assert!(md.line("```Mermaid", &p).is_empty());
         assert!(md.line("flowchart LR", &p).is_empty());
         assert!(md.line("  A --> B", &p).is_empty());
         assert_eq!(
-            md.line("```", &p),
+            unparted(md.line("```", &p)),
             [Out::Diagram("flowchart LR\n  A --> B".into())]
         );
         // A row as the text ends, and a diagram never closed, written as
@@ -516,6 +634,51 @@ mod tests {
         assert_eq!(
             one(md.line("[x](javascript:alert(1))", &p)).as_deref(),
             Some("x (javascript:alert(1))")
+        );
+    }
+
+    #[test]
+    fn blocks_are_parted_by_one_empty_row_and_a_list_by_none() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut md = Markdown::default();
+        let source = "Two things:\n- one\n\n- two\n  still two\n\n\n\n### Next\nText\nmore text\n\n\nAnother\n```sh\nls\n\n\nls -a\n```\nAfter\n> a\n> b";
+        let mut out: Vec<Out> = source.lines().flat_map(|line| md.line(line, &p)).collect();
+        out.extend(md.flush(&p));
+        let rows: Vec<String> = out
+            .into_iter()
+            .map(|out| match out {
+                Out::Line(styled) => text(&styled),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "Two things:",
+                "",
+                "• one",
+                "• two",
+                "  still two",
+                "",
+                "Next",
+                "",
+                "Text",
+                "more text",
+                "",
+                "Another",
+                "",
+                "╭ sh",
+                "ls",
+                "",
+                "",
+                "ls -a",
+                "╰",
+                "",
+                "After",
+                "",
+                "▎ a",
+                "▎ b",
+            ]
         );
     }
 }

@@ -630,6 +630,7 @@ impl Iq {
             let screen = &mut self.screen;
             Inline::clear_above(&mut screen.out, rows, rows)?;
             screen.inline = Inline::new(cols, rows);
+            screen.inline.began_above();
             let live = Live {
                 board: &self.board,
                 history: &self.history,

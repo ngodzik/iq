@@ -1855,6 +1855,82 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_streamed_in_any_chunks_has_one_empty_row_between_blocks() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let answer = "Done:\n- the parser\n- its tests\n\n### Next\nThe docs.\n";
+        let expected = [
+            "● lead",
+            "  Done:",
+            "",
+            "  • the parser",
+            "  • its tests",
+            "",
+            "  Next",
+            "",
+            "  The docs.",
+        ];
+        let rows = |chunks: &[&str]| -> Vec<String> {
+            let mut board = Board::default();
+            let mut history = History::default();
+            crew(
+                &mut board,
+                &mut history,
+                Event::Joined {
+                    agent: "lead".into(),
+                    model: "lab/lead".into(),
+                    by: PERSON.into(),
+                },
+                &p,
+            );
+            for chunk in chunks {
+                crew(
+                    &mut board,
+                    &mut history,
+                    Event::Text {
+                        agent: "lead".into(),
+                        text: (*chunk).into(),
+                    },
+                    &p,
+                );
+            }
+            crew(
+                &mut board,
+                &mut history,
+                Event::Done {
+                    agent: "lead".into(),
+                    outcome: Ok(answer.into()),
+                },
+                &p,
+            );
+            history
+                .take(60, Some("lead"))
+                .iter()
+                .map(|l| l.to_string().trim_end().to_owned())
+                .skip_while(String::is_empty)
+                .collect()
+        };
+        // Cut at every place, once and twice.
+        let at: Vec<usize> = answer.char_indices().map(|(i, _)| i).skip(1).collect();
+        for &one in &at {
+            let shown = rows(&[&answer[..one], &answer[one..]]);
+            assert_eq!(
+                shown[..expected.len()],
+                expected,
+                "cut at {one}: {shown:#?}"
+            );
+            for &two in at.iter().filter(|&&two| two > one).step_by(5) {
+                let shown = rows(&[&answer[..one], &answer[one..two], &answer[two..]]);
+                assert_eq!(shown[..expected.len()], expected, "cut at {one}, {two}");
+            }
+        }
+        // An answer whose model left empty lines everywhere, and new lines
+        // as Windows writes them.
+        let loose = "Done:\r\n\r\n\r\n- the parser\r\n\r\n- its tests\r\n\r\n\r\n\r\n### Next\r\n\r\nThe docs.\r\n";
+        let shown = rows(&[loose]);
+        assert_eq!(shown[..expected.len()], expected, "{shown:#?}");
+    }
+
+    #[test]
     fn a_chat_come_back_to_is_written_as_it_was_shown() {
         use iq_ui::crew::{Back, Entry};
         let p = Palette::new(Theme::Graphite, Depth::True);
