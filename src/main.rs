@@ -729,11 +729,11 @@ fn unlisted(endpoint: &str, in_use: &[(&str, String)], listed: &[String]) -> Vec
 }
 
 /// The models the settings put to use, each with the setting that names
-/// it: the lead's, the reviewer's and the observer's.
+/// it: the lead's, the autopilot's and the observer's.
 fn in_use(settings: &Settings, lead: &ModelId) -> Result<Vec<(&'static str, String)>> {
     let mut models = vec![("model", lead.to_string())];
     if let Some(reviewer) = settings.crew()?.reviewer {
-        models.push(("reviewer", reviewer.to_string()));
+        models.push(("autopilot_model", reviewer.to_string()));
     }
     models.push(("[observe] model", settings.observing()?.model.to_string()));
     if let Some(summarizer) = settings.summarizer()? {
@@ -1579,9 +1579,18 @@ fn left_over(settings: &Settings) -> Vec<String> {
 }
 
 /// What iq says at start of what the settings hold that it reads no more,
-/// for the person to change it.
+/// or under an old name, for the person to change it.
 fn retired(settings: &Settings) -> Vec<String> {
-    let mut said = Vec::new();
+    let mut said: Vec<String> = settings
+        .renamed()
+        .into_iter()
+        .map(|(old, new)| {
+            format!(
+                "~/.iq/settings.toml names `{old}`, now `{new}`: it is read under its old name \
+                 until the next release."
+            )
+        })
+        .collect();
     let retired = settings.retired();
     if !retired.is_empty() {
         said.push(format!(

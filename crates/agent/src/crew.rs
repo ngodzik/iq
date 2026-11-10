@@ -440,6 +440,9 @@ struct Member {
     prompt: Option<String>,
     /// Its last actions and how they ended, the latest last.
     done: VecDeque<String>,
+    /// What it wrote last in its turn under way, for the reviewer: its own
+    /// reason for the actions it calls after.
+    reason: Option<String>,
     /// The first message it has not read.
     read: usize,
     /// Its turn under way, when it works.
@@ -716,6 +719,7 @@ where
                 written: saved.written,
                 prompt: None,
                 done: VecDeque::new(),
+                reason: None,
                 read,
                 turn: None,
                 turns: 0,
@@ -1221,6 +1225,7 @@ where
                 written: (by == PERSON).then(now),
                 prompt: None,
                 done: VecDeque::new(),
+                reason: None,
                 read,
                 turn: None,
                 turns: 0,
@@ -2319,6 +2324,9 @@ where
         number: u64,
     ) -> (Vec<Message>, Result<String, String>) {
         messages.push(Message::user(prompt));
+        if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
+            member.reason = None;
+        }
         let mut urged = false;
         for _ in 0..self.inner.settings.steps {
             if let Some(news) = self.unread(name) {
@@ -2390,6 +2398,11 @@ where
                 continue;
             }
             messages.push(response.to_message());
+            if let Some(text) = response.content.as_ref().filter(|t| !t.trim().is_empty())
+                && let Some(member) = lock(&self.inner.board).members.get_mut(name)
+            {
+                member.reason = Some(text.clone());
+            }
             if let Some(text) = response.content.as_ref().filter(|t| !t.trim().is_empty()) {
                 self.report(Event::TextStart {
                     agent: name.to_owned(),
@@ -3129,6 +3142,7 @@ where
                 asked: member.asked.clone(),
                 prompt: member.prompt.clone(),
                 done: member.done.iter().cloned().collect(),
+                reason: member.reason.clone(),
             })
             .unwrap_or_default();
         let prompt = review::prompt(&work, action, place, reason, does);
