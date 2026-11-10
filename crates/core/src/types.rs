@@ -313,6 +313,11 @@ pub enum Message {
         content: Option<String>,
         /// Calls to run before the conversation continues.
         tool_calls: Vec<ToolCall>,
+        /// What the provider gave with the answer to be sent back with it,
+        /// as it came: a signature of the model's reasoning, which Gemini
+        /// asks again with its calls of tools when it thinks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_signature: Option<serde_json::Value>,
     },
     /// The result of one tool call.
     Tool {
@@ -469,6 +474,9 @@ pub struct ChatResponse {
     pub cost: Option<Usd>,
     /// What it read from the prompt cache and wrote to it, when known.
     pub cache: Option<CacheUse>,
+    /// What the provider gave with the answer to be sent back with it, as
+    /// it came: a signature of the model's reasoning.
+    pub reasoning_signature: Option<serde_json::Value>,
 }
 
 impl ChatResponse {
@@ -477,6 +485,7 @@ impl ChatResponse {
         Message::Assistant {
             content: self.content.clone(),
             tool_calls: self.tool_calls.clone(),
+            reasoning_signature: self.reasoning_signature.clone(),
         }
     }
 }

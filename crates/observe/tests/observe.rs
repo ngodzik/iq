@@ -30,6 +30,7 @@ impl ChatModel for Scripted {
             },
             cost: Some(Usd(0.0001)),
             cache: None,
+            reasoning_signature: None,
         })
     }
 }

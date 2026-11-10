@@ -183,6 +183,7 @@ fn say(text: &str) -> ChatResponse {
         },
         cost: Some(Usd(0.001)),
         cache: None,
+        reasoning_signature: None,
     }
 }
 

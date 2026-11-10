@@ -285,7 +285,11 @@ pub struct Back {
 /// let kept = [
 ///     Message::system("You are lead"),
 ///     Message::user("fix the login"),
-///     Message::Assistant { content: Some("Fixed.".into()), tool_calls: Vec::new() },
+///     Message::Assistant {
+///         content: Some("Fixed.".into()),
+///         tool_calls: Vec::new(),
+///         reasoning_signature: None,
+///     },
 /// ];
 /// assert_eq!(
 ///     past(&kept),
@@ -310,6 +314,7 @@ pub fn past(messages: &[Message]) -> Vec<Entry> {
             Message::Assistant {
                 content,
                 tool_calls,
+                ..
             } => {
                 if let Some(text) = content.as_ref().filter(|t| !t.trim().is_empty()) {
                     thread.push(Entry::Text(text.clone()));
@@ -954,6 +959,7 @@ mod tests {
                     name: "run".into(),
                     arguments: r#"{"command":"make test"}"#.into(),
                 }],
+                reasoning_signature: None,
             },
             Message::Tool {
                 call_id: "c1".into(),
@@ -962,6 +968,7 @@ mod tests {
             Message::Assistant {
                 content: Some("Blocked.".into()),
                 tool_calls: Vec::new(),
+                reasoning_signature: None,
             },
         ];
         assert_eq!(

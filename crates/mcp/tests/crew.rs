@@ -98,6 +98,7 @@ fn say(text: &str) -> ChatResponse {
         },
         cost: None,
         cache: None,
+        reasoning_signature: None,
     }
 }
 

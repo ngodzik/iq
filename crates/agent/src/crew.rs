@@ -3631,6 +3631,7 @@ fn compacted(
         kept.push(Message::Assistant {
             content: Some(answer.clone()),
             tool_calls: Vec::new(),
+            reasoning_signature: None,
         });
     }
     kept
