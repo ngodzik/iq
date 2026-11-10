@@ -2584,6 +2584,54 @@ async fn a_provider_s_refusal_is_kept_and_told_to_the_starter_as_iq_s_facts() {
 }
 
 #[tokio::test]
+async fn two_chats_writing_in_one_checkout_are_said_once() {
+    let write = |path: &str| {
+        calls(
+            "write_file",
+            serde_json::json!({"path": path, "content": "x\n"}),
+        )
+    };
+    let f = fixture(
+        &[
+            ("login", vec![write("login.txt"), say("Written.")]),
+            (
+                "build",
+                vec![
+                    write("build.txt"),
+                    say("Written."),
+                    write("again.txt"),
+                    say("Again."),
+                ],
+            ),
+        ],
+        Settings::default(),
+    );
+    f.crew
+        .start("login", &model("cheap/model"), "write it".into(), PERSON);
+    f.settled().await;
+    f.crew
+        .start("build", &model("cheap/model"), "write it".into(), PERSON);
+    f.settled().await;
+    f.crew.tell("build", "once more".into()).unwrap();
+    f.settled().await;
+    let said: Vec<(String, String)> = f
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Notice { agent, text } if text.contains("one checkout") => Some((agent, text)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said.len(), 1, "{said:#?}");
+    assert_eq!(said[0].0, "build");
+    assert!(
+        said[0].1.starts_with("the chat login wrote in "),
+        "{}",
+        said[0].1
+    );
+}
+
+#[tokio::test]
 async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
     let f = fixture(
         &[(

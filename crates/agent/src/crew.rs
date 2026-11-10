@@ -298,6 +298,33 @@ struct Inner<M> {
     /// with the number of its turn under way or last. Never locked before
     /// the board.
     aside: Mutex<HashMap<String, AsideLog>>,
+    /// Which chats wrote in each folder lately, and when; and the pairs
+    /// of chats the person was told wrote in the same one.
+    writers: Mutex<Writers>,
+}
+
+/// The tools that write where their agent works, as far as iq can tell: a
+/// command may write too.
+const WRITERS: [&str; 3] = ["write_file", "edit_file", "run"];
+
+/// How long a chat that wrote in a folder counts as writing there.
+const LATELY: Duration = Duration::from_secs(30 * 60);
+
+/// Which chats wrote in each folder lately, and which pairs of chats the
+/// person was told of.
+#[derive(Default)]
+struct Writers {
+    lately: HashMap<PathBuf, HashMap<String, Instant>>,
+    told: std::collections::HashSet<(String, String)>,
+}
+
+/// Two chats, in the same order whichever comes first.
+fn pair_of(one: &str, other: &str) -> (String, String) {
+    if one <= other {
+        (one.to_owned(), other.to_owned())
+    } else {
+        (other.to_owned(), one.to_owned())
+    }
 }
 
 /// What was set aside of one agent, with where its conversation stands.
@@ -560,6 +587,7 @@ where
                 wakes: Mutex::new(HashMap::new()),
                 listed: Mutex::new(Vec::new()),
                 aside: Mutex::new(HashMap::new()),
+                writers: Mutex::new(Writers::default()),
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
                 peer_wakes: Mutex::new(Vec::new()),
@@ -2274,6 +2302,53 @@ where
         }
     }
 
+    /// Notes that `agent` wrote where it works, and tells the person, once
+    /// for two chats, when another chat of this session wrote there lately:
+    /// two chats in one checkout may undo each other's changes.
+    fn wrote(&self, agent: &str) {
+        let (chat, folder) = {
+            let board = lock(&self.inner.board);
+            let Some(member) = board.members.get(agent) else {
+                return;
+            };
+            (
+                board.chat_of(agent),
+                member.place.gate.workspace().to_path_buf(),
+            )
+        };
+        let now = Instant::now();
+        let mut writers = lock(&self.inner.writers);
+        let Writers { lately, told } = &mut *writers;
+        let wrote = lately.entry(folder.clone()).or_default();
+        wrote.retain(|_, at| now.duration_since(*at) < LATELY);
+        let others: Vec<(String, Duration)> = wrote
+            .iter()
+            .filter(|(other, _)| **other != chat)
+            .filter(|(other, _)| {
+                let pair = pair_of(&chat, other);
+                !told.contains(&pair)
+            })
+            .map(|(other, at)| (other.clone(), now.duration_since(*at)))
+            .collect();
+        wrote.insert(chat.clone(), now);
+        for (other, _) in &others {
+            told.insert(pair_of(&chat, other));
+        }
+        drop(writers);
+        for (other, ago) in others {
+            self.report(Event::Notice {
+                agent: chat.clone(),
+                text: format!(
+                    "the chat {other} wrote in {} {} ago, as this one does now: two chats in one \
+                     checkout may undo each other's changes. Let one finish first, or give the \
+                     next a worktree of its own (worktree = true)",
+                    folder.display(),
+                    lasted(ago),
+                ),
+            });
+        }
+    }
+
     /// Reports the call of `agent`'s to `model` that `failed`, its turn
     /// with it, with where it stood (its last call's size and `added`
     /// since, what it spent until then), and gives what iq says of it: the
@@ -2580,6 +2655,9 @@ where
             Ok(output) => (output, true),
             Err(error) => (format!("Error: {error}"), false),
         };
+        if ok && WRITERS.contains(&call.name.as_str()) {
+            self.wrote(agent);
+        }
         if let Some(done) = review::done(&call.name, &input, &output, ok)
             && let Some(member) = lock(&self.inner.board).members.get_mut(agent)
         {
