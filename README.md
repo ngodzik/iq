@@ -78,6 +78,22 @@ scripts/check.sh                    # formatting, lints, docs, tests, dependency
 git config core.hooksPath .githooks # run those checks before every commit
 ```
 
+## The assay
+
+An optional part of iq, built only when asked for, to try a new model on your own kind of work without a second copy of iq: frozen exercises are given to candidate models, each run in a folder of its own, checked by hidden tests a command runs, then graded blind by one grader, always the same so that grades compare, and summed into what each candidate does and costs. Like the rest, it may change or go at any time.
+
+```bash
+cargo install --path . --features assay
+iq assay                                   # what its folder holds: the exercises, where each stands, the results
+iq assay freeze <exercise>                 # freezes an exercise, once its check fails on start/ and passes on the reference
+iq assay run <exercise | kind | all> <candidates...> [--times N]   # runs, checks and grades them
+iq assay grade [<exercise | kind | all>]   # grades with the current grader what it has not graded yet
+```
+
+A candidate is a model of the provider, or a team: `pair: writer + reviewer`, `lead: lead + cheaper`, `debate: a + b`. A run or a grading says what it should cost and asks before anything is spent.
+
+The assay keeps a folder of its own, never iq's: `$XDG_DATA_HOME/iq-assay` (`~/.local/share/iq-assay` by default), or the one `IQ_ASSAY_HOME` names. Its `README.md` says how an exercise is written. Its settings are in `settings.toml` there: `grader` (needed to run and to grade), `grader_effort`, `candidates` (`models`, `teams`, or candidates by name), `effort` (the candidates'), `reference` (the model the others are measured against), `parallel` (runs at once) and `base_url`. A key it does not read is said and left aside. The provider's key comes from `REQUESTY_API_KEY`, as iq's does. Its audit log and the calls it was billed are kept in the same folder. The exercises and runs an older iq kept in `~/.local/share/iq/assay` are read as they are, once moved there.
+
 ## Data from others
 
 None of this data ships with the program: each install fetches it for its own use and says where it comes from.

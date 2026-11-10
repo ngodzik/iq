@@ -2,6 +2,8 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(feature = "assay")]
+mod assay;
 mod chats;
 mod diagrams;
 mod journal;
@@ -117,6 +119,14 @@ enum Command {
         #[arg(long)]
         host: bool,
     },
+    /// The assay, in a folder of its own: frozen exercises given to
+    /// candidate models, checked, then graded blind by one grader. Without
+    /// a command, what its folder holds.
+    #[cfg(feature = "assay")]
+    Assay {
+        #[command(subcommand)]
+        act: Option<assay::Act>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -138,6 +148,12 @@ fn main() -> Result<()> {
         _ => {}
     }
     let mut cli = Cli::parse();
+    // The assay reads its own settings and keeps its own folder, never
+    // iq's: it goes its way before iq's are read.
+    #[cfg(feature = "assay")]
+    if let Some(Command::Assay { act }) = &cli.command {
+        return assay::main(&cli, act.as_ref());
+    }
     // The provider's address: as the command line or the environment
     // names it, else the settings, else Requesty's router.
     if cli.base_url.is_none() {
@@ -1588,9 +1604,10 @@ fn left_over(settings: &Settings) -> Vec<String> {
     let assay = settings::data_folder(&home).join("assay");
     if assay.is_dir() {
         said.push(format!(
-            "{} is the store of the assay iq no longer has: it is synced no more, and the next \
-             sync takes it out of the repository, whose history keeps it. Move it out of iq's \
-             folder, or remove it.",
+            "{} is the store of an older iq's assay: it is synced no more, and the next sync \
+             takes it out of the repository, whose history keeps it. The assay, built with the \
+             `assay` feature, keeps a folder of its own (~/.local/share/iq-assay): move it \
+             there to keep its exercises, or remove it.",
             assay.display()
         ));
     }
@@ -1655,6 +1672,8 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
     let (base_url, api_key) = (cli.endpoint(), cli.api_key.clone());
     match command {
         Command::Do { .. } => bail!("a task is handed to the crew"),
+        #[cfg(feature = "assay")]
+        Command::Assay { .. } => bail!("the assay runs apart"),
         Command::Models => {
             let provider = match api_key {
                 Some(key) => OpenAiCompatible::new(base_url, key),

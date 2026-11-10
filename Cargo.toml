@@ -4,6 +4,7 @@ members = [
     "crates/llm",
     "crates/gate",
     "crates/agent",
+    "crates/assay",
     "crates/memory",
     "crates/observe",
     "crates/sync",
@@ -30,6 +31,7 @@ iq-core  = { path = "crates/core", version = "0.1.0" }
 iq-llm   = { path = "crates/llm", version = "0.1.0" }
 iq-gate  = { path = "crates/gate", version = "0.1.0" }
 iq-agent = { path = "crates/agent", version = "0.1.0" }
+iq-assay = { path = "crates/assay", version = "0.1.0" }
 iq-sync  = { path = "crates/sync", version = "0.1.0" }
 iq-memory = { path = "crates/memory", version = "0.1.0" }
 iq-observe = { path = "crates/observe", version = "0.1.0" }
@@ -110,6 +112,8 @@ iq-tui.workspace             = true
 iq-plugin.workspace          = true
 iq-mcp.workspace             = true
 iq-web.workspace             = true
+# The assay, with the `assay` feature alone.
+iq-assay = { workspace = true, optional = true }
 base64.workspace             = true
 anyhow.workspace             = true
 clap.workspace               = true
@@ -122,6 +126,12 @@ toml.workspace               = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[features]
+# `iq assay`: frozen exercises given to candidate models, checked and
+# graded blind, in a folder and with settings of their own. Off unless
+# asked for: cargo install --path . --features assay
+assay = ["dep:iq-assay"]
 
 # iq's own crates build lightly optimised, so that they still build fast;
 # the others once, optimised and without their debug information, which
