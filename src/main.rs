@@ -1395,6 +1395,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     let _ = working.set_effort(&agent, effort);
                 }
                 Request::Stop { agent } => working.stop(&agent),
+                Request::StopJob { id } => working.stop_job(id),
                 Request::Rename { agent, name } => {
                     let said = match working.rename(&agent, &name) {
                         Ok(new) => format!("{agent} is named {new} now"),

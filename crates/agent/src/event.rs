@@ -99,6 +99,21 @@ pub enum Event {
         chat: String,
         /// Its number, from 1, in this session.
         number: u64,
+        /// What it may spend before the person is asked whether it goes
+        /// on; said again, under the same number, each time they let it
+        /// go on. None never asks.
+        ask_at: Option<Usd>,
+    },
+    /// What an agent's conversation is measured against: where its
+    /// model's price per token rises, and the most it reads at once, when
+    /// the provider says. Said once an agent first calls its model.
+    Window {
+        /// The agent.
+        agent: String,
+        /// The tokens past which a call costs more.
+        rises: Option<u64>,
+        /// The most its model reads at once.
+        most: Option<u64>,
     },
     /// A tool call ended.
     Tool {
@@ -305,6 +320,7 @@ impl Event {
             | Event::Reviewed { agent, .. }
             | Event::Done { agent, .. }
             | Event::Failed { agent, .. }
+            | Event::Window { agent, .. }
             | Event::Retired { agent }
             | Event::Notice { agent, .. } => renamed(agent),
             Event::Waiting { agent, on } => {

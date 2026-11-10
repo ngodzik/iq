@@ -614,6 +614,8 @@ struct Member {
     team: Vec<String>,
     /// Whether its answer reached who started it: done with its task.
     answered: bool,
+    /// Whether what its conversation is measured against was said.
+    measured: bool,
     /// The first message it has not read.
     read: usize,
     /// Its turn under way, when it works.
@@ -905,6 +907,7 @@ where
                 spent: saved.spent,
                 team: Vec::new(),
                 answered: false,
+                measured: false,
                 read,
                 turn: None,
                 turns: 0,
@@ -1430,6 +1433,7 @@ where
                 spent: Usd(0.0),
                 team: Vec::new(),
                 answered: false,
+                measured: false,
                 read,
                 turn: None,
                 turns: 0,
@@ -2665,6 +2669,47 @@ where
         )
     }
 
+    /// Says, once, what `agent`'s conversation on `model` is measured
+    /// against: where its price rises, the most it reads.
+    async fn measure(&self, agent: &str, model: &ModelId) {
+        let first = lock(&self.inner.board)
+            .members
+            .get_mut(agent)
+            .is_some_and(|member| !std::mem::replace(&mut member.measured, true));
+        if !first {
+            return;
+        }
+        let rises = self
+            .inner
+            .provider
+            .pricing(model)
+            .await
+            .and_then(|pricing| pricing.rises_at())
+            .map(|rises| rises.0);
+        let most = self.inner.provider.context_window(model).await;
+        self.report(Event::Window {
+            agent: agent.to_owned(),
+            rises,
+            most,
+        });
+    }
+
+    /// Stops the job `id`, as the person asks: its agent is woken with how
+    /// it ended.
+    pub fn stop_job(&self, id: u64) {
+        let stopped = {
+            let mut jobs = lock(&self.inner.jobs);
+            jobs.get_mut(&id).and_then(|job| {
+                let task = job.running.take()?;
+                task.abort();
+                Some((job.agent.clone(), job.line.clone()))
+            })
+        };
+        if let Some((agent, line)) = stopped {
+            self.job_ended(&agent, id, &line, "stopped by the person".to_owned());
+        }
+    }
+
     /// What `agent` on `model` is told of its conversation's size, once it
     /// grew by the settings' step since it was last told: how much each
     /// call reads, and where its model's price rises, when the provider
@@ -2822,6 +2867,7 @@ where
             if let Err(stopped) = self.within_turn(name).await {
                 return (messages, Err(stopped));
             }
+            self.measure(name, model).await;
             let response = match self.ask_model(name, &request).await {
                 Ok(response) => response,
                 Err(failed) => {
@@ -3795,6 +3841,7 @@ where
         self.report(Event::Turn {
             chat: chat.to_owned(),
             number,
+            ask_at: self.inner.settings.turn_ask,
         });
     }
 
@@ -3840,6 +3887,13 @@ where
         let turn = turns.entry(chat.clone()).or_default();
         if go_on {
             turn.ask_at = Some(total + step);
+            let said = Event::Turn {
+                chat: chat.clone(),
+                number: turn.number,
+                ask_at: turn.ask_at,
+            };
+            drop(turns);
+            self.report(said);
             Ok(())
         } else {
             turn.stopped = true;

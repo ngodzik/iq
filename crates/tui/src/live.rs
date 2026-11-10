@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use iq_ui::Board;
 use iq_ui::crew::Entry;
 use iq_ui::keys::Action;
+use iq_ui::look::TurnShown;
 use iq_ui::screen::Talk;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -137,7 +138,58 @@ impl Live<'_> {
     /// How many rows at the top of a screen `rows` tall the panes take:
     /// none unless the chat written to started agents that work.
     pub(crate) fn head_height(&self, rows: u16) -> u16 {
+        if self.board.look().turn() == TurnShown::Strip {
+            return 0;
+        }
         panes_height(self.started().len(), rows)
+    }
+
+    /// In place of the panes, as the settings ask: a strip of the turn's
+    /// map below the conversation, its line and a row for each agent at
+    /// work, the others counted.
+    fn strip(&self, motion: &Motion, width: usize) -> Option<Part> {
+        if self.board.look().turn() != TurnShown::Strip || self.started().is_empty() {
+            return None;
+        }
+        let chat = self.window()?;
+        let p = self.p;
+        let labels = |id: u64| self.history.job_label(id);
+        let writing = |agent: &str| self.history.partial(agent).map(str::to_owned);
+        let map = crate::map::Map {
+            board: self.board,
+            p,
+            motion,
+            now: self.now,
+            labels: &labels,
+            writing: &writing,
+        };
+        let mut lines = vec![map.head(&chat, width)];
+        lines.extend(map.rows(&chat, width, None, false, true));
+        let resting = self
+            .board
+            .crew()
+            .agents()
+            .iter()
+            .filter(|a| !a.working && a.name != chat)
+            .filter(|a| chat_of(self.board, &a.name).as_ref() == Some(&chat))
+            .count();
+        let finished = iq_ui::map::finished(self.board.crew(), &chat);
+        if resting + finished > 0 {
+            let see = self
+                .board
+                .keys()
+                .chord(Action::Map)
+                .map(|chord| format!(" · {chord} the whole map"))
+                .unwrap_or_default();
+            lines.push(fit(
+                vec![Span::styled(
+                    format!("   + {resting} resting · {finished} finished{see}"),
+                    p.fg(p.faint),
+                )],
+                width,
+            ));
+        }
+        Some(Part::Lines(lines))
     }
 
     /// Draws the panes of the agents the chat written to started, at work,
@@ -305,6 +357,11 @@ impl Live<'_> {
     fn working(&self, motion: &Motion, width: usize) -> Vec<Part> {
         let p = self.p;
         let mut parts = Vec::new();
+        // The strip says it all: the chat's agent, those at work, the jobs.
+        if let Some(strip) = self.strip(motion, width) {
+            parts.push(strip);
+            return parts;
+        }
         if let Some(own) = self.own() {
             parts.push(Part::Lines(self.alone(own, motion, width)));
         }
@@ -1454,6 +1511,7 @@ mod tests {
             Event::Turn {
                 chat: "fix".into(),
                 number: 3,
+                ask_at: None,
             },
             Event::Working {
                 agent: "fix".into(),

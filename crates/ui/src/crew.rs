@@ -92,6 +92,11 @@ pub enum Request {
     /// Give every command the internet, or only what a rule gives it to
     /// and what the person allows.
     Internet(bool),
+    /// Stop a command run in the background.
+    StopJob {
+        /// Its number.
+        id: u64,
+    },
     /// Stop an agent's turn.
     Stop {
         /// The agent.
@@ -203,6 +208,9 @@ pub struct TurnView {
     /// What each who spent in it spent, in the order they first did: its
     /// agents, the autopilot's model, the summaries.
     pub by: Vec<TurnSpending>,
+    /// What it may spend before the person is asked whether it goes on;
+    /// none never.
+    pub ask_at: Option<Usd>,
 }
 
 /// What one spent in a chat's turn.
@@ -283,6 +291,10 @@ pub struct AgentView {
     /// Whether it is done with the task another gave it: off the board,
     /// its name free for the next, what it did still read here.
     pub retired: bool,
+    /// The tokens past which a call of its model costs more, when told.
+    pub rises: Option<u64>,
+    /// The most its model reads at once, when told.
+    pub most: Option<u64>,
 }
 
 /// An agent waiting for the agents it started to write.
@@ -683,6 +695,8 @@ impl CrewView {
             worked: Some(finished.worked),
             waiting: None,
             retired: true,
+            rises: None,
+            most: None,
         });
     }
 
@@ -752,6 +766,8 @@ impl CrewView {
                     worked: None,
                     waiting: None,
                     retired: false,
+                    rises: None,
+                    most: None,
                 });
             }
             Event::Retired { agent } => {
@@ -788,15 +804,30 @@ impl CrewView {
                     }
                 }
             }
-            Event::Turn { chat, number } => {
-                self.turns.insert(
-                    chat,
-                    TurnView {
-                        number,
-                        since: crate::now(),
-                        ..TurnView::default()
-                    },
-                );
+            // The same turn said again: the person let it go on.
+            Event::Turn {
+                chat,
+                number,
+                ask_at,
+            } => match self.turns.get_mut(&chat) {
+                Some(turn) if turn.number == number => turn.ask_at = ask_at,
+                _ => {
+                    self.turns.insert(
+                        chat,
+                        TurnView {
+                            number,
+                            since: crate::now(),
+                            ask_at,
+                            ..TurnView::default()
+                        },
+                    );
+                }
+            },
+            Event::Window { agent, rises, most } => {
+                if let Some(view) = self.agent_mut(&agent) {
+                    view.rises = rises;
+                    view.most = most;
+                }
             }
             Event::Spent {
                 agent,
@@ -1107,6 +1138,7 @@ mod tests {
         crew.event(Event::Turn {
             chat: "lead".into(),
             number: 1,
+            ask_at: None,
         });
         for (cost, read) in [(0.25, 1200), (1.0, 1800)] {
             crew.event(Event::Spent {

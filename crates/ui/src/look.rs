@@ -62,6 +62,32 @@ impl FromStr for Theme {
     }
 }
 
+/// What shows a turn of several agents below the conversation, as the
+/// settings' `turn_view` says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TurnShown {
+    /// The agents at work side by side, a pane each, at the top.
+    #[default]
+    Panes,
+    /// A strip of the turn's map: a line for the turn, one for each agent
+    /// at work, the rest folded.
+    Strip,
+}
+
+impl std::str::FromStr for TurnShown {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "panes" => Ok(TurnShown::Panes),
+            "strip" => Ok(TurnShown::Strip),
+            other => Err(format!(
+                "turn_view = {other:?} is none iq knows: \"panes\" or \"strip\""
+            )),
+        }
+    }
+}
+
 /// How iq looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Look {
@@ -70,6 +96,8 @@ pub struct Look {
     steps: usize,
     /// How many of a job's latest lines show while it runs.
     job_lines: usize,
+    /// What shows a turn of several agents.
+    turn: TurnShown,
 }
 
 /// How many of a job's latest lines show while it runs, unless the
@@ -91,7 +119,21 @@ impl Look {
             theme,
             steps: crate::steps::SHOWN,
             job_lines: JOB_LINES,
+            turn: TurnShown::Panes,
         }
+    }
+
+    /// With a turn of several agents shown as `turn` says.
+    #[must_use]
+    pub fn with_turn(mut self, turn: TurnShown) -> Self {
+        self.turn = turn;
+        self
+    }
+
+    /// What shows a turn of several agents.
+    #[must_use]
+    pub fn turn(&self) -> TurnShown {
+        self.turn
     }
 
     /// With the latest `lines` of a job shown while it runs; none for 0.

@@ -205,6 +205,9 @@ mod tests {
             width: 80,
             images: false,
             summed,
+            motion: &crate::motion::Motion::default(),
+            labels: &|_| None,
+            writing: &|_| None,
         };
         let (lines, focus) = lines(&seen);
         (

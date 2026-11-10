@@ -119,7 +119,7 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
             "  ⚙ {agent} runs job {id} in the background: {}",
             iq_ui::shell::few_words(line, 72)
         ),
-        Event::JobOutput { .. } | Event::Turn { .. } => Ok(()),
+        Event::JobOutput { .. } | Event::Turn { .. } | Event::Window { .. } => Ok(()),
         Event::JobEnded {
             agent, id, said, ..
         } => {

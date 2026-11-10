@@ -734,7 +734,10 @@ impl History {
             }
             // Its turn's end says it, with the facts; the agents line
             // counts those retired.
-            Event::Failed { .. } | Event::Retired { .. } | Event::Turn { .. } => {}
+            Event::Failed { .. }
+            | Event::Retired { .. }
+            | Event::Turn { .. }
+            | Event::Window { .. } => {}
             Event::Notice { agent, text } => {
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
@@ -1658,6 +1661,7 @@ fn agent_of(event: &Event) -> Option<&str> {
         | Event::JobEnded { agent, .. }
         | Event::JobOutput { agent, .. }
         | Event::Failed { agent, .. }
+        | Event::Window { agent, .. }
         | Event::Retired { agent }
         | Event::Notice { agent, .. } => Some(agent),
         Event::Posted { from, .. } => Some(from),

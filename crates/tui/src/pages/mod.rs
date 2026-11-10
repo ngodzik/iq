@@ -22,6 +22,19 @@ use crate::history::short;
 use crate::theme::Palette;
 use crate::wrap::{cut, spans_width};
 
+/// What the pages read beside the board: what the conversation made of
+/// it, and what moves.
+pub(crate) struct Beside<'a> {
+    /// The summary of the message between agents of a number, once made.
+    pub(crate) summed: &'a dyn Fn(usize) -> Option<String>,
+    /// What moves: the spinners, the messages' sparks.
+    pub(crate) motion: &'a crate::motion::Motion,
+    /// What a job does in a few words, by its number.
+    pub(crate) labels: &'a dyn Fn(u64) -> Option<String>,
+    /// What an agent writes now, while it writes.
+    pub(crate) writing: &'a dyn Fn(&str) -> Option<String>,
+}
+
 /// What a page draws from.
 pub(crate) struct Seen<'a> {
     pub(crate) board: &'a Board,
@@ -34,6 +47,12 @@ pub(crate) struct Seen<'a> {
     pub(crate) images: bool,
     /// The summary of the message between agents of a number, once made.
     pub(crate) summed: &'a dyn Fn(usize) -> Option<String>,
+    /// What moves: the spinners, the messages' sparks.
+    pub(crate) motion: &'a crate::motion::Motion,
+    /// What a job does in a few words, by its number.
+    pub(crate) labels: &'a dyn Fn(u64) -> Option<String>,
+    /// What an agent writes now, while it writes.
+    pub(crate) writing: &'a dyn Fn(&str) -> Option<String>,
 }
 
 impl Seen<'_> {
@@ -89,6 +108,10 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String, Option<
             "← → earlier, later · s the span · b by · n now · ↑↓ scroll",
         ),
         Page::Keys => (keys::lines(seen), "↑↓ scroll"),
+        Page::Map => (
+            map(seen),
+            "↑↓ choose · Enter its thread, or the job whole · w write to it · s stop it · f those finished",
+        ),
         Page::Changes => return (changes::lines(seen), changes::foot(seen), None),
         Page::Steps => (Vec::new(), ""),
         Page::Diagram => (
@@ -97,6 +120,42 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String, Option<
         ),
     };
     (lines, foot.to_owned(), None)
+}
+
+/// The map of the turn of the chat written to, whole.
+fn map(seen: &Seen<'_>) -> Vec<Line<'static>> {
+    let p = seen.p;
+    let Some(chat) = seen.board.chat_shown() else {
+        let mut lines = Vec::new();
+        seen.said(&mut lines, "Write to a chat: its turn shows here.", p.dim);
+        return lines;
+    };
+    let map = crate::map::Map {
+        board: seen.board,
+        p,
+        motion: seen.motion,
+        now: seen.now,
+        labels: seen.labels,
+        writing: seen.writing,
+    };
+    let finished = seen.board.screen().finished_shown();
+    let mut lines = vec![
+        Line::default(),
+        map.head(&chat, seen.width),
+        Line::default(),
+    ];
+    lines.extend(map.rows(
+        &chat,
+        seen.width,
+        Some(seen.board.screen().chosen()),
+        finished,
+        false,
+    ));
+    if let Some(foot) = map.foot(&chat, seen.width, finished) {
+        lines.push(Line::default());
+        lines.push(foot);
+    }
+    lines
 }
 
 /// What the diagram page says beside the image: what it is, and, where
@@ -129,7 +188,7 @@ pub(crate) fn draw(
     p: &Palette,
     now: u64,
     images: bool,
-    summed: &dyn Fn(usize) -> Option<String>,
+    beside: &Beside<'_>,
 ) -> Rect {
     let Some(page) = board.screen().page().cloned() else {
         return Rect::default();
@@ -141,7 +200,10 @@ pub(crate) fn draw(
         now,
         width: usize::from(area.width),
         images,
-        summed,
+        summed: beside.summed,
+        motion: beside.motion,
+        labels: beside.labels,
+        writing: beside.writing,
     };
     let (lines, foot, focus) = content(&page, &seen);
     let mut top: Vec<Line<'static>> = vec![title(&page, &seen)];

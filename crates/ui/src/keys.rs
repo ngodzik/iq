@@ -46,6 +46,8 @@ pub enum Action {
     Changes,
     /// Every step the agents took, unfolded.
     Steps,
+    /// The map of the turn: who works, waits and spends, and their jobs.
+    Map,
     /// Stops the agent the person writes to.
     Stop,
     /// Quits.
@@ -54,7 +56,7 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order the list of shortcuts gives them.
-    pub const ALL: [Action; 15] = [
+    pub const ALL: [Action; 16] = [
         Action::Switch,
         Action::NewChat,
         Action::Team,
@@ -68,6 +70,7 @@ impl Action {
         Action::Refuse,
         Action::Changes,
         Action::Steps,
+        Action::Map,
         Action::Stop,
         Action::Quit,
     ];
@@ -89,6 +92,7 @@ impl Action {
             Action::Refuse => "refuse",
             Action::Changes => "changes",
             Action::Steps => "steps",
+            Action::Map => "map",
             Action::Stop => "stop",
             Action::Quit => "quit",
         }
@@ -111,6 +115,7 @@ impl Action {
             Action::Refuse => "refuse it",
             Action::Changes => "what a sync would send, line by line",
             Action::Steps => "every step the agents took and what they wrote each other, unfolded",
+            Action::Map => "the map of the turn: who works, waits and spends, their jobs",
             Action::Stop => "stop the agent you write to",
             Action::Quit => "quit",
         }
@@ -130,8 +135,9 @@ impl Action {
             Action::Autopilot => "shift+tab",
             Action::Allow => "ctrl+y",
             Action::Refuse => "ctrl+r",
-            Action::Changes => "ctrl+g",
+            Action::Changes => "ctrl+d",
             Action::Steps => "ctrl+x",
+            Action::Map => "ctrl+g",
             Action::Stop => "escape",
             // A terminal never hands Cmd-Q to the program in it.
             Action::Quit => "ctrl+q",

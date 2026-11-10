@@ -23,6 +23,7 @@ mod inline;
 mod keys;
 mod link;
 mod live;
+mod map;
 mod markdown;
 mod motion;
 mod pages;
@@ -401,15 +402,24 @@ impl Iq {
     /// Writes what the conversation gained, then draws the live part or
     /// the page.
     fn draw(&mut self, now: u64) -> io::Result<()> {
+        self.motion.tick();
         let screen = &mut self.screen;
         if screen.paged {
             let (board, p, history) = (&mut self.board, &self.p, &self.history);
             let images = screen.kitty.is_some();
             let mut body = Rect::default();
             let summed = |id: usize| history.summed(id);
+            let labels = |id: u64| history.job_label(id);
+            let writing = |agent: &str| history.partial(agent).map(str::to_owned);
+            let beside = pages::Beside {
+                summed: &summed,
+                motion: &self.motion,
+                labels: &labels,
+                writing: &writing,
+            };
             screen
                 .terminal
-                .draw(|frame| body = pages::draw(frame, board, p, now, images, &summed))?;
+                .draw(|frame| body = pages::draw(frame, board, p, now, images, &beside))?;
             return self.picture(body);
         }
         if screen.placed.is_some() {

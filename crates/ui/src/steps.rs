@@ -274,6 +274,7 @@ impl Steps {
             | Event::Choose { .. }
             | Event::Chosen { .. }
             | Event::Turn { .. }
+            | Event::Window { .. }
             | Event::JobOutput { .. } => {}
             Event::JobStarted { id, line, .. } => {
                 self.jobs.insert(*id, line.clone());
