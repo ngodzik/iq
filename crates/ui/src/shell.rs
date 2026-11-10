@@ -13,10 +13,19 @@ const WITH_THEIR_FIRST: [&str; 22] = [
 /// What only sets up the commands after it, said through.
 const SETTING_UP: [&str; 7] = ["sudo", "env", "time", "nice", "nohup", "exec", "command"];
 
+/// The shell's own words before a command, said through: `do sleep 1`.
+const LEADING: [&str; 9] = [
+    "do", "then", "else", "elif", "if", "while", "until", "!", "time",
+];
+
+/// The shell's own words that make a whole part, said nothing of: a loop's
+/// head, a block's end.
+const SHELL_ONLY: [&str; 8] = ["for", "case", "select", "done", "fi", "esac", "}", ")"];
+
 /// Commands that say nothing of what the line does.
-const SAYING_NOTHING: [&str; 12] = [
+const SAYING_NOTHING: [&str; 15] = [
     "cd", "set", "export", "echo", "printf", "true", "false", ":", "exit", "pushd", "popd",
-    "source",
+    "source", "[", "[[", "test",
 ];
 
 /// The endings of a word that names a file.
@@ -48,7 +57,9 @@ pub fn few_words(line: &str, most: usize) -> String {
         // What sets a variable or only sets up the rest.
         while let Some(word) = words.peek() {
             let assigns = word.contains('=') && !word.starts_with('-') && !word.starts_with('=');
-            if *word == "timeout" {
+            if LEADING.contains(word) {
+                words.next();
+            } else if *word == "timeout" {
                 // With how long it gives.
                 words.next();
                 words.next_if(|word| word.starts_with(|c: char| c.is_ascii_digit()));
@@ -61,7 +72,7 @@ pub fn few_words(line: &str, most: usize) -> String {
         let Some(program) = words.next() else {
             continue;
         };
-        if SAYING_NOTHING.contains(&program) {
+        if SAYING_NOTHING.contains(&program) || SHELL_ONLY.contains(&program) {
             continue;
         }
         let rest: Vec<&str> = words.collect();
@@ -208,6 +219,15 @@ mod tests {
             "python -m pytest"
         );
         assert_eq!(few_words("echo done", 80), "");
+        // The shell's own words are not programs.
+        assert_eq!(
+            few_words("for i in 1 2 3; do echo step $i; sleep 1; done", 80),
+            "sleep"
+        );
+        assert_eq!(
+            few_words("if [ -f x.toml ]; then cargo build; else make; fi", 80),
+            "cargo build, make"
+        );
     }
 
     #[test]
