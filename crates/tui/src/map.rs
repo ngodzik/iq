@@ -115,11 +115,17 @@ impl Map<'_> {
                 Kind::Agent(agent) => {
                     at_row.push((agent.name.clone(), lines.len()));
                     lines.push(self.agent_row(row, agent, turn, &columns, on, width));
+                    // Between two agents neither of which started the other:
+                    // a spark runs along the tree between the others.
+                    let peers = |to: &str| {
+                        agent.by != to
+                            && crew.agent(to).is_none_or(|reader| reader.by != agent.name)
+                    };
                     for arc in self
                         .motion
                         .arcs()
                         .iter()
-                        .filter(|arc| arc.from == agent.name)
+                        .filter(|arc| arc.from == agent.name && peers(&arc.to))
                     {
                         lines.push(self.arc_row(row, &arc.to, &arc.words, width));
                     }
@@ -219,8 +225,14 @@ impl Map<'_> {
         let spent = turn
             .filter(|turn| !agent.retired || agent.worked.is_some_and(|at| at >= turn.since))
             .and_then(|turn| turn.by.iter().find(|spent| spent.who == agent.name));
+        // A price unknown is said by nothing, not by a cost of nothing.
         let (cost, calls) = spent.map_or((String::new(), 0), |spent| {
-            (spent.spent.to_string(), spent.calls)
+            let cost = if spent.spent.0 > 0.0 {
+                spent.spent.to_string()
+            } else {
+                String::new()
+            };
+            (cost, spent.calls)
         });
         spans.push(Span::styled(format!("{cost:>7} "), p.fg(p.text)));
         if columns.calls {
@@ -352,7 +364,7 @@ impl Map<'_> {
                 _ => None,
             }) {
                 Some((name, input)) => tool_said(name, input),
-                None => "thinking".to_owned(),
+                None => "working".to_owned(),
             };
         }
         match agent.thread.last() {
@@ -481,13 +493,15 @@ fn part(name: &str) -> String {
         .to_owned()
 }
 
-/// The first words of `text`, its first line cut.
+/// The first words of `text`, its first line cut, its Markdown's marks
+/// left out.
 fn first_words(text: &str) -> String {
     let line = text
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("");
-    cut(line.trim(), 60)
+    let plain = line.replace("**", "").replace("__", "").replace('`', "");
+    cut(plain.trim().trim_start_matches(['#', '-', '*', ' ']), 60)
 }
 
 /// What a tool call does, said with its target: `reading src/hook.rs`,
@@ -642,6 +656,10 @@ mod tests {
             rows[2].ends_with("answered · 1 medium, 4 minor"),
             "{}",
             rows[2]
+        );
+        assert_eq!(
+            first_words("**3** lines in `notes.txt`\nmore"),
+            "3 lines in notes.txt"
         );
         assert!(
             rows[3].starts_with(" └─ ⠋ job 3 · cargo test · 0s"),
