@@ -397,6 +397,47 @@ async fn what_the_person_lets_on_the_machine_runs_outside_the_sandbox() {
 }
 
 #[tokio::test]
+async fn no_command_has_a_terminal_to_ask_at_and_git_asks_nothing() {
+    let f = fixture();
+    // Leading a session of its own, its shell's session is its own id,
+    // which Linux tells.
+    let line = "(: < /dev/tty) 2>/dev/null && echo tty || echo no-tty; \
+                echo prompt=$GIT_TERMINAL_PROMPT; \
+                if [ -r /proc/$$/stat ]; then \
+                  [ \"$(cut -d' ' -f6 /proc/$$/stat)\" = \"$$\" ] && echo leads || echo joined; \
+                else echo leads; fi";
+    let ran = run(&f, line).await;
+    assert_eq!(
+        ran.output.trim(),
+        "no-tty\nprompt=0\nleads",
+        "{}",
+        ran.output
+    );
+    // Run on the machine itself, as the person approved, all the same.
+    let Judged::Asked { pending, .. } = f
+        .gate
+        .judge(Action::Run {
+            line: line.to_owned(),
+            folder: f.root.clone(),
+            network: false,
+            host: true,
+        })
+        .unwrap()
+    else {
+        panic!("not asked")
+    };
+    let permit = f.gate.approve(pending, Approver::Person).unwrap();
+    assert!(matches!(permit.action(), Action::Run { host: true, .. }));
+    let ran = f.sandbox.run(permit).await.unwrap();
+    assert_eq!(
+        ran.output.trim(),
+        "no-tty\nprompt=0\nleads",
+        "{}",
+        ran.output
+    );
+}
+
+#[tokio::test]
 async fn in_a_worktree_a_command_commits_to_the_repository_whose_hooks_are_put_back() {
     let repository = tempfile::tempdir().unwrap();
     let top = repository.path().canonicalize().unwrap();

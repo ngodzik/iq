@@ -3,7 +3,10 @@
 //! their own and the toolchains' caches, and reach no network unless their
 //! permit says. Each starts through a helper, iq itself, that confines its
 //! own process and then becomes the command, so that what the command
-//! starts is held as it is.
+//! starts is held as it is. A command run on the machine itself goes
+//! through the helper too, which only detaches it: no command ever has the
+//! person's terminal, to write over iq's screen or wait there for an
+//! answer.
 
 use std::ffi::OsString;
 use std::io::BufRead;
@@ -28,6 +31,15 @@ pub const HELPER_FLAG: &str = "--iq-sandbox";
 /// The flag that makes the helper hold a network of the sandbox's own,
 /// where only localhost answers, for its commands to share.
 pub const HOLD_FLAG: &str = "--iq-network";
+
+/// The flag that makes the helper only detach the command from iq's
+/// terminal, without confining it: a command run on the machine itself.
+pub const DETACH_FLAG: &str = "--iq-detach";
+
+/// How git reaches a remote over ssh unless the person named their own
+/// way: never asking, so that what would wait for an answer fails at once
+/// with a message.
+const SSH_ASKING_NOTHING: &str = "ssh -o BatchMode=yes";
 
 /// What the holder of that network says once it holds it.
 pub(crate) const HOLDING: &str = "holding";
@@ -493,8 +505,13 @@ impl Sandbox {
         // Errors land with the output, in order.
         let shell = ["/bin/sh", "-c", &format!("exec 2>&1; {line}")];
         let mut command = if host {
-            let mut command = tokio::process::Command::new(shell[0]);
-            command.args(&shell[1..]).envs(kept(std::env::vars_os()));
+            let mut command = tokio::process::Command::new(&self.helper.program);
+            command
+                .arg(DETACH_FLAG)
+                .arg("--")
+                .args(shell)
+                .env_clear()
+                .envs(kept(std::env::vars_os()));
             command
         } else {
             let mut command = tokio::process::Command::new(&self.helper.program);
@@ -513,6 +530,12 @@ impl Sandbox {
             }
             command
         };
+        // Nobody can answer what git or ssh would ask at a terminal, which
+        // the command has not: they fail at once instead of waiting.
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        if !ssh_named(std::env::vars_os()) && !ssh_set(&folder).await {
+            command.env("GIT_SSH_COMMAND", SSH_ASKING_NOTHING);
+        }
         // What the person's programs gave this place, the plugin that keeps
         // its containers apart among them, either way.
         command.envs(self.given.of(workspace));
@@ -530,10 +553,10 @@ impl Sandbox {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .process_group(0)
             .kill_on_drop(true);
         let watch = Watch::take(workspace);
         let mut child = command.spawn().map_err(GateError::Spawn)?;
+        // The helper leads a session of its own, its group the same.
         let group = child.id();
         // Kept from the start: a turn stopped while the command runs drops
         // this wait, which stops the group, and the sandbox's end stops
@@ -807,6 +830,29 @@ fn passed(
     })
 }
 
+/// Whether the person named in their environment, `env`, how git reaches
+/// a remote over ssh, which [`SSH_ASKING_NOTHING`] would override.
+fn ssh_named(env: impl IntoIterator<Item = (OsString, OsString)>) -> bool {
+    env.into_iter()
+        .any(|(name, value)| (name == "GIT_SSH_COMMAND" || name == "GIT_SSH") && !value.is_empty())
+}
+
+/// Whether git's settings, as `folder` reads them, name how it reaches a
+/// remote over ssh (`core.sshCommand`), which [`SSH_ASKING_NOTHING`]
+/// would override.
+async fn ssh_set(folder: &Path) -> bool {
+    tokio::process::Command::new("git")
+        .args(["config", "--get", "core.sshCommand"])
+        .current_dir(folder)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .is_ok_and(|said| said.status.success() && !said.stdout.trim_ascii().is_empty())
+}
+
 /// Stops every process of the command's group, the command's own children
 /// with it. A group below 2 would name every process the person may
 /// signal, and is never signalled.
@@ -866,11 +912,47 @@ pub fn sandboxed(args: impl IntoIterator<Item = OsString>) -> GateError {
     let Some(program) = args.next() else {
         return GateError::Confine("no command was given".to_owned());
     };
+    if let Err(error) = own_session() {
+        return error;
+    }
     let (program, args) = match crate::confine::confine(&policy, program, args.collect()) {
         Ok(command) => command,
         Err(error) => return error,
     };
     GateError::Spawn(std::process::Command::new(program).args(args).exec())
+}
+
+/// Becomes the command after `--` in a session of its own, with no
+/// terminal, without confining it: what the helper does with
+/// [`DETACH_FLAG`], for a command run on the machine itself. Returns only
+/// when that fails; the helper prints it as [`helper_failure`] writes it
+/// and exits.
+pub fn detached(args: impl IntoIterator<Item = OsString>) -> GateError {
+    use std::os::unix::process::CommandExt;
+    let mut args = args.into_iter();
+    if args.next().as_deref() != Some("--".as_ref()) {
+        return GateError::Confine("no command was given".to_owned());
+    }
+    let Some(program) = args.next() else {
+        return GateError::Confine("no command was given".to_owned());
+    };
+    if let Err(error) = own_session() {
+        return error;
+    }
+    GateError::Spawn(std::process::Command::new(program).args(args).exec())
+}
+
+/// Leaves iq's session for one of this process's own, with no terminal:
+/// what the command would ask at one (ssh, sudo, a pinentry) fails at
+/// once instead of writing over iq's screen and waiting there for an
+/// answer. The session's group, the one the sandbox stops, is this
+/// process's.
+fn own_session() -> Result<(), GateError> {
+    nix::unistd::setsid().map(drop).map_err(|error| {
+        GateError::Confine(format!(
+            "the command could not leave iq's terminal: {error}"
+        ))
+    })
 }
 
 /// Holds a network of the sandbox's own, where only localhost answers, for
@@ -889,6 +971,39 @@ pub fn helper_failure(error: &GateError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_reaches_ssh_the_persons_way_when_they_named_one() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+            pairs
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect()
+        };
+        assert!(ssh_named(env(&[("GIT_SSH_COMMAND", "ssh -i ~/.ssh/work")])));
+        assert!(ssh_named(env(&[("GIT_SSH", "plink")])));
+        assert!(!ssh_named(env(&[
+            ("GIT_SSH_COMMAND", ""),
+            ("PATH", "/bin")
+        ])));
+    }
+
+    #[tokio::test]
+    async fn git_s_own_settings_name_how_it_reaches_ssh() {
+        let repository = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .output()
+                .is_ok_and(|done| done.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        assert!(git(&["config", "core.sshCommand", "ssh -i ~/.ssh/work"]));
+        assert!(ssh_set(repository.path()).await);
+    }
 
     #[test]
     fn the_data_volume_is_read_only_where_the_policy_names_it() {

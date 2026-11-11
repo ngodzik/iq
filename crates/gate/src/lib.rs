@@ -61,7 +61,8 @@ pub fn holds_secrets(path: &std::path::Path, home: Option<&std::path::Path>) -> 
 }
 
 pub use sandbox::{
-    HELPER_FLAG, HOLD_FLAG, Helper, Live, Ran, Sandbox, helper_failure, hold_network, sandboxed,
+    DETACH_FLAG, HELPER_FLAG, HOLD_FLAG, Helper, Live, Ran, Sandbox, detached, helper_failure,
+    hold_network, sandboxed,
 };
 
 /// Whether `text` holds a secret value: one of the environment's, or of the

@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use iq_agent::{Crew, Event, Keeper, PERSON, Report};
 use iq_core::ModelId;
-use iq_gate::{Action, Approver, Gate, HELPER_FLAG, HOLD_FLAG, Helper, Judged, Rules};
+use iq_gate::{Action, Approver, DETACH_FLAG, Gate, HELPER_FLAG, HOLD_FLAG, Helper, Judged, Rules};
 use iq_llm::OpenAiCompatible;
 use iq_ui::Update;
 use iq_ui::crew::Request;
@@ -137,7 +137,8 @@ enum Command {
 fn main() -> Result<()> {
     // iq's program run for another purpose than the person's, before
     // anything else starts: the sandbox's helper confines itself and
-    // becomes the command.
+    // becomes the command, or only leaves iq's terminal for a command run
+    // on the machine itself.
     let mut args = std::env::args_os();
     match args.nth(1) {
         Some(flag) if flag == HELPER_FLAG => {
@@ -147,6 +148,11 @@ fn main() -> Result<()> {
         }
         Some(flag) if flag == HOLD_FLAG => {
             let error = iq_gate::hold_network();
+            eprintln!("{}", iq_gate::helper_failure(&error));
+            std::process::exit(125);
+        }
+        Some(flag) if flag == DETACH_FLAG => {
+            let error = iq_gate::detached(args);
             eprintln!("{}", iq_gate::helper_failure(&error));
             std::process::exit(125);
         }

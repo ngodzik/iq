@@ -2758,7 +2758,7 @@ where
             })
         };
         if let Some((agent, line)) = stopped {
-            self.job_ended(&agent, id, &line, "stopped by the person".to_owned());
+            self.job_ended(&agent, id, &line, "stopped by the person".to_owned(), false);
         }
     }
 
@@ -3338,7 +3338,8 @@ where
     /// Runs the command `permit` allows for `agent`, in its place, and says
     /// how it went, and whether it succeeded. A command that failed without
     /// the internet, as one that needs it does, is told how to ask for it:
-    /// `ask`.
+    /// `ask`; one that failed in the sandbox for want of the person's ssh
+    /// keys, how to run it where they are.
     pub(crate) async fn run(
         &self,
         agent: &str,
@@ -3353,6 +3354,7 @@ where
                 ..
             }
         );
+        let sandboxed = matches!(permit.action(), Action::Run { host: false, .. });
         let ran = self
             .sandbox_of(agent)
             .run(permit)
@@ -3402,6 +3404,9 @@ where
             out.push_str(&format!(
                 "\n[it ran without the internet, localhost only: {ask}]"
             ));
+        }
+        if keyless(sandboxed, ran.status, &out) {
+            out.push_str(&format!("\n{KEYLESS_SAID}"));
         }
         Ok((out, ran.status == Some(0)))
     }
@@ -3534,6 +3539,7 @@ where
     /// for `agent`, as long as two hours: it is woken with how it ended.
     fn background(&self, agent: &str, line: String, permit: Permit) -> String {
         let id = self.inner.next_job.fetch_add(1, Ordering::Relaxed);
+        let sandboxed = matches!(permit.action(), Action::Run { host: false, .. });
         let live = iq_gate::Live::default();
         let sandbox = self
             .sandbox_of(agent)
@@ -3542,15 +3548,18 @@ where
         let crew = self.clone();
         let (name, kept_line, watched) = (agent.to_owned(), line.clone(), live.clone());
         let running = tokio::spawn(async move {
-            let said = match sandbox.run_live(permit, &watched).await {
-                Ok(ran) if ran.timed_out => "it was stopped, out of time".to_owned(),
-                Ok(ran) => match ran.status {
-                    Some(status) => format!("exit status {status}"),
-                    None => "ended by a signal".to_owned(),
-                },
-                Err(error) => format!("it could not run: {}", chain(&error)),
+            let (said, keys) = match sandbox.run_live(permit, &watched).await {
+                Ok(ran) if ran.timed_out => ("it was stopped, out of time".to_owned(), false),
+                Ok(ran) => (
+                    match ran.status {
+                        Some(status) => format!("exit status {status}"),
+                        None => "ended by a signal".to_owned(),
+                    },
+                    keyless(sandboxed, ran.status, &ran.output),
+                ),
+                Err(error) => (format!("it could not run: {}", chain(&error)), false),
             };
-            crew.job_ended(&name, id, &kept_line, said);
+            crew.job_ended(&name, id, &kept_line, said, keys);
         });
         lock(&self.inner.jobs).insert(
             id,
@@ -3605,8 +3614,10 @@ where
     }
 
     /// Writes down how the job `id` of `agent`'s ended, and wakes it with
-    /// its status and the end of its output.
-    fn job_ended(&self, agent: &str, id: u64, line: &str, said: String) {
+    /// its status and the end of its output, and, when it failed in the
+    /// sandbox for want of the person's ssh keys (`keyless`), how to run it
+    /// where they are.
+    fn job_ended(&self, agent: &str, id: u64, line: &str, said: String, keyless: bool) {
         let last = {
             let mut jobs = lock(&self.inner.jobs);
             let Some(job) = jobs.get_mut(&id) else {
@@ -3625,9 +3636,14 @@ where
             said: said.clone(),
             output: last.clone(),
         });
+        let keys = if keyless {
+            format!("\n{KEYLESS_SAID}")
+        } else {
+            String::new()
+        };
         self.iq_says(
             agent,
-            format!("Job {id}, `{line}`, ended: {said}. The end of its output:\n{last}"),
+            format!("Job {id}, `{line}`, ended: {said}. The end of its output:\n{last}{keys}"),
         );
     }
 
@@ -3648,7 +3664,7 @@ where
             {
                 task.abort();
             }
-            self.job_ended(agent, id, &line, "stopped, as you asked".to_owned());
+            self.job_ended(agent, id, &line, "stopped, as you asked".to_owned(), false);
         }
         let jobs = lock(&self.inner.jobs);
         let Some(job) = jobs.get(&id) else {
@@ -3678,7 +3694,13 @@ where
                 .collect()
         };
         for (id, agent, line) in stopped {
-            self.job_ended(&agent, id, &line, "stopped with its agent".to_owned());
+            self.job_ended(
+                &agent,
+                id,
+                &line,
+                "stopped with its agent".to_owned(),
+                false,
+            );
         }
     }
 
@@ -4671,6 +4693,28 @@ const OFFLINE: &[&str] = &[
     "--offline was specified",
 ];
 
+/// What ssh prints when it reached a remote without the person's keys nor
+/// the hosts they know, which the sandbox keeps out, and what git prints
+/// after it.
+const KEYLESS: &[&str] = &[
+    "Host key verification failed",
+    "Permission denied (publickey",
+    "Could not read from remote repository",
+];
+
+/// What a command that failed so in the sandbox is told.
+const KEYLESS_SAID: &str = "[it ran in the sandbox, which holds none of the person's ssh keys \
+                            nor the hosts they know: a git command that reaches a remote over \
+                            ssh (fetch, pull, push, ls-remote) runs on the machine, with \
+                            \"host\": true]";
+
+/// Whether a command that ended with `status`, in the sandbox when
+/// `sandboxed`, failed there for want of the person's ssh keys, as its
+/// output `out` shows. One run on the machine had them.
+fn keyless(sandboxed: bool, status: Option<i32>, out: &str) -> bool {
+    sandboxed && status != Some(0) && KEYLESS.iter().any(|sign| out.contains(sign))
+}
+
 /// How one of iq's agents asks for the internet for a command.
 const OWN_ASK: &str = "to have it, run it again with \"network\": true, which the person approves, \
                        unless a rule gives it";
@@ -4837,6 +4881,24 @@ mod tests {
         assert!(wakes.ask(at).unwrap_err().contains("within the hour"));
         // An hour on, it may again.
         assert!(wakes.ask(at + Duration::from_secs(3600)).is_ok());
+    }
+
+    #[test]
+    fn a_command_failing_in_the_sandbox_for_want_of_ssh_keys_is_told_to_run_on_the_machine() {
+        let refused = "Host key verification failed.\r\n\
+                       fatal: Could not read from remote repository.\n\n\
+                       Please make sure you have the correct access rights\n";
+        assert!(keyless(true, Some(128), refused));
+        assert!(keyless(
+            true,
+            None,
+            "git@forge: Permission denied (publickey).\n"
+        ));
+        // On the machine, it had the keys: what failed there is another thing.
+        assert!(!keyless(false, Some(128), refused));
+        assert!(!keyless(true, Some(0), refused));
+        assert!(!keyless(true, Some(1), "error: pathspec 'x' did not match"));
+        assert!(KEYLESS_SAID.contains("\"host\": true"));
     }
 
     #[test]
