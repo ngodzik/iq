@@ -960,13 +960,20 @@ async fn work(
             agent,
             question,
             choices,
+            raised,
         } = &event
         {
             let crew = crew.clone();
-            let (id, agent, question, choices) =
-                (*id, agent.clone(), question.clone(), choices.clone());
+            let (id, agent, question, choices, raised) = (
+                *id,
+                agent.clone(),
+                question.clone(),
+                choices.clone(),
+                raised.clone(),
+            );
             tokio::task::spawn_blocking(move || {
-                crew.choose(id, terminal::choose(&agent, &question, &choices));
+                let answer = terminal::choose(&agent, &question, &choices, raised.as_deref());
+                crew.choose(id, answer);
             });
         }
         if let Some((id, question)) = terminal::show(&event, tally) {

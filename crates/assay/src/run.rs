@@ -660,6 +660,7 @@ mod tests {
                 agent: "candidate".into(),
                 question: "Which name?".into(),
                 choices: vec!["mul".into(), "times".into()],
+                raised: None,
             },
             Event::Done {
                 agent: "candidate".into(),

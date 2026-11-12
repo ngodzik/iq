@@ -2528,6 +2528,7 @@ mod tests {
                 agent: lead(),
                 question: "Which environment?".into(),
                 choices: vec!["staging".into(), "production".into()],
+                raised: None,
             },
             Event::Chosen {
                 id: 1,

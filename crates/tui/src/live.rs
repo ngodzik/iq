@@ -750,6 +750,15 @@ impl Live<'_> {
             &pad,
             &pad,
         );
+        // Who raised it, for "go on" or "stop" to be an informed answer.
+        if let Some(raised) = &choice.raised {
+            lines.extend(wrap(
+                &[Span::styled(raised.clone(), p.fg(p.faint))],
+                inner,
+                &pad,
+                &pad,
+            ));
+        }
         let picked = self
             .board
             .picking()
@@ -2132,6 +2141,7 @@ mod tests {
                 agent: "deploy".into(),
                 question: "Which environment?".into(),
                 choices: vec!["staging".into(), "production".into()],
+                raised: None,
             },
             &p,
         );

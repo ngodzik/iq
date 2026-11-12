@@ -294,6 +294,9 @@ struct Inner<M> {
     images: Mutex<HashMap<String, Vec<Message>>>,
     /// The questions with choices waiting for the person.
     choices: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
+    /// The questions the agents another started put to it and that wait
+    /// for its answer, by the name of the agent asked.
+    raised: Mutex<HashMap<String, Vec<Raised>>>,
     /// The commands left to run in the background, by number.
     jobs: Mutex<HashMap<u64, Job>>,
     next_job: AtomicU64,
@@ -563,6 +566,16 @@ struct Board {
     retired: Vec<Retired>,
 }
 
+/// A question an agent put to the agent that started it, waiting for its
+/// answer.
+#[derive(Debug, Clone)]
+struct Raised {
+    /// The agent that asked it.
+    asker: String,
+    /// Who raised it, as iq tells it: through whom, and what they spent.
+    said: String,
+}
+
 /// An agent retired: done with the task another gave it, it is off the
 /// board and its name free again. What writes to it by its name is told it
 /// finished, with its last answer.
@@ -746,6 +759,7 @@ where
                 shown: Mutex::new(HashMap::new()),
                 images: Mutex::new(HashMap::new()),
                 choices: Mutex::new(HashMap::new()),
+                raised: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
                 next_job: AtomicU64::new(1),
                 wakes: Mutex::new(HashMap::new()),
@@ -3294,6 +3308,14 @@ where
                 if question.is_empty() || !(2..=4).contains(&choices.len()) {
                     return Err("ask one question with two to four choices".into());
                 }
+                // An agent another started asks it first: it knows the task
+                // and the other parts, and puts to the person what is
+                // theirs to choose, so that the person is never asked the
+                // same thing by several agents at once.
+                let starter = self.started_by(agent);
+                if starter != PERSON && lock(&self.inner.board).members.contains_key(&starter) {
+                    return Ok(self.ask_starter(agent, &starter, question, choices).await);
+                }
                 Ok(self.ask_person(agent, question, choices).await)
             }
             "list_agents" => Ok(self
@@ -3760,9 +3782,17 @@ where
     /// answer as long as the settings' patience. What they answered is
     /// kept with what they asked of `agent`, so that the reviewer reads a
     /// "yes" with the question it answered.
+    /// When agents it started raised the question, the person is told who,
+    /// through whom, and what each spent.
     async fn ask_person(&self, agent: &str, question: String, choices: Vec<String>) -> String {
+        let raised: Vec<String> = lock(&self.inner.raised)
+            .get(agent)
+            .map(|raised| raised.iter().map(|r| r.said.clone()).collect())
+            .unwrap_or_default();
+        let raised = (!raised.is_empty())
+            .then(|| format!("raised by {}, through {agent}", raised.join(" and ")));
         let answer = self
-            .choose_of(agent, question.clone(), choices.clone())
+            .choose_of(agent, question.clone(), choices.clone(), raised)
             .await;
         match answer {
             Some(answer) => {
@@ -3783,6 +3813,124 @@ where
         }
     }
 
+    /// Puts `agent`'s question to `starter`, the agent that started it, as
+    /// a message it must answer, with iq's account of who raised it and
+    /// what they spent; the starter answers it, or puts it to the person.
+    /// Waits for its answer as long as a question waits for the person,
+    /// and gives it with whatever else was written to `agent` meanwhile.
+    async fn ask_starter(
+        &self,
+        agent: &str,
+        starter: &str,
+        question: String,
+        choices: Vec<String>,
+    ) -> String {
+        let said = self.raised_by(agent);
+        lock(&self.inner.raised)
+            .entry(starter.to_owned())
+            .or_default()
+            .push(Raised {
+                asker: agent.to_owned(),
+                said: said.clone(),
+            });
+        let listed: Vec<String> = choices
+            .iter()
+            .enumerate()
+            .map(|(at, choice)| format!("{}. {choice}", at + 1))
+            .collect();
+        let text = format!(
+            "A question for you, as the agent that started me:\n\n{question}\n\n{}\n\n(iq: \
+             raised by {said}. Answer it with send_message to {agent} when you can; put it to \
+             the person with ask_person only when the choice is theirs, then pass on their \
+             answer.)",
+            listed.join("\n")
+        );
+        let mut posted = self.inner.posted.subscribe();
+        let since = lock(&self.inner.board).messages.len();
+        let answer = match self.post(agent, starter, text) {
+            Ok(()) => self.answer_of(agent, starter, since, &mut posted).await,
+            Err(why) => Some(format!("Your question could not reach {starter}: {why}")),
+        };
+        if let Some(raised) = lock(&self.inner.raised).get_mut(starter) {
+            raised.retain(|r| r.asker != agent);
+        }
+        answer.unwrap_or_else(|| {
+            format!(
+                "{starter} gave no answer: go on as best you can within your brief, and say \
+                 what you needed to know."
+            )
+        })
+    }
+
+    /// Who raised `agent`'s question, as iq says it: the agents it started
+    /// whose questions it carries up, through it; else itself, its role,
+    /// and what it spent.
+    fn raised_by(&self, agent: &str) -> String {
+        let below: Vec<String> = lock(&self.inner.raised)
+            .get(agent)
+            .map(|raised| raised.iter().map(|r| r.said.clone()).collect())
+            .unwrap_or_default();
+        if !below.is_empty() {
+            return format!("{}, through {agent}", below.join(" and "));
+        }
+        let board = lock(&self.inner.board);
+        let Some(member) = board.members.get(agent) else {
+            return agent.to_owned();
+        };
+        let role = member
+            .role
+            .as_deref()
+            .map(|role| format!(" ({role})"))
+            .unwrap_or_default();
+        format!(
+            "{agent}{role}, which spent {} in {} call{} so far",
+            member.spent,
+            member.calls,
+            if member.calls == 1 { "" } else { "s" }
+        )
+    }
+
+    /// Waits for `starter`'s answer to `agent`, written after the message
+    /// numbered `since`, as long as a question waits for the person; then
+    /// gives what was written to `agent` since it last read. None once that
+    /// time is past, or when `starter` worked and ended its turn without
+    /// answering.
+    async fn answer_of(
+        &self,
+        agent: &str,
+        starter: &str,
+        since: usize,
+        posted: &mut watch::Receiver<usize>,
+    ) -> Option<String> {
+        let until = tokio::time::Instant::now() + self.inner.settings.patience;
+        let mut worked = false;
+        loop {
+            posted.borrow_and_update();
+            let answered = lock(&self.inner.board)
+                .messages
+                .iter()
+                .skip(since)
+                .any(|m| m.from == starter && m.to == agent);
+            if answered {
+                return self.unread(agent);
+            }
+            let works = lock(&self.inner.board)
+                .members
+                .get(starter)
+                .is_some_and(|m| m.turn.as_ref().is_some_and(|turn| !turn.is_finished()));
+            if works {
+                worked = true;
+            } else if worked {
+                return None;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= until {
+                return None;
+            }
+            let _ = tokio::time::timeout_at(until.min(now + WAIT_LOOK), posted.changed()).await;
+        }
+    }
+
     /// Asks the person, for `agent`, to choose among `choices` or answer in
     /// their own words, and gives their answer; none when they gave none in
     /// time.
@@ -3791,6 +3939,7 @@ where
         agent: &str,
         question: String,
         choices: Vec<String>,
+        raised: Option<String>,
     ) -> Option<String> {
         let id = self.inner.next_question.fetch_add(1, Ordering::Relaxed);
         let (reply, answer) = oneshot::channel();
@@ -3800,6 +3949,7 @@ where
             agent: agent.to_owned(),
             question,
             choices,
+            raised,
         });
         let answer = tokio::time::timeout(self.inner.settings.patience, answer)
             .await
@@ -4038,6 +4188,7 @@ where
                 &chat,
                 question,
                 vec![GO_ON.to_owned(), STOP_TURN.to_owned()],
+                None,
             )
             .await;
         let go_on = answer
@@ -4124,6 +4275,7 @@ where
                 agent,
                 question,
                 choices,
+                ..
             } => (
                 agent,
                 Shown::Question {
@@ -4280,6 +4432,13 @@ where
              Other agents may work beside you. start_agent hands a task to a new one, \
              send_message writes to one, to all, or to the person, and wait_for_messages waits \
              for an answer. Messages to you also arrive between your calls.{models}\n\n\
+             When the path you are on goes beyond your part or your brief, when you reach the \
+             budget your brief gives (reads, commands, dollars) and believe more is needed, or \
+             when what you found is of uncertain worth against what going on would cost, stop \
+             and ask with ask_person rather than go on alone, saying in one line what you found, \
+             what more you would do, and what it would take. A question from an agent you \
+             started comes to you as a message: answer it with send_message when you can, and \
+             put it to the person with ask_person only when the choice is theirs.\n\n\
              Read before you change, check your work with the project's own tools (its build, \
              tests, linters), and be brief. When the task is done, answer with what you did and \
              call no tool.{}{}",

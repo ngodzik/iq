@@ -753,6 +753,7 @@ mod tests {
             agent: "lead".into(),
             question: "Go on?".into(),
             choices: vec!["yes".into(), "no".into()],
+            raised: None,
         });
         steps.event(&Event::Chosen {
             id: 3,

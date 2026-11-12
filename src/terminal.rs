@@ -172,8 +172,16 @@ pub(crate) fn heard(update: &iq_ui::Update) {
 /// Asks the person `question` on the terminal, `agent`'s, offering
 /// `choices` by number; their own words when they write something else,
 /// none when they write nothing.
-pub(crate) fn choose(agent: &str, question: &str, choices: &[String]) -> Option<String> {
+pub(crate) fn choose(
+    agent: &str,
+    question: &str,
+    choices: &[String],
+    raised: Option<&str>,
+) -> Option<String> {
     println!("\n? {agent} asks: {question}");
+    if let Some(raised) = raised {
+        println!("  ({raised})");
+    }
     for (at, choice) in choices.iter().enumerate() {
         println!("  {}. {choice}", at + 1);
     }

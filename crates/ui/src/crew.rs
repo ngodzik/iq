@@ -272,6 +272,9 @@ pub struct Choice {
     pub question: String,
     /// What it offers.
     pub choices: Vec<String>,
+    /// Who raised it, when the agent asks for agents it started: their
+    /// names, through whom, and what each spent.
+    pub raised: Option<String>,
 }
 
 /// An agent of the crew, as shown.
@@ -906,11 +909,13 @@ impl CrewView {
                 agent,
                 question,
                 choices,
+                raised,
             } => self.choices.push(Choice {
                 id,
                 agent,
                 question,
                 choices,
+                raised,
             }),
             Event::Chosen { id, answer } => {
                 if let Some(at) = self.choices.iter().position(|c| c.id == id) {

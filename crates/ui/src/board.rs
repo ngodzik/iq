@@ -1978,6 +1978,7 @@ mod tests {
                 agent: agent.into(),
                 question: "Which one?".into(),
                 choices: vec!["a".into(), "b".into(), "c".into()],
+                raised: None,
             }));
         };
         ask(&mut board, 1, "lead");

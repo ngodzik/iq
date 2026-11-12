@@ -3081,3 +3081,93 @@ async fn a_command_left_in_the_background_returns_at_once_and_its_end_wakes_its_
             .any(|e| matches!(e, Event::JobEnded { id: 1, .. }))
     );
 }
+
+#[tokio::test]
+async fn an_agent_another_started_asks_it_first_and_the_person_sees_who_raised_it() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"role": "review", "model": "cheap/model", "task": "review the backend, 25 reads at most"}),
+                    ),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 1})),
+                    calls(
+                        "ask_person",
+                        serde_json::json!({"question": "Follow the database lead further?", "choices": ["Go on", "Stop"]}),
+                    ),
+                    calls(
+                        "send_message",
+                        serde_json::json!({"to": "lead/review", "text": "The person says: stop."}),
+                    ),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 1})),
+                    say("Reviewed."),
+                ],
+            ),
+            (
+                "lead/review",
+                vec![
+                    calls(
+                        "ask_person",
+                        serde_json::json!({"question": "25 reads done, two leads on the database: go on?", "choices": ["Go on", "Stop"]}),
+                    ),
+                    say("Stopped, as asked."),
+                ],
+            ),
+        ],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "review it".into(), PERSON);
+    // The person is asked once, by the lead, told who raised it.
+    let mut asked = None;
+    for _ in 0..500 {
+        asked = f.events().into_iter().find_map(|event| match event {
+            Event::Choose {
+                id, agent, raised, ..
+            } => Some((id, agent, raised)),
+            _ => None,
+        });
+        if asked.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (id, agent, raised) = asked.expect("the person was never asked");
+    assert_eq!(agent, "lead");
+    let raised = raised.unwrap_or_default();
+    assert!(
+        raised.starts_with("raised by lead/review (review), which spent $")
+            && raised.ends_with("in 1 call so far, through lead"),
+        "{raised}"
+    );
+    f.crew.choose(id, Some("Stop".into()));
+    f.settled().await;
+    // The reviewer's question reached the lead as a message to answer,
+    // with iq's account of who raised it; the lead's answer reached it.
+    let lead = f.model.seen_by("lead");
+    assert!(
+        lead.contains("Message from lead/review: A question for you, as the agent that started me"),
+        "{lead}"
+    );
+    assert!(lead.contains("Answer it with send_message to lead/review"));
+    assert!(
+        f.model
+            .seen_by("lead/review")
+            .contains("Message from lead: The person says: stop.")
+    );
+    let choices = f
+        .events()
+        .iter()
+        .filter(|event| matches!(event, Event::Choose { .. }))
+        .count();
+    assert_eq!(choices, 1);
+    // Every agent is told when to ask rather than go on alone.
+    assert!(
+        f.model
+            .instructions_of("lead/review")
+            .contains("stop and ask with ask_person rather than go on alone")
+    );
+}

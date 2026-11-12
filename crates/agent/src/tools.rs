@@ -249,8 +249,11 @@ pub fn board() -> Vec<ToolSpec> {
             description: "Asks the person a question with two to four choices, which they pick \
                           with a digit or the arrows, or answer in their own words; waits for \
                           their answer. For a choice that is theirs to make: an option, an \
-                          environment, whether to start again. Not for leave to act, which the \
-                          tools ask themselves."
+                          environment, whether to start again; and when you do not know whether \
+                          to go on: past your part, your brief or its budget, or with what you \
+                          found of uncertain worth against what going on costs. From an agent \
+                          another started, it goes to that agent, which answers it or puts it to \
+                          the person. Not for leave to act, which the tools ask themselves."
                 .into(),
             parameters: json!({
                 "type": "object",
