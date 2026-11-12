@@ -14,8 +14,10 @@ const BEFORE: [&str; 9] = [
 /// part after the provider's, or one word of it, as people say `opus` for
 /// `anthropic/claude-opus-5-5`. Of several a word names, the newest, as
 /// their numbers say, then one served without a region or a variant
-/// (`@eu`, `:flex`), then the first listed. A name with a slash the
-/// provider does not list is no model: `src/main.rs` is a path.
+/// (`@eu`, `:flex`), then the first listed; a word that models of several
+/// lines share, a maker's name (`claude`, `gemini`), names none of them.
+/// A name with a slash the provider does not list is no model:
+/// `src/main.rs` is a path.
 ///
 /// # Examples
 ///
@@ -93,22 +95,42 @@ fn resolve(word: &str, known: &[String]) -> Option<String> {
     if !word.chars().any(char::is_alphabetic) || word.contains('/') {
         return None;
     }
+    let named: Vec<&String> = known
+        .iter()
+        .filter(|model| {
+            last(model)
+                .split(['-', '.', '_', ':', '@'])
+                .any(|part| part.eq_ignore_ascii_case(word))
+        })
+        .collect();
+    // A maker's name, which models of several lines share, names none.
+    let mut lines: Vec<String> = named.iter().map(|model| line(&last(model))).collect();
+    lines.sort();
+    lines.dedup();
+    if lines.len() > 1 {
+        return None;
+    }
     let mut best: Option<(&String, Rank)> = None;
-    for model in known {
-        let name = last(model);
-        if !name
-            .split(['-', '.', '_', ':', '@'])
-            .any(|part| part.eq_ignore_ascii_case(word))
-        {
-            continue;
-        }
-        let rank = rank(&name);
+    for model in named {
+        let rank = rank(&last(model));
         // Strictly better only: of equals, the first listed stays.
         if best.as_ref().is_none_or(|(_, kept)| rank > *kept) {
             best = Some((model, rank));
         }
     }
     best.map(|(model, _)| model.clone())
+}
+
+/// The line of models `name` is of, a model's name without its
+/// provider's: its words without its numbers, its region or its variant,
+/// as `claude-opus` for `claude-opus-5-5@eu`.
+fn line(name: &str) -> String {
+    let base = name.split(['@', ':']).next().unwrap_or(name);
+    base.split(['-', '.', '_'])
+        .filter(|part| part.chars().any(char::is_alphabetic))
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// How a model's name ranks among those a word names: its numbers as a
@@ -158,5 +180,20 @@ mod tests {
             named("look at src/main.rs with quill", &known),
             ["lab/model-7-quill"]
         );
+    }
+
+    #[test]
+    fn a_makers_name_names_no_model_and_a_lines_word_its_newest() {
+        let known = vec![
+            "anthropic/claude-haiku-4-5".to_owned(),
+            "anthropic/claude-sonnet-5-10".to_owned(),
+            "anthropic/claude-opus-5-1".to_owned(),
+            "vertex/claude-opus-5-5@eu".to_owned(),
+            "anthropic/claude-opus-5-5".to_owned(),
+        ];
+        assert!(named("the review that ran with claude review", &known).is_empty());
+        assert_eq!(named("with opus", &known), ["anthropic/claude-opus-5-5"]);
+        assert_eq!(named("avec haiku", &known), ["anthropic/claude-haiku-4-5"]);
+        assert_eq!(line("claude-opus-5-5@eu"), "claude-opus");
     }
 }

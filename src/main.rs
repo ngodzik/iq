@@ -1521,8 +1521,10 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     ran
 }
 
-/// `text`, the models the person named in it told to the agent: "with
-/// opus" is the person's choice, and what they name is what works.
+/// `text`, the models the person named in it told to the agent as a fact:
+/// "with opus" is the person's choice, and what they name is what works.
+/// Never an order in their name, which a provider's filter takes for a
+/// prompt injection.
 fn with_named(text: String, named: &[String]) -> String {
     let models: Vec<ModelId> = named.iter().filter_map(|m| ModelId::new(m).ok()).collect();
     if models.is_empty() {
@@ -1533,10 +1535,7 @@ fn with_named(text: String, named: &[String]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "{text}\n\n(iq: the person names {list} for this. Do as they say with them: start an agent \
-         on each, with start_agent, for the part they name it for.)"
-    )
+    format!("{text}\n\n(iq: models the person named in this message: {list}.)")
 }
 
 /// Resolves once the person or the system asks iq to stop: Ctrl-C in its

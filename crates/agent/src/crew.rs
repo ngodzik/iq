@@ -4431,7 +4431,10 @@ where
              or say what you need.{scratch}\n\n\
              Other agents may work beside you. start_agent hands a task to a new one, \
              send_message writes to one, to all, or to the person, and wait_for_messages waits \
-             for an answer. Messages to you also arrive between your calls.{models}\n\n\
+             for an answer. Messages to you also arrive between your calls. When iq notes after \
+             a message of the person's the models they named in it, those are the ones they \
+             want for the part they name each for: start an agent on one with start_agent when \
+             it is not yours.{models}\n\n\
              When the path you are on goes beyond your part or your brief, when you reach the \
              budget your brief gives (reads, commands, dollars) and believe more is needed, or \
              when what you found is of uncertain worth against what going on would cost, stop \
