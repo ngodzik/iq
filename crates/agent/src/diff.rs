@@ -9,6 +9,10 @@ const AROUND: usize = 3;
 /// The most lines a diff holds; past them, it says how many it left out.
 const MOST: usize = 400;
 
+/// The most characters of a line a diff holds: a minified file's one line
+/// is cut there.
+const LINE_MOST: usize = 400;
+
 /// The most cells the comparison of what differs may take: past them, all
 /// of the old is said removed and all of the new added.
 const CELLS: usize = 1_000_000;
@@ -70,9 +74,9 @@ pub(crate) fn unified(before: &str, after: &str) -> Option<String> {
         ));
         for op in span.iter().take(MOST - written) {
             out.push(match *op {
-                Op::Kept(at, _) => format!(" {}", old[at]),
-                Op::Removed(at) => format!("-{}", old[at]),
-                Op::Added(at) => format!("+{}", new[at]),
+                Op::Kept(at, _) => format!(" {}", cut(old[at])),
+                Op::Removed(at) => format!("-{}", cut(old[at])),
+                Op::Added(at) => format!("+{}", cut(new[at])),
             });
             written += 1;
         }
@@ -81,6 +85,15 @@ pub(crate) fn unified(before: &str, after: &str) -> Option<String> {
         out.push(format!("\\ {} more lines left out", total - written));
     }
     Some(out.join("\n"))
+}
+
+/// `line`, or its first [`LINE_MOST`] characters and a mark that it goes
+/// on.
+fn cut(line: &str) -> String {
+    match line.char_indices().nth(LINE_MOST) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line.to_owned(),
+    }
 }
 
 /// Where the old and the new stand at `ops[at]`, as indices of their
@@ -171,6 +184,16 @@ mod tests {
         let heads: Vec<&str> = said.lines().filter(|l| l.starts_with("@@")).collect();
         assert_eq!(heads, ["@@ -1,5 +1,5 @@", "@@ -25,6 +25,5 @@"]);
         assert!(said.contains("-28\n"), "{said}");
+    }
+
+    #[test]
+    fn a_long_line_is_cut() {
+        let line = "x".repeat(LINE_MOST + 10);
+        let said = unified("", &line).unwrap();
+        assert_eq!(
+            said.lines().nth(1).unwrap(),
+            format!("+{}…", "x".repeat(LINE_MOST))
+        );
     }
 
     #[test]

@@ -3131,8 +3131,19 @@ where
     }
 
     /// Says how `agent` changed the file at `path`, from `before` to
-    /// `after`, when a line of it changed.
+    /// `after`, when a line of it changed: never for a file of secrets,
+    /// as it is named or as the file it leads to is, whose lines the
+    /// person allowed written, not shown.
     fn changed(&self, agent: &str, path: &std::path::Path, before: &str, after: &str) {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let full = self.place_of(agent).gate.workspace().join(path);
+        let real = std::fs::canonicalize(&full).unwrap_or(full);
+        if [path, real.as_path()]
+            .iter()
+            .any(|path| iq_gate::holds_secrets(path, home.as_deref()))
+        {
+            return;
+        }
         if let Some(diff) = crate::diff::unified(before, after) {
             self.report(Event::Changed {
                 agent: agent.to_owned(),

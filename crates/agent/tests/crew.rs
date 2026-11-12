@@ -372,14 +372,26 @@ async fn a_file_written_or_edited_is_said_with_how_its_lines_changed() {
                     "edit_file",
                     serde_json::json!({"path": "src/hello.txt", "old_text": "there", "new_text": "you"}),
                 ),
+                calls(
+                    "write_file",
+                    serde_json::json!({"path": ".env", "content": "KEY=new-value\n"}),
+                ),
                 say("Done."),
             ],
         )],
         Settings::default(),
     );
+    std::fs::write(f.root.join(".env"), "KEY=old-secret-value\n").unwrap();
     f.crew
         .start("lead", &model("cheap/model"), "write hello".into(), PERSON);
+    // The person allows the file of secrets written.
+    let id = f.question().await;
+    f.crew.answer(id, true);
     f.settled().await;
+    assert_eq!(
+        std::fs::read_to_string(f.root.join(".env")).unwrap(),
+        "KEY=new-value\n"
+    );
     let events = f.events();
     let changed: Vec<(&str, &str)> = events
         .iter()
@@ -395,6 +407,9 @@ async fn a_file_written_or_edited_is_said_with_how_its_lines_changed() {
             ("src/hello.txt", "@@ -1,2 +1,2 @@\n hi\n-there\n+you"),
         ]
     );
+    // Never for a file of secrets, whose lines the person allowed written
+    // but not shown.
+    assert!(!changed.iter().any(|(path, _)| path.contains(".env")));
     // Said before the step that wrote it.
     let at = |name: &str| {
         events
