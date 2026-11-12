@@ -4,6 +4,7 @@
 //! their source. A diagram being drawn holds back what its window writes
 //! after it, so that the conversation keeps its order.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -72,20 +73,42 @@ pub(crate) enum Shown {
     Source(Option<String>),
 }
 
-/// A diagram of the conversation: the id its image has with the terminal,
-/// and where its drawing stands.
+/// A diagram of the conversation: where its drawing stands, and the ids
+/// its image has with the terminal, one for each size it is shown at.
 #[derive(Debug)]
 pub(crate) struct Diagram {
-    id: u32,
+    /// Where the ids of images come from.
+    ids: Arc<AtomicU32>,
+    /// The id of each size it was shown at, in cells: the terminal keeps
+    /// an image with the cells it shows under, so that an image shown at
+    /// another size, as the screen was made narrower, is another, and
+    /// what the scrollback shows of the first stays as it was.
+    shown: Mutex<Vec<((u16, u16), u32)>>,
     state: Mutex<State>,
+}
+
+/// The next id an image takes with the terminal, from `ids`: 24 bits, as a
+/// placeholder's colour carries it, and never 0.
+pub(crate) fn next_id(ids: &AtomicU32) -> u32 {
+    loop {
+        let id = ids.fetch_add(1, Ordering::Relaxed) & 0x00ff_ffff;
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 impl Diagram {
     /// The diagram of `source`, which `draw` draws on a thread of its own
-    /// when given.
-    pub(crate) fn new(source: String, id: u32, draw: Option<Arc<dyn Draw>>) -> Arc<Diagram> {
+    /// when given, its images taking their ids from `ids`.
+    pub(crate) fn new(
+        source: String,
+        ids: Arc<AtomicU32>,
+        draw: Option<Arc<dyn Draw>>,
+    ) -> Arc<Diagram> {
         let diagram = Arc::new(Diagram {
-            id,
+            ids,
+            shown: Mutex::new(Vec::new()),
             state: Mutex::new(if draw.is_some() {
                 State::Drawing(Instant::now())
             } else {
@@ -104,6 +127,17 @@ impl Diagram {
             });
         }
         diagram
+    }
+
+    /// The id of its image shown on `cells`, columns by rows.
+    fn id(&self, cells: (u16, u16)) -> u32 {
+        let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, id)) = shown.iter().find(|(seen, _)| *seen == cells) {
+            return *id;
+        }
+        let id = next_id(&self.ids);
+        shown.push((cells, id));
+        id
     }
 
     /// Whether it is still being drawn, and waited for.
@@ -146,13 +180,14 @@ impl Diagram {
                     pixels.1.saturating_mul(larger) / LARGER.1,
                 );
                 let (cols, rows) = graphics::fit(shown, cell, room, MOST_ROWS);
+                let id = self.id((cols, rows));
                 images.push(Image {
-                    id: self.id,
+                    id,
                     png: Arc::new(drawn.png.clone()),
                     cols,
                     rows,
                 });
-                Shown::Image(graphics::cells(self.id, cols, rows, indent))
+                Shown::Image(graphics::cells(id, cols, rows, indent))
             }
             State::Failed(why) => Shown::Source(Some(format!(
                 "the diagram could not be drawn: {}",
@@ -181,7 +216,7 @@ mod tests {
     fn drawn(draw: Option<Fixed>) -> Arc<Diagram> {
         let diagram = Diagram::new(
             "graph TD\n A --> B".into(),
-            9,
+            Arc::new(AtomicU32::new(9)),
             draw.map(|d| Arc::new(d) as Arc<dyn Draw>),
         );
         for _ in 0..500 {
@@ -216,6 +251,22 @@ mod tests {
         let mut images = Vec::new();
         wide.shown(80, &[Span::raw("  ")], (10, 20), &mut images);
         assert_eq!((images[0].cols, images[0].rows), (78, 13));
+    }
+
+    #[test]
+    fn a_diagram_shown_at_another_size_is_another_image() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend(200u32.to_be_bytes());
+        png.extend(100u32.to_be_bytes());
+        let diagram = drawn(Some(Fixed(Ok(Drawn { png }))));
+        let mut images = Vec::new();
+        for width in [80, 80, 20] {
+            diagram.shown(width, &[], (10, 20), &mut images);
+        }
+        let ids: Vec<(u32, u16)> = images.iter().map(|image| (image.id, image.cols)).collect();
+        // The same size, the same image; narrower, another, which the
+        // terminal is sent with its own cells.
+        assert_eq!(ids, [(9, 30), (9, 30), (10, 20)]);
     }
 
     #[test]

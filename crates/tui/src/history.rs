@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use iq_agent::{Event, PERSON};
@@ -346,8 +347,8 @@ pub(crate) struct History {
     /// The images the lines written last show, for the terminal to be sent
     /// before them.
     images: Vec<Image>,
-    /// The id the next image takes with the terminal.
-    next_image: u32,
+    /// Where the next image takes its id with the terminal.
+    image_ids: Arc<AtomicU32>,
     /// Whether what follows a diagram being drawn waits for it: not as iq
     /// ends.
     hurried: bool,
@@ -381,7 +382,7 @@ impl History {
             .map_or(1, |d| {
                 d.subsec_nanos() ^ u32::try_from(d.as_secs() & 0xff_ffff).unwrap_or(1)
             });
-        self.next_image = now & 0x00ff_ffff;
+        self.image_ids.store(now & 0x00ff_ffff, Ordering::Relaxed);
     }
 
     /// Sums up the messages between agents with `summarize`, when given;
@@ -1235,10 +1236,9 @@ impl History {
                         .into_iter()
                         .map(Block::text)
                         .collect();
-                    let id = self.next_image.max(1);
-                    self.next_image = (id + 1) & 0x00ff_ffff;
                     let said = diagram_said(&source);
-                    let diagram = Diagram::new(source, id, self.drawer.0.clone());
+                    let diagram =
+                        Diagram::new(source, Arc::clone(&self.image_ids), self.drawer.0.clone());
                     // Folded, when the settings say and it can be drawn.
                     let block = if board.look().diagrams_folded() && self.drawer.0.is_some() {
                         Block::Folded {
@@ -2056,6 +2056,87 @@ mod tests {
         assert_eq!(after.last().map(String::as_str), Some("  after it"));
         let images = history.take_images();
         assert_eq!((images.len(), images[0].cols, images[0].rows), (1, 30, 8));
+    }
+
+    /// Draws every diagram at once as a PNG of `.0` by `.1` pixels.
+    struct Sized(u32, u32);
+
+    impl Draw for Sized {
+        fn draw(&self, _source: &str) -> Result<crate::diagram::Drawn, String> {
+            let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+            png.extend(self.0.to_be_bytes());
+            png.extend(self.1.to_be_bytes());
+            Ok(crate::diagram::Drawn { png })
+        }
+    }
+
+    #[test]
+    fn two_diagrams_of_an_answer_take_their_own_rows_and_what_follows_comes_below() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        // A tall one, held to the most rows.
+        history.pictures(Some(Arc::new(Sized(200, 2000))), (10, 20));
+        crew(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: "lead".into(),
+                model: "lab/lead".into(),
+                by: PERSON.into(),
+            },
+            &p,
+        );
+        let diagram = |n: u32| format!("```mermaid\ngraph TD\n A{n} --> B{n}\n```\n");
+        crew(
+            &mut board,
+            &mut history,
+            Event::Text {
+                agent: "lead".into(),
+                text: format!("First:\n{}Between.\n{}After.\n", diagram(1), diagram(2)),
+            },
+            &p,
+        );
+        let mut lines = Vec::new();
+        for _ in 0..500 {
+            lines.extend(history.take(80, Some("lead")));
+            if lines.iter().any(|l| l.to_string().contains("After.")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let images = history.take_images();
+        assert_eq!(images.len(), 2);
+        assert_ne!(images[0].id, images[1].id);
+        // 200 by 2000 pixels, half as large again, on cells of 10 by 20:
+        // held to 30 rows, 6 columns.
+        assert!(images.iter().all(|i| (i.cols, i.rows) == (6, 30)));
+        let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        let at = |text: &str| rows.iter().position(|r| r.contains(text)).unwrap();
+        // Each image's rows exactly, one after the other, in its own
+        // colour, what follows each below it.
+        for (image, (from, to)) in images.iter().zip([
+            (at("First:"), at("Between.")),
+            (at("Between."), at("After.")),
+        ]) {
+            let colour = ratatui::style::Color::Rgb(
+                ((image.id >> 16) & 0xff) as u8,
+                ((image.id >> 8) & 0xff) as u8,
+                (image.id & 0xff) as u8,
+            );
+            let theirs: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.spans.iter().any(|s| s.style.fg == Some(colour)))
+                .map(|(at, _)| at)
+                .collect();
+            assert_eq!(theirs.len(), usize::from(image.rows), "{rows:#?}");
+            assert!(theirs.windows(2).all(|pair| pair[1] == pair[0] + 1));
+            assert!(
+                from < theirs[0] && *theirs.last().unwrap() < to,
+                "{rows:#?}"
+            );
+        }
     }
 
     #[test]
