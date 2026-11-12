@@ -10,10 +10,14 @@
 //! and copies what is marked as it was written. A link opens with a click,
 //! its address shown while the mouse is over it, or with a key from what
 //! is marked, iq handing it to the system's opener as the terminal would.
-//! The end follows what is written while the person is at it; scrolled up,
-//! the view stays put as more comes, its top held by the block it is in.
+//! An answer is read whole one after another: back to its top from the
+//! mark after it when it is taller than the room, with Home, End and Shift
+//! with the arrows. The end follows what is written while the person is
+//! at it; scrolled up, the view stays put as more comes, its top held by
+//! the block it is in.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iq_ui::steps::Entry;
@@ -22,7 +26,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::diagram::Image;
-use crate::history::{Block, History};
+use crate::history::{Block, History, Speaker};
 use crate::pages::steps::body;
 use crate::theme::Palette;
 
@@ -41,16 +45,17 @@ pub(crate) struct View {
     top: Option<(usize, usize)>,
     /// The blocks unfolded in place, by their numbers.
     unfolded: HashSet<usize>,
-    /// The block marked, by its number: what Enter unfolds or folds.
-    mark: Option<usize>,
+    /// What is marked: what Enter unfolds or folds, or the mark after an
+    /// answer, which goes back to its top.
+    mark: Option<Spot>,
     /// The diagram enlarged, by its block's number, and its first row
     /// shown.
     zoom: Option<(usize, usize)>,
     /// What the person looks for, and the blocks that hold it, by their
     /// numbers, the oldest first.
     found: Option<(String, Vec<usize>)>,
-    /// The block each row of the conversation showed, as last drawn.
-    rows: Vec<Option<usize>>,
+    /// What each row of the conversation showed, as last drawn.
+    rows: Vec<Option<Spot>>,
     /// The links each row showed, as last drawn.
     links: Vec<Vec<Link>>,
     /// The screen's row the conversation began at, as last drawn.
@@ -59,6 +64,41 @@ pub(crate) struct View {
     pointer: Option<(u16, u16)>,
     /// The links of what is marked, listed for the person to choose one.
     listing: Option<Listing>,
+}
+
+/// What a row of the conversation shows, or the mark is on: a block, by
+/// its number, or the mark after an agent's answer taller than the room,
+/// which goes back to its top, by the number of the block it follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spot {
+    Block(usize),
+    Back(usize),
+}
+
+impl Spot {
+    /// The block it is, when it is one.
+    fn block(self) -> Option<usize> {
+        match self {
+            Spot::Block(number) => Some(number),
+            Spot::Back(_) => None,
+        }
+    }
+
+    /// The number of the block it is, or follows.
+    fn number(self) -> usize {
+        match self {
+            Spot::Block(number) | Spot::Back(number) => number,
+        }
+    }
+
+    /// Where it stands among what is in one place: the block, then the
+    /// mark after it.
+    fn rank(self) -> u8 {
+        match self {
+            Spot::Block(_) => 1,
+            Spot::Back(_) => 2,
+        }
+    }
 }
 
 /// A link where the conversation shows it: its columns on its row, and
@@ -115,10 +155,14 @@ struct Laid<'a> {
     first: usize,
     blocks: Vec<&'a Block>,
     width: usize,
+    /// The conversation's room, in rows.
+    height: usize,
     cell: (u16, u16),
     board: &'a Board,
     p: &'a Palette,
     unfolded: &'a HashSet<usize>,
+    /// How many rows each place's block takes, by the place, once counted.
+    counted: RefCell<HashMap<usize, usize>>,
 }
 
 impl Laid<'_> {
@@ -170,7 +214,7 @@ impl Laid<'_> {
         let words = words.to_lowercase();
         (1..self.len())
             .filter(|at| {
-                self.lines(*at, &mut Vec::new())
+                self.block_lines(*at, &mut Vec::new())
                     .iter()
                     .any(|line| line.to_string().to_lowercase().contains(&words))
             })
@@ -226,7 +270,7 @@ impl Laid<'_> {
     /// order they show: a link folded over lines is one.
     fn links(&self, at: usize) -> Vec<(String, String)> {
         let mut links: Vec<(usize, String, String)> = Vec::new();
-        for line in self.lines(at, &mut Vec::new()) {
+        for line in self.block_lines(at, &mut Vec::new()) {
             let mut last = None;
             for span in &line.spans {
                 let Some((number, address, _)) = crate::link::address_of(span.style) else {
@@ -257,9 +301,108 @@ impl Laid<'_> {
         self.foldable(at) || at > 0 && matches!(self.blocks[at - 1], Block::Diagram { .. })
     }
 
-    /// The rows of place `at`, unfolded when the person unfolded it, the
-    /// images they show put in `images`.
+    /// The rows of place `at`, the mark back to its answer's top after it
+    /// when it ends one taller than the room, the images they show put in
+    /// `images`.
     fn lines(&self, at: usize, images: &mut Vec<Image>) -> Vec<Line<'static>> {
+        let mut lines = self.block_lines(at, images);
+        if self.ends_tall(at) {
+            let p = self.p;
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("↑ top of this answer", p.fg(p.faint)),
+            ]));
+        }
+        lines
+    }
+
+    /// What each of `count` rows of place `at` shows: its block, the last
+    /// the mark back to its answer's top when it ends one taller than the
+    /// room; nothing for what iq opens with.
+    fn spots(&self, at: usize, count: usize) -> Vec<Option<Spot>> {
+        if at == 0 {
+            return vec![None; count];
+        }
+        let number = self.number(at);
+        let mut spots = vec![Some(Spot::Block(number)); count];
+        if self.ends_tall(at)
+            && let Some(last) = spots.last_mut()
+        {
+            *last = Some(Spot::Back(number));
+        }
+        spots
+    }
+
+    /// Whose turn place `at` begins, when it begins one.
+    fn head(&self, at: usize) -> Option<Speaker> {
+        self.blocks.get(at.checked_sub(1)?)?.head()
+    }
+
+    /// Whether place `at` is a line left empty.
+    fn blank(&self, at: usize) -> bool {
+        at > 0 && self.blocks[at - 1].blank()
+    }
+
+    /// Where the turn holding place `at` begins: what iq opens with when
+    /// none does.
+    fn head_of(&self, at: usize) -> usize {
+        (1..=at)
+            .rev()
+            .find(|place| self.head(*place).is_some())
+            .unwrap_or(0)
+    }
+
+    /// The last place of the turn holding place `at`, the lines left empty
+    /// before the next aside.
+    fn end_of(&self, at: usize) -> usize {
+        let next = (at + 1..self.len())
+            .find(|place| self.head(*place).is_some())
+            .unwrap_or(self.len());
+        (at..next)
+            .rev()
+            .find(|place| !self.blank(*place))
+            .unwrap_or(at)
+    }
+
+    /// Whether place `at` ends an agent's answer taller than the room,
+    /// which the mark back to its top then follows.
+    fn ends_tall(&self, at: usize) -> bool {
+        if at == 0 || self.blank(at) {
+            return false;
+        }
+        let mut next = at + 1;
+        while next < self.len() && self.blank(next) {
+            next += 1;
+        }
+        if next < self.len() && self.head(next).is_none() {
+            return false;
+        }
+        let mut rows = 0;
+        for place in (1..=at).rev() {
+            rows += self.block_rows(place);
+            if let Some(speaker) = self.head(place) {
+                return speaker == Speaker::Agent && rows > self.height;
+            }
+            if rows > self.height {
+                return self.head(self.head_of(place)) == Some(Speaker::Agent);
+            }
+        }
+        false
+    }
+
+    /// How many rows place `at`'s block takes, counted once.
+    fn block_rows(&self, at: usize) -> usize {
+        if let Some(rows) = self.counted.borrow().get(&at) {
+            return *rows;
+        }
+        let rows = self.block_lines(at, &mut Vec::new()).len();
+        self.counted.borrow_mut().insert(at, rows);
+        rows
+    }
+
+    /// The rows of place `at`'s block, unfolded when the person unfolded
+    /// it, the images they show put in `images`.
+    fn block_lines(&self, at: usize, images: &mut Vec<Image>) -> Vec<Line<'static>> {
         if at == 0 {
             return self.opening.clone();
         }
@@ -315,7 +458,7 @@ impl Laid<'_> {
 
     /// How many rows place `at` takes.
     fn rows(&self, at: usize) -> usize {
-        self.lines(at, &mut Vec::new()).len()
+        self.block_rows(at) + usize::from(self.ends_tall(at))
     }
 }
 
@@ -354,10 +497,12 @@ impl View {
                 first,
                 blocks: blocks.clone(),
                 width: area.width,
+                height,
                 cell: history.cell(),
                 board,
                 p,
                 unfolded: &unfolded,
+                counted: RefCell::default(),
             };
             // Enlarged, a diagram takes the wheel; a click, Enter or
             // anything else puts it back.
@@ -425,11 +570,14 @@ impl View {
                     self.scroll(&laid, height, pages * rows);
                 }
                 Reading::Mark(by) => self.move_mark(&laid, height, *by),
-                Reading::Toggle => {
-                    if let Some(number) = self.mark {
-                        self.open(&laid, height, number);
+                Reading::Toggle => match self.mark {
+                    Some(Spot::Block(number)) => self.open(&laid, height, number),
+                    Some(Spot::Back(number)) => {
+                        self.go_to(&laid, height, laid.head_of(laid.at(number)));
+                        self.mark = None;
                     }
-                }
+                    None => {}
+                },
                 Reading::Click(column, row) => {
                     let shown = usize::from(row.saturating_sub(self.from));
                     let clicked = (*row >= self.from)
@@ -444,9 +592,13 @@ impl View {
                         continue;
                     }
                     match clicked {
-                        Some(number) => {
-                            self.mark = Some(number);
+                        Some(Spot::Block(number)) => {
+                            self.mark = clicked;
                             self.open(&laid, height, number);
+                        }
+                        Some(Spot::Back(number)) => {
+                            self.go_to(&laid, height, laid.head_of(laid.at(number)));
+                            self.mark = None;
                         }
                         None => {
                             self.mark = None;
@@ -461,9 +613,9 @@ impl View {
                         1 => format!("“{words}” found once"),
                         count => format!("“{words}” found {count} times: n, N go through them"),
                     });
-                    self.mark = found.last().copied();
-                    if let Some(number) = self.mark {
-                        self.show(&laid, height, laid.at(number));
+                    self.mark = found.last().copied().map(Spot::Block);
+                    if let Some(number) = found.last() {
+                        self.show(&laid, height, laid.at(*number));
                     }
                     self.found = Some((words.clone(), found));
                 }
@@ -473,18 +625,23 @@ impl View {
                     {
                         let now = self
                             .mark
+                            .and_then(Spot::block)
                             .and_then(|mark| found.iter().position(|n| *n == mark));
                         let at = match now {
                             Some(now) => now.saturating_add_signed(*by).min(found.len() - 1),
                             None => found.len() - 1,
                         };
                         let number = found[at];
-                        self.mark = Some(number);
+                        self.mark = Some(Spot::Block(number));
                         self.show(&laid, height, laid.at(number));
                     }
                 }
                 Reading::Copy => {
-                    if let Some(text) = self.mark.and_then(|mark| laid.copied(laid.at(mark))) {
+                    if let Some(text) = self
+                        .mark
+                        .and_then(Spot::block)
+                        .and_then(|mark| laid.copied(laid.at(mark)))
+                    {
                         let lines = text.lines().count().max(1);
                         said = Some(format!(
                             "copied {lines} line{}",
@@ -496,6 +653,7 @@ impl View {
                 Reading::Open | Reading::Pick(_) => {
                     let links = self
                         .mark
+                        .and_then(Spot::block)
                         .map(|mark| laid.links(laid.at(mark)))
                         .unwrap_or_default();
                     match (reading, links.len()) {
@@ -515,6 +673,10 @@ impl View {
                         _ => self.listing = Some(Listing { links, picked: 0 }),
                     }
                 }
+                Reading::Top | Reading::End | Reading::Answer(_) => {
+                    self.answer(&laid, height, reading);
+                    self.mark = None;
+                }
                 Reading::Leave => {
                     self.mark = None;
                     self.found = None;
@@ -527,10 +689,12 @@ impl View {
             first,
             blocks,
             width: area.width,
+            height,
             cell: history.cell(),
             board,
             p,
             unfolded: &unfolded,
+            counted: RefCell::default(),
         };
         let mark = self.mark;
         let enlarged = self.zoom.and_then(|(number, first)| {
@@ -542,7 +706,7 @@ impl View {
             Some((number, first, lines, images)) => {
                 let lines: Vec<Line<'static>> =
                     lines.into_iter().skip(first).take(height).collect();
-                self.rows = vec![Some(number); lines.len()];
+                self.rows = vec![Some(Spot::Block(number)); lines.len()];
                 Shown {
                     lines,
                     images,
@@ -590,7 +754,7 @@ impl View {
                 let (address, more) = match &self.listing {
                     Some(listing) => (listing.links.get(listing.picked)?.1.clone(), 0),
                     None => {
-                        let links = laid.links(laid.at(mark?));
+                        let links = laid.links(laid.at(mark?.block()?));
                         let more = links.len().saturating_sub(1);
                         (links.into_iter().next()?.1, more)
                     }
@@ -695,35 +859,107 @@ impl View {
         }
     }
 
-    /// Moves the mark to what is folded before it, or after it, by `by`,
-    /// from the end when none is marked, and scrolls to show it.
+    /// Moves the mark to what is folded, a diagram or the mark after an
+    /// answer, before it or after it, by `by`; from what shows when none
+    /// is marked, up from its last row or down from its first. Scrolls to
+    /// show it.
     fn move_mark(&mut self, laid: &Laid<'_>, height: usize, by: isize) {
-        let foldable: Vec<usize> = (0..laid.len()).filter(|at| laid.markable(*at)).collect();
-        let Some(&last) = foldable.last() else {
-            return;
+        let stops = |at: usize| -> Vec<Spot> {
+            let number = laid.number(at);
+            let mut stops = Vec::new();
+            if laid.markable(at) {
+                stops.push(Spot::Block(number));
+            }
+            if laid.ends_tall(at) {
+                stops.push(Spot::Back(number));
+            }
+            stops
         };
-        let at = match self.mark.map(|number| laid.at(number)) {
-            None => last,
-            Some(now) if by < 0 => foldable
-                .iter()
-                .rev()
-                .find(|at| **at < now)
-                .copied()
-                .unwrap_or(now),
-            Some(now) => foldable
-                .iter()
-                .find(|at| **at > now)
-                .copied()
-                .unwrap_or(now),
+        let shown = |last: bool| {
+            let mut spots = self.rows.iter().flatten();
+            let spot = if last { spots.last() } else { spots.next() };
+            spot.map_or(if last { laid.len() - 1 } else { 0 }, |spot| {
+                laid.at(spot.number())
+            })
         };
-        self.mark = Some(laid.number(at));
-        self.show(laid, height, at);
+        // Where it goes from: a place, and where in it.
+        let (from, rank) = match self.mark {
+            Some(spot) => (laid.at(spot.number()), spot.rank()),
+            None if by < 0 => (shown(true), 3),
+            None => (shown(false), 0),
+        };
+        let found = if by < 0 {
+            (0..=from).rev().find_map(|at| {
+                stops(at)
+                    .into_iter()
+                    .rev()
+                    .find(|spot| at < from || spot.rank() < rank)
+                    .map(|spot| (at, spot))
+            })
+        } else {
+            (from..laid.len()).find_map(|at| {
+                stops(at)
+                    .into_iter()
+                    .find(|spot| at > from || spot.rank() > rank)
+                    .map(|spot| (at, spot))
+            })
+        };
+        if let Some((at, spot)) = found {
+            self.mark = Some(spot);
+            self.show(laid, height, at);
+        }
     }
 
-    /// Scrolls to show place `at`: whole when it fits, its start at least.
-    fn show(&mut self, laid: &Laid<'_>, height: usize, at: usize) {
+    /// Goes to the top of the answer the view's top is in, to its end, or
+    /// to the top of the answer before or after it, as `reading` asks.
+    fn answer(&mut self, laid: &Laid<'_>, height: usize, reading: &Reading) {
+        let (mut top, _) = self.top_now(laid, height);
+        // A line left empty before a turn is read with it.
+        if laid.blank(top) && top + 1 < laid.len() {
+            top += 1;
+        }
+        let here = laid.head_of(top);
+        match reading {
+            Reading::Top => self.go_to(laid, height, here),
+            Reading::End => {
+                // What the person wrote is read with the answer after it.
+                let mut end = laid.end_of(top);
+                if laid.head(here) == Some(Speaker::Person)
+                    && let Some(next) = (end + 1..laid.len()).find(|at| laid.head(*at).is_some())
+                    && laid.head(next) == Some(Speaker::Agent)
+                {
+                    end = laid.end_of(next);
+                }
+                let by = self.offset(laid, height, end) + laid.rows(end) as isize - height as isize;
+                self.scroll(laid, height, by.max(0));
+            }
+            // Its own top first, when it is above the view.
+            Reading::Answer(by) if *by < 0 => {
+                let to = if self.offset(laid, height, here) < 0 {
+                    here
+                } else {
+                    laid.head_of(here.saturating_sub(1))
+                };
+                self.go_to(laid, height, to);
+            }
+            _ => match (top + 1..laid.len()).find(|at| laid.head(*at).is_some()) {
+                Some(next) => self.go_to(laid, height, next),
+                None => self.top = None,
+            },
+        }
+    }
+
+    /// Scrolls to put place `at` at the view's top, as far as the end lets.
+    fn go_to(&mut self, laid: &Laid<'_>, height: usize, at: usize) {
+        let by = self.offset(laid, height, at);
+        self.scroll(laid, height, by);
+    }
+
+    /// Where place `at` begins, in rows from the view's top: fewer than
+    /// none above it.
+    fn offset(&self, laid: &Laid<'_>, height: usize, at: usize) -> isize {
         let (top, row) = self.top_now(laid, height);
-        let start: isize = if at >= top {
+        if at >= top {
             (top..at)
                 .map(|place| laid.rows(place) as isize)
                 .sum::<isize>()
@@ -733,7 +969,12 @@ impl View {
                 .map(|place| laid.rows(place) as isize)
                 .sum::<isize>()
                 + row as isize)
-        };
+        }
+    }
+
+    /// Scrolls to show place `at`: whole when it fits, its start at least.
+    fn show(&mut self, laid: &Laid<'_>, height: usize, at: usize) {
+        let start = self.offset(laid, height, at);
         let end = start + laid.rows(at) as isize;
         if start < 0 {
             self.scroll(laid, height, start);
@@ -754,14 +995,12 @@ impl View {
             while at < laid.len() && shown.lines.len() < height {
                 let mut images = Vec::new();
                 let lines = laid.lines(at, &mut images);
+                let spots = laid.spots(at, lines.len());
                 let taken: Vec<Line<'static>> = lines.into_iter().skip(skip).collect();
                 if !taken.is_empty() {
                     shown.images.extend(images);
                 }
-                rows.extend(std::iter::repeat_n(
-                    (at > 0).then(|| laid.number(at)),
-                    taken.len(),
-                ));
+                rows.extend(spots.into_iter().skip(skip));
                 shown.lines.extend(taken);
                 skip = 0;
                 at += 1;
@@ -789,10 +1028,7 @@ impl View {
             parts.push((at, lines, images));
         }
         for (at, lines, images) in parts.into_iter().rev() {
-            rows.extend(std::iter::repeat_n(
-                (at > 0).then(|| laid.number(at)),
-                lines.len(),
-            ));
+            rows.extend(laid.spots(at, lines.len()));
             shown.lines.extend(lines);
             shown.images.extend(images);
         }
@@ -998,9 +1234,12 @@ mod tests {
         let mut shown = |history: &History, board: &Board, readings: &[Reading]| {
             rows(&view.shown(history, board, &p, Some("lead"), area(5), readings))
         };
+        // Taller than the room, the answer ends with the way back to its
+        // top.
+        let end = shown(&history, &board, &[]);
         assert_eq!(
-            shown(&history, &board, &[]).last().map(String::as_str),
-            Some("  line 20")
+            end[end.len() - 2..],
+            ["  line 20", "  ↑ top of this answer"]
         );
         // Up by 3 pages less a row each: what shows stays as more comes.
         let before = shown(&history, &board, &[Reading::Page(-3)]);
@@ -1013,7 +1252,82 @@ mod tests {
         assert_eq!(top[1], "● lead");
         // Back down to the end, it follows it again.
         let end = shown(&history, &board, &[Reading::Scroll(500)]);
-        assert_eq!(end.last().map(String::as_str), Some("  line 21"));
+        assert_eq!(end[end.len() - 2], "  line 21");
+    }
+
+    #[test]
+    fn answers_are_read_one_after_another_and_a_long_one_goes_back_to_its_top() {
+        let (p, mut board, mut history) = joined();
+        let tall: String = (1..=12).map(|n| format!("line {n}\n\n")).collect();
+        for (question, answer) in [("first?", "short\n"), ("second?", tall.as_str())] {
+            // A later turn is the person's message.
+            crew(
+                &mut board,
+                &mut history,
+                &p,
+                Event::Posted {
+                    from: PERSON.into(),
+                    to: "lead".into(),
+                    text: question.into(),
+                },
+            );
+            for event in [
+                Event::Working {
+                    agent: "lead".into(),
+                    prompt: question.into(),
+                },
+                Event::Text {
+                    agent: "lead".into(),
+                    text: answer.into(),
+                },
+                Event::Done {
+                    agent: "lead".into(),
+                    outcome: Ok("done".into()),
+                },
+            ] {
+                crew(&mut board, &mut history, &p, event);
+            }
+        }
+        let _ = history.take(60, Some("lead"));
+        let mut view = View::default();
+        let mut shown = |readings: &[Reading]| {
+            rows(&view.shown(&history, &board, &p, Some("lead"), area(8), readings))
+        };
+        // Taller than the room: a click on the mark after it goes back to
+        // its top.
+        let end = shown(&[]);
+        assert_eq!(
+            end.last().map(String::as_str),
+            Some("  ↑ top of this answer")
+        );
+        let back = Reading::Click(4, 2 + 7);
+        assert_eq!(shown(&[back])[0], "● lead");
+        // Shift and the arrows go from one answer to the next, Home and
+        // End to the top and the end of the one read.
+        assert_eq!(shown(&[Reading::Answer(-1)])[0], "› second?");
+        assert_eq!(shown(&[Reading::Answer(-1)])[0], "● lead");
+        assert_eq!(shown(&[Reading::Answer(-1)])[0], "› first?");
+        assert_eq!(shown(&[Reading::Answer(1)])[0], "● lead");
+        assert_eq!(shown(&[Reading::Answer(1)])[0], "› second?");
+        assert_eq!(shown(&[Reading::Answer(1)])[0], "● lead");
+        let end = shown(&[Reading::End]);
+        assert_eq!(
+            end.last().map(String::as_str),
+            Some("  ↑ top of this answer")
+        );
+        assert_eq!(shown(&[Reading::Top])[0], "● lead");
+        // From what the person wrote, the end of the answer after it.
+        assert_eq!(shown(&[Reading::Answer(-1)])[0], "› second?");
+        assert_eq!(shown(&[Reading::End]), end);
+        // Past the last, the end, followed again.
+        assert_eq!(shown(&[Reading::Answer(1)]), end);
+        // The mark goes to it from what shows, and Enter goes back up.
+        let marked = shown(&[Reading::Mark(-1)]);
+        assert_eq!(
+            marked.last().map(String::as_str),
+            Some("▌ ↑ top of this answer")
+        );
+        assert_eq!(shown(&[Reading::Toggle])[0], "● lead");
     }
 
     /// Draws every diagram at once as a PNG of 400 by 600 pixels.

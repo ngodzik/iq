@@ -322,13 +322,15 @@ impl Live<'_> {
         // Reading the conversation iq draws: what the keys do there.
         if self.board.reading() {
             let p = self.p;
-            parts.push(Part::Lines(vec![fit(
-                vec![Span::styled(
-                    "  ↑ ↓ mark what is folded or a diagram · Enter unfolds, folds, enlarges · o opens its links · c copies · n N the matches · Esc writes again",
+            parts.push(Part::Lines(wrap(
+                &[Span::styled(
+                    "↑ ↓ mark what is folded, a diagram or the end of an answer · Enter unfolds, folds, enlarges, goes back up · Home End this answer · Shift ↑ ↓ the answers · o opens its links · c copies · n N the matches · Esc writes again",
                     p.fg(p.faint),
                 )],
-                width,
-            )]));
+                width.saturating_sub(1),
+                &[Span::raw("  ")],
+                &[Span::raw("  ")],
+            )));
         }
         let listed = self.completions(width);
         if !listed.is_empty() {

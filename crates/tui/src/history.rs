@@ -110,6 +110,12 @@ impl Para {
 #[derive(Debug, Clone)]
 pub(crate) enum Block {
     Para(Para),
+    /// The head of a turn: an agent's name, or what the person wrote. The
+    /// conversation iq draws goes from one to the next.
+    Head {
+        para: Para,
+        person: bool,
+    },
     /// A line of an agent's text, folded as a paragraph is.
     Text(Para),
     Whole(Line<'static>),
@@ -155,6 +161,13 @@ pub(crate) enum Block {
     },
 }
 
+/// Whose turn a head begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Speaker {
+    Person,
+    Agent,
+}
+
 impl Block {
     /// A styled line of an agent's text: code at the line's start, whole,
     /// the rest under its block's indent.
@@ -180,7 +193,7 @@ impl Block {
             spans.iter().map(|span| span.content.as_ref()).collect()
         };
         match self {
-            Block::Para(para) | Block::Text(para) => spans(&para.body),
+            Block::Para(para) | Block::Text(para) | Block::Head { para, .. } => spans(&para.body),
             Block::Whole(line) => line.to_string(),
             Block::Row(row) => spans(row).trim().to_owned(),
             Block::Table(table) => table
@@ -216,6 +229,21 @@ impl Block {
         }
     }
 
+    /// Whether it is the head of an agent's turn, of the person's, or
+    /// neither.
+    pub(crate) fn head(&self) -> Option<Speaker> {
+        match self {
+            Block::Head { person: true, .. } => Some(Speaker::Person),
+            Block::Head { person: false, .. } => Some(Speaker::Agent),
+            _ => None,
+        }
+    }
+
+    /// Whether it is a line left empty.
+    pub(crate) fn blank(&self) -> bool {
+        matches!(self, Block::Para(para) if para.first.iter().chain(&para.body).all(|span| span.content.trim().is_empty()))
+    }
+
     /// Whether it is a diagram being drawn, which what comes after it waits
     /// for.
     fn drawing(&self) -> bool {
@@ -225,6 +253,7 @@ impl Block {
             Block::Summed { summary, .. } => summary.making(),
             Block::Job { label, .. } => label.making(),
             Block::Para(_)
+            | Block::Head { .. }
             | Block::Text(_)
             | Block::Whole(_)
             | Block::Row(_)
@@ -243,7 +272,7 @@ impl Block {
     ) -> Vec<Line<'static>> {
         let indent = [Span::raw("  ")];
         match self {
-            Block::Para(para) | Block::Text(para) => {
+            Block::Para(para) | Block::Text(para) | Block::Head { para, .. } => {
                 wrap(&para.body, width, &para.first, &para.rest)
             }
             Block::Whole(line) => vec![line.clone()],
@@ -1119,10 +1148,13 @@ impl History {
             ));
         }
         body.extend(inline(text.trim(), p.fg(p.text), p, self.links));
-        self.push(Para {
-            first: vec![Span::styled("› ", p.bold(p.accent))],
-            rest: vec![Span::raw("  ")],
-            body,
+        self.push_block(Block::Head {
+            para: Para {
+                first: vec![Span::styled("› ", p.bold(p.accent))],
+                rest: vec![Span::raw("  ")],
+                body,
+            },
+            person: true,
         });
         if let Some(said) = self.after.remove(agent) {
             self.push(Para::indented("  ", vec![Span::styled(said, p.fg(p.info))]));
@@ -1284,14 +1316,17 @@ impl History {
             format!("  {beside}")
         };
         self.blank();
-        self.push(Para::indented(
-            "",
-            vec![
-                Span::styled("● ", p.fg(tint)),
-                Span::styled(name, p.bold(tint)),
-                Span::styled(beside, p.fg(p.faint)),
-            ],
-        ));
+        self.push_block(Block::Head {
+            para: Para::indented(
+                "",
+                vec![
+                    Span::styled("● ", p.fg(tint)),
+                    Span::styled(name, p.bold(tint)),
+                    Span::styled(beside, p.fg(p.faint)),
+                ],
+            ),
+            person: false,
+        });
         self.set_speaker(Some(agent.to_owned()));
     }
 

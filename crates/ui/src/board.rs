@@ -275,6 +275,12 @@ pub enum Reading {
     /// Open the link of this number, from one, of those listed, else of
     /// those what is marked holds.
     Pick(usize),
+    /// Go to the top of the answer read: Home.
+    Top,
+    /// Go to its end: End.
+    End,
+    /// Go to the top of the answer before, or after: `-1`, `1`.
+    Answer(isize),
     /// The person reads no more: the mark goes, and what was found.
     Leave,
 }
@@ -385,11 +391,13 @@ impl Board {
 
     /// What `chord` does while the person reads the conversation iq
     /// draws: the arrows move the mark, Enter unfolds what it marks or
-    /// folds it again, o and the numbers open its links, Escape stops
-    /// reading. None for another key, which stops reading and goes where
-    /// the person writes.
+    /// folds it again, o and the numbers open its links, Home and End go
+    /// to the top and the end of the answer read, Shift and the arrows to
+    /// the answer before or after, Escape stops reading. None for another
+    /// key, which stops reading and goes where the person writes.
     fn reading_key(&mut self, chord: &Chord, typed: Option<char>) -> Option<Vec<Request>> {
         let plain = !chord.ctrl && !chord.alt && !chord.cmd && !chord.shift;
+        let shifted = chord.shift && !chord.ctrl && !chord.alt && !chord.cmd;
         let reading = match (chord.key.as_str(), typed) {
             (_, Some('c')) => Reading::Copy,
             (_, Some('n')) => Reading::Match(-1),
@@ -399,6 +407,10 @@ impl Board {
             _ => match chord.key.as_str() {
                 "Up" if plain => Reading::Mark(-1),
                 "Down" if plain => Reading::Mark(1),
+                "Up" if shifted => Reading::Answer(-1),
+                "Down" if shifted => Reading::Answer(1),
+                "Home" if plain => Reading::Top,
+                "End" if plain => Reading::End,
                 "Enter" if plain => Reading::Toggle,
                 "Escape" if plain => {
                     self.reading = false;
@@ -2013,9 +2025,17 @@ mod tests {
         let mut board = Board::new(Keymap::default(), look);
         key(&mut board, "shift+up");
         assert!(board.reading());
-        key(&mut board, "Up");
-        key(&mut board, "Down");
-        key(&mut board, "Enter");
+        for chord in [
+            "Up",
+            "Down",
+            "Enter",
+            "shift+up",
+            "shift+down",
+            "Home",
+            "End",
+        ] {
+            key(&mut board, chord);
+        }
         key(&mut board, "Escape");
         assert!(!board.reading());
         assert_eq!(
@@ -2025,6 +2045,10 @@ mod tests {
                 Reading::Mark(-1),
                 Reading::Mark(1),
                 Reading::Toggle,
+                Reading::Answer(-1),
+                Reading::Answer(1),
+                Reading::Top,
+                Reading::End,
                 Reading::Leave
             ]
         );
