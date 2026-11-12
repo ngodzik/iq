@@ -59,8 +59,6 @@ pub enum Page {
     /// Every step the agents took, fold by fold, and what they wrote to
     /// each other, the latest last.
     Steps,
-    /// A diagram of the chat alone, at its whole size, zoomed and moved.
-    Diagram,
     /// The map of the turn of the chat written to.
     Map,
 }
@@ -77,7 +75,6 @@ impl Page {
             Page::Keys => "Keys and commands".to_owned(),
             Page::Changes => "What a sync would send".to_owned(),
             Page::Steps => "Steps and messages".to_owned(),
-            Page::Diagram => "Diagram".to_owned(),
             Page::Map => "The turn".to_owned(),
         }
     }

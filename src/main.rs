@@ -604,38 +604,6 @@ fn attached(
     shown
 }
 
-/// Opens the image of a diagram drawn, `path`, in the system's viewer, as
-/// the person asked: `open` on macOS, `xdg-open` elsewhere; only an image
-/// of iq's own cache of diagrams, and written to `gate`'s audit log.
-fn open_diagram(gate: &Gate, path: &Path) -> Result<()> {
-    let cache = cache_folder(&home_dir()?).join("diagrams");
-    let real = path.canonicalize().context("reading where it is")?;
-    let cache = cache.canonicalize().context("reading iq's cache")?;
-    if !real.starts_with(&cache) || real.extension().is_none_or(|e| e != "png") {
-        anyhow::bail!("only a diagram iq drew is opened");
-    }
-    let program = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    gate.outside(
-        "the person",
-        &format!("{program} {}", real.display()),
-        gate.workspace(),
-    )?;
-    let mut child = std::process::Command::new(program)
-        .arg(&real)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("starting {program}"))?;
-    // Waited for on a thread of its own, so that it leaves no zombie.
-    std::thread::spawn(move || child.wait());
-    Ok(())
-}
-
 /// Where iq keeps what it can make again, apart from its own folder: the
 /// cache the system's conventions name.
 fn cache_folder(home: &Path) -> PathBuf {
@@ -1404,14 +1372,6 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                 }
                 Request::Answer { id, approved } => working.answer(id, approved),
                 Request::Choose { id, answer } => working.choose(id, answer),
-                Request::Open { path } => {
-                    if let Err(why) = open_diagram(working.gate(), &path) {
-                        let _ = told.send(Update::Notice(format!(
-                            "{} is not opened: {why}",
-                            path.display()
-                        )));
-                    }
-                }
                 Request::Autopilot(on) => working.set_autopilot(on),
                 Request::Internet(open) => working.set_internet(open),
                 Request::Effort { agent, effort } => {

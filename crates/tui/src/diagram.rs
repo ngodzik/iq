@@ -4,7 +4,6 @@
 //! their source. A diagram being drawn holds back what its window writes
 //! after it, so that the conversation keeps its order.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -24,20 +23,12 @@ pub trait Draw: Send + Sync {
     fn draw(&self, source: &str) -> Result<Drawn, String>;
 }
 
-/// A diagram drawn, and where its source is kept.
+/// A diagram drawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Drawn {
     /// The image, a PNG.
     pub png: Vec<u8>,
-    /// The file its source is kept in, for the person to open.
-    pub source: Option<PathBuf>,
-    /// The file the image is kept in, for the person to open it larger.
-    pub image: Option<PathBuf>,
 }
-
-/// A diagram's image: its id with the terminal, its PNG and its size in
-/// pixels.
-pub(crate) type Shot = (u32, Arc<Vec<u8>>, (u32, u32));
 
 /// The most rows an image takes, so that one fits on screen with what was
 /// said of it.
@@ -113,20 +104,6 @@ impl Diagram {
             });
         }
         diagram
-    }
-
-    /// Its image, once drawn: its id with the terminal, the PNG, its size
-    /// in pixels, and the file it is kept in.
-    pub(crate) fn image(&self) -> Option<(Shot, PathBuf)> {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let State::Drawn(drawn) = &*state else {
-            return None;
-        };
-        let pixels = graphics::png_size(&drawn.png)?;
-        Some((
-            (self.id, Arc::new(drawn.png.clone()), pixels),
-            drawn.image.clone()?,
-        ))
     }
 
     /// Whether it is still being drawn, and waited for.
@@ -221,11 +198,7 @@ mod tests {
         let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
         png.extend(200u32.to_be_bytes());
         png.extend(100u32.to_be_bytes());
-        let diagram = drawn(Some(Fixed(Ok(Drawn {
-            png,
-            source: Some("/cache/d.mmd".into()),
-            image: Some("/cache/d.png".into()),
-        }))));
+        let diagram = drawn(Some(Fixed(Ok(Drawn { png }))));
         let mut images = Vec::new();
         let shown = diagram.shown(80, &[Span::raw("  ")], (10, 20), &mut images);
         let Shown::Image(lines) = shown else {
@@ -239,11 +212,7 @@ mod tests {
         let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
         png.extend(300u32.to_be_bytes());
         png.extend(100u32.to_be_bytes());
-        let wide = drawn(Some(Fixed(Ok(Drawn {
-            png,
-            source: None,
-            image: None,
-        }))));
+        let wide = drawn(Some(Fixed(Ok(Drawn { png }))));
         let mut images = Vec::new();
         wide.shown(80, &[Span::raw("  ")], (10, 20), &mut images);
         assert_eq!((images[0].cols, images[0].rows), (78, 13));
@@ -265,8 +234,6 @@ mod tests {
         );
         let not_png = drawn(Some(Fixed(Ok(Drawn {
             png: b"<svg/>".to_vec(),
-            source: None,
-            image: None,
         }))));
         assert!(
             matches!(shown(&not_png), Shown::Source(Some(why)) if why.ends_with("no PNG image"))

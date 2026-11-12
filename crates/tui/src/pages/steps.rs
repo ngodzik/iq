@@ -214,7 +214,6 @@ mod tests {
             p: &p,
             now: 0,
             width: 80,
-            images: false,
             summed,
             motion: &crate::motion::Motion::default(),
             labels: &|_| None,

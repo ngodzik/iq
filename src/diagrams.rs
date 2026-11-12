@@ -208,11 +208,7 @@ impl Draw for Diagrams {
             return Err(format!("its image is {size} bytes, more than iq shows"));
         }
         let png = std::fs::read(&output).map_err(|e| format!("{}: {e}", output.display()))?;
-        Ok(Drawn {
-            png,
-            source: Some(input),
-            image: Some(output),
-        })
+        Ok(Drawn { png })
     }
 }
 

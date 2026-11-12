@@ -377,7 +377,6 @@ mod tests {
             p: &p,
             now: 0,
             width: 100,
-            images: false,
             summed: &|_| None,
             motion: &crate::motion::Motion::default(),
             labels: &|_| None,

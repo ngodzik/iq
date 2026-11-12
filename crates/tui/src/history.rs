@@ -336,17 +336,9 @@ pub(crate) struct History {
     /// Whether what follows a diagram being drawn waits for it: not as iq
     /// ends.
     hurried: bool,
-    /// Whether diagrams are drawn as images, in Kitty.
-    drawn_images: bool,
     /// The commands left to run in the background, by number: what they
     /// do in a few words, and since when they run.
     jobs: HashMap<u64, (Label, Instant)>,
-    /// The diagrams shown as images since last asked, each with the chat
-    /// whose window shows it and the file its image is kept in.
-    drawn: Vec<(Option<String>, std::path::PathBuf)>,
-    /// The images of the diagrams shown, by their files: their ids with
-    /// the terminal, their PNGs and their sizes in pixels.
-    pictures: HashMap<std::path::PathBuf, crate::diagram::Shot>,
     /// What sums up the messages between agents.
     summarizer: Summarizer,
     /// The summaries of the messages between agents, by their numbers.
@@ -367,7 +359,6 @@ impl History {
     /// take none of an earlier session's, whose images the scrollback
     /// still shows.
     pub(crate) fn pictures(&mut self, draw: Option<Arc<dyn Draw>>, cell: (u16, u16)) {
-        self.drawn_images = draw.is_some();
         self.drawer = Drawer(draw);
         self.set_cell(cell);
         let now = std::time::SystemTime::now()
@@ -397,11 +388,6 @@ impl History {
         } else if self.cell == (0, 0) {
             self.cell = (8, 16);
         }
-    }
-
-    /// The size of a cell in pixels, as the terminal said it.
-    pub(crate) fn cell(&self) -> (u16, u16) {
-        self.cell
     }
 
     /// The images the lines written last show, to be sent first.
@@ -1324,7 +1310,6 @@ impl History {
             }
             if chat == window {
                 lines.extend(block.lines(width, self.cell, &mut self.images));
-                self.shown(&chat, &block);
             }
             let kept = self.kept.entry(chat).or_default();
             kept.push_back(block);
@@ -1372,34 +1357,8 @@ impl History {
         let blocks: Vec<Block> = self.kept.get(&key).into_iter().flatten().cloned().collect();
         for block in blocks {
             lines.extend(block.lines(width, self.cell, &mut self.images));
-            self.shown(&key, &block);
         }
         lines
-    }
-
-    /// Notes the image of `block`, when it is a diagram shown as one, as
-    /// shown in `chat`'s window.
-    fn shown(&mut self, chat: &Option<String>, block: &Block) {
-        let Block::Diagram { diagram, .. } = block else {
-            return;
-        };
-        if let Some((shot, path)) = diagram.image()
-            && self.drawn_images
-        {
-            self.pictures.insert(path.clone(), shot);
-            self.drawn.push((chat.clone(), path));
-        }
-    }
-
-    /// The diagrams shown as images since last asked, with their chats.
-    pub(crate) fn take_drawn(&mut self) -> Vec<(Option<String>, std::path::PathBuf)> {
-        std::mem::take(&mut self.drawn)
-    }
-
-    /// The image of the diagram kept in `path`: its id, its PNG and its
-    /// size in pixels.
-    pub(crate) fn picture(&self, path: &std::path::Path) -> Option<crate::diagram::Shot> {
-        self.pictures.get(path).cloned()
     }
 
     /// The last of the lines written in `window`, as many as `rows`,
@@ -1864,11 +1823,7 @@ mod tests {
             let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
             png.extend(200u32.to_be_bytes());
             png.extend(100u32.to_be_bytes());
-            Ok(crate::diagram::Drawn {
-                png,
-                source: None,
-                image: None,
-            })
+            Ok(crate::diagram::Drawn { png })
         }
     }
 

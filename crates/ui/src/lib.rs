@@ -20,9 +20,7 @@ pub mod screen;
 pub mod shell;
 pub mod steps;
 
-pub use board::{
-    Board, PERIODS, Picture, Post, Recall, SWITCH_ROWS, Switcher, SyncAsk, Synced, Update,
-};
+pub use board::{Board, PERIODS, Post, Recall, SWITCH_ROWS, Switcher, SyncAsk, Synced, Update};
 pub use error::UiError;
 pub use iq_agent::Pattern;
 
