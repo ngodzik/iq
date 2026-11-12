@@ -31,6 +31,7 @@
 //! steps = 5                              # an agent's latest steps (tools, what was allowed) shown as it works; once it writes again only their count, Ctrl-X unfolds them; 0 none
 //! job_lines = 3                          # a background job's latest lines shown under its line while it runs, cut to the screen's width; 0 none
 //! turn_view = "panes"                    # a turn of several agents shown as panes side by side at the top, or "strip": a few lines of its map below the conversation; Ctrl-G opens the whole map either way
+//! diagrams_folded = false                # a diagram shown as one line, unfolded in place with the down arrow while it is the last thing written
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set; the project's .claude/skills are read after them, yours winning a name both hold
@@ -193,6 +194,8 @@ pub(crate) struct Settings {
     job_lines: Option<usize>,
     /// What shows a turn of several agents: panes, or a strip of its map.
     turn_view: Option<String>,
+    /// Whether diagrams show folded, as a line, until unfolded.
+    diagrams_folded: Option<bool>,
     /// The person's rules for every project, files of their home.
     rules: Option<Vec<String>>,
     /// The folders of the person's skills.
@@ -572,7 +575,8 @@ impl Settings {
             .with_turn(match self.turn_view.as_deref() {
                 Some(turn) => turn.parse().map_err(anyhow::Error::msg)?,
                 None => iq_ui::look::TurnShown::Panes,
-            }))
+            })
+            .with_diagrams_folded(self.diagrams_folded.unwrap_or(false)))
     }
 
     /// The model that sums up what agents write to each other, when set.

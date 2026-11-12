@@ -118,6 +118,15 @@ enum Block {
         code: Vec<Block>,
         failed: Style,
     },
+    /// A diagram shown folded, as the settings say: `line`, what it is,
+    /// until the person unfolds it while it is the last thing written;
+    /// once anything comes after it, that line for good.
+    Folded {
+        diagram: Arc<Diagram>,
+        code: Vec<Block>,
+        failed: Style,
+        line: Vec<Span<'static>>,
+    },
     /// A command run in the background, in one line never folded: `head`,
     /// then what it does in a few words (the summarizer's, else `instead`,
     /// read from the line), then `tail`.
@@ -160,7 +169,11 @@ impl Block {
             Block::Diagram { diagram, .. } => diagram.drawing(),
             Block::Summed { summary, .. } => summary.making(),
             Block::Job { label, .. } => label.making(),
-            Block::Para(_) | Block::Whole(_) | Block::Row(_) | Block::Table(_) => false,
+            Block::Para(_)
+            | Block::Whole(_)
+            | Block::Row(_)
+            | Block::Table(_)
+            | Block::Folded { .. } => false,
         }
     }
 
@@ -171,7 +184,9 @@ impl Block {
         match self {
             Block::Para(para) => wrap(&para.body, width, &para.first, &para.rest),
             Block::Whole(line) => vec![line.clone()],
-            Block::Row(spans) => vec![fit(spans.clone(), width)],
+            Block::Row(spans) | Block::Folded { line: spans, .. } => {
+                vec![fit(spans.clone(), width)]
+            }
             // Too long, the hint to unfold it goes first, then what it does
             // is cut: how it ended always shows.
             Block::Job { head, label, tail } => {
@@ -1222,12 +1237,28 @@ impl History {
                         .collect();
                     let id = self.next_image.max(1);
                     self.next_image = (id + 1) & 0x00ff_ffff;
+                    let said = diagram_said(&source);
                     let diagram = Diagram::new(source, id, self.drawer.0.clone());
-                    self.push_text_block(Block::Diagram {
-                        diagram,
-                        code,
-                        failed: p.fg(p.warn),
-                    });
+                    // Folded, when the settings say and it can be drawn.
+                    let block = if board.look().diagrams_folded() && self.drawer.0.is_some() {
+                        Block::Folded {
+                            diagram,
+                            code,
+                            failed: p.fg(p.warn),
+                            line: vec![
+                                Span::raw("  "),
+                                Span::styled("▸ ", p.fg(p.faint)),
+                                Span::styled(format!("diagram · {said}"), p.fg(p.dim)),
+                            ],
+                        }
+                    } else {
+                        Block::Diagram {
+                            diagram,
+                            code,
+                            failed: p.fg(p.warn),
+                        }
+                    };
+                    self.push_text_block(block);
                 }
             }
         }
@@ -1308,6 +1339,16 @@ impl History {
                 self.paras.extend(queued);
                 break;
             }
+            // A diagram folded waits as the last thing its window writes,
+            // for the person to unfold it.
+            let last = !queued
+                .as_slice()
+                .iter()
+                .any(|(other, _)| other.clone().or_else(|| window.clone()) == chat);
+            if chat == window && !self.hurried && last && matches!(block, Block::Folded { .. }) {
+                self.paras.push((given, block));
+                continue;
+            }
             if chat == window {
                 lines.extend(block.lines(width, self.cell, &mut self.images));
             }
@@ -1318,6 +1359,46 @@ impl History {
             }
         }
         lines
+    }
+
+    /// The line of the diagram folded as the last thing `window` writes,
+    /// while it waits for the person to unfold it.
+    pub(crate) fn folded(&self, window: Option<&str>) -> Option<Vec<Span<'static>>> {
+        let window = window.map(str::to_owned);
+        match self
+            .paras
+            .iter()
+            .rev()
+            .find(|(chat, _)| chat.clone().or_else(|| window.clone()) == window)
+        {
+            Some((_, Block::Folded { line, .. })) => Some(line.clone()),
+            _ => None,
+        }
+    }
+
+    /// Unfolds the diagram folded as the last thing `window` writes: its
+    /// image is written next, once drawn, for good.
+    pub(crate) fn unfold(&mut self, window: Option<&str>) {
+        let window = window.map(str::to_owned);
+        let last = self
+            .paras
+            .iter_mut()
+            .rev()
+            .find(|(chat, _)| chat.clone().or_else(|| window.clone()) == window);
+        if let Some((_, block)) = last
+            && let Block::Folded {
+                diagram,
+                code,
+                failed,
+                ..
+            } = block
+        {
+            *block = Block::Diagram {
+                diagram: Arc::clone(diagram),
+                code: std::mem::take(code),
+                failed: *failed,
+            };
+        }
     }
 
     /// Makes what the new chat's window holds `chat`'s, as the chat starts
@@ -1467,6 +1548,96 @@ impl History {
             Some(speaker) => self.speakers.insert(self.at.clone(), speaker),
             None => self.speakers.remove(&self.at),
         };
+    }
+}
+
+/// What a Mermaid diagram is, in a few words: its kind, and how many nodes
+/// a flowchart has, how many take part in a sequence, else how many lines
+/// it is.
+fn diagram_said(source: &str) -> String {
+    let lines: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("%%"))
+        .collect();
+    let Some(head) = lines.first() else {
+        return "empty".to_owned();
+    };
+    let kind = head.split_whitespace().next().unwrap_or_default();
+    let body = &lines[1..];
+    let ident = |part: &str| -> Option<String> {
+        let id: String = part
+            .trim()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!id.is_empty()).then_some(id)
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut count = |id: Option<String>| {
+        if let Some(id) = id
+            && !seen.contains(&id)
+        {
+            seen.push(id);
+        }
+    };
+    match kind {
+        "graph" | "flowchart" => {
+            const NOT_NODES: [&str; 7] = [
+                "subgraph",
+                "end",
+                "style",
+                "classDef",
+                "class",
+                "click",
+                "linkStyle",
+            ];
+            for line in body {
+                if NOT_NODES.contains(&line.split_whitespace().next().unwrap_or_default()) {
+                    continue;
+                }
+                // Without the labels of its links, parted at its arrows.
+                let mut plain = String::new();
+                let mut label = false;
+                for c in line.chars() {
+                    match c {
+                        '|' => label = !label,
+                        _ if label => {}
+                        '-' | '=' | '.' | '<' | '>' => plain.push('\n'),
+                        _ => plain.push(c),
+                    }
+                }
+                for part in plain.split('\n').flat_map(|part| part.split('&')) {
+                    count(ident(part));
+                }
+            }
+            format!(
+                "flowchart, {} node{}",
+                seen.len(),
+                if seen.len() == 1 { "" } else { "s" }
+            )
+        }
+        "sequenceDiagram" => {
+            for line in body {
+                let mut words = line.split_whitespace();
+                match words.next() {
+                    Some("participant" | "actor") => count(words.next().map(str::to_owned)),
+                    _ if line.contains("->") || line.contains("--") => {
+                        let said = line.split(':').next().unwrap_or_default();
+                        for part in said.split(['-', '>', 'x', ')', '+']) {
+                            count(ident(part));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            format!("sequence, {} taking part", seen.len())
+        }
+        _ => format!(
+            "{kind}, {} line{}",
+            body.len(),
+            if body.len() == 1 { "" } else { "s" }
+        ),
     }
 }
 
@@ -1885,6 +2056,76 @@ mod tests {
         assert_eq!(after.last().map(String::as_str), Some("  after it"));
         let images = history.take_images();
         assert_eq!((images.len(), images[0].cols, images[0].rows), (1, 30, 8));
+    }
+
+    #[test]
+    fn a_diagram_folded_waits_last_for_the_down_arrow_and_stays_folded_once_passed() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let look = iq_ui::look::Look::default().with_diagrams_folded(true);
+        let mut board = Board::new(iq_ui::keys::Keymap::default(), look);
+        let mut history = History::default();
+        let (go, wait) = std::sync::mpsc::channel();
+        history.pictures(Some(Arc::new(Held(std::sync::Mutex::new(wait)))), (10, 20));
+        let run = |board: &mut Board, history: &mut History, event| crew(board, history, event, &p);
+        run(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: "lead".into(),
+                model: "lab/lead".into(),
+                by: PERSON.into(),
+            },
+        );
+        let diagram = "```mermaid\nflowchart LR\n A[Parse] -->|ok| B & C\n B --> D\n```\n";
+        let said = |board: &mut Board, history: &mut History, text: &str| {
+            run(
+                board,
+                history,
+                Event::Text {
+                    agent: "lead".into(),
+                    text: text.into(),
+                },
+            );
+        };
+        let text = |lines: Vec<Line<'static>>| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l.to_string().trim_end().to_owned())
+                .collect()
+        };
+        said(&mut board, &mut history, &format!("Here:\n{diagram}"));
+        // The last thing written, it waits folded, said where the live part
+        // begins; nothing waits for its drawing.
+        let written = text(history.take(60, Some("lead")));
+        assert!(written.contains(&"  Here:".to_owned()), "{written:#?}");
+        assert!(
+            !written.iter().any(|l| l.contains("diagram")),
+            "{written:#?}"
+        );
+        let folded = Line::from(history.folded(Some("lead")).unwrap()).to_string();
+        assert_eq!(folded, "  ▸ diagram · flowchart, 4 nodes");
+        // Unfolded, its image is written once drawn.
+        history.unfold(Some("lead"));
+        assert!(history.folded(Some("lead")).is_none());
+        go.send(()).unwrap();
+        let mut image = Vec::new();
+        for _ in 0..500 {
+            image = text(history.take(60, Some("lead")));
+            if !image.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(image.iter().all(|l| l.contains('\u{10EEEE}')), "{image:#?}");
+        // Another, then text after it: folded for good.
+        said(&mut board, &mut history, &format!("{diagram}And on.\n"));
+        let written = text(history.take(60, Some("lead")));
+        assert!(
+            written.contains(&"  ▸ diagram · flowchart, 4 nodes".to_owned()),
+            "{written:#?}"
+        );
+        assert_eq!(written.last().map(String::as_str), Some("  And on."));
+        assert!(history.folded(Some("lead")).is_none());
     }
 
     #[test]

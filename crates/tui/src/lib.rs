@@ -270,6 +270,15 @@ impl Iq {
                 self.history.recall(&recall, &self.board, &self.p);
                 changed = true;
             }
+            // A diagram folded at the conversation's end, for the down
+            // arrow to unfold.
+            let window = window_of(&self.board);
+            if self.board.take_unfold() {
+                self.history.unfold(window.as_deref());
+                changed = true;
+            }
+            self.board
+                .set_folded(self.history.folded(window.as_deref()).is_some());
             if self.board.quitting() {
                 return Ok(());
             }

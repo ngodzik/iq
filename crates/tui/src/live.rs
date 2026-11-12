@@ -279,6 +279,12 @@ impl Live<'_> {
     fn parts(&self, motion: &Motion, width: u16) -> Vec<Part> {
         let width = usize::from(width);
         let mut parts = Vec::new();
+        // A diagram folded at the conversation's end, where it is written.
+        if let Some(mut line) = self.history.folded(self.window().as_deref()) {
+            let p = self.p;
+            line.push(Span::styled("  ↓ unfolds", p.fg(p.faint)));
+            parts.push(Part::Lines(vec![fit(line, width)]));
+        }
         parts.extend(self.working(motion, width));
         if let Some(question) = self.question(width) {
             parts.push(question);

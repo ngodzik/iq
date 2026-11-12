@@ -212,6 +212,11 @@ pub struct Board {
     attached: Vec<std::path::PathBuf>,
     /// The choice picked in the question with choices shown.
     picking: usize,
+    /// Whether a diagram shows folded as the last thing written, for the
+    /// down arrow to unfold.
+    folded: bool,
+    /// Whether the person asked the diagram folded to unfold.
+    unfold: bool,
 }
 
 /// The image a paste is, when it is the path of one alone: a file dropped
@@ -274,7 +279,21 @@ impl Board {
             switching: None,
             attached: Vec::new(),
             picking: 0,
+            folded: false,
+            unfold: false,
         }
+    }
+
+    /// Says whether a diagram shows folded as the last thing written in
+    /// the chat written to: the down arrow, where nothing is written,
+    /// unfolds it.
+    pub fn set_folded(&mut self, folded: bool) {
+        self.folded = folded;
+    }
+
+    /// Whether the person asked the diagram folded to unfold, once.
+    pub fn take_unfold(&mut self) -> bool {
+        std::mem::take(&mut self.unfold)
     }
 
     /// The question with choices the person answers where they write: the
@@ -839,6 +858,17 @@ impl Board {
             if self.screen.ask_quit(now) {
                 self.quitting = true;
             }
+            return Vec::new();
+        }
+        // Where nothing is written, the down arrow moves nowhere: it
+        // unfolds the diagram folded at the conversation's end.
+        if plain
+            && !chord.shift
+            && chord.key == "Down"
+            && self.folded
+            && self.screen.editor().is_empty()
+        {
+            self.unfold = true;
             return Vec::new();
         }
         if chord.key == "Enter" && !chord.ctrl && !chord.cmd {
@@ -1783,6 +1813,21 @@ fn from_words(request: &str, named: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_down_arrow_unfolds_a_diagram_folded_only_where_nothing_is_written() {
+        let mut board = Board::default();
+        key(&mut board, "Down");
+        assert!(!board.take_unfold());
+        board.set_folded(true);
+        write(&mut board, "draft");
+        key(&mut board, "Down");
+        assert!(!board.take_unfold());
+        board.screen_mut().editor_mut().clear();
+        key(&mut board, "Down");
+        assert!(board.take_unfold());
+        assert!(!board.take_unfold());
+    }
 
     #[test]
     fn a_question_with_choices_is_answered_with_a_digit_the_arrows_or_ones_own_words() {
