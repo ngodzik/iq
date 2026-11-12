@@ -245,7 +245,14 @@ pub enum Reading {
     /// The cell at this column and row of the screen was clicked: what
     /// shows there is marked, and unfolded or folded again.
     Click(u16, u16),
-    /// The person reads no more: the mark goes.
+    /// Mark what holds these words, the newest first, and each of them
+    /// where it shows.
+    Find(String),
+    /// Mark the match before the one marked, or after it: `-1`, `1`.
+    Match(isize),
+    /// Copy what is marked, as it was written.
+    Copy,
+    /// The person reads no more: the mark goes, and what was found.
     Leave,
 }
 
@@ -343,21 +350,26 @@ impl Board {
     /// draws: the arrows move the mark, Enter unfolds what it marks or
     /// folds it again, Escape stops reading. None for another key, which
     /// stops reading and goes where the person writes.
-    fn reading_key(&mut self, chord: &Chord) -> Option<Vec<Request>> {
+    fn reading_key(&mut self, chord: &Chord, typed: Option<char>) -> Option<Vec<Request>> {
         let plain = !chord.ctrl && !chord.alt && !chord.cmd && !chord.shift;
-        let reading = match chord.key.as_str() {
-            "Up" if plain => Reading::Mark(-1),
-            "Down" if plain => Reading::Mark(1),
-            "Enter" if plain => Reading::Toggle,
-            "Escape" if plain => {
-                self.reading = false;
-                Reading::Leave
-            }
-            _ => {
-                self.reading = false;
-                self.readings.push(Reading::Leave);
-                return None;
-            }
+        let reading = match (chord.key.as_str(), typed) {
+            (_, Some('c')) => Reading::Copy,
+            (_, Some('n')) => Reading::Match(-1),
+            (_, Some('N')) => Reading::Match(1),
+            _ => match chord.key.as_str() {
+                "Up" if plain => Reading::Mark(-1),
+                "Down" if plain => Reading::Mark(1),
+                "Enter" if plain => Reading::Toggle,
+                "Escape" if plain => {
+                    self.reading = false;
+                    Reading::Leave
+                }
+                _ => {
+                    self.reading = false;
+                    self.readings.push(Reading::Leave);
+                    return None;
+                }
+            },
         };
         self.readings.push(reading);
         Some(Vec::new())
@@ -889,7 +901,7 @@ impl Board {
         }
         if self.reading
             && self.drawn()
-            && let Some(done) = self.reading_key(chord)
+            && let Some(done) = self.reading_key(chord, typed)
         {
             return done;
         }
@@ -1537,6 +1549,14 @@ impl Board {
                 self.attached.clear();
                 self.screen.notice(said, now);
             }
+            Command::Find(words) if self.drawn() => {
+                self.reading = true;
+                self.readings.push(Reading::Find(words));
+            }
+            Command::Find(_) => self.screen.notice(
+                "the terminal searches its own scrollback: /find is the conversation iq draws, as the settings' conversation = \"drawn\" asks",
+                now,
+            ),
             Command::Image(Some(path)) => {
                 let path = path.trim().trim_matches(['\'', '"']).to_owned();
                 self.screen
@@ -1981,6 +2001,32 @@ mod tests {
         // Not reading, the arrows are the editor's.
         key(&mut board, "Up");
         assert!(board.take_readings().is_empty());
+        // Words found, the matches gone through and what is marked copied.
+        board.screen_mut().editor_mut().clear();
+        board.run(Command::Find("the parser".into()), 1);
+        assert!(board.reading());
+        for c in ['n', 'N', 'c'] {
+            board.press(&Chord::plain(&c.to_string()), Some(c), 1);
+        }
+        assert_eq!(
+            board.take_readings(),
+            [
+                Reading::Find("the parser".into()),
+                Reading::Match(-1),
+                Reading::Match(1),
+                Reading::Copy
+            ]
+        );
+        // Written to the scrollback, the terminal searches it.
+        let mut board = Board::default();
+        board.run(Command::Find("parser".into()), 1);
+        assert!(
+            board
+                .screen()
+                .noticed(1)
+                .unwrap()
+                .contains("own scrollback")
+        );
     }
 
     #[test]

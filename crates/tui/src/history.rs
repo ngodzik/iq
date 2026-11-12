@@ -110,6 +110,8 @@ impl Para {
 #[derive(Debug, Clone)]
 pub(crate) enum Block {
     Para(Para),
+    /// A line of an agent's text, folded as a paragraph is.
+    Text(Para),
     Whole(Line<'static>),
     /// One row, cut to the width: a step said in a few words.
     Row(Vec<Span<'static>>),
@@ -166,7 +168,51 @@ impl Block {
                     .collect::<Vec<_>>(),
             ))
         } else {
-            Block::Para(Para::text(styled))
+            Block::Text(Para::text(styled))
+        }
+    }
+
+    /// What it says, as it was written, for the person to copy: a line of
+    /// text without its indent nor folds, a line of code whole, a table's
+    /// rows, a diagram's source, a message's summary or its first lines.
+    pub(crate) fn written(&self) -> String {
+        let spans = |spans: &[Span<'static>]| -> String {
+            spans.iter().map(|span| span.content.as_ref()).collect()
+        };
+        match self {
+            Block::Para(para) | Block::Text(para) => spans(&para.body),
+            Block::Whole(line) => line.to_string(),
+            Block::Row(row) => spans(row).trim().to_owned(),
+            Block::Table(table) => table
+                .lines(usize::MAX / 4, &[])
+                .iter()
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Block::Diagram { code, .. } | Block::Folded { code, .. } => code
+                .iter()
+                .map(Block::written)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Block::Job { head, label, tail } => {
+                format!("{}{}{}", spans(head), label.text(), spans(tail))
+                    .trim()
+                    .to_owned()
+            }
+            Block::Summed {
+                summary, instead, ..
+            } => summary.text().unwrap_or_else(|| {
+                instead
+                    .iter()
+                    .map(|para| spans(&para.body))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+            Block::Entry { blocks, .. } => blocks
+                .iter()
+                .map(Block::written)
+                .collect::<Vec<_>>()
+                .join("\n"),
         }
     }
 
@@ -179,6 +225,7 @@ impl Block {
             Block::Summed { summary, .. } => summary.making(),
             Block::Job { label, .. } => label.making(),
             Block::Para(_)
+            | Block::Text(_)
             | Block::Whole(_)
             | Block::Row(_)
             | Block::Table(_)
@@ -196,7 +243,9 @@ impl Block {
     ) -> Vec<Line<'static>> {
         let indent = [Span::raw("  ")];
         match self {
-            Block::Para(para) => wrap(&para.body, width, &para.first, &para.rest),
+            Block::Para(para) | Block::Text(para) => {
+                wrap(&para.body, width, &para.first, &para.rest)
+            }
             Block::Whole(line) => vec![line.clone()],
             Block::Row(spans) | Block::Folded { line: spans, .. } => {
                 vec![fit(spans.clone(), width)]

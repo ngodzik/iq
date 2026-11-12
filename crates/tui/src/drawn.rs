@@ -6,7 +6,9 @@
 //! Enter on the mark, and folds again the same, nothing moving but what
 //! follows it. A diagram is enlarged with a click, across the width, the
 //! conversation's room its alone and the wheel its, until another click
-//! puts it back. The end follows what is written while the person is at it;
+//! puts it back. iq finds words in it itself, each match marked in turn,
+//! and copies what is marked as it was written. The end follows what is
+//! written while the person is at it;
 //! scrolled up, the view stays put as more comes, its top held by the
 //! block it is in.
 
@@ -42,6 +44,9 @@ pub(crate) struct View {
     /// The diagram enlarged, by its block's number, and its first row
     /// shown.
     zoom: Option<(usize, usize)>,
+    /// What the person looks for, and the blocks that hold it, by their
+    /// numbers, the oldest first.
+    found: Option<(String, Vec<usize>)>,
     /// The block each row of the conversation showed, as last drawn.
     rows: Vec<Option<usize>>,
     /// The screen's row the conversation began at, as last drawn.
@@ -57,6 +62,12 @@ pub(crate) struct Shown {
     pub(crate) images: Vec<Image>,
     /// Whether a click fell outside it: the person reads it no more.
     pub(crate) missed: bool,
+    /// What the person copied, as it was written, for the terminal's
+    /// clipboard.
+    pub(crate) copied: Option<String>,
+    /// What to tell the person of what they asked: what was found, what
+    /// was copied.
+    pub(crate) said: Option<String>,
 }
 
 /// Where the conversation is drawn: the screen's rows from `from`, as many
@@ -120,6 +131,64 @@ impl Laid<'_> {
         match self.blocks.get(at.checked_sub(1)?)? {
             Block::Diagram { diagram, .. } => diagram.enlarged(self.width, self.cell, images),
             _ => None,
+        }
+    }
+
+    /// The blocks whose rows hold `words`, whatever their case, by their
+    /// numbers, the oldest first.
+    fn holding(&self, words: &str) -> Vec<usize> {
+        let words = words.to_lowercase();
+        (1..self.len())
+            .filter(|at| {
+                self.lines(*at, &mut Vec::new())
+                    .iter()
+                    .any(|line| line.to_string().to_lowercase().contains(&words))
+            })
+            .map(|at| self.number(at))
+            .collect()
+    }
+
+    /// What place `at` says, as it was written, for the person to copy: a
+    /// fold's steps whole, a message whole, a job's command and output, a
+    /// block of code or a paragraph of text whole, anything else as it is.
+    fn copied(&self, at: usize) -> Option<String> {
+        let block = self.blocks.get(at.checked_sub(1)?)?;
+        let same = |other: &Block| match (block, other) {
+            (Block::Whole(_), Block::Whole(_)) => true,
+            (Block::Text(_), Block::Text(_)) => !other.written().trim().is_empty(),
+            _ => false,
+        };
+        match block {
+            Block::Entry { id, .. } => Some(match self.board.steps().entry(*id)? {
+                Entry::Fold(fold) => fold
+                    .steps
+                    .iter()
+                    .map(iq_ui::steps::Step::whole)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Entry::Said(said) => said.text.clone(),
+                Entry::Ran(ran) => format!("{}\n{}", ran.line, ran.output),
+            }),
+            Block::Whole(_) | Block::Text(_) => {
+                let at = at - 1;
+                let first = (0..=at)
+                    .rev()
+                    .take_while(|place| same(self.blocks[*place]))
+                    .last()
+                    .unwrap_or(at);
+                let last = (at..self.blocks.len())
+                    .take_while(|place| same(self.blocks[*place]))
+                    .last()
+                    .unwrap_or(at);
+                // A block of code without the marks above and below it.
+                let written: Vec<String> = self.blocks[first..=last]
+                    .iter()
+                    .map(|block| block.written())
+                    .filter(|line| !line.starts_with(['╭', '╰']))
+                    .collect();
+                Some(written.join("\n"))
+            }
+            other => Some(other.written()),
         }
     }
 
@@ -208,10 +277,13 @@ impl View {
             self.top = None;
             self.mark = None;
             self.zoom = None;
+            self.found = None;
             self.unfolded.clear();
         }
         let height = area.height.max(1);
         let mut missed = false;
+        let mut copied = None;
+        let mut said = None;
         let (first, blocks) = history.blocks(window);
         let blocks: Vec<&Block> = blocks.into_iter().flatten().collect();
         for reading in readings {
@@ -246,7 +318,10 @@ impl View {
                     }
                     None => self.zoom = None,
                 }
-                if !matches!(reading, Reading::Mark(_) | Reading::Leave) {
+                if matches!(
+                    reading,
+                    Reading::Scroll(_) | Reading::Page(_) | Reading::Click(..) | Reading::Toggle
+                ) {
                     continue;
                 }
             }
@@ -278,7 +353,49 @@ impl View {
                         }
                     }
                 }
-                Reading::Leave => self.mark = None,
+                Reading::Find(words) => {
+                    let found = laid.holding(words);
+                    said = Some(match found.len() {
+                        0 => format!("nothing here holds “{words}”"),
+                        1 => format!("“{words}” found once"),
+                        count => format!("“{words}” found {count} times: n, N go through them"),
+                    });
+                    self.mark = found.last().copied();
+                    if let Some(number) = self.mark {
+                        self.show(&laid, height, laid.at(number));
+                    }
+                    self.found = Some((words.clone(), found));
+                }
+                Reading::Match(by) => {
+                    if let Some((_, found)) = &self.found
+                        && !found.is_empty()
+                    {
+                        let now = self
+                            .mark
+                            .and_then(|mark| found.iter().position(|n| *n == mark));
+                        let at = match now {
+                            Some(now) => now.saturating_add_signed(*by).min(found.len() - 1),
+                            None => found.len() - 1,
+                        };
+                        let number = found[at];
+                        self.mark = Some(number);
+                        self.show(&laid, height, laid.at(number));
+                    }
+                }
+                Reading::Copy => {
+                    if let Some(text) = self.mark.and_then(|mark| laid.copied(laid.at(mark))) {
+                        let lines = text.lines().count().max(1);
+                        said = Some(format!(
+                            "copied {lines} line{}",
+                            if lines == 1 { "" } else { "s" }
+                        ));
+                        copied = Some(text);
+                    }
+                }
+                Reading::Leave => {
+                    self.mark = None;
+                    self.found = None;
+                }
             }
         }
         let unfolded = self.unfolded.clone();
@@ -306,7 +423,7 @@ impl View {
                 Shown {
                     lines,
                     images,
-                    missed: false,
+                    ..Shown::default()
                 }
             }
             None => {
@@ -315,6 +432,13 @@ impl View {
             }
         };
         shown.missed = missed;
+        shown.copied = copied;
+        shown.said = said;
+        if let Some((words, _)) = &self.found {
+            for line in &mut shown.lines {
+                highlighted(line, words);
+            }
+        }
         self.from = area.from;
         if let Some(mark) = mark {
             for (line, number) in shown.lines.iter_mut().zip(&self.rows) {
@@ -369,7 +493,11 @@ impl View {
                 .unwrap_or(now),
         };
         self.mark = Some(laid.number(at));
-        // Shown whole when it fits, its start at least.
+        self.show(laid, height, at);
+    }
+
+    /// Scrolls to show place `at`: whole when it fits, its start at least.
+    fn show(&mut self, laid: &Laid<'_>, height: usize, at: usize) {
         let (top, row) = self.top_now(laid, height);
         let start: isize = if at >= top {
             (top..at)
@@ -505,6 +633,40 @@ impl View {
         }
         self.top = (below > height).then(|| (laid.number(at), row));
     }
+}
+
+/// `line` with `words` shown reversed wherever it holds them, whatever
+/// their case.
+fn highlighted(line: &mut Line<'static>, words: &str) {
+    let words = words.to_lowercase();
+    if words.is_empty() || !line.to_string().to_lowercase().contains(&words) {
+        return;
+    }
+    let mut spans = Vec::new();
+    for span in std::mem::take(&mut line.spans) {
+        let text = span.content.to_string();
+        let lower = text.to_lowercase();
+        // Lowercase may change lengths: only where it keeps them.
+        if lower.len() != text.len() || !lower.contains(&words) {
+            spans.push(span);
+            continue;
+        }
+        let mut from = 0;
+        for (at, _) in lower.match_indices(&words) {
+            if at > from {
+                spans.push(Span::styled(text[from..at].to_owned(), span.style));
+            }
+            spans.push(Span::styled(
+                text[at..at + words.len()].to_owned(),
+                span.style.add_modifier(ratatui::style::Modifier::REVERSED),
+            ));
+            from = at + words.len();
+        }
+        if from < text.len() {
+            spans.push(Span::styled(text[from..].to_owned(), span.style));
+        }
+    }
+    line.spans = spans;
 }
 
 /// `line` marked: a bar where it begins, in the accent's colour, over the
@@ -677,6 +839,80 @@ mod tests {
             &[Reading::Click(10, 5)],
         );
         assert!(rows(&back).iter().any(|row| row.contains("After it.")));
+    }
+
+    #[test]
+    fn words_found_are_marked_in_turn_and_what_is_marked_copied_as_written() {
+        let (p, mut board, mut history) = joined();
+        said(
+            &mut board,
+            &mut history,
+            &p,
+            "The Parser reads it.\n\n```rust\nfn parse() {}\nfn check() {}\n```\n\nThen the parser checks it.\n",
+        );
+        let _ = history.take(60, Some("lead"));
+        let mut view = View::default();
+        let find = Reading::Find("parser".into());
+        let found = view.shown(&history, &board, &p, Some("lead"), area(20), &[find]);
+        assert_eq!(
+            found.said.as_deref(),
+            Some("“parser” found 2 times: n, N go through them")
+        );
+        // The newest marked, each match shown reversed.
+        let rows = rows(&found);
+        assert!(
+            rows.iter().any(|row| row == "▌ Then the parser checks it."),
+            "{rows:#?}"
+        );
+        let reversed = |line: &Line<'_>| {
+            line.spans.iter().any(|span| {
+                span.content == "Parser"
+                    && span
+                        .style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::REVERSED)
+            })
+        };
+        assert!(found.lines.iter().any(reversed));
+        // The one before, then copied as written.
+        let older = view.shown(
+            &history,
+            &board,
+            &p,
+            Some("lead"),
+            area(20),
+            &[Reading::Match(-1), Reading::Copy],
+        );
+        assert_eq!(older.copied.as_deref(), Some("The Parser reads it."));
+        assert_eq!(older.said.as_deref(), Some("copied 1 line"));
+        // A block of code copied whole, as it is.
+        let code = older
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("fn check"))
+            .unwrap();
+        let copied = view.shown(
+            &history,
+            &board,
+            &p,
+            Some("lead"),
+            area(20),
+            &[Reading::Click(3, 2 + code as u16), Reading::Copy],
+        );
+        assert_eq!(
+            copied.copied.as_deref(),
+            Some("fn parse() {}\nfn check() {}")
+        );
+        // Done reading, nothing is marked nor shown reversed.
+        let left = view.shown(
+            &history,
+            &board,
+            &p,
+            Some("lead"),
+            area(20),
+            &[Reading::Leave],
+        );
+        assert!(!left.lines.iter().any(reversed));
     }
 
     #[test]

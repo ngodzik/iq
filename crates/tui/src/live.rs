@@ -324,7 +324,7 @@ impl Live<'_> {
             let p = self.p;
             parts.push(Part::Lines(vec![fit(
                 vec![Span::styled(
-                    "  ↑ ↓ mark what is folded or a diagram · Enter unfolds, folds, enlarges · Esc writes again",
+                    "  ↑ ↓ mark what is folded or a diagram · Enter unfolds, folds, enlarges · c copies · n N the matches · Esc writes again",
                     p.fg(p.faint),
                 )],
                 width,

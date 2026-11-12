@@ -596,6 +596,15 @@ impl Iq {
             screen.out.flush()?;
         }
         let missed = shown.missed;
+        // What was copied goes to the terminal's clipboard, as a selection
+        // copied in it would.
+        if let Some(copied) = &shown.copied {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(copied);
+            write!(screen.out, "\x1b]52;c;{encoded}\x07")?;
+            screen.out.flush()?;
+        }
+        let said = shown.said.clone();
         let motion = &mut self.motion;
         screen.terminal.draw(|frame| {
             live.draw_head_in(frame, Rect::new(0, 0, cols, head), motion);
@@ -605,6 +614,9 @@ impl Iq {
         // A click outside the conversation: the person writes again.
         if missed {
             self.board.read_no_more();
+        }
+        if let Some(said) = said {
+            self.board.screen_mut().notice(said, now);
         }
         Ok(())
     }
