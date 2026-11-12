@@ -587,6 +587,18 @@ impl Steps {
         self.said.get(at)
     }
 
+    /// The entry numbered `id`, while it is kept: a fold, a message, a job.
+    #[must_use]
+    pub fn entry(&self, id: usize) -> Option<Entry<'_>> {
+        self.fold(id)
+            .map(Entry::Fold)
+            .or_else(|| self.said_by_id(id).map(Entry::Said))
+            .or_else(|| {
+                let at = self.ran.binary_search_by_key(&id, |ran| ran.id).ok()?;
+                self.ran.get(at).map(Entry::Ran)
+            })
+    }
+
     /// The last message between agents kept: the one the event just taken
     /// made, when it made one.
     #[must_use]

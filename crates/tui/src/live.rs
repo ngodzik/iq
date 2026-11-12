@@ -319,6 +319,17 @@ impl Live<'_> {
         if let Some(switcher) = self.switcher(motion, width) {
             parts.push(switcher);
         }
+        // Reading the conversation iq draws: what the keys do there.
+        if self.board.reading() {
+            let p = self.p;
+            parts.push(Part::Lines(vec![fit(
+                vec![Span::styled(
+                    "  ↑ ↓ mark what is folded · Enter unfolds it or folds it again · Esc writes again",
+                    p.fg(p.faint),
+                )],
+                width,
+            )]));
+        }
         let listed = self.completions(width);
         if !listed.is_empty() {
             parts.push(Part::Lines(listed));

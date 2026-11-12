@@ -45,7 +45,7 @@ use iq_ui::look::Conversation;
 use iq_ui::{Board, Update};
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::MoveTo;
-use ratatui::crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
+use ratatui::crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::crossterm::terminal::{Clear, ClearType};
 use ratatui::crossterm::{cursor, queue, terminal};
 use ratatui::layout::Rect;
@@ -576,9 +576,14 @@ impl Iq {
         };
         let shown = drawn.shown(
             &self.history,
+            &self.board,
+            &self.p,
             window.as_deref(),
-            width,
-            usize::from(room),
+            drawn::Area {
+                from: head,
+                width,
+                height: usize::from(room),
+            },
             &readings,
         );
         if let Some(kitty) = screen.kitty {
@@ -590,12 +595,17 @@ impl Iq {
             }
             screen.out.flush()?;
         }
+        let missed = shown.missed;
         let motion = &mut self.motion;
         screen.terminal.draw(|frame| {
             live.draw_head_in(frame, Rect::new(0, 0, cols, head), motion);
             frame.render_widget(Paragraph::new(shown.lines), Rect::new(0, head, cols, room));
             live.draw_in(frame, Rect::new(0, head + room, cols, height), motion);
         })?;
+        // A click outside the conversation: the person writes again.
+        if missed {
+            self.board.read_no_more();
+        }
         Ok(())
     }
 
@@ -627,6 +637,9 @@ impl Iq {
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => self.board.scroll(-3),
                     MouseEventKind::ScrollDown => self.board.scroll(3),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.board.click(mouse.column, mouse.row);
+                    }
                     _ => {}
                 },
                 Event::Resize(cols, rows) => {

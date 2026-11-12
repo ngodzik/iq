@@ -113,6 +113,13 @@ pub(crate) enum Block {
     Whole(Line<'static>),
     /// One row, cut to the width: a step said in a few words.
     Row(Vec<Span<'static>>),
+    /// What stands for the steps' page's entry `id` (a fold of steps, a
+    /// message between agents, a job that ended), which the conversation
+    /// iq draws unfolds in place.
+    Entry {
+        id: usize,
+        blocks: Vec<Block>,
+    },
     Table(Table),
     Diagram {
         diagram: Arc<Diagram>,
@@ -168,6 +175,7 @@ impl Block {
     fn drawing(&self) -> bool {
         match self {
             Block::Diagram { diagram, .. } => diagram.drawing(),
+            Block::Entry { blocks, .. } => blocks.iter().any(Block::drawing),
             Block::Summed { summary, .. } => summary.making(),
             Block::Job { label, .. } => label.making(),
             Block::Para(_)
@@ -193,6 +201,10 @@ impl Block {
             Block::Row(spans) | Block::Folded { line: spans, .. } => {
                 vec![fit(spans.clone(), width)]
             }
+            Block::Entry { blocks, .. } => blocks
+                .iter()
+                .flat_map(|block| block.lines(width, cell, images))
+                .collect(),
             // Too long, the hint to unfold it goes first, then what it does
             // is cut: how it ended always shows.
             Block::Job { head, label, tail } => {
@@ -691,13 +703,14 @@ impl History {
                     ),
                 ];
                 let unfold = board.keys().chord(Action::Steps);
-                if let (Some(ran), Some(unfold)) = (board.steps().latest_ran(), unfold) {
+                let ran = board.steps().latest_ran().map(|ran| ran.id);
+                if let (Some(ran), Some(unfold)) = (ran, unfold) {
                     tail.push(Span::styled(
-                        format!("  {unfold} unfolds #{}", ran.id),
+                        format!("  {unfold} unfolds #{ran}"),
                         p.fg(p.faint),
                     ));
                 }
-                self.push_job(Block::Job {
+                let job = Block::Job {
                     head: vec![
                         Span::raw("  "),
                         Span::styled("⚙ ", p.fg(colour)),
@@ -705,6 +718,13 @@ impl History {
                     ],
                     label,
                     tail,
+                };
+                self.push_job(match ran {
+                    Some(id) => Block::Entry {
+                        id,
+                        blocks: vec![job],
+                    },
+                    None => job,
                 });
             }
             // A line once it waits for those it started: how long, the live
@@ -1077,18 +1097,25 @@ impl History {
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         let short = lines.len() <= MESSAGE_LINES
             && lines.iter().all(|line| line.chars().count() <= LINE_CHARS);
-        match (&self.summarizer.0, id) {
+        let said = match (&self.summarizer.0, id) {
             (Some(summarize), Some(id)) if !short => {
                 let summary = Summary::new(from, to, text, Arc::clone(summarize));
                 self.summaries.insert(id, Arc::clone(&summary));
-                self.push_block(Block::Summed {
+                vec![Block::Summed {
                     summary,
                     instead: first_lines(text, INDENT, p, MESSAGE_LINES),
                     indent: INDENT.to_owned(),
                     style: p.fg(p.dim),
-                });
+                }]
             }
-            _ => self.lines_of(text, INDENT, p, MESSAGE_LINES),
+            _ => first_lines(text, INDENT, p, MESSAGE_LINES)
+                .into_iter()
+                .map(Block::Para)
+                .collect(),
+        };
+        match id {
+            Some(id) => self.push_block(Block::Entry { id, blocks: said }),
+            None => said.into_iter().for_each(|block| self.push_block(block)),
         }
     }
 
@@ -1141,47 +1168,57 @@ impl History {
     /// Writes `fold`: of one step, that step; of more, their count and the
     /// key that unfolds them.
     fn fold(&mut self, fold: &Fold, board: &Board, p: &Palette) {
-        match fold.steps.as_slice() {
-            [] => {}
+        let blocks = match fold.steps.as_slice() {
+            [] => return,
             [step @ Step::Tool { output, ok, .. }] => {
                 let (first, body) = step_line(step, p);
-                self.push_step(Para {
+                let mut blocks = vec![Block::Para(Para {
                     first,
                     rest: vec![Span::raw("    ")],
                     body,
-                });
+                })];
                 if !ok {
-                    for line in output
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .take(FAILED_LINES)
-                    {
-                        self.push_step(Para::indented(
-                            "    ",
-                            vec![Span::styled(cut(&short(line), LINE_CHARS), p.fg(p.faint))],
-                        ));
-                    }
+                    blocks.extend(
+                        output
+                            .lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .take(FAILED_LINES)
+                            .map(|line| {
+                                Block::Para(Para::indented(
+                                    "    ",
+                                    vec![Span::styled(
+                                        cut(&short(line), LINE_CHARS),
+                                        p.fg(p.faint),
+                                    )],
+                                ))
+                            }),
+                    );
                 }
+                blocks
             }
             // A verdict, an answer, a question, a notice: one row, whole
             // on the steps' page.
             [step] => {
                 let (mut first, body) = step_line(step, p);
                 first.extend(body);
-                self.push_step_block(Block::Row(first));
+                vec![Block::Row(first)]
             }
             _ => {
                 let unfold = board
                     .keys()
                     .chord(Action::Steps)
                     .map(|chord| chord.to_string());
-                self.push_step(Para {
+                vec![Block::Para(Para {
                     first: vec![Span::raw("  "), Span::styled("▸ ", p.fg(p.faint))],
                     rest: vec![Span::raw("    ")],
                     body: counted(fold, unfold.as_deref(), p),
-                });
+                })]
             }
-        }
+        };
+        self.push_step_block(Block::Entry {
+            id: fold.id,
+            blocks,
+        });
     }
 
     /// `agent`'s name and model, when another spoke last.

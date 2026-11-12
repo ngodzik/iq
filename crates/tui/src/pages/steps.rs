@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 
 use super::Seen;
 use crate::history::{agent_tint, short, step_line};
+use crate::theme::Palette;
 use crate::wrap::{cut, wrap};
 
 /// How many lines of a failed tool's output show while its fold is folded:
@@ -35,7 +36,6 @@ pub(super) fn lines(seen: &Seen<'_>) -> (Vec<Line<'static>>, Option<usize>) {
     let mut focus = None;
     for entry in &entries {
         let on = Some(entry.id()) == chosen;
-        let whole = screen.unfolded(entry.id());
         lines.push(Line::default());
         if on {
             focus = Some(lines.len());
@@ -44,149 +44,15 @@ pub(super) fn lines(seen: &Seen<'_>) -> (Vec<Line<'static>>, Option<usize>) {
             Span::styled(if on { "▸" } else { " " }, p.bold(p.accent)),
             Span::styled(format!("#{} ", entry.id()), p.bold(p.text)),
         ];
-        match entry {
-            Entry::Fold(fold) => {
-                head.extend([
-                    Span::styled(
-                        fold.agent.clone(),
-                        p.bold(agent_tint(seen.board, &fold.agent, p)),
-                    ),
-                    Span::styled(
-                        format!(
-                            "  {} step{}",
-                            fold.steps.len(),
-                            if fold.steps.len() == 1 { "" } else { "s" }
-                        ),
-                        p.fg(p.faint),
-                    ),
-                ]);
-                if !fold.closed {
-                    head.push(Span::styled("  at work", p.fg(p.accent)));
-                }
-                lines.push(Line::from(head));
-                for step in &fold.steps {
-                    let (first, body) = step_line(step, p);
-                    if whole {
-                        let indent = [Span::raw("    ")];
-                        for (at, line) in step.whole().lines().enumerate() {
-                            let said = [Span::styled(short(line), p.fg(p.text))];
-                            let head = if at == 0 { first.as_slice() } else { &indent };
-                            lines.extend(wrap(&said, width, head, &indent));
-                        }
-                    } else {
-                        lines.extend(wrap(&body, width, &first, &[Span::raw("    ")]));
-                    }
-                    if let Step::Tool { output, ok, .. } = step {
-                        let shown = match (whole, ok) {
-                            (true, _) => OUTPUT_LINES,
-                            (false, false) => FAILED_LINES,
-                            (false, true) => 0,
-                        };
-                        for line in output.lines().filter(|l| !l.trim().is_empty()).take(shown) {
-                            lines.push(Line::from(Span::styled(
-                                format!("    {}", cut(&short(line), width.saturating_sub(4))),
-                                p.fg(if *ok { p.faint } else { p.dim }),
-                            )));
-                        }
-                    }
-                }
-            }
-            Entry::Said(said) => {
-                head.extend([
-                    Span::styled("✉ ", p.fg(p.info)),
-                    Span::styled(
-                        said.from.clone(),
-                        p.fg(agent_tint(seen.board, &said.from, p)),
-                    ),
-                    Span::styled(" → ", p.fg(p.faint)),
-                    Span::styled(said.to.clone(), p.fg(agent_tint(seen.board, &said.to, p))),
-                ]);
-                if said.task {
-                    head.push(Span::styled("  its task", p.fg(p.faint)));
-                }
-                lines.push(Line::from(head));
-                let indent = [Span::raw("    ")];
-                let text = if whole {
-                    said.text.clone()
-                } else {
-                    (seen.summed)(said.id).unwrap_or_else(|| {
-                        said.text
-                            .lines()
-                            .filter(|l| !l.trim().is_empty())
-                            .take(MESSAGE_LINES)
-                            .map(|line| cut(line, width.saturating_sub(4)))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                };
-                let tint = if whole { p.text } else { p.dim };
-                for line in text.lines() {
-                    if line.trim().is_empty() && !whole {
-                        continue;
-                    }
-                    lines.extend(wrap(
-                        &[Span::styled(line.to_owned(), p.fg(tint))],
-                        width,
-                        &indent,
-                        &indent,
-                    ));
-                }
-            }
-            // A job folded: what it does, how it ended; unfolded, its
-            // command whole and the end of its output.
-            Entry::Ran(ran) => {
-                let colour = if ran.said == "exit status 0" {
-                    p.ok
-                } else {
-                    p.warn
-                };
-                head.extend([
-                    Span::styled("⚙ ", p.fg(colour)),
-                    Span::styled(
-                        ran.agent.clone(),
-                        p.fg(agent_tint(seen.board, &ran.agent, p)),
-                    ),
-                    Span::styled(format!("  job {} · {}", ran.job, ran.said), p.fg(p.faint)),
-                ]);
-                lines.push(Line::from(head));
-                let indent = [Span::raw("    ")];
-                if whole {
-                    for line in ran.line.lines() {
-                        lines.extend(wrap(
-                            &[Span::styled(short(line), p.fg(p.text))],
-                            width,
-                            &indent,
-                            &indent,
-                        ));
-                    }
-                    if !ran.output.trim().is_empty() {
-                        lines.push(Line::from(Span::styled(
-                            "    the end of its output:",
-                            p.fg(p.faint),
-                        )));
-                    }
-                    for line in ran
-                        .output
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .take(OUTPUT_LINES)
-                    {
-                        lines.push(Line::from(Span::styled(
-                            format!("    {}", cut(&short(line), width.saturating_sub(4))),
-                            p.fg(p.dim),
-                        )));
-                    }
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "    {}",
-                            iq_ui::shell::few_words(&ran.line, width.saturating_sub(4))
-                        ),
-                        p.fg(p.dim),
-                    )));
-                }
-            }
-        }
+        head.extend(named(entry, seen.board, p));
+        lines.push(Line::from(head));
+        lines.extend(body(
+            entry,
+            screen.unfolded(entry.id()),
+            p,
+            width,
+            seen.summed,
+        ));
     }
     if entries.is_empty() {
         lines.push(Line::default());
@@ -197,6 +63,170 @@ pub(super) fn lines(seen: &Seen<'_>) -> (Vec<Line<'static>>, Option<usize>) {
         );
     }
     (lines, focus)
+}
+
+/// What `entry` is, after its number: whose fold and how many steps,
+/// who wrote to whom, whose job and how it ended.
+fn named(entry: &Entry<'_>, board: &iq_ui::Board, p: &Palette) -> Vec<Span<'static>> {
+    match entry {
+        Entry::Fold(fold) => {
+            let mut spans = vec![
+                Span::styled(
+                    fold.agent.clone(),
+                    p.bold(agent_tint(board, &fold.agent, p)),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} step{}",
+                        fold.steps.len(),
+                        if fold.steps.len() == 1 { "" } else { "s" }
+                    ),
+                    p.fg(p.faint),
+                ),
+            ];
+            if !fold.closed {
+                spans.push(Span::styled("  at work", p.fg(p.accent)));
+            }
+            spans
+        }
+        Entry::Said(said) => {
+            let mut spans = vec![
+                Span::styled("✉ ", p.fg(p.info)),
+                Span::styled(said.from.clone(), p.fg(agent_tint(board, &said.from, p))),
+                Span::styled(" → ", p.fg(p.faint)),
+                Span::styled(said.to.clone(), p.fg(agent_tint(board, &said.to, p))),
+            ];
+            if said.task {
+                spans.push(Span::styled("  its task", p.fg(p.faint)));
+            }
+            spans
+        }
+        Entry::Ran(ran) => {
+            let colour = if ran.said == "exit status 0" {
+                p.ok
+            } else {
+                p.warn
+            };
+            vec![
+                Span::styled("⚙ ", p.fg(colour)),
+                Span::styled(ran.agent.clone(), p.fg(agent_tint(board, &ran.agent, p))),
+                Span::styled(format!("  job {} · {}", ran.job, ran.said), p.fg(p.faint)),
+            ]
+        }
+    }
+}
+
+/// What `entry` holds, within `width` columns, under its head: folded, a
+/// fold's steps in a line each and what failed, a message summed up (as
+/// `summed` gives it) or its first lines, a job in a few words; `whole`,
+/// each step whole and what its tools returned, the message as it was
+/// written, the job's command whole and the end of its output. The
+/// conversation iq draws unfolds an entry in place with it.
+pub(crate) fn body(
+    entry: &Entry<'_>,
+    whole: bool,
+    p: &Palette,
+    width: usize,
+    summed: &dyn Fn(usize) -> Option<String>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let indent = [Span::raw("    ")];
+    match entry {
+        Entry::Fold(fold) => {
+            for step in &fold.steps {
+                let (first, body) = step_line(step, p);
+                if whole {
+                    for (at, line) in step.whole().lines().enumerate() {
+                        let said = [Span::styled(short(line), p.fg(p.text))];
+                        let head = if at == 0 { first.as_slice() } else { &indent };
+                        lines.extend(wrap(&said, width, head, &indent));
+                    }
+                } else {
+                    lines.extend(wrap(&body, width, &first, &indent));
+                }
+                if let Step::Tool { output, ok, .. } = step {
+                    let shown = match (whole, ok) {
+                        (true, _) => OUTPUT_LINES,
+                        (false, false) => FAILED_LINES,
+                        (false, true) => 0,
+                    };
+                    for line in output.lines().filter(|l| !l.trim().is_empty()).take(shown) {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", cut(&short(line), width.saturating_sub(4))),
+                            p.fg(if *ok { p.faint } else { p.dim }),
+                        )));
+                    }
+                }
+            }
+        }
+        Entry::Said(said) => {
+            let text = if whole {
+                said.text.clone()
+            } else {
+                summed(said.id).unwrap_or_else(|| {
+                    said.text
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .take(MESSAGE_LINES)
+                        .map(|line| cut(line, width.saturating_sub(4)))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+            };
+            let tint = if whole { p.text } else { p.dim };
+            for line in text.lines() {
+                if line.trim().is_empty() && !whole {
+                    continue;
+                }
+                lines.extend(wrap(
+                    &[Span::styled(line.to_owned(), p.fg(tint))],
+                    width,
+                    &indent,
+                    &indent,
+                ));
+            }
+        }
+        // A job folded: what it does, how it ended; unfolded, its
+        // command whole and the end of its output.
+        Entry::Ran(ran) => {
+            if whole {
+                for line in ran.line.lines() {
+                    lines.extend(wrap(
+                        &[Span::styled(short(line), p.fg(p.text))],
+                        width,
+                        &indent,
+                        &indent,
+                    ));
+                }
+                if !ran.output.trim().is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "    the end of its output:",
+                        p.fg(p.faint),
+                    )));
+                }
+                for line in ran
+                    .output
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .take(OUTPUT_LINES)
+                {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", cut(&short(line), width.saturating_sub(4))),
+                        p.fg(p.dim),
+                    )));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    {}",
+                        iq_ui::shell::few_words(&ran.line, width.saturating_sub(4))
+                    ),
+                    p.fg(p.dim),
+                )));
+            }
+        }
+    }
+    lines
 }
 
 #[cfg(test)]

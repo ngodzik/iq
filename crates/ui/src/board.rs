@@ -220,6 +220,10 @@ pub struct Board {
     /// What the person asked of the conversation iq draws since the
     /// terminal last took it.
     readings: Vec<Reading>,
+    /// Whether the person reads the conversation iq draws, a mark on what
+    /// they chose in it: the arrows and Enter are its, until Escape or
+    /// another key.
+    reading: bool,
 }
 
 /// What the person asks of the conversation iq draws on the terminal's
@@ -233,6 +237,16 @@ pub enum Reading {
     /// Scroll it by as many of its heights, a row kept: Page Up, Page
     /// Down.
     Page(isize),
+    /// Mark what is folded before what is marked, or after it: `-1`,
+    /// `1`; from the end when nothing is.
+    Mark(isize),
+    /// Unfold what is marked in place, alone, or fold it again.
+    Toggle,
+    /// The cell at this column and row of the screen was clicked: what
+    /// shows there is marked, and unfolded or folded again.
+    Click(u16, u16),
+    /// The person reads no more: the mark goes.
+    Leave,
 }
 
 /// The image a paste is, when it is the path of one alone: a file dropped
@@ -298,7 +312,55 @@ impl Board {
             folded: false,
             unfold: false,
             readings: Vec::new(),
+            reading: false,
         }
+    }
+
+    /// Whether the person reads the conversation iq draws, the arrows
+    /// moving the mark in it.
+    #[must_use]
+    pub fn reading(&self) -> bool {
+        self.reading
+    }
+
+    /// The person reads the conversation iq draws no more: a click fell
+    /// outside it.
+    pub fn read_no_more(&mut self) {
+        self.reading = false;
+    }
+
+    /// The cell at `column` and `row` of the screen was clicked: in the
+    /// conversation iq draws, what shows there is marked and unfolded or
+    /// folded again.
+    pub fn click(&mut self, column: u16, row: u16) {
+        if self.drawn() {
+            self.reading = true;
+            self.readings.push(Reading::Click(column, row));
+        }
+    }
+
+    /// What `chord` does while the person reads the conversation iq
+    /// draws: the arrows move the mark, Enter unfolds what it marks or
+    /// folds it again, Escape stops reading. None for another key, which
+    /// stops reading and goes where the person writes.
+    fn reading_key(&mut self, chord: &Chord) -> Option<Vec<Request>> {
+        let plain = !chord.ctrl && !chord.alt && !chord.cmd && !chord.shift;
+        let reading = match chord.key.as_str() {
+            "Up" if plain => Reading::Mark(-1),
+            "Down" if plain => Reading::Mark(1),
+            "Enter" if plain => Reading::Toggle,
+            "Escape" if plain => {
+                self.reading = false;
+                Reading::Leave
+            }
+            _ => {
+                self.reading = false;
+                self.readings.push(Reading::Leave);
+                return None;
+            }
+        };
+        self.readings.push(reading);
+        Some(Vec::new())
     }
 
     /// What the person asked of the conversation iq draws since last
@@ -825,6 +887,12 @@ impl Board {
             }
             return self.page_key(chord, typed);
         }
+        if self.reading
+            && self.drawn()
+            && let Some(done) = self.reading_key(chord)
+        {
+            return done;
+        }
         if let Some(done) = self.choice_key(chord, typed) {
             return done;
         }
@@ -886,6 +954,13 @@ impl Board {
             if self.screen.ask_quit(now) {
                 self.quitting = true;
             }
+            return Vec::new();
+        }
+        // Shift and the up arrow start reading the conversation iq draws,
+        // from the last thing folded.
+        if self.drawn() && !self.reading && chord.shift && !chord.ctrl && chord.key == "Up" {
+            self.reading = true;
+            self.readings.push(Reading::Mark(-1));
             return Vec::new();
         }
         // The conversation iq draws scrolls by its height.
@@ -1869,6 +1944,42 @@ mod tests {
         let mut board = Board::default();
         board.scroll(-3);
         key(&mut board, "PageUp");
+        assert!(board.take_readings().is_empty());
+    }
+
+    #[test]
+    fn reading_the_conversation_iq_draws_the_arrows_move_the_mark_and_enter_unfolds() {
+        let look = Look::default().with_conversation(crate::look::Conversation::Drawn);
+        let mut board = Board::new(Keymap::default(), look);
+        key(&mut board, "shift+up");
+        assert!(board.reading());
+        key(&mut board, "Up");
+        key(&mut board, "Down");
+        key(&mut board, "Enter");
+        key(&mut board, "Escape");
+        assert!(!board.reading());
+        assert_eq!(
+            board.take_readings(),
+            [
+                Reading::Mark(-1),
+                Reading::Mark(-1),
+                Reading::Mark(1),
+                Reading::Toggle,
+                Reading::Leave
+            ]
+        );
+        // A click marks; another key goes where the person writes.
+        board.click(4, 9);
+        assert!(board.reading());
+        board.press(&Chord::plain("h"), Some('h'), 1);
+        assert!(!board.reading());
+        assert_eq!(board.screen().editor().text(), "h");
+        assert_eq!(
+            board.take_readings(),
+            [Reading::Click(4, 9), Reading::Leave]
+        );
+        // Not reading, the arrows are the editor's.
+        key(&mut board, "Up");
         assert!(board.take_readings().is_empty());
     }
 
