@@ -322,11 +322,18 @@ impl Live<'_> {
         // Reading the conversation iq draws: what the keys do there.
         if self.board.reading() {
             let p = self.p;
+            // After a click, a letter writes: the keys that are letters
+            // are said only while reading from the keyboard.
+            let (letters, leave) = if self.board.reading_letters() {
+                (" · c copies · n N the matches", "Esc writes again")
+            } else {
+                ("", "Esc or a letter writes again")
+            };
+            let said = format!(
+                "↑ ↓ mark what is folded, a diagram or the end of an answer · Enter unfolds, folds, enlarges, opens a link, goes back up · Home End this answer · Shift ↑ ↓ the answers{letters} · {leave}"
+            );
             parts.push(Part::Lines(wrap(
-                &[Span::styled(
-                    "↑ ↓ mark what is folded, a diagram or the end of an answer · Enter unfolds, folds, enlarges, opens a link, goes back up · Home End this answer · Shift ↑ ↓ the answers · c copies · n N the matches · Esc writes again",
-                    p.fg(p.faint),
-                )],
+                &[Span::styled(said, p.fg(p.faint))],
                 width.saturating_sub(1),
                 &[Span::raw("  ")],
                 &[Span::raw("  ")],

@@ -230,6 +230,10 @@ pub struct Board {
     /// Whether the conversation iq draws lists links to choose one, as
     /// the terminal last drew it: the numbers are theirs.
     listed: bool,
+    /// Whether the person last marked something in the conversation iq
+    /// draws with a click: a letter is then what they start writing,
+    /// never a key.
+    clicked: bool,
 }
 
 /// A link the person points at in the conversation iq draws, the mouse
@@ -353,6 +357,7 @@ impl Board {
             reading: false,
             pointed: None,
             listed: false,
+            clicked: false,
         }
     }
 
@@ -389,8 +394,18 @@ impl Board {
     pub fn click(&mut self, column: u16, row: u16) {
         if self.drawn() {
             self.reading = true;
+            self.clicked = true;
             self.readings.push(Reading::Click(column, row));
         }
+    }
+
+    /// Whether letters are keys of the conversation iq draws (c copies, n
+    /// and N go through what was found): while the person reads it from
+    /// the keyboard, never after a click, when a letter is what they
+    /// start writing.
+    #[must_use]
+    pub fn reading_letters(&self) -> bool {
+        self.reading && !self.clicked
     }
 
     /// What `chord` does while the person reads the conversation iq
@@ -403,10 +418,11 @@ impl Board {
     fn reading_key(&mut self, chord: &Chord, typed: Option<char>) -> Option<Vec<Request>> {
         let plain = !chord.ctrl && !chord.alt && !chord.cmd && !chord.shift;
         let shifted = chord.shift && !chord.ctrl && !chord.alt && !chord.cmd;
+        let letters = !self.clicked;
         let reading = match (chord.key.as_str(), typed) {
-            (_, Some('c')) => Reading::Copy,
-            (_, Some('n')) => Reading::Match(-1),
-            (_, Some('N')) => Reading::Match(1),
+            (_, Some('c')) if letters => Reading::Copy,
+            (_, Some('n')) if letters => Reading::Match(-1),
+            (_, Some('N')) if letters => Reading::Match(1),
             (_, Some(digit @ '1'..='9')) if self.listed => {
                 Reading::Pick(digit as usize - '0' as usize)
             }
@@ -1030,6 +1046,7 @@ impl Board {
         // from the last thing folded.
         if self.drawn() && !self.reading && chord.shift && !chord.ctrl && chord.key == "Up" {
             self.reading = true;
+            self.clicked = false;
             self.readings.push(Reading::Mark(-1));
             return Vec::new();
         }
@@ -1609,6 +1626,7 @@ impl Board {
             }
             Command::Find(words) if self.drawn() => {
                 self.reading = true;
+                self.clicked = false;
                 self.readings.push(Reading::Find(words));
             }
             Command::Find(_) => self.screen.notice(
@@ -2085,6 +2103,26 @@ mod tests {
         // Not reading, the arrows are the editor's.
         key(&mut board, "Up");
         assert!(board.take_readings().is_empty());
+        // After a click, a letter is what the person starts writing, never
+        // a key: the c of "cool" copies nothing.
+        board.screen_mut().editor_mut().clear();
+        board.click(4, 9);
+        assert!(board.reading() && !board.reading_letters());
+        board.press(&Chord::plain("c"), Some('c'), 1);
+        assert!(!board.reading());
+        assert_eq!(board.screen().editor().text(), "c");
+        assert_eq!(
+            board.take_readings(),
+            [Reading::Click(4, 9), Reading::Leave]
+        );
+        // Read from the keyboard, it copies.
+        board.screen_mut().editor_mut().clear();
+        key(&mut board, "shift+up");
+        assert!(board.reading_letters());
+        board.press(&Chord::plain("c"), Some('c'), 1);
+        assert_eq!(board.take_readings(), [Reading::Mark(-1), Reading::Copy]);
+        key(&mut board, "Escape");
+        let _ = board.take_readings();
         // Words found, the matches gone through and what is marked copied.
         board.screen_mut().editor_mut().clear();
         board.run(Command::Find("the parser".into()), 1);
