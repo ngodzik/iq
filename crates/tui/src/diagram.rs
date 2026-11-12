@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::graphics;
@@ -43,6 +42,13 @@ pub(crate) type Shot = (u32, Arc<Vec<u8>>, (u32, u32));
 /// The most rows an image takes, so that one fits on screen with what was
 /// said of it.
 const MOST_ROWS: u16 = 30;
+
+/// How much larger than its pixels a diagram is shown, as a fraction: half
+/// as large again, so that it reads on dense cells.
+const LARGER: (u32, u32) = (3, 2);
+
+/// How many times wider than tall a diagram is that takes the whole width.
+const WIDE: u32 = 3;
 
 /// How long a diagram is waited for before it is written as its source.
 const PATIENCE: Duration = Duration::from_secs(90);
@@ -133,14 +139,14 @@ impl Diagram {
 
     /// What it shows within `width` columns, after `indent`, on cells of
     /// `cell` pixels: its image's cells, the image put in `images` to be
-    /// sent first, and a line in `said` saying where its source is; else
-    /// its source.
+    /// sent first; else its source. Its image is shown half as large again
+    /// as its pixels, one at least [`WIDE`] times wider than tall across
+    /// the whole width, and never past [`MOST_ROWS`].
     pub(crate) fn shown(
         &self,
         width: usize,
         indent: &[Span<'static>],
         cell: (u16, u16),
-        said: Style,
         images: &mut Vec<Image>,
     ) -> Shown {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -151,23 +157,25 @@ impl Diagram {
                 };
                 let room = width.saturating_sub(crate::wrap::spans_width(indent));
                 let room = u16::try_from(room).unwrap_or(u16::MAX);
-                let (cols, rows) = graphics::fit(pixels, cell, room, MOST_ROWS);
+                let larger = if pixels.0 >= WIDE.saturating_mul(pixels.1) {
+                    // As large as the width needs, which fit keeps to.
+                    let across = u32::from(room) * u32::from(cell.0.max(1));
+                    (across * LARGER.1).div_ceil(pixels.0.max(1)).max(LARGER.0)
+                } else {
+                    LARGER.0
+                };
+                let shown = (
+                    pixels.0.saturating_mul(larger) / LARGER.1,
+                    pixels.1.saturating_mul(larger) / LARGER.1,
+                );
+                let (cols, rows) = graphics::fit(shown, cell, room, MOST_ROWS);
                 images.push(Image {
                     id: self.id,
                     png: Arc::new(drawn.png.clone()),
                     cols,
                     rows,
                 });
-                let mut lines = graphics::cells(self.id, cols, rows, indent);
-                if let Some(path) = &drawn.source {
-                    let mut spans = indent.to_vec();
-                    spans.push(Span::styled(
-                        format!("╰ mermaid, its source in {}", path.display()),
-                        said,
-                    ));
-                    lines.push(Line::from(spans));
-                }
-                Shown::Image(lines)
+                Shown::Image(graphics::cells(self.id, cols, rows, indent))
             }
             State::Failed(why) => Shown::Source(Some(format!(
                 "the diagram could not be drawn: {}",
@@ -209,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn a_diagram_drawn_is_its_cells_the_image_to_send_and_where_its_source_is() {
+    fn a_diagram_drawn_is_its_cells_half_as_large_again_and_a_wide_one_takes_the_width() {
         let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
         png.extend(200u32.to_be_bytes());
         png.extend(100u32.to_be_bytes());
@@ -219,24 +227,32 @@ mod tests {
             image: Some("/cache/d.png".into()),
         }))));
         let mut images = Vec::new();
-        let shown = diagram.shown(80, &[Span::raw("  ")], (10, 20), Style::new(), &mut images);
+        let shown = diagram.shown(80, &[Span::raw("  ")], (10, 20), &mut images);
         let Shown::Image(lines) = shown else {
             panic!("{shown:?}")
         };
-        // 200 by 100 pixels on cells of 10 by 20: 20 columns, 5 rows.
-        assert_eq!(lines.len(), 6);
-        assert_eq!((images[0].id, images[0].cols, images[0].rows), (9, 20, 5));
-        assert_eq!(
-            lines[5].to_string(),
-            "  ╰ mermaid, its source in /cache/d.mmd"
-        );
+        // 200 by 100 pixels shown as 300 by 150, on cells of 10 by 20: 30
+        // columns, 8 rows; the image alone.
+        assert_eq!(lines.len(), 8);
+        assert_eq!((images[0].id, images[0].cols, images[0].rows), (9, 30, 8));
+        // Three times wider than tall: across the whole width.
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend(300u32.to_be_bytes());
+        png.extend(100u32.to_be_bytes());
+        let wide = drawn(Some(Fixed(Ok(Drawn {
+            png,
+            source: None,
+            image: None,
+        }))));
+        let mut images = Vec::new();
+        wide.shown(80, &[Span::raw("  ")], (10, 20), &mut images);
+        assert_eq!((images[0].cols, images[0].rows), (78, 13));
     }
 
     #[test]
     fn a_diagram_nothing_draws_is_its_source_and_one_that_failed_says_why() {
         let mut images = Vec::new();
-        let mut shown =
-            |diagram: &Diagram| diagram.shown(80, &[], (10, 20), Style::new(), &mut images);
+        let mut shown = |diagram: &Diagram| diagram.shown(80, &[], (10, 20), &mut images);
         let source = drawn(None);
         assert!(!source.drawing());
         assert_eq!(shown(&source), Shown::Source(None));

@@ -36,7 +36,7 @@
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set; the project's .claude/skills are read after them, yours winning a name both hold
 //! claude_memory = true                   # the notes kept of the project under ~/.claude read beside iq's own
 //! plugins = ["name"]                     # programs of their own iq starts and speaks with: iq-name for name, found on the PATH, run on your machine as you
-//! mermaid = "auto"                       # Mermaid diagrams drawn as images in Kitty, by mmdr (cargo install mermaid-rs-renderer) run in the sandbox; or a command with {input} and {output}; off unless set
+//! mermaid = "auto"                       # Mermaid diagrams drawn as images in Kitty, by mmdr (cargo install mermaid-rs-renderer) run in the sandbox, dark, on the terminal's own background; or a command with {input} and {output}, and {look} for iq's look; off unless set
 //!
 //! [keys]                                 # any shortcut moved, "" for none; Ctrl-S lists them
 //! costs = "ctrl+o"

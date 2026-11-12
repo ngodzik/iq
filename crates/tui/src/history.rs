@@ -116,7 +116,6 @@ enum Block {
     Diagram {
         diagram: Arc<Diagram>,
         code: Vec<Block>,
-        said: Style,
         failed: Style,
     },
     /// A command run in the background, in one line never folded: `head`,
@@ -215,9 +214,8 @@ impl Block {
             Block::Diagram {
                 diagram,
                 code,
-                said,
                 failed,
-            } => match diagram.shown(width, &indent, cell, *said, images) {
+            } => match diagram.shown(width, &indent, cell, images) {
                 Shown::Image(lines) => lines,
                 Shown::Source(why) => {
                     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1242,7 +1240,6 @@ impl History {
                     self.push_text_block(Block::Diagram {
                         diagram,
                         code,
-                        said: p.fg(p.faint),
                         failed: p.fg(p.warn),
                     });
                 }
@@ -1927,11 +1924,12 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        // 200 by 100 pixels on cells of 10 by 20: 5 rows of 20 cells.
-        assert_eq!(after.iter().filter(|l| l.contains('\u{10EEEE}')).count(), 5);
+        // 200 by 100 pixels shown half as large again on cells of 10 by
+        // 20: 8 rows of 30 cells.
+        assert_eq!(after.iter().filter(|l| l.contains('\u{10EEEE}')).count(), 8);
         assert_eq!(after.last().map(String::as_str), Some("  after it"));
         let images = history.take_images();
-        assert_eq!((images.len(), images[0].cols, images[0].rows), (1, 20, 5));
+        assert_eq!((images.len(), images[0].cols, images[0].rows), (1, 30, 8));
     }
 
     #[test]

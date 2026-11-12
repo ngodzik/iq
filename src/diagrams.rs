@@ -14,8 +14,15 @@ use iq_gate::{Action, Gate, Helper, Judged};
 use iq_tui::{Draw, Drawn};
 
 /// The program `mermaid = "auto"` draws with, and how: a single binary that
-/// draws without a browser.
-const AUTO: [&str; 7] = ["mmdr", "-i", "{input}", "-o", "{output}", "-e", "png"];
+/// draws without a browser, with its dark theme and iq's look.
+const AUTO: [&str; 11] = [
+    "mmdr", "-i", "{input}", "-o", "{output}", "-e", "png", "-t", "dark", "-c", "{look}",
+];
+
+/// The look `{look}` names, written beside the source: a transparent
+/// background, so that only the diagram lies over the terminal's, and text
+/// twice mmdr's size, so that the image stays sharp once shown larger.
+const LOOK: &str = r#"{"themeVariables":{"background":"transparent","fontSize":32}}"#;
 
 /// What `mermaid = "auto"` says when its program is not installed.
 pub(crate) const NO_MMDR: &str = "mermaid = \"auto\" draws diagrams with mmdr, which is not on the PATH: \
@@ -30,9 +37,10 @@ const QUIET_WITHIN: Duration = Duration::from_secs(30);
 /// The largest image taken, in bytes.
 const MOST_BYTES: u64 = 16 << 20;
 
-/// The source's file and the image's, in a diagram's folder.
+/// The source's file, the image's and the look's, in a diagram's folder.
 const INPUT: &str = "diagram.mmd";
 const OUTPUT: &str = "diagram.png";
+const LOOK_FILE: &str = "look.json";
 
 /// What draws the diagrams: the program and its arguments, `{input}` and
 /// `{output}` standing for the files, where the drawn ones are kept, what
@@ -84,7 +92,7 @@ fn quoted(word: &str) -> String {
 fn key(command: &[String], source: &str) -> u64 {
     // FNV-1a: stable across versions, unlike the standard hasher.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in command.iter().map(String::as_str).chain([source]) {
+    for part in command.iter().map(String::as_str).chain([LOOK, source]) {
         for byte in part.bytes().chain([0]) {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0100_0000_01b3);
@@ -116,7 +124,14 @@ impl Diagrams {
     fn line(&self) -> String {
         self.command
             .iter()
-            .map(|word| quoted(&word.replace("{input}", INPUT).replace("{output}", OUTPUT)))
+            .map(|word| {
+                quoted(
+                    &word
+                        .replace("{input}", INPUT)
+                        .replace("{output}", OUTPUT)
+                        .replace("{look}", LOOK_FILE),
+                )
+            })
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -180,6 +195,10 @@ impl Draw for Diagrams {
         if !output.is_file() {
             std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
             std::fs::write(&input, source).map_err(|e| format!("{}: {e}", input.display()))?;
+            if self.command.iter().any(|word| word.contains("{look}")) {
+                let look = folder.join(LOOK_FILE);
+                std::fs::write(&look, LOOK).map_err(|e| format!("{}: {e}", look.display()))?;
+            }
             self.run(&folder)?;
         }
         let size = std::fs::metadata(&output)
@@ -207,7 +226,10 @@ mod tests {
         let found = command(&Mermaid::Auto, |p| p == "mmdr").unwrap();
         assert_eq!(
             found,
-            ["mmdr", "-i", "{input}", "-o", "{output}", "-e", "png"]
+            [
+                "mmdr", "-i", "{input}", "-o", "{output}", "-e", "png", "-t", "dark", "-c",
+                "{look}"
+            ]
         );
         // Nothing heavier is looked for.
         assert_eq!(command(&Mermaid::Auto, |p| p == "mmdc"), None);
@@ -238,6 +260,21 @@ mod tests {
                 .clone(),
         );
         assert_eq!(diagrams.line(), "draw -i diagram.mmd --title 'a b'");
+        let auto = Diagrams::new(
+            command(&Mermaid::Auto, |_| true).unwrap(),
+            PathBuf::new(),
+            PathBuf::new(),
+            None,
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .handle()
+                .clone(),
+        );
+        assert_eq!(
+            auto.line(),
+            "mmdr -i diagram.mmd -o diagram.png -e png -t dark -c look.json"
+        );
         assert_eq!(quoted("it's"), r"'it'\''s'");
         assert_ne!(key(&["a".into()], "x"), key(&["a".into()], "y"));
     }
