@@ -4,7 +4,9 @@
 //! what is folded (a fold of steps, a job that ended, a message between
 //! agents, a diagram folded) unfolds in place, alone, with a click or
 //! Enter on the mark, and folds again the same, nothing moving but what
-//! follows it. The end follows what is written while the person is at it;
+//! follows it. A diagram is enlarged with a click, across the width, the
+//! conversation's room its alone and the wheel its, until another click
+//! puts it back. The end follows what is written while the person is at it;
 //! scrolled up, the view stays put as more comes, its top held by the
 //! block it is in.
 
@@ -37,6 +39,9 @@ pub(crate) struct View {
     unfolded: HashSet<usize>,
     /// The block marked, by its number: what Enter unfolds or folds.
     mark: Option<usize>,
+    /// The diagram enlarged, by its block's number, and its first row
+    /// shown.
+    zoom: Option<(usize, usize)>,
     /// The block each row of the conversation showed, as last drawn.
     rows: Vec<Option<usize>>,
     /// The screen's row the conversation began at, as last drawn.
@@ -107,6 +112,20 @@ impl Laid<'_> {
                 self.blocks[at - 1],
                 Block::Entry { .. } | Block::Folded { .. }
             )
+    }
+
+    /// The rows of the diagram place `at` holds, enlarged; none for
+    /// anything else, or a diagram that shows no image.
+    fn enlarged(&self, at: usize, images: &mut Vec<Image>) -> Option<Vec<Line<'static>>> {
+        match self.blocks.get(at.checked_sub(1)?)? {
+            Block::Diagram { diagram, .. } => diagram.enlarged(self.width, self.cell, images),
+            _ => None,
+        }
+    }
+
+    /// Whether the mark goes to place `at`: what folds, a diagram.
+    fn markable(&self, at: usize) -> bool {
+        self.foldable(at) || at > 0 && matches!(self.blocks[at - 1], Block::Diagram { .. })
     }
 
     /// The rows of place `at`, unfolded when the person unfolded it, the
@@ -188,6 +207,7 @@ impl View {
             self.window = Some(key);
             self.top = None;
             self.mark = None;
+            self.zoom = None;
             self.unfolded.clear();
         }
         let height = area.height.max(1);
@@ -206,6 +226,30 @@ impl View {
                 p,
                 unfolded: &unfolded,
             };
+            // Enlarged, a diagram takes the wheel; a click, Enter or
+            // anything else puts it back.
+            if let Some((number, first)) = self.zoom {
+                let page = height.saturating_sub(1).max(1) as isize;
+                let by = match reading {
+                    Reading::Scroll(rows) => Some(*rows),
+                    Reading::Page(pages) => Some(pages * page),
+                    _ => None,
+                };
+                match by {
+                    Some(by) => {
+                        let rows = laid
+                            .enlarged(laid.at(number), &mut Vec::new())
+                            .map_or(0, |lines| lines.len());
+                        let most = rows.saturating_sub(height);
+                        let first = (first as isize + by).clamp(0, most as isize);
+                        self.zoom = Some((number, first as usize));
+                    }
+                    None => self.zoom = None,
+                }
+                if !matches!(reading, Reading::Mark(_) | Reading::Leave) {
+                    continue;
+                }
+            }
             match reading {
                 Reading::Scroll(rows) => self.scroll(&laid, height, *rows),
                 Reading::Page(pages) => {
@@ -214,10 +258,8 @@ impl View {
                 }
                 Reading::Mark(by) => self.move_mark(&laid, height, *by),
                 Reading::Toggle => {
-                    if let Some(number) = self.mark
-                        && laid.foldable(laid.at(number))
-                    {
-                        self.toggle(&laid, height, number);
+                    if let Some(number) = self.mark {
+                        self.open(&laid, height, number);
                     }
                 }
                 Reading::Click(_, row) => {
@@ -228,9 +270,7 @@ impl View {
                     match clicked {
                         Some(number) => {
                             self.mark = Some(number);
-                            if laid.foldable(laid.at(number)) {
-                                self.toggle(&laid, height, number);
-                            }
+                            self.open(&laid, height, number);
                         }
                         None => {
                             self.mark = None;
@@ -253,7 +293,27 @@ impl View {
             unfolded: &unfolded,
         };
         let mark = self.mark;
-        let mut shown = self.lay_out(&laid, height);
+        let enlarged = self.zoom.and_then(|(number, first)| {
+            let mut images = Vec::new();
+            let lines = laid.enlarged(laid.at(number), &mut images)?;
+            Some((number, first, lines, images))
+        });
+        let mut shown = match enlarged {
+            Some((number, first, lines, images)) => {
+                let lines: Vec<Line<'static>> =
+                    lines.into_iter().skip(first).take(height).collect();
+                self.rows = vec![Some(number); lines.len()];
+                Shown {
+                    lines,
+                    images,
+                    missed: false,
+                }
+            }
+            None => {
+                self.zoom = None;
+                self.lay_out(&laid, height)
+            }
+        };
         shown.missed = missed;
         self.from = area.from;
         if let Some(mark) = mark {
@@ -264,6 +324,17 @@ impl View {
             }
         }
         shown
+    }
+
+    /// Opens the block numbered `number`: a diagram enlarged, what is
+    /// folded unfolded, or folded again.
+    fn open(&mut self, laid: &Laid<'_>, height: usize, number: usize) {
+        let at = laid.at(number);
+        if laid.foldable(at) {
+            self.toggle(laid, height, number);
+        } else if laid.enlarged(at, &mut Vec::new()).is_some() {
+            self.zoom = Some((number, 0));
+        }
     }
 
     /// Unfolds the block numbered `number`, or folds it again: what is
@@ -279,7 +350,7 @@ impl View {
     /// Moves the mark to what is folded before it, or after it, by `by`,
     /// from the end when none is marked, and scrolls to show it.
     fn move_mark(&mut self, laid: &Laid<'_>, height: usize, by: isize) {
-        let foldable: Vec<usize> = (0..laid.len()).filter(|at| laid.foldable(*at)).collect();
+        let foldable: Vec<usize> = (0..laid.len()).filter(|at| laid.markable(*at)).collect();
         let Some(&last) = foldable.last() else {
             return;
         };
@@ -533,6 +604,79 @@ mod tests {
         // Back down to the end, it follows it again.
         let end = shown(&history, &board, &[Reading::Scroll(500)]);
         assert_eq!(end.last().map(String::as_str), Some("  line 21"));
+    }
+
+    /// Draws every diagram at once as a PNG of 400 by 600 pixels.
+    struct Tall;
+
+    impl crate::diagram::Draw for Tall {
+        fn draw(&self, _source: &str) -> Result<crate::diagram::Drawn, String> {
+            let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+            png.extend(400u32.to_be_bytes());
+            png.extend(600u32.to_be_bytes());
+            Ok(crate::diagram::Drawn { png })
+        }
+    }
+
+    #[test]
+    fn a_click_enlarges_a_diagram_which_takes_the_wheel_until_put_back() {
+        let (p, mut board, mut history) = joined();
+        history.pictures(Some(std::sync::Arc::new(Tall)), (10, 20));
+        said(
+            &mut board,
+            &mut history,
+            &p,
+            "```mermaid\ngraph TD\n A --> B\n```\nAfter it.\n",
+        );
+        for _ in 0..500 {
+            let _ = history.take(60, Some("lead"));
+            if !history.waiting() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut view = View::default();
+        let placed = |shown: &Shown| {
+            shown
+                .lines
+                .iter()
+                .filter(|line| line.to_string().contains('\u{10EEEE}'))
+                .count()
+        };
+        let small = view.shown(&history, &board, &p, Some("lead"), area(20), &[]);
+        let row = small
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains('\u{10EEEE}'))
+            .unwrap();
+        let click = Reading::Click(10, 2 + row as u16);
+        let large = view.shown(&history, &board, &p, Some("lead"), area(20), &[click]);
+        // Alone, the conversation's whole room, wider than it was shown.
+        assert_eq!(placed(&large), 20);
+        assert!(large.images[0].cols > small.images[0].cols);
+        assert!(!rows(&large).iter().any(|row| row.contains("After it.")));
+        // The wheel moves through it, never past its end.
+        let first = large.lines[0].to_string();
+        let moved = view.shown(
+            &history,
+            &board,
+            &p,
+            Some("lead"),
+            area(20),
+            &[Reading::Scroll(3)],
+        );
+        assert_ne!(moved.lines[0].to_string(), first);
+        assert_eq!(placed(&moved), 20);
+        // Clicked again, it is back in the conversation.
+        let back = view.shown(
+            &history,
+            &board,
+            &p,
+            Some("lead"),
+            area(20),
+            &[Reading::Click(10, 5)],
+        );
+        assert!(rows(&back).iter().any(|row| row.contains("After it.")));
     }
 
     #[test]

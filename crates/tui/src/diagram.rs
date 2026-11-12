@@ -148,6 +148,39 @@ impl Diagram {
         )
     }
 
+    /// Its image enlarged within `width` columns, centred, on cells of
+    /// `cell` pixels: across the width, as large as it reads well, twice
+    /// its pixels at most, which its text, drawn larger than mmdr's, bears;
+    /// as many rows as that takes. The image is put in `images` to be sent
+    /// first. None while it shows no image.
+    pub(crate) fn enlarged(
+        &self,
+        width: usize,
+        cell: (u16, u16),
+        images: &mut Vec<Image>,
+    ) -> Option<Vec<Line<'static>>> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let State::Drawn(drawn) = &*state else {
+            return None;
+        };
+        let pixels = graphics::png_size(&drawn.png)?;
+        let room = u16::try_from(width).unwrap_or(u16::MAX);
+        let most =
+            u16::try_from((2 * pixels.0).div_ceil(u32::from(cell.0.max(1)))).unwrap_or(u16::MAX);
+        let (cols, rows) = graphics::across(pixels, cell, room.min(most).max(1), u16::MAX);
+        let id = self.id((cols, rows));
+        images.push(Image {
+            id,
+            png: Arc::new(drawn.png.clone()),
+            cols,
+            rows,
+        });
+        let indent = [Span::raw(
+            " ".repeat(usize::from(room.saturating_sub(cols) / 2)),
+        )];
+        Some(graphics::cells(id, cols, rows, &indent))
+    }
+
     /// What it shows within `width` columns, after `indent`, on cells of
     /// `cell` pixels: its image's cells, the image put in `images` to be
     /// sent first; else its source. Its image is shown half as large again
