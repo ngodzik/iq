@@ -227,6 +227,9 @@ pub struct Board {
     /// The link the person points at in the conversation iq draws, as the
     /// terminal last drew it.
     pointed: Option<Pointed>,
+    /// Whether the conversation iq draws lists links to choose one, as
+    /// the terminal last drew it: the numbers are theirs.
+    listed: bool,
 }
 
 /// A link the person points at in the conversation iq draws, the mouse
@@ -257,7 +260,10 @@ pub enum Reading {
     /// Mark what is folded before what is marked, or after it: `-1`,
     /// `1`; from the end when nothing is.
     Mark(isize),
-    /// Unfold what is marked in place, alone, or fold it again.
+    /// Unfold what is marked in place, alone, or fold it again; enlarge
+    /// a diagram; go back to the top of an answer; open the link of what
+    /// does none of that, or list its links; open the link chosen of those
+    /// listed.
     Toggle,
     /// The cell at this column and row of the screen was clicked: what
     /// shows there is marked, and unfolded or folded again.
@@ -269,11 +275,7 @@ pub enum Reading {
     Match(isize),
     /// Copy what is marked, as it was written.
     Copy,
-    /// Open the link what is marked holds, or list them when it holds
-    /// several, to choose one; the one chosen, while they are listed.
-    Open,
-    /// Open the link of this number, from one, of those listed, else of
-    /// those what is marked holds.
+    /// Open the link of this number, from one, of those listed.
     Pick(usize),
     /// Go to the top of the answer read: Home.
     Top,
@@ -350,6 +352,7 @@ impl Board {
             readings: Vec::new(),
             reading: false,
             pointed: None,
+            listed: false,
         }
     }
 
@@ -368,9 +371,10 @@ impl Board {
     }
 
     /// Says which link the person points at in the conversation iq draws,
-    /// as the terminal drew it.
-    pub fn set_pointed(&mut self, pointed: Option<Pointed>) {
+    /// and whether it lists links to choose one, as the terminal drew it.
+    pub fn set_pointed(&mut self, pointed: Option<Pointed>, listed: bool) {
         self.pointed = pointed;
+        self.listed = listed;
     }
 
     /// The person reads the conversation iq draws no more: a click fell
@@ -391,7 +395,8 @@ impl Board {
 
     /// What `chord` does while the person reads the conversation iq
     /// draws: the arrows move the mark, Enter unfolds what it marks or
-    /// folds it again, o and the numbers open its links, Home and End go
+    /// folds it again or opens its link, the numbers one of the links
+    /// listed (any other time a number is written), Home and End go
     /// to the top and the end of the answer read, Shift and the arrows to
     /// the answer before or after, Escape stops reading. None for another
     /// key, which stops reading and goes where the person writes.
@@ -402,8 +407,9 @@ impl Board {
             (_, Some('c')) => Reading::Copy,
             (_, Some('n')) => Reading::Match(-1),
             (_, Some('N')) => Reading::Match(1),
-            (_, Some('o')) => Reading::Open,
-            (_, Some(digit @ '1'..='9')) => Reading::Pick(digit as usize - '0' as usize),
+            (_, Some(digit @ '1'..='9')) if self.listed => {
+                Reading::Pick(digit as usize - '0' as usize)
+            }
             _ => match chord.key.as_str() {
                 "Up" if plain => Reading::Mark(-1),
                 "Down" if plain => Reading::Mark(1),
@@ -2062,16 +2068,19 @@ mod tests {
             board.take_readings(),
             [Reading::Click(4, 9), Reading::Leave]
         );
-        // Its links opened: the first, or the one of a number.
+        // A number chooses one of the links listed, and only then: written
+        // any other time, it goes where the person writes.
         board.click(4, 9);
-        for c in ['o', '2'] {
-            board.press(&Chord::plain(&c.to_string()), Some(c), 1);
-        }
+        board.set_pointed(None, true);
+        board.press(&Chord::plain("2"), Some('2'), 1);
         assert_eq!(
             board.take_readings(),
-            [Reading::Click(4, 9), Reading::Open, Reading::Pick(2)]
+            [Reading::Click(4, 9), Reading::Pick(2)]
         );
-        key(&mut board, "Escape");
+        board.set_pointed(None, false);
+        board.press(&Chord::plain("2"), Some('2'), 1);
+        assert!(!board.reading());
+        assert_eq!(board.screen().editor().text(), "h2");
         let _ = board.take_readings();
         // Not reading, the arrows are the editor's.
         key(&mut board, "Up");

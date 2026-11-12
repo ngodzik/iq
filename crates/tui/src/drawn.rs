@@ -144,6 +144,8 @@ pub(crate) struct Shown {
     pub(crate) open: Option<String>,
     /// The link the person points at, for the status line.
     pub(crate) pointed: Option<Pointed>,
+    /// Whether links are listed, for the numbers to choose one.
+    pub(crate) listed: bool,
     /// The background each row takes past its text, left empty rather
     /// than filled with spaces: the mark's on what it marks, the
     /// terminal's own elsewhere.
@@ -304,6 +306,11 @@ impl Laid<'_> {
             .into_iter()
             .map(|(_, text, address)| (text.trim().to_owned(), address))
             .collect()
+    }
+
+    /// Whether Enter on place `at` unfolds it, folds it or enlarges it.
+    fn opens(&self, at: usize) -> bool {
+        self.foldable(at) || self.enlarged(at, &mut Vec::new()).is_some()
     }
 
     /// Whether the mark goes to place `at`: what folds, a diagram.
@@ -515,8 +522,6 @@ impl View {
                 unfolded: &unfolded,
                 counted: RefCell::default(),
             };
-            // Enlarged, a diagram takes the wheel; a click, Enter or
-            // anything else puts it back.
             // Listed, the links take the arrows, Enter and the numbers;
             // anything else but the wheel puts them away.
             if let Some(listing) = &mut self.listing {
@@ -526,9 +531,7 @@ impl View {
                         listing.picked = listing.picked.saturating_add_signed(*by).min(last);
                         continue;
                     }
-                    Reading::Toggle | Reading::Open => {
-                        Some(listing.links.get(listing.picked).cloned())
-                    }
+                    Reading::Toggle => Some(listing.links.get(listing.picked).cloned()),
                     Reading::Pick(number) => Some(
                         number
                             .checked_sub(1)
@@ -549,6 +552,8 @@ impl View {
                     None => {}
                 }
             }
+            // Enlarged, a diagram takes the wheel; a click, Enter or
+            // anything else puts it back.
             if let Some((number, first)) = self.zoom {
                 let page = height.saturating_sub(1).max(1) as isize;
                 let by = match reading {
@@ -582,6 +587,15 @@ impl View {
                 }
                 Reading::Mark(by) => self.move_mark(&laid, height, *by),
                 Reading::Toggle => match self.mark {
+                    // What neither folds nor enlarges opens its links.
+                    Some(Spot::Block(number)) if !laid.opens(laid.at(number)) => {
+                        let links = laid.links(laid.at(number));
+                        match links.len() {
+                            0 => {}
+                            1 => open = links.into_iter().next().map(|(_, address)| address),
+                            _ => self.listing = Some(Listing { links, picked: 0 }),
+                        }
+                    }
                     Some(Spot::Block(number)) => self.open(&laid, height, number),
                     Some(Spot::Back(number)) => {
                         self.go_to(&laid, height, laid.head_of(laid.at(number)));
@@ -661,29 +675,8 @@ impl View {
                         copied = Some(text);
                     }
                 }
-                Reading::Open | Reading::Pick(_) => {
-                    let links = self
-                        .mark
-                        .and_then(Spot::block)
-                        .map(|mark| laid.links(laid.at(mark)))
-                        .unwrap_or_default();
-                    match (reading, links.len()) {
-                        (_, 0) => said = Some("nothing marked holds a link".to_owned()),
-                        (Reading::Pick(number), count) => {
-                            match number.checked_sub(1).and_then(|at| links.get(at)) {
-                                Some((_, address)) => open = Some(address.clone()),
-                                None => {
-                                    said = Some(format!(
-                                        "what is marked holds {count} link{}",
-                                        if count == 1 { "" } else { "s" }
-                                    ));
-                                }
-                            }
-                        }
-                        (_, 1) => open = links.into_iter().next().map(|(_, address)| address),
-                        _ => self.listing = Some(Listing { links, picked: 0 }),
-                    }
-                }
+                // A number counts only while links are listed.
+                Reading::Pick(_) => {}
                 Reading::Top | Reading::End | Reading::Answer(_) => {
                     self.answer(&laid, height, reading);
                     self.mark = None;
@@ -762,6 +755,7 @@ impl View {
             self.list(&mut shown, &listing, area, p);
             self.listing = Some(listing);
         }
+        shown.listed = self.listing.is_some();
         shown.pointed = self
             .pointer
             .and_then(|(column, row)| self.link_at(column, row))
@@ -1560,7 +1554,7 @@ mod tests {
             .iter()
             .position(|line| line.to_string().contains("Then"))
             .unwrap();
-        let readings = [Reading::Click(0, 2 + both as u16), Reading::Open];
+        let readings = [Reading::Click(0, 2 + both as u16), Reading::Toggle];
         let listed = view.shown(&history, &board, &p, Some("lead"), area(20), &readings);
         assert_eq!(listed.open, None);
         let listed = rows(&listed);
@@ -1573,13 +1567,24 @@ mod tests {
         let opened = view.shown(&history, &board, &p, Some("lead"), area(20), &chosen);
         assert_eq!(opened.open.as_deref(), Some("https://example.com/2"));
         assert!(!rows(&opened).iter().any(|row| row.contains("links in")));
-        // Or by its number, the first said with how many more there are.
+        // The first said with how many more there are; then, listed, one
+        // of them by its number.
         let pointed = view.shown(&history, &board, &p, Some("lead"), area(20), &[]);
+        assert!(!pointed.listed);
         let pointed = pointed.pointed.unwrap();
         assert_eq!(
             (pointed.address.as_str(), pointed.more),
             ("https://example.com/1", 1)
         );
+        let listed = view.shown(
+            &history,
+            &board,
+            &p,
+            Some("lead"),
+            area(20),
+            &[Reading::Toggle],
+        );
+        assert!(listed.listed);
         let picked = view.shown(
             &history,
             &board,

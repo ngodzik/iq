@@ -324,7 +324,7 @@ impl Live<'_> {
             let p = self.p;
             parts.push(Part::Lines(wrap(
                 &[Span::styled(
-                    "↑ ↓ mark what is folded, a diagram or the end of an answer · Enter unfolds, folds, enlarges, goes back up · Home End this answer · Shift ↑ ↓ the answers · o opens its links · c copies · n N the matches · Esc writes again",
+                    "↑ ↓ mark what is folded, a diagram or the end of an answer · Enter unfolds, folds, enlarges, opens a link, goes back up · Home End this answer · Shift ↑ ↓ the answers · c copies · n N the matches · Esc writes again",
                     p.fg(p.faint),
                 )],
                 width.saturating_sub(1),
@@ -1270,8 +1270,8 @@ impl Live<'_> {
         if let Some(pointed) = self.board.pointed() {
             let how = match (pointed.mouse, pointed.more) {
                 (true, _) => " · a click opens it".to_owned(),
-                (false, 0) => " · o opens it".to_owned(),
-                (false, more) => format!(" · and {more} more: o lists them"),
+                (false, 0) => " · Enter opens it".to_owned(),
+                (false, more) => format!(" · and {more} more: Enter lists them"),
             };
             left = vec![
                 Span::raw(" "),

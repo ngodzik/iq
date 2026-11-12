@@ -624,7 +624,7 @@ impl Iq {
             });
         }
         // The status line says where the link pointed at leads.
-        self.board.set_pointed(shown.pointed.clone());
+        self.board.set_pointed(shown.pointed.clone(), shown.listed);
         let live = Live {
             board: &self.board,
             history: &self.history,
