@@ -145,7 +145,7 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
 
 /// Prints what a plugin said that the person reads: its words, and the line
 /// that sets a place's variables in a terminal there. What it shows on the
-/// status line and the Team page is for iq's own terminal.
+/// status line and the chats' page is for iq's own terminal.
 pub(crate) fn heard(update: &iq_ui::Update) {
     use iq_ui::plugins::Told;
     let mut out = std::io::stdout().lock();

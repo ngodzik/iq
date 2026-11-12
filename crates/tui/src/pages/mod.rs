@@ -99,9 +99,9 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String, Option<
     let (lines, foot) = match page {
         Page::Team => (
             team::lines(seen),
-            "↑↓ choose · Enter write to it · v its thread · n a new chat",
+            "↑↓ choose · Enter write to it · → its whole thread · n a new chat",
         ),
-        Page::Thread(agent) => (team::thread(seen, agent), "↑↓ scroll · ← the team"),
+        Page::Thread(agent) => (team::thread(seen, agent), "↑↓ scroll · ← the chats"),
         Page::Costs => (costs::lines(seen), "← → the period · ↑↓ scroll"),
         Page::Observations => (
             observations::lines(seen),

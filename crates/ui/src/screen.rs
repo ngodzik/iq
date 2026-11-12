@@ -44,7 +44,7 @@ pub enum Talk {
 /// A page over the conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
-    /// The crew: each agent, what it does and spends.
+    /// The person's chats, to choose one from.
     Team,
     /// One agent's whole thread.
     Thread(String),
@@ -70,7 +70,7 @@ impl Page {
     #[must_use]
     pub fn title(&self) -> String {
         match self {
-            Page::Team => "Team".to_owned(),
+            Page::Team => "Chats".to_owned(),
             Page::Thread(agent) => format!("Thread of {agent}"),
             Page::Costs => "Costs".to_owned(),
             Page::Observations => "Observations".to_owned(),
@@ -100,7 +100,7 @@ pub struct Screen {
     /// How many lines of the page show at once, as the terminal last drew
     /// it.
     rows: usize,
-    /// The agent chosen on the team's page, by its place.
+    /// The chat chosen on the chats' page, by its place.
     chosen: usize,
     /// The completion picked in the list, by its place.
     picked: usize,
@@ -233,7 +233,7 @@ impl Screen {
         self.scroll = 0;
     }
 
-    /// Closes the page open; a thread goes back to the team's page.
+    /// Closes the page open; a thread goes back to the chats' page.
     pub fn close(&mut self) {
         self.page = match self.page.take() {
             Some(Page::Thread(_)) => Some(Page::Team),
@@ -277,7 +277,7 @@ impl Screen {
         self.scroll = line;
     }
 
-    /// The agent chosen on the team's page, by its place.
+    /// The chat chosen on the chats' page, by its place.
     #[must_use]
     pub fn chosen(&self) -> usize {
         self.chosen
@@ -294,7 +294,7 @@ impl Screen {
         self.finished = !self.finished;
     }
 
-    /// Chooses the agent at `at` on the team's page, within `count`.
+    /// Chooses the chat at `at` on the chats' page, within `count`.
     pub fn choose(&mut self, at: usize, count: usize) {
         self.chosen = at.min(count.saturating_sub(1));
     }

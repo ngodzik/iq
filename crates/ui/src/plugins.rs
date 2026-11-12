@@ -1,6 +1,6 @@
 //! What the person's plugins show: the commands each takes, written after
 //! a `/` as iq's own are, what it says on the status line, its lines under
-//! a chat on the Team page, and the line that sets a place's variables in
+//! a chat on the chats' page, and the line that sets a place's variables in
 //! another terminal. Each says it in place of what it said before; a
 //! plugin that stopped takes all of it with it.
 
@@ -27,7 +27,7 @@ pub enum Told {
     Commands(Vec<PluginCommand>),
     /// What it shows on the status line; empty for nothing.
     Status(String),
-    /// Its lines under a chat on the Team page.
+    /// Its lines under a chat on the chats' page.
     Lines {
         /// The chat.
         chat: String,
@@ -133,7 +133,7 @@ impl Plugins {
         }
     }
 
-    /// Their lines under `chat` on the Team page.
+    /// Their lines under `chat` on the chats' page.
     #[must_use]
     pub fn lines(&self, chat: &str) -> Vec<&str> {
         self.shown

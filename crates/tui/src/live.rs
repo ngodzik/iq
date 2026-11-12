@@ -519,8 +519,8 @@ impl Live<'_> {
             let see = self
                 .board
                 .keys()
-                .chord(Action::Team)
-                .map(|chord| format!(", {chord} lists them"))
+                .chord(Action::Map)
+                .map(|chord| format!(", {chord} maps them"))
                 .unwrap_or_default();
             spans.push(Span::styled(
                 format!("{finished} finished{see}"),
@@ -1467,7 +1467,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{rows:#?}"));
         assert_eq!(
             listed.trim_end(),
-            "  ◦ writer sage by fix at work · 1 finished, Ctrl-T lists them"
+            "  ◦ writer sage by fix at work · 1 finished, Ctrl-G maps them"
         );
         // Another chat's agents are not this one's.
         board.screen_mut().talk_to("docs");
@@ -2091,7 +2091,11 @@ mod tests {
             head[0].ends_with('╮') && head[0].chars().count() == 80,
             "{head:#?}"
         );
-        let rows = drawn(&board, &history, 80).join("\n");
+        // How long, read off the clock, may be past a second.
+        let rows =
+            drawn(&board, &history, 80)
+                .join("\n")
+                .replacen("reviewer · 1s", "reviewer · 0s", 1);
         assert!(rows.contains("⠋ sage waiting for reviewer · 0s"), "{rows}");
         // And the conversation says so, once.
         let written: Vec<String> = history

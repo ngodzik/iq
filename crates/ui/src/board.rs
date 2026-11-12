@@ -528,6 +528,16 @@ impl Board {
         chats
     }
 
+    /// The person's chats as their page lists them, the one used last
+    /// first, as the switcher has them.
+    #[must_use]
+    pub fn chats_listed(&self) -> Vec<&crate::crew::AgentView> {
+        self.chats_by_use()
+            .into_iter()
+            .map(|(view, _)| view)
+            .collect()
+    }
+
     /// The switcher, while it is open.
     #[must_use]
     pub fn switcher(&self) -> Option<Switcher<'_>> {
@@ -980,7 +990,7 @@ impl Board {
         } else if self.screen.page() == Some(&Page::Team) {
             let chosen = self.screen.chosen() as isize + lines.signum();
             self.screen
-                .choose(chosen.max(0) as usize, self.crew.listed().len());
+                .choose(chosen.max(0) as usize, self.chats_by_use().len());
         } else {
             self.screen.scroll_by(lines);
         }
@@ -1002,7 +1012,7 @@ impl Board {
         let step = self.screen.rows().saturating_sub(2).max(1) as isize;
         let agents = match page {
             Page::Map => self.map_rows(),
-            _ => self.crew.listed().len(),
+            _ => self.chats_by_use().len(),
         };
         let chosen = self.screen.chosen();
         if page == Page::Steps
@@ -1089,18 +1099,11 @@ impl Board {
                 self.lens = lens;
             }
             Page::Team => {
-                let (agent, retired) = self
-                    .crew
-                    .listed()
+                let agent = self
+                    .chats_by_use()
                     .get(self.screen.chosen())
-                    .map_or((None, false), |(_, a)| (Some(a.name.clone()), a.retired));
+                    .map(|(chat, _)| chat.name.clone());
                 match (key, letter, agent) {
-                    // One retired is read, never written to.
-                    ("Enter" | "Right", _, Some(agent)) | (_, Some('w' | 'v'), Some(agent))
-                        if retired =>
-                    {
-                        self.screen.open(Page::Thread(agent));
-                    }
                     ("Enter", _, Some(agent)) | (_, Some('w'), Some(agent)) => {
                         self.chose_to(&agent);
                         self.screen.close();
@@ -2762,12 +2765,20 @@ mod tests {
         board.screen_mut().talk_to("helper");
         assert_eq!(key(&mut board, "escape"), vec![]);
         assert_eq!(key(&mut board, "shift+tab"), vec![Request::Autopilot(true)]);
-        // On the team's page, the agent chosen is written to.
+        // On the chats' page, the chat chosen is written to: the agents a
+        // chat started are not listed there.
+        joined(&mut board, "docs", PERSON);
         key(&mut board, "ctrl+t");
+        let listed: Vec<&str> = board
+            .chats_listed()
+            .iter()
+            .map(|chat| chat.name.as_str())
+            .collect();
+        assert_eq!(listed, ["lead", "docs"]);
         key(&mut board, "down");
         key(&mut board, "enter");
         assert_eq!(board.screen().page(), None);
-        assert_eq!(board.screen().talking_to(), Some("helper"));
+        assert_eq!(board.screen().talking_to(), Some("docs"));
     }
 
     #[test]
