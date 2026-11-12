@@ -72,7 +72,7 @@ pub const COMMANDS: [Spec; 20] = [
     Spec {
         name: "autopilot",
         args: "",
-        what: "the reviewer answering for you, or not",
+        what: "a model answering for you, or not",
     },
     Spec {
         name: "internet",

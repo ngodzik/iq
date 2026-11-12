@@ -2137,14 +2137,30 @@ mod tests {
         assert!(rows.contains("│ Which environment?"), "{rows}");
         assert!(rows.contains("│ ▸ 1. staging"), "{rows}");
         assert!(rows.contains("│   2. production"), "{rows}");
-        // Its question is in the conversation, its answer to come below it.
+        // While it waits, it is in its box alone; answered, a step of the
+        // agent's fold, written with it.
+        assert!(history.take(80, Some("deploy")).is_empty());
+        for event in [
+            Event::Chosen {
+                id: 1,
+                answer: Some("staging".into()),
+            },
+            Event::Done {
+                agent: "deploy".into(),
+                outcome: Ok(String::new()),
+            },
+        ] {
+            crew(&mut board, &mut history, event, &p);
+        }
         let written: Vec<String> = history
             .take(80, Some("deploy"))
             .iter()
             .map(ToString::to_string)
             .collect();
         assert!(
-            written.iter().any(|l| l.trim() == "? Which environment?"),
+            written
+                .iter()
+                .any(|l| l.trim() == "? Which environment? → staging"),
             "{written:#?}"
         );
     }

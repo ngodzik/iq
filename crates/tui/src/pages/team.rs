@@ -308,7 +308,7 @@ pub(super) fn thread(seen: &Seen<'_>, agent: &str) -> Vec<Line<'static>> {
                 };
                 lines.extend(wrap(
                     &[Span::styled(
-                        format!("the reviewer {word} {}: {why}", short(action)),
+                        format!("autopilot {word} {}: {why}", short(action)),
                         p.fg(colour),
                     )],
                     width,

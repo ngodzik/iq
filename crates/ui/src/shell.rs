@@ -112,6 +112,42 @@ pub fn few_words(line: &str, most: usize) -> String {
     cut_at_word(&said, most)
 }
 
+/// An action the gate held, as the crew says it (`run`, the line in
+/// backquotes, `in` its folder, then where it runs), in at most
+/// `most` characters: for a command, its few words and where it runs,
+/// never its body; anything else, on one line.
+///
+/// # Examples
+///
+/// ```
+/// let action = "run `cat >> tests/test_x.py <<'EOF'\nassert x\nEOF\nuv run pytest` in /w, on the machine itself, outside the sandbox";
+/// assert_eq!(
+///     iq_ui::shell::action_words(action, 80),
+///     "run cat, uv run · tests/test_x.py · on the machine"
+/// );
+/// ```
+#[must_use]
+pub fn action_words(action: &str, most: usize) -> String {
+    let command = action
+        .strip_prefix("run `")
+        .and_then(|rest| rest.rsplit_once("` in "));
+    let Some((line, place)) = command else {
+        return cut_at_word(
+            &action.split_whitespace().collect::<Vec<_>>().join(" "),
+            most,
+        );
+    };
+    let place = if place.contains(", on the machine itself") {
+        " · on the machine"
+    } else if place.contains(", with the internet") {
+        " · with the internet"
+    } else {
+        ""
+    };
+    let room = most.saturating_sub(4 + place.chars().count()).max(1);
+    format!("run {}{place}", few_words(line, room))
+}
+
 /// `line` without the bodies of the here-documents it feeds commands: what
 /// they write is not what the line runs.
 fn without_heredocs(line: &str) -> String {

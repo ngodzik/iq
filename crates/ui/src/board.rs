@@ -466,8 +466,14 @@ impl Board {
 
     /// The chat whose last exchanges the conversation writes again, once:
     /// one of an earlier session the person comes back to.
+    /// Its thread's steps are made into folds then, numbered as live ones
+    /// are, for the conversation to name them and their page to unfold.
     pub fn take_recall(&mut self) -> Option<Recall> {
-        self.recall.take()
+        let recall = self.recall.take()?;
+        if let Some(view) = self.crew.agent(&recall.agent) {
+            self.steps.recall(&recall.agent, &view.thread);
+        }
+        Some(recall)
     }
 
     /// Writes to `agent` from now on; a chat of an earlier session is

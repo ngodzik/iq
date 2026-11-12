@@ -53,6 +53,10 @@ const FAILED_LINES: usize = 3;
 /// The longest tool input written, in characters.
 pub(crate) const INPUT_CHARS: usize = 160;
 
+/// The longest question the person answered written among the steps, in
+/// characters: its answer comes after it.
+const QUESTION_CHARS: usize = 100;
+
 /// How many kinds of step a fold's count names.
 const KINDS: usize = 4;
 
@@ -106,6 +110,8 @@ impl Para {
 enum Block {
     Para(Para),
     Whole(Line<'static>),
+    /// One row, cut to the width: a step said in a few words.
+    Row(Vec<Span<'static>>),
     Table(Table),
     Diagram {
         diagram: Arc<Diagram>,
@@ -155,7 +161,7 @@ impl Block {
             Block::Diagram { diagram, .. } => diagram.drawing(),
             Block::Summed { summary, .. } => summary.making(),
             Block::Job { label, .. } => label.making(),
-            Block::Para(_) | Block::Whole(_) | Block::Table(_) => false,
+            Block::Para(_) | Block::Whole(_) | Block::Row(_) | Block::Table(_) => false,
         }
     }
 
@@ -166,6 +172,7 @@ impl Block {
         match self {
             Block::Para(para) => wrap(&para.body, width, &para.first, &para.rest),
             Block::Whole(line) => vec![line.clone()],
+            Block::Row(spans) => vec![fit(spans.clone(), width)],
             // Too long, the hint to unfold it goes first, then what it does
             // is cut: how it ended always shows.
             Block::Job { head, label, tail } => {
@@ -333,9 +340,6 @@ pub(crate) struct History {
     hurried: bool,
     /// Whether diagrams are drawn as images, in Kitty.
     drawn_images: bool,
-    /// The questions with choices asked, by number: the agent that asked,
-    /// and the window the answer goes in.
-    chosen: HashMap<u64, (String, Option<String>)>,
     /// The commands left to run in the background, by number: what they
     /// do in a few words, and since when they run.
     jobs: HashMap<u64, (Label, Instant)>,
@@ -546,10 +550,15 @@ impl History {
             }
             // A step: the board keeps it in the agent's fold, which the live
             // part shows as it grows. What the agent wrote so far comes
-            // before it.
-            Event::Tool { agent, .. } | Event::Reviewed { agent, .. } => {
+            // before it. A question waits in its box with its choices, and
+            // becomes a step once answered; iq's notice is a step too.
+            Event::Tool { agent, .. }
+            | Event::Reviewed { agent, .. }
+            | Event::Choose { agent, .. }
+            | Event::Notice { agent, .. } => {
                 self.finish(agent, board, p);
             }
+            Event::Chosen { .. } => {}
             Event::Asked { .. } | Event::Answered { .. } => {}
             // A job's end, told its agent by iq: the job's own line says it,
             // never its whole command.
@@ -630,38 +639,6 @@ impl History {
                 }
                 self.set_speaker(None);
             }
-            // The question as it is asked, its answer below it once given:
-            // the live part shows its choices meanwhile.
-            Event::Choose {
-                id,
-                agent,
-                question,
-                ..
-            } => {
-                self.finish(agent, board, p);
-                self.header(agent, board, p);
-                self.chosen.insert(*id, (agent.clone(), self.at.clone()));
-                self.push_step(Para {
-                    first: vec![Span::raw("  "), Span::styled("? ", p.fg(p.warn))],
-                    rest: vec![Span::raw("    ")],
-                    body: inline(question.trim(), p.fg(p.text), p, self.links),
-                });
-            }
-            Event::Chosen { id, answer } => {
-                if let Some((agent, at)) = self.chosen.remove(id) {
-                    self.at = at;
-                    self.header(&agent, board, p);
-                    let (said, style) = match answer {
-                        Some(answer) => (answer.clone(), p.fg(p.accent)),
-                        None => ("no answer".to_owned(), p.fg(p.faint)),
-                    };
-                    self.push_step(Para {
-                        first: vec![Span::raw("    "), Span::styled("→ ", p.fg(p.faint))],
-                        rest: vec![Span::raw("      ")],
-                        body: vec![Span::styled(said, style)],
-                    });
-                }
-            }
             // A command left to run, and how it ended: the live part says
             // meanwhile for how long it has run.
             // A job in a line as it starts and as it ends, never its whole
@@ -741,15 +718,6 @@ impl History {
             | Event::Retired { .. }
             | Event::Turn { .. }
             | Event::Window { .. } => {}
-            Event::Notice { agent, text } => {
-                self.finish(agent, board, p);
-                self.header(agent, board, p);
-                self.push(Para {
-                    first: vec![Span::raw("  "), Span::styled("! ", p.fg(p.warn))],
-                    rest: vec![Span::raw("    ")],
-                    body: vec![Span::styled(short(text), p.fg(p.dim))],
-                });
-            }
             Event::Placed {
                 agent,
                 said: Some(said),
@@ -882,12 +850,36 @@ impl History {
                 )],
             ));
         }
-        let mut steps: Vec<(String, String, bool)> = Vec::new();
-        for entry in &view.thread[from..] {
+        // The board made the thread's steps into folds as it came back,
+        // told at once, so that none is said again as a new one: each is
+        // written where it ends, as live.
+        let recalled = board
+            .steps()
+            .folds()
+            .filter(|fold| fold.agent == agent && fold.begins.is_some())
+            .map(|fold| fold.id)
+            .max();
+        if let Some(last) = recalled {
+            let told = self.told.entry(agent.to_owned()).or_default();
+            *told = (*told).max(last);
+        }
+        let mut fold: Option<usize> = None;
+        for (at, entry) in view.thread.iter().enumerate().skip(from) {
             use iq_ui::crew::Entry;
-            if !matches!(entry, Entry::Tool { .. }) {
-                self.recalled_steps(agent, &mut steps, board, p);
+            if let Some(begun) = board.steps().begun(agent, at) {
+                fold = Some(begun.id);
             }
+            if matches!(
+                entry,
+                Entry::Tool { .. }
+                    | Entry::Reviewed { .. }
+                    | Entry::Asked { .. }
+                    | Entry::Chose { .. }
+                    | Entry::Notice(_)
+            ) {
+                continue;
+            }
+            self.recalled_fold(agent, fold.take(), board, p);
             match entry {
                 Entry::Prompt(text) => {
                     let text = text.trim();
@@ -929,45 +921,6 @@ impl History {
                     let out = markdown.flush(p);
                     self.write(agent, out, board, p);
                 }
-                Entry::Tool {
-                    name, input, ok, ..
-                } => steps.push((name.clone(), input.clone(), *ok)),
-                Entry::Reviewed {
-                    action,
-                    approved,
-                    why,
-                } => {
-                    self.header(agent, board, p);
-                    let (mark, colour, did) = if *approved {
-                        ("✓ ", p.ok, "allowed")
-                    } else {
-                        ("✗ ", p.bad, "refused")
-                    };
-                    self.push_step(Para {
-                        first: vec![Span::raw("  "), Span::styled(mark, p.fg(colour))],
-                        rest: vec![Span::raw("    ")],
-                        body: vec![Span::styled(
-                            format!("the reviewer {did} {}: {}", short(action), short(why)),
-                            p.fg(p.dim),
-                        )],
-                    });
-                }
-                Entry::Asked { action, answer, .. } => {
-                    self.header(agent, board, p);
-                    let said = match answer {
-                        Some(true) => "you allowed",
-                        Some(false) => "you refused",
-                        None => "asked you, unanswered:",
-                    };
-                    self.push_step(Para {
-                        first: vec![Span::raw("  "), Span::styled("? ", p.fg(p.warn))],
-                        rest: vec![Span::raw("    ")],
-                        body: vec![Span::styled(
-                            format!("{said} {}", short(action)),
-                            p.fg(p.dim),
-                        )],
-                    });
-                }
                 Entry::Message { from, to, text } => {
                     if to == PERSON {
                         self.header(from, board, p);
@@ -1002,29 +955,6 @@ impl History {
                         self.lines_of(text, "    ", p, MESSAGE_LINES);
                     }
                 }
-                Entry::Notice(text) => {
-                    self.header(agent, board, p);
-                    self.push(Para {
-                        first: vec![Span::raw("  "), Span::styled("! ", p.fg(p.warn))],
-                        rest: vec![Span::raw("    ")],
-                        body: vec![Span::styled(short(text), p.fg(p.dim))],
-                    });
-                }
-                Entry::Chose { question, answer } => {
-                    self.header(agent, board, p);
-                    self.push_step(Para {
-                        first: vec![Span::raw("  "), Span::styled("? ", p.fg(p.warn))],
-                        rest: vec![Span::raw("    ")],
-                        body: vec![
-                            Span::styled(question.trim().to_owned(), p.fg(p.text)),
-                            Span::styled(" → ", p.fg(p.faint)),
-                            Span::styled(
-                                answer.clone().unwrap_or_else(|| "no answer".to_owned()),
-                                p.fg(p.accent),
-                            ),
-                        ],
-                    });
-                }
                 Entry::Done(outcome) => {
                     self.header(agent, board, p);
                     self.blank();
@@ -1040,9 +970,14 @@ impl History {
                     }
                     self.set_speaker(None);
                 }
+                Entry::Tool { .. }
+                | Entry::Reviewed { .. }
+                | Entry::Asked { .. }
+                | Entry::Chose { .. }
+                | Entry::Notice(_) => {}
             }
         }
-        self.recalled_steps(agent, &mut steps, board, p);
+        self.recalled_fold(agent, fold, board, p);
         if recall.opening {
             let others = board.crew().chats().count().saturating_sub(1);
             let mut said = format!("you write to {agent}, the chat you wrote to last");
@@ -1060,60 +995,13 @@ impl History {
         self.set_speaker(None);
     }
 
-    /// Writes the steps of a chat coming back since its last line, as a
-    /// fold is written once its agent goes on: one step as itself, more as
-    /// their count, by tool.
-    fn recalled_steps(
-        &mut self,
-        agent: &str,
-        steps: &mut Vec<(String, String, bool)>,
-        board: &Board,
-        p: &Palette,
-    ) {
-        if steps.is_empty() {
-            return;
+    /// Writes the fold `id` of a chat coming back, under its agent's name,
+    /// as a fold is written once its agent goes on.
+    fn recalled_fold(&mut self, agent: &str, id: Option<usize>, board: &Board, p: &Palette) {
+        if let Some(fold) = id.and_then(|id| board.steps().fold(id)) {
+            self.header(agent, board, p);
+            self.fold(fold, board, p);
         }
-        let taken = std::mem::take(steps);
-        self.header(agent, board, p);
-        let body = match taken.as_slice() {
-            [(name, input, ok)] => {
-                let colour = if *ok { p.dim } else { p.bad };
-                vec![
-                    Span::styled(name.clone(), p.fg(p.text)),
-                    Span::styled(format!(" {}", short(input)), p.fg(colour)),
-                ]
-            }
-            all => {
-                let mut tools: Vec<(String, usize)> = Vec::new();
-                for (name, _, _) in all {
-                    match tools.iter_mut().find(|(seen, _)| seen == name) {
-                        Some((_, count)) => *count += 1,
-                        None => tools.push((name.clone(), 1)),
-                    }
-                }
-                let named: Vec<String> = tools
-                    .iter()
-                    .map(|(name, count)| {
-                        if *count > 1 {
-                            format!("{name} ×{count}")
-                        } else {
-                            name.clone()
-                        }
-                    })
-                    .collect();
-                let failed = all.iter().filter(|(_, _, ok)| !ok).count();
-                let mut said = format!("{} steps: {}", all.len(), named.join(", "));
-                if failed > 0 {
-                    said.push_str(&format!(", {failed} failed"));
-                }
-                vec![Span::styled(said, p.fg(p.dim))]
-            }
-        };
-        self.push_step(Para {
-            first: vec![Span::raw("  "), Span::styled("▸ ", p.fg(p.faint))],
-            rest: vec![Span::raw("    ")],
-            body,
-        });
     }
 
     /// Something said to the person by iq itself, in passing.
@@ -1232,41 +1120,53 @@ impl History {
         self.told
             .insert(agent.to_owned(), new.last().map_or(told, |fold| fold.id));
         self.named(agent, board, p);
-        let unfold = board
-            .keys()
-            .chord(Action::Steps)
-            .map(|chord| chord.to_string());
         for fold in new {
-            match fold.steps.as_slice() {
-                [] => {}
-                [step] => {
-                    let (first, body) = step_line(step, p);
-                    self.push_step(Para {
-                        first,
-                        rest: vec![Span::raw("    ")],
-                        body,
-                    });
-                    if let Step::Tool {
-                        output, ok: false, ..
-                    } = step
+            self.fold(fold, board, p);
+        }
+    }
+
+    /// Writes `fold`: of one step, that step; of more, their count and the
+    /// key that unfolds them.
+    fn fold(&mut self, fold: &Fold, board: &Board, p: &Palette) {
+        match fold.steps.as_slice() {
+            [] => {}
+            [step @ Step::Tool { output, ok, .. }] => {
+                let (first, body) = step_line(step, p);
+                self.push_step(Para {
+                    first,
+                    rest: vec![Span::raw("    ")],
+                    body,
+                });
+                if !ok {
+                    for line in output
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .take(FAILED_LINES)
                     {
-                        for line in output
-                            .lines()
-                            .filter(|l| !l.trim().is_empty())
-                            .take(FAILED_LINES)
-                        {
-                            self.push_step(Para::indented(
-                                "    ",
-                                vec![Span::styled(cut(&short(line), LINE_CHARS), p.fg(p.faint))],
-                            ));
-                        }
+                        self.push_step(Para::indented(
+                            "    ",
+                            vec![Span::styled(cut(&short(line), LINE_CHARS), p.fg(p.faint))],
+                        ));
                     }
                 }
-                _ => self.push_step(Para {
+            }
+            // A verdict, an answer, a question, a notice: one row, whole
+            // on the steps' page.
+            [step] => {
+                let (mut first, body) = step_line(step, p);
+                first.extend(body);
+                self.push_step_block(Block::Row(first));
+            }
+            _ => {
+                let unfold = board
+                    .keys()
+                    .chord(Action::Steps)
+                    .map(|chord| chord.to_string());
+                self.push_step(Para {
                     first: vec![Span::raw("  "), Span::styled("▸ ", p.fg(p.faint))],
                     rest: vec![Span::raw("    ")],
                     body: counted(fold, unfold.as_deref(), p),
-                }),
+                });
             }
         }
     }
@@ -1575,10 +1475,15 @@ impl History {
     /// Puts a line of an agent's steps in the window, a line left between
     /// it and the text before.
     fn push_step(&mut self, para: Para) {
+        self.push_step_block(Block::Para(para));
+    }
+
+    /// The same, of any block.
+    fn push_step_block(&mut self, block: Block) {
         if self.kind() == Some(Kind::Text) {
             self.blank();
         }
-        self.push(para);
+        self.push_block(block);
         self.kinds.insert(self.at.clone(), Kind::Steps);
     }
 
@@ -1743,35 +1648,47 @@ pub(crate) fn step_line(step: &Step, p: &Palette) -> (Vec<Span<'static>>, Vec<Sp
                 ],
             )
         }
-        Step::Answered { action, approved } => {
-            let (said, tint) = if *approved {
-                ("✓ you allowed ", p.ok)
-            } else {
-                ("✗ refused ", p.bad)
-            };
-            (
-                vec![Span::raw("  "), Span::styled(said, p.fg(tint))],
-                vec![Span::styled(one(action), p.fg(p.dim))],
-            )
-        }
-        Step::Reviewed {
-            action,
-            approved,
-            why,
+        // An action in a few words, never a command's body: the steps' page
+        // gives it whole.
+        Step::Answered { action, approved }
+        | Step::Reviewed {
+            action, approved, ..
         } => {
-            let (said, tint) = if *approved {
-                ("⏵⏵ the reviewer allowed ", p.ok)
+            let (mark, tint) = if *approved {
+                ("✓ ", p.ok)
             } else {
-                ("⏵⏵ the reviewer refused ", p.bad)
+                ("✗ ", p.bad)
+            };
+            let mut body = vec![
+                Span::styled(format!("{} ", step.kind()), p.fg(tint)),
+                Span::styled(
+                    iq_ui::shell::action_words(&short(action), INPUT_CHARS),
+                    p.fg(p.text),
+                ),
+            ];
+            if let Step::Reviewed { why, .. } = step {
+                body.push(Span::styled(format!(": {}", one(why)), p.fg(p.dim)));
+            }
+            (vec![Span::raw("  "), Span::styled(mark, p.fg(tint))], body)
+        }
+        Step::Question { question, answer } => {
+            let answer = match answer {
+                Some(answer) => Span::styled(one(answer), p.fg(p.accent)),
+                None => Span::styled("no answer", p.fg(p.faint)),
             };
             (
-                vec![Span::raw("  "), Span::styled(said, p.fg(tint))],
-                vec![Span::styled(
-                    format!("{}: {}", one(action), short(why)),
-                    p.fg(p.dim),
-                )],
+                vec![Span::raw("  "), Span::styled("? ", p.fg(p.warn))],
+                vec![
+                    Span::styled(cut(&one(question), QUESTION_CHARS), p.fg(p.dim)),
+                    Span::styled(" → ", p.fg(p.faint)),
+                    answer,
+                ],
             )
         }
+        Step::Notice { text } => (
+            vec![Span::raw("  "), Span::styled("! ", p.fg(p.warn))],
+            vec![Span::styled(one(text), p.fg(p.dim))],
+        ),
     }
 }
 
@@ -1782,14 +1699,20 @@ fn counted(fold: &Fold, unfold: Option<&str>, p: &Palette) -> Vec<Span<'static>>
     let mut named: Vec<String> = kinds
         .iter()
         .take(KINDS)
-        .map(|(kind, count)| format!("{kind} {count}"))
+        .map(|(kind, count)| {
+            if *count > 1 {
+                format!("{kind} ×{count}")
+            } else {
+                kind.clone()
+            }
+        })
         .collect();
     if kinds.len() > KINDS {
         named.push("…".to_owned());
     }
     let mut spans = vec![
         Span::styled(format!("{} steps", fold.steps.len()), p.fg(p.text)),
-        Span::styled(format!(" · {}", named.join(", ")), p.fg(p.dim)),
+        Span::styled(format!(": {}", named.join(", ")), p.fg(p.dim)),
     ];
     let failed = fold.failed();
     if failed > 0 {
@@ -2105,15 +2028,39 @@ mod tests {
                 &p,
             );
         }
+        let run = || Entry::Tool {
+            name: "run".into(),
+            input: "make test".into(),
+            output: "ok".into(),
+            ok: true,
+        };
+        let verdict = || Entry::Reviewed {
+            action: "run `cat >> tests/test_x.py <<'EOF'\nassert x\nEOF\nuv run pytest` in /w, \
+                     on the machine itself, outside the sandbox"
+                .into(),
+            approved: true,
+            why: "These focused tests serve the requested fixes.".into(),
+        };
         let mut thread = Vec::new();
         for n in 1..=4 {
             thread.push(Entry::Prompt(format!("Message from person: ask {n}")));
-            thread.push(Entry::Tool {
-                name: "run".into(),
-                input: "make test".into(),
-                output: "ok".into(),
-                ok: true,
-            });
+            match n {
+                // A verdict alone, in a few words.
+                3 => thread.push(verdict()),
+                // A verdict, a notice and a question answered fold with the
+                // tools around them.
+                4 => thread.extend([
+                    run(),
+                    verdict(),
+                    Entry::Notice("set apart 36 of its old tool results".into()),
+                    Entry::Chose {
+                        question: "Which environment?".into(),
+                        answer: Some("staging".into()),
+                    },
+                    run(),
+                ]),
+                _ => thread.push(run()),
+            }
             thread.push(Entry::Text(format!("answer {n}")));
         }
         thread.push(Entry::Text("| a | b |\n|---|---|\n| one | two |".into()));
@@ -2153,14 +2100,21 @@ mod tests {
         .map(str::to_owned)
         .to_vec();
         // Each exchange as it was shown: what was asked, the agent, its
-        // step folded, its answer.
+        // steps folded under the number their page gives them, its answer.
         for n in 1..=4 {
+            let steps = match n {
+                3 => {
+                    "  ✓ autopilot allowed run cat, uv run · tests/test_x.py · on the machine: These focused tests serve…"
+                }
+                4 => "  ▸ 5 steps: run ×2, autopilot allowed, notice, question  Ctrl-X unfolds #4",
+                _ => "  ▸ run make test",
+            };
             shown.extend([
                 String::new(),
                 format!("› ask {n}"),
                 String::new(),
                 "● model".to_owned(),
-                "  ▸ run make test".to_owned(),
+                steps.to_owned(),
                 String::new(),
                 format!("  answer {n}"),
             ]);
@@ -2176,6 +2130,11 @@ mod tests {
         );
         let trimmed: Vec<String> = lines.iter().map(|l| l.trim_end().to_owned()).collect();
         assert_eq!(trimmed, shown);
+        // Their page gives each step whole.
+        let fold = board.steps().fold(4).unwrap();
+        assert_eq!(fold.begins, Some(10));
+        assert!(fold.steps[1].whole().contains("assert x"));
+        assert!(fold.steps[3].whole().ends_with("→ staging"));
         // Gone to again, its window is the same conversation.
         let again: Vec<String> = history
             .window(100, Some("login"))
@@ -2183,6 +2142,20 @@ mod tests {
             .map(|l| l.to_string().trim_end().to_owned())
             .collect();
         assert!(again.ends_with(&trimmed), "{again:#?}");
+        // Its folds were told: the next step opens one of its own.
+        crew(
+            &mut board,
+            &mut history,
+            Event::Tool {
+                agent: "login".into(),
+                name: "run".into(),
+                input: "ls".into(),
+                output: String::new(),
+                ok: true,
+            },
+            &p,
+        );
+        assert_eq!(board.steps().open("login").unwrap().id, 5);
         // Its next turn, woken by the person's message, is not written as
         // a task of its own.
         crew(
@@ -2491,7 +2464,7 @@ mod tests {
             [
                 "",
                 "● m",
-                "  ▸ 4 steps · read_file 2, run 1, asked you 1 · 1 went wrong  Ctrl-X unfolds #1",
+                "  ▸ 4 steps: read_file ×2, run, you refused · 1 went wrong  Ctrl-X unfolds #1",
                 "",
                 "  I add the test.",
                 "",
@@ -2502,6 +2475,107 @@ mod tests {
             ]
         );
         assert!(board.steps().folds().all(|fold| fold.closed));
+    }
+
+    #[test]
+    fn a_verdict_a_notice_and_an_answered_question_are_steps_of_a_fold_that_stays_open() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        let run = |board: &mut Board, history: &mut History, event| crew(board, history, event, &p);
+        let lead = || "lead".to_owned();
+        run(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: lead(),
+                model: "m".into(),
+                by: PERSON.into(),
+            },
+        );
+        run(
+            &mut board,
+            &mut history,
+            Event::Working {
+                agent: lead(),
+                prompt: "fix it".into(),
+            },
+        );
+        let verdict = || Event::Reviewed {
+            agent: lead(),
+            action: "run `cat >> tests/test_x.py <<'EOF'\nassert x\nEOF\nuv run pytest` in /w, \
+                     on the machine itself, outside the sandbox"
+                .into(),
+            reason: "it runs on the machine".into(),
+            approved: true,
+            why: "These focused tests serve the requested fixes.".into(),
+        };
+        for event in [
+            Event::Tool {
+                agent: lead(),
+                name: "read_file".into(),
+                input: "src/a.rs".into(),
+                output: String::new(),
+                ok: true,
+            },
+            verdict(),
+            Event::Notice {
+                agent: lead(),
+                text: "set apart 36 of its old tool results".into(),
+            },
+            Event::Choose {
+                id: 1,
+                agent: lead(),
+                question: "Which environment?".into(),
+                choices: vec!["staging".into(), "production".into()],
+            },
+            Event::Chosen {
+                id: 1,
+                answer: Some("staging".into()),
+            },
+        ] {
+            run(&mut board, &mut history, event);
+        }
+        // Neither the notice nor the question closed the fold, nor wrote
+        // anything of their own.
+        let fold = board.steps().open("lead").unwrap();
+        assert_eq!((fold.id, fold.steps.len()), (1, 4));
+        assert_eq!(history.take(120, Some("lead")).len(), 2);
+        for event in [
+            Event::TextStart { agent: lead() },
+            Event::Text {
+                agent: lead(),
+                text: "Tested.\n".into(),
+            },
+            verdict(),
+            Event::Done {
+                agent: lead(),
+                outcome: Ok("done".into()),
+            },
+        ] {
+            run(&mut board, &mut history, event);
+        }
+        let lines: Vec<String> = history
+            .take(100, Some("lead"))
+            .iter()
+            .map(|l| l.to_string().trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "",
+                "● m",
+                "  ▸ 4 steps: read_file, autopilot allowed, notice, question  Ctrl-X unfolds #1",
+                "",
+                "  Tested.",
+                "",
+                // Alone, a verdict in a few words, in one row: never the
+                // script's body.
+                "  ✓ autopilot allowed run cat, uv run · tests/test_x.py · on the machine: These focused tests serve…",
+                "",
+                "  ✔ 0s",
+            ]
+        );
     }
 
     #[test]
