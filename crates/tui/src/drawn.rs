@@ -10,7 +10,9 @@
 //! and copies what is marked as it was written. A link opens with a click,
 //! its address shown while the mouse is over it, or with a key from what
 //! is marked, iq handing it to the system's opener as the terminal would.
-//! An answer is read whole one after another: back to its top from the
+//! What is marked is tinted, and no row is filled with spaces past its
+//! text, so that a selection in the terminal takes neither the mark nor
+//! the padding. An answer is read whole one after another: back to its top from the
 //! mark after it when it is taller than the room, with Home, End and Shift
 //! with the arrows. The end follows what is written while the person is
 //! at it; scrolled up, the view stays put as more comes, its top held by
@@ -22,7 +24,7 @@ use std::sync::Arc;
 
 use iq_ui::steps::Entry;
 use iq_ui::{Board, Pointed, Reading};
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use ratatui::text::{Line, Span};
 
 use crate::diagram::Image;
@@ -32,6 +34,10 @@ use crate::theme::Palette;
 
 /// What iq opens with, before the first block, as a place of the view.
 const OPENING: usize = usize::MAX;
+
+/// How far toward the accent the mark tints its rows, from the
+/// background.
+const MARKED: f32 = 0.18;
 
 /// The conversation as iq draws it, and where the person reads it.
 #[derive(Debug, Default)]
@@ -138,6 +144,10 @@ pub(crate) struct Shown {
     pub(crate) open: Option<String>,
     /// The link the person points at, for the status line.
     pub(crate) pointed: Option<Pointed>,
+    /// The background each row takes past its text, left empty rather
+    /// than filled with spaces: the mark's on what it marks, the
+    /// terminal's own elsewhere.
+    pub(crate) grounds: Vec<Option<Color>>,
 }
 
 /// Where the conversation is drawn: the screen's rows from `from`, as many
@@ -731,10 +741,19 @@ impl View {
             }
         }
         self.from = area.from;
-        if let Some(mark) = mark {
-            for (line, number) in shown.lines.iter_mut().zip(&self.rows) {
-                if *number == Some(mark) {
-                    marked(line, p);
+        for line in &mut shown.lines {
+            trimmed(line);
+        }
+        let ground = p.color(p.ground.mix(p.accent, MARKED));
+        shown.grounds = self
+            .rows
+            .iter()
+            .map(|spot| (mark.is_some() && *spot == mark).then_some(ground))
+            .collect();
+        for (line, ground) in shown.lines.iter_mut().zip(&shown.grounds) {
+            if let Some(ground) = ground {
+                for span in &mut line.spans {
+                    span.style = span.style.bg(*ground);
                 }
             }
         }
@@ -828,11 +847,13 @@ impl View {
         }
         let over = lines.len().min(height);
         shown.lines.resize(height, Line::default());
+        shown.grounds.resize(height, None);
         self.rows.resize(height, None);
         self.links.resize(height, Vec::new());
         let start = height - over;
         for (row, (line, links)) in lines.into_iter().zip(links).take(over).enumerate() {
             shown.lines[start + row] = line;
+            shown.grounds[start + row] = None;
             self.rows[start + row] = None;
             self.links[start + row] = links;
         }
@@ -1153,18 +1174,18 @@ fn highlighted(line: &mut Line<'static>, words: &str) {
     line.spans = spans;
 }
 
-/// `line` marked: a bar where it begins, in the accent's colour, over the
-/// space its indent leaves there.
-fn marked(line: &mut Line<'static>, p: &Palette) {
-    let Some(first) = line.spans.iter().position(|span| !span.content.is_empty()) else {
-        line.spans.push(Span::styled("▌", p.bold(p.accent)));
-        return;
-    };
-    let span = &line.spans[first];
-    if let Some(rest) = span.content.strip_prefix(' ') {
-        let rest = Span::styled(rest.to_owned(), span.style);
-        line.spans
-            .splice(first..=first, [Span::styled("▌", p.bold(p.accent)), rest]);
+/// `line` without the spaces after its text, which a selection in the
+/// terminal would take.
+fn trimmed(line: &mut Line<'static>) {
+    while let Some(last) = line.spans.last_mut() {
+        let kept = last.content.trim_end().len();
+        if kept > 0 {
+            if kept < last.content.len() {
+                last.content = last.content[..kept].to_owned().into();
+            }
+            return;
+        }
+        line.spans.pop();
     }
 }
 
@@ -1189,11 +1210,24 @@ mod tests {
         crew(board, history, p, event);
     }
 
+    /// The rows shown, a row marked with a bar where it begins, over the
+    /// space its indent leaves there.
     fn rows(shown: &Shown) -> Vec<String> {
         shown
             .lines
             .iter()
-            .map(|l| l.to_string().trim_end().to_owned())
+            .enumerate()
+            .map(|(at, line)| {
+                let text = line.to_string().trim_end().to_owned();
+                if shown.grounds.get(at).copied().flatten().is_none() {
+                    return text;
+                }
+                match text.strip_prefix(' ') {
+                    Some(rest) => format!("▌{rest}"),
+                    None if text.is_empty() => "▌".to_owned(),
+                    None => text,
+                }
+            })
             .collect()
     }
 
@@ -1599,7 +1633,21 @@ mod tests {
         // Clicked, the first fold unfolds under its count, alone: what is
         // above it stays.
         let click = Reading::Click(5, 2 + first as u16);
-        let unfolded = rows(&view.shown(&history, &board, &p, Some("lead"), area(20), &[click]));
+        let drawn = view.shown(&history, &board, &p, Some("lead"), area(20), &[click]);
+        // Marked, its rows tinted, nothing written in them for it, nor
+        // after their text.
+        assert!(drawn.grounds[first].is_some());
+        assert!(
+            drawn.lines[first]
+                .spans
+                .iter()
+                .all(|span| span.style.bg.is_some())
+        );
+        assert!(drawn.lines.iter().all(|line| {
+            let text = line.to_string();
+            !text.contains('▌') && text.trim_end() == text
+        }));
+        let unfolded = rows(&drawn);
         assert_eq!(unfolded[..first], folded[..first]);
         assert!(unfolded[first].starts_with("▌ ▸ 2 steps"), "{unfolded:#?}");
         // Marked, a bar where its rows begin.

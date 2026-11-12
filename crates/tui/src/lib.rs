@@ -49,6 +49,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEve
 use ratatui::crossterm::terminal::{Clear, ClearType};
 use ratatui::crossterm::{cursor, queue, terminal};
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -247,6 +248,16 @@ fn cell() -> (u16, u16) {
             (size.width / size.columns, size.height / size.rows)
         }
     })
+}
+
+/// The escape that sets the background to `color`, or to the terminal's
+/// own.
+fn background(color: Option<Color>) -> String {
+    match color {
+        Some(Color::Rgb(r, g, b)) => format!("\x1b[48;2;{r};{g};{b}m"),
+        Some(Color::Indexed(n)) => format!("\x1b[48;5;{n}m"),
+        _ => "\x1b[49m".to_owned(),
+    }
 }
 
 /// The chat whose window shows: that of the agent written to, none for a
@@ -620,12 +631,34 @@ impl Iq {
             p: &self.p,
             now,
         };
+        let ends: Vec<(u16, Option<Color>)> = (0..usize::from(room))
+            .map(|row| {
+                let width = shown.lines.get(row).map_or(0, Line::width);
+                let ground = shown.grounds.get(row).copied().flatten();
+                (u16::try_from(width).unwrap_or(u16::MAX), ground)
+            })
+            .collect();
         let motion = &mut self.motion;
+        let mut caret = None;
         screen.terminal.draw(|frame| {
             live.draw_head_in(frame, Rect::new(0, 0, cols, head), motion);
             frame.render_widget(Paragraph::new(shown.lines), Rect::new(0, head, cols, room));
-            live.draw_in(frame, Rect::new(0, head + room, cols, height), motion);
+            caret = live.draw_in(frame, Rect::new(0, head + room, cols, height), motion);
         })?;
+        // Past its text, each row of the conversation is left empty rather
+        // than filled with spaces, in the mark's colour on what it marks:
+        // a selection in the terminal takes neither.
+        for (row, (width, ground)) in (head..).zip(ends) {
+            if width < cols {
+                queue!(screen.out, MoveTo(width, row))?;
+                write!(screen.out, "{}\x1b[K", background(ground))?;
+            }
+        }
+        write!(screen.out, "\x1b[0m")?;
+        if let Some((x, y)) = caret {
+            queue!(screen.out, MoveTo(x, y))?;
+        }
+        screen.out.flush()?;
         // A click outside the conversation: the person writes again.
         if missed {
             self.board.read_no_more();
