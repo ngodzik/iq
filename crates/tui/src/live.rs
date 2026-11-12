@@ -165,15 +165,8 @@ impl Live<'_> {
         };
         let mut lines = vec![map.head(&chat, width)];
         lines.extend(map.rows(&chat, width, None, false, true));
-        let resting = self
-            .board
-            .crew()
-            .agents()
-            .iter()
-            .filter(|a| !a.working && a.name != chat)
-            .filter(|a| chat_of(self.board, &a.name).as_ref() == Some(&chat))
-            .count();
-        let finished = iq_ui::map::finished(self.board.crew(), &chat);
+        let (agents, finished) = iq_ui::map::of_turn(self.board.crew(), &chat);
+        let resting = agents.iter().filter(|a| !a.working).count();
         if resting + finished > 0 {
             let see = self
                 .board
@@ -457,28 +450,15 @@ impl Live<'_> {
         )))
     }
 
-    /// Every agent the chat written to started, at work or resting, each
-    /// with its model and who started it, in a line or two: those the
-    /// panes leave out, and those at rest, are seen too.
+    /// The agents the chat written to started that its turn under way
+    /// concerns, at work or resting, each with its model and who started
+    /// it, in a line or two: those the panes leave out, and those at rest,
+    /// are seen too. Once nothing of the chat works, nothing.
     fn crew_line(&self, width: usize) -> Option<Part> {
         let p = self.p;
         let window = self.window()?;
-        let mut agents: Vec<&iq_ui::crew::AgentView> = self
-            .board
-            .crew()
-            .agents()
-            .iter()
-            .filter(|a| a.name != window)
-            .filter(|a| chat_of(self.board, &a.name).as_ref() == Some(&window))
-            .collect();
         // Those done with their task, retired: counted, not listed.
-        let finished = self
-            .board
-            .crew()
-            .finished()
-            .iter()
-            .filter(|a| a.name.split('/').next() == Some(window.as_str()))
-            .count();
+        let (mut agents, finished) = iq_ui::map::of_turn(self.board.crew(), &window);
         if agents.is_empty() && finished == 0 {
             return None;
         }
@@ -1465,7 +1445,12 @@ mod tests {
             listed.trim_end(),
             "  ◦ writer sage by fix at work · tests quick by writer resting"
         );
-        // Done with its task, it is counted at the end, not listed.
+        // Done with its task in this turn, it is counted at the end, not
+        // listed.
+        board.update(Update::Crew(Event::Working {
+            agent: "fix/tests".into(),
+            prompt: "test it".into(),
+        }));
         board.update(Update::Crew(Event::Retired {
             agent: "fix/tests".into(),
         }));
@@ -1480,6 +1465,17 @@ mod tests {
         );
         // Another chat's agents are not this one's.
         board.screen_mut().talk_to("docs");
+        assert!(
+            !drawn(&board, &history, 100)
+                .iter()
+                .any(|row| row.contains("◦ "))
+        );
+        // Once nothing of the chat works, its turn is over: the line goes.
+        board.screen_mut().talk_to("fix");
+        board.update(Update::Crew(Event::Done {
+            agent: "fix/writer".into(),
+            outcome: Ok("written".into()),
+        }));
         assert!(
             !drawn(&board, &history, 100)
                 .iter()
