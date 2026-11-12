@@ -128,6 +128,16 @@ pub enum Event {
         /// Whether it succeeded.
         ok: bool,
     },
+    /// A file an agent wrote, and how its lines changed: a unified diff,
+    /// a few lines around each change. Said before the step that wrote it.
+    Changed {
+        /// The agent.
+        agent: String,
+        /// The file, as the agent named it.
+        path: String,
+        /// How it changed.
+        diff: String,
+    },
     /// An action waits for the person.
     Asked {
         /// The question's number, to answer it with.
@@ -319,6 +329,7 @@ impl Event {
             | Event::TextStart { agent }
             | Event::Text { agent, .. }
             | Event::Tool { agent, .. }
+            | Event::Changed { agent, .. }
             | Event::Asked { agent, .. }
             | Event::Reviewed { agent, .. }
             | Event::Done { agent, .. }

@@ -72,6 +72,10 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
                 )
             }
         }
+        Event::Changed { agent, path, diff } => {
+            let lines: Vec<String> = diff.lines().map(|line| format!("    {line}")).collect();
+            writeln!(out, "  ✎ {agent} changed {path}\n{}", lines.join("\n"))
+        }
         Event::Asked {
             id,
             agent,

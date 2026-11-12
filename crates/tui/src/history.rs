@@ -51,6 +51,10 @@ const RECALLED: usize = 40;
 /// How many lines of a failed tool's output are written.
 const FAILED_LINES: usize = 3;
 
+/// How many lines of a file's change are written; the conversation iq
+/// draws unfolds the rest in place.
+const CHANGE_LINES: usize = 12;
+
 /// The longest tool input written, in characters.
 pub(crate) const INPUT_CHARS: usize = 160;
 
@@ -143,6 +147,16 @@ pub(crate) enum Block {
         failed: Style,
         line: Vec<Span<'static>>,
     },
+    /// A file an agent changed: `head`, its name and how many lines came
+    /// and went, then its lines changed with a few around them, numbered,
+    /// the first [`CHANGE_LINES`] until the person unfolds them, how many
+    /// more said in `faint`; `diff`, what it is copied as.
+    Change {
+        head: Vec<Span<'static>>,
+        rows: Vec<Vec<Span<'static>>>,
+        faint: Style,
+        diff: String,
+    },
     /// A command run in the background, in one line never folded: `head`,
     /// then what it does in a few words (the summarizer's, else `instead`,
     /// read from the line), then `tail`.
@@ -212,6 +226,7 @@ impl Block {
                     .trim()
                     .to_owned()
             }
+            Block::Change { diff, .. } => diff.clone(),
             Block::Summed {
                 summary, instead, ..
             } => summary.text().unwrap_or_else(|| {
@@ -239,6 +254,20 @@ impl Block {
         }
     }
 
+    /// A file's change whole, every line of it, within `width` columns;
+    /// none for anything else.
+    pub(crate) fn change_whole(&self, width: usize) -> Option<Vec<Line<'static>>> {
+        let Block::Change { head, rows, .. } = self else {
+            return None;
+        };
+        Some(
+            std::iter::once(head)
+                .chain(rows)
+                .map(|row| fit(row.clone(), width))
+                .collect(),
+        )
+    }
+
     /// Whether it is a line left empty.
     pub(crate) fn blank(&self) -> bool {
         matches!(self, Block::Para(para) if para.first.iter().chain(&para.body).all(|span| span.content.trim().is_empty()))
@@ -253,6 +282,7 @@ impl Block {
             Block::Summed { summary, .. } => summary.making(),
             Block::Job { label, .. } => label.making(),
             Block::Para(_)
+            | Block::Change { .. }
             | Block::Head { .. }
             | Block::Text(_)
             | Block::Whole(_)
@@ -303,6 +333,26 @@ impl Block {
                 vec![fit(spans, width)]
             }
             Block::Table(table) => table.lines(width, &indent),
+            Block::Change {
+                head, rows, faint, ..
+            } => {
+                let mut lines = vec![fit(head.clone(), width)];
+                lines.extend(
+                    rows.iter()
+                        .take(CHANGE_LINES)
+                        .map(|row| fit(row.clone(), width)),
+                );
+                if rows.len() > CHANGE_LINES {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(
+                            format!("… {} more lines", rows.len() - CHANGE_LINES),
+                            *faint,
+                        ),
+                    ]));
+                }
+                lines
+            }
             Block::Summed {
                 summary,
                 instead,
@@ -433,6 +483,9 @@ pub(crate) struct History {
     /// What to say after the person's next message to an agent: the models
     /// they named in it.
     after: HashMap<String, String>,
+    /// The files each agent changed since its steps were last written,
+    /// written under them.
+    changes: HashMap<String, Vec<Block>>,
     /// The number of each agent's last fold of steps written.
     told: HashMap<String, usize>,
     /// Where the line saying an agent joined waits to be written: one that
@@ -652,8 +705,25 @@ impl History {
             // part shows as it grows. What the agent wrote so far comes
             // before it. A question waits in its box with its choices, and
             // becomes a step once answered; iq's notice is a step too.
-            Event::Tool { agent, .. }
-            | Event::Reviewed { agent, .. }
+            Event::Tool { agent, .. } => {
+                self.finish(agent, board, p);
+                // A file changed: the fold it closed is written now, with
+                // the change.
+                if self
+                    .changes
+                    .get(agent)
+                    .is_some_and(|changes| !changes.is_empty())
+                {
+                    self.folds(agent, board, p);
+                }
+            }
+            Event::Changed { agent, path, diff } => {
+                if !self.in_pane(agent, board) {
+                    let change = change(path, diff, p);
+                    self.changes.entry(agent.clone()).or_default().push(change);
+                }
+            }
+            Event::Reviewed { agent, .. }
             | Event::Choose { agent, .. }
             | Event::Notice { agent, .. } => {
                 self.finish(agent, board, p);
@@ -1241,8 +1311,19 @@ impl History {
         self.told
             .insert(agent.to_owned(), new.last().map_or(told, |fold| fold.id));
         self.named(agent, board, p);
-        for fold in new {
-            self.fold(fold, board, p);
+        let changes = self.changes.remove(agent).unwrap_or_default();
+        let last = new.len() - 1;
+        for (at, fold) in new.into_iter().enumerate() {
+            // The one step that changed a file: the change stands for it.
+            let alone = at == last
+                && !changes.is_empty()
+                && matches!(fold.steps.as_slice(), [Step::Tool { ok: true, .. }]);
+            if !alone {
+                self.fold(fold, board, p);
+            }
+        }
+        for change in changes {
+            self.push_step_block(change);
         }
     }
 
@@ -1841,6 +1922,113 @@ fn first_lines(text: &str, first: &str, p: &Palette, most: usize) -> Vec<Para> {
         .collect()
 }
 
+/// How the file at `path` changed, as `diff`, a unified diff, says it:
+/// its name and how many lines came and went, then each line numbered as
+/// it stands in the file, those added green, those removed red.
+fn change(path: &str, diff: &str, p: &Palette) -> Block {
+    enum Kind {
+        Kept,
+        Added,
+        Removed,
+        Apart,
+        Said,
+    }
+    // Where a part of it begins, in the old file and the new.
+    let begins = |line: &str| -> Option<(usize, usize)> {
+        let rest = line.strip_prefix("@@ -")?;
+        let (old, rest) = rest.split_once(" +")?;
+        let new = rest.split_once(" @@")?.0;
+        let start = |part: &str| part.split(',').next()?.parse::<usize>().ok();
+        Some((start(old)?, start(new)?))
+    };
+    let mut lines: Vec<(Kind, usize, String)> = Vec::new();
+    let (mut old, mut new) = (0, 0);
+    for line in diff.lines() {
+        if let Some((from_old, from_new)) = begins(line) {
+            if !lines.is_empty() {
+                lines.push((Kind::Apart, 0, String::new()));
+            }
+            (old, new) = (from_old, from_new);
+            continue;
+        }
+        // Written as iq writes code: tabs as spaces, no control character.
+        let text = |rest: &str| -> String {
+            rest.replace('\t', "    ")
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect()
+        };
+        match line.split_at_checked(1) {
+            Some(("+", rest)) => {
+                lines.push((Kind::Added, new, text(rest)));
+                new += 1;
+            }
+            Some(("-", rest)) => {
+                lines.push((Kind::Removed, old, text(rest)));
+                old += 1;
+            }
+            Some((" ", rest)) => {
+                lines.push((Kind::Kept, new, text(rest)));
+                (old, new) = (old + 1, new + 1);
+            }
+            Some(("\\", rest)) => lines.push((Kind::Said, 0, text(rest.trim()))),
+            _ => {}
+        }
+    }
+    let count = |kind: fn(&Kind) -> bool| lines.iter().filter(|(k, ..)| kind(k)).count();
+    let added = count(|kind| matches!(kind, Kind::Added));
+    let removed = count(|kind| matches!(kind, Kind::Removed));
+    let mut head = vec![
+        Span::styled("  ✎ ", p.fg(p.info)),
+        Span::styled(short(path), p.fg(p.text)),
+    ];
+    if added > 0 {
+        head.push(Span::styled(format!("  +{added}"), p.fg(p.ok)));
+    }
+    if removed > 0 {
+        head.push(Span::styled(format!("  -{removed}"), p.fg(p.bad)));
+    }
+    let width = lines
+        .iter()
+        .map(|(_, number, _)| number.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let rows = lines
+        .into_iter()
+        .map(|(kind, number, text)| {
+            let (sign, style) = match kind {
+                Kind::Added => ("+", p.fg(p.ok)),
+                Kind::Removed => ("-", p.fg(p.bad)),
+                Kind::Kept => (" ", p.fg(p.dim)),
+                Kind::Apart => {
+                    return vec![
+                        Span::raw("    "),
+                        Span::styled(format!("{:>width$}", "⋮"), p.fg(p.faint)),
+                    ];
+                }
+                Kind::Said => {
+                    return vec![
+                        Span::raw("    "),
+                        Span::styled(format!("… {text}"), p.fg(p.faint)),
+                    ];
+                }
+            };
+            vec![
+                Span::raw("    "),
+                Span::styled(format!("{number:>width$} "), p.fg(p.faint)),
+                Span::styled(format!("{sign} "), style),
+                Span::styled(text, style),
+            ]
+        })
+        .collect();
+    Block::Change {
+        head,
+        rows,
+        faint: p.fg(p.faint),
+        diff: diff.to_owned(),
+    }
+}
+
 /// The number a message has on the steps' page, as its head ends: the
 /// way to it whole.
 fn numbered(id: Option<usize>, p: &Palette) -> Vec<Span<'static>> {
@@ -1860,6 +2048,7 @@ fn agent_of(event: &Event) -> Option<&str> {
         | Event::Text { agent, .. }
         | Event::Spent { agent, .. }
         | Event::Tool { agent, .. }
+        | Event::Changed { agent, .. }
         | Event::Asked { agent, .. }
         | Event::Reviewed { agent, .. }
         | Event::Done { agent, .. }
@@ -3262,6 +3451,88 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("still waiting: {lines:?}");
+    }
+
+    #[test]
+    fn a_file_changed_is_written_as_it_is_with_its_lines_added_and_removed() {
+        let p = Palette::new(Theme::Ink, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        let tool = |name: &str, input: &str| Event::Tool {
+            agent: "lead".into(),
+            name: name.into(),
+            input: input.into(),
+            output: "Edited.".into(),
+            ok: true,
+        };
+        let changed = |path: &str, diff: &str| Event::Changed {
+            agent: "lead".into(),
+            path: path.into(),
+            diff: diff.into(),
+        };
+        let new: String = (1..=20).map(|n| format!("\n+line {n}")).collect();
+        for event in [
+            Event::Joined {
+                agent: "lead".into(),
+                model: "m".into(),
+                by: PERSON.into(),
+            },
+            Event::Working {
+                agent: "lead".into(),
+                prompt: "fix it".into(),
+            },
+            tool("read_file", "src/a.rs"),
+            changed(
+                "src/a.rs",
+                "@@ -9,3 +9,3 @@\n fn a() {\n-    old();\n+    new();\n }",
+            ),
+            tool("edit_file", "src/a.rs"),
+        ] {
+            crew(&mut board, &mut history, event, &p);
+        }
+        // Written as it is made, under the steps it closes.
+        let lines = settled(&mut history, "lead");
+        let at = lines
+            .iter()
+            .position(|line| line.contains("2 steps"))
+            .expect("the steps before it");
+        assert_eq!(
+            lines[at + 1..at + 6],
+            [
+                "  ✎ src/a.rs  +1  -1",
+                "     9   fn a() {",
+                "    10 -     old();",
+                "    10 +     new();",
+                "    11   }",
+            ]
+        );
+        // A file written alone: the change stands for its step, its first
+        // lines written.
+        for event in [
+            changed("src/new.rs", &format!("@@ -0,0 +1,20 @@{new}")),
+            tool("write_file", "src/new.rs"),
+        ] {
+            crew(&mut board, &mut history, event, &p);
+        }
+        let lines = settled(&mut history, "lead");
+        assert!(
+            !lines.iter().any(|line| line.contains("write_file")),
+            "{lines:#?}"
+        );
+        let head = lines
+            .iter()
+            .position(|line| line == "  ✎ src/new.rs  +20")
+            .unwrap();
+        assert_eq!(lines[head + 1], "     1 + line 1");
+        assert_eq!(lines[head + 12], "    12 + line 12");
+        assert_eq!(lines[head + 13], "    … 8 more lines");
+        // Green added, red removed.
+        let p2 = Palette::new(Theme::Ink, Depth::True);
+        let Block::Change { rows, .. } = change("x", "@@ -1,1 +1,1 @@\n-a\n+b", &p2) else {
+            panic!("a change");
+        };
+        assert_eq!(rows[0][3].style, p2.fg(p2.bad));
+        assert_eq!(rows[1][3].style, p2.fg(p2.ok));
     }
 
     #[test]

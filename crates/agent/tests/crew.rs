@@ -359,6 +359,57 @@ async fn an_agent_writes_and_reads_through_the_gate_and_says_what_it_spent() {
 }
 
 #[tokio::test]
+async fn a_file_written_or_edited_is_said_with_how_its_lines_changed() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls(
+                    "write_file",
+                    serde_json::json!({"path": "src/hello.txt", "content": "hi\nthere\n"}),
+                ),
+                calls(
+                    "edit_file",
+                    serde_json::json!({"path": "src/hello.txt", "old_text": "there", "new_text": "you"}),
+                ),
+                say("Done."),
+            ],
+        )],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "write hello".into(), PERSON);
+    f.settled().await;
+    let events = f.events();
+    let changed: Vec<(&str, &str)> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Changed { path, diff, .. } => Some((path.as_str(), diff.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            ("src/hello.txt", "@@ -0,0 +1,2 @@\n+hi\n+there"),
+            ("src/hello.txt", "@@ -1,2 +1,2 @@\n hi\n-there\n+you"),
+        ]
+    );
+    // Said before the step that wrote it.
+    let at = |name: &str| {
+        events
+            .iter()
+            .position(|event| matches!(event, Event::Tool { name: n, .. } if n == name))
+            .unwrap()
+    };
+    let first = events
+        .iter()
+        .position(|event| matches!(event, Event::Changed { .. }))
+        .unwrap();
+    assert!(first < at("write_file"));
+}
+
+#[tokio::test]
 async fn what_the_gate_asks_waits_for_the_person() {
     let f = fixture(
         &[(

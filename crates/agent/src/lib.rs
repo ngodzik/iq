@@ -18,6 +18,7 @@
 #![warn(missing_docs)]
 
 mod crew;
+mod diff;
 mod event;
 mod extension;
 mod keep;

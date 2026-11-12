@@ -205,7 +205,7 @@ impl Laid<'_> {
         at > 0
             && matches!(
                 self.blocks[at - 1],
-                Block::Entry { .. } | Block::Folded { .. }
+                Block::Entry { .. } | Block::Folded { .. } | Block::Change { .. }
             )
     }
 
@@ -462,6 +462,7 @@ impl Laid<'_> {
                 }
                 .lines(self.width, self.cell, images),
             ),
+            Block::Change { .. } => block.change_whole(self.width),
             _ => None,
         }
     }
