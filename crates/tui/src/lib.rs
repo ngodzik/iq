@@ -137,7 +137,8 @@ pub fn run(
     let p = Palette::new(board.look().theme(), depth);
     let mut history = History::default();
     history.set_drawn(drawn);
-    history.set_links(link::supported(|name| std::env::var(name).ok()));
+    // Drawn, iq opens a link itself.
+    history.set_links(drawn || link::supported(|name| std::env::var(name).ok()));
     history.pictures(screen.kitty.and(draw), cell());
     history.summaries(summarize);
     let mut iq = Iq {
@@ -604,7 +605,21 @@ impl Iq {
             write!(screen.out, "\x1b]52;c;{encoded}\x07")?;
             screen.out.flush()?;
         }
-        let said = shown.said.clone();
+        let mut said = shown.said.clone();
+        if let Some(address) = &shown.open {
+            said = Some(match link::open(address) {
+                Ok(()) => format!("opening {address}"),
+                Err(error) => format!("{address} could not be opened: {error}"),
+            });
+        }
+        // The status line says where the link pointed at leads.
+        self.board.set_pointed(shown.pointed.clone());
+        let live = Live {
+            board: &self.board,
+            history: &self.history,
+            p: &self.p,
+            now,
+        };
         let motion = &mut self.motion;
         screen.terminal.draw(|frame| {
             live.draw_head_in(frame, Rect::new(0, 0, cols, head), motion);
@@ -615,14 +630,19 @@ impl Iq {
         if missed {
             self.board.read_no_more();
         }
+        // What is said takes rows of the live part: drawn again at once
+        // with it, rather than at the next change.
         if let Some(said) = said {
             self.board.screen_mut().notice(said, now);
+            return self.draw_drawn(now);
         }
         Ok(())
     }
 
-    /// Waits up to `wait` for keys, pastes, the wheel and resizes, and
-    /// takes them all. Returns whether any came.
+    /// Waits up to `wait` for keys, pastes, the wheel, the mouse and
+    /// resizes, and takes them all. Returns whether any came that changes
+    /// what shows: the mouse moving changes it only as it comes over a
+    /// link or leaves one.
     fn keys(&mut self, wait: Duration) -> io::Result<bool> {
         match self.screen.tty.wait(wait) {
             Wait::Nothing => return Ok(false),
@@ -634,11 +654,22 @@ impl Iq {
             }
             Wait::Ready => {}
         }
+        let mut changed = false;
         loop {
             if !event::poll(Duration::ZERO)? {
-                return Ok(true);
+                return Ok(changed);
             }
-            match event::read()? {
+            let event = event::read()?;
+            if let Event::Mouse(mouse) = &event
+                && mouse.kind == MouseEventKind::Moved
+            {
+                if let Some(view) = self.screen.drawn.as_mut() {
+                    changed |= view.point(mouse.column, mouse.row);
+                }
+                continue;
+            }
+            changed = true;
+            match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let (chord, typed) = keys::chord(&key);
                     for request in self.board.press(&chord, typed, iq_ui::now()) {

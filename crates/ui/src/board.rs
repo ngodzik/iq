@@ -224,6 +224,23 @@ pub struct Board {
     /// they chose in it: the arrows and Enter are its, until Escape or
     /// another key.
     reading: bool,
+    /// The link the person points at in the conversation iq draws, as the
+    /// terminal last drew it.
+    pointed: Option<Pointed>,
+}
+
+/// A link the person points at in the conversation iq draws, the mouse
+/// over it or the mark on what holds it: the status line shows its
+/// address, so that what opens is known before it opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pointed {
+    /// Its address.
+    pub address: String,
+    /// How many more links what is marked holds.
+    pub more: usize,
+    /// Whether the mouse is over it, rather than the mark on what holds
+    /// it.
+    pub mouse: bool,
 }
 
 /// What the person asks of the conversation iq draws on the terminal's
@@ -252,6 +269,12 @@ pub enum Reading {
     Match(isize),
     /// Copy what is marked, as it was written.
     Copy,
+    /// Open the link what is marked holds, or list them when it holds
+    /// several, to choose one; the one chosen, while they are listed.
+    Open,
+    /// Open the link of this number, from one, of those listed, else of
+    /// those what is marked holds.
+    Pick(usize),
     /// The person reads no more: the mark goes, and what was found.
     Leave,
 }
@@ -320,6 +343,7 @@ impl Board {
             unfold: false,
             readings: Vec::new(),
             reading: false,
+            pointed: None,
         }
     }
 
@@ -328,6 +352,19 @@ impl Board {
     #[must_use]
     pub fn reading(&self) -> bool {
         self.reading
+    }
+
+    /// The link the person points at in the conversation iq draws, as the
+    /// terminal last drew it.
+    #[must_use]
+    pub fn pointed(&self) -> Option<&Pointed> {
+        self.pointed.as_ref()
+    }
+
+    /// Says which link the person points at in the conversation iq draws,
+    /// as the terminal drew it.
+    pub fn set_pointed(&mut self, pointed: Option<Pointed>) {
+        self.pointed = pointed;
     }
 
     /// The person reads the conversation iq draws no more: a click fell
@@ -348,14 +385,17 @@ impl Board {
 
     /// What `chord` does while the person reads the conversation iq
     /// draws: the arrows move the mark, Enter unfolds what it marks or
-    /// folds it again, Escape stops reading. None for another key, which
-    /// stops reading and goes where the person writes.
+    /// folds it again, o and the numbers open its links, Escape stops
+    /// reading. None for another key, which stops reading and goes where
+    /// the person writes.
     fn reading_key(&mut self, chord: &Chord, typed: Option<char>) -> Option<Vec<Request>> {
         let plain = !chord.ctrl && !chord.alt && !chord.cmd && !chord.shift;
         let reading = match (chord.key.as_str(), typed) {
             (_, Some('c')) => Reading::Copy,
             (_, Some('n')) => Reading::Match(-1),
             (_, Some('N')) => Reading::Match(1),
+            (_, Some('o')) => Reading::Open,
+            (_, Some(digit @ '1'..='9')) => Reading::Pick(digit as usize - '0' as usize),
             _ => match chord.key.as_str() {
                 "Up" if plain => Reading::Mark(-1),
                 "Down" if plain => Reading::Mark(1),
@@ -1998,6 +2038,17 @@ mod tests {
             board.take_readings(),
             [Reading::Click(4, 9), Reading::Leave]
         );
+        // Its links opened: the first, or the one of a number.
+        board.click(4, 9);
+        for c in ['o', '2'] {
+            board.press(&Chord::plain(&c.to_string()), Some(c), 1);
+        }
+        assert_eq!(
+            board.take_readings(),
+            [Reading::Click(4, 9), Reading::Open, Reading::Pick(2)]
+        );
+        key(&mut board, "Escape");
+        let _ = board.take_readings();
         // Not reading, the arrows are the editor's.
         key(&mut board, "Up");
         assert!(board.take_readings().is_empty());

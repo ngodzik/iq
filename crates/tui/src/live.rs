@@ -324,7 +324,7 @@ impl Live<'_> {
             let p = self.p;
             parts.push(Part::Lines(vec![fit(
                 vec![Span::styled(
-                    "  ↑ ↓ mark what is folded or a diagram · Enter unfolds, folds, enlarges · c copies · n N the matches · Esc writes again",
+                    "  ↑ ↓ mark what is folded or a diagram · Enter unfolds, folds, enlarges · o opens its links · c copies · n N the matches · Esc writes again",
                     p.fg(p.faint),
                 )],
                 width,
@@ -1262,6 +1262,24 @@ impl Live<'_> {
                 format!("{waiting} waiting for you"),
                 p.fg(p.warn),
             ));
+        }
+        // A link pointed at in the conversation iq draws: where it leads,
+        // before it opens.
+        if let Some(pointed) = self.board.pointed() {
+            let how = match (pointed.mouse, pointed.more) {
+                (true, _) => " · a click opens it".to_owned(),
+                (false, 0) => " · o opens it".to_owned(),
+                (false, more) => format!(" · and {more} more: o lists them"),
+            };
+            left = vec![
+                Span::raw(" "),
+                Span::styled("↗ ", p.fg(p.accent)),
+                Span::styled(
+                    pointed.address.clone(),
+                    p.fg(p.info).add_modifier(Modifier::UNDERLINED),
+                ),
+                Span::styled(how, p.fg(p.faint)),
+            ];
         }
         // On the right, the person, the chat written to and the agents it
         // started, by name while they fit: the other chats are the

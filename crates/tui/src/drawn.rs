@@ -7,16 +7,18 @@
 //! follows it. A diagram is enlarged with a click, across the width, the
 //! conversation's room its alone and the wheel its, until another click
 //! puts it back. iq finds words in it itself, each match marked in turn,
-//! and copies what is marked as it was written. The end follows what is
-//! written while the person is at it;
-//! scrolled up, the view stays put as more comes, its top held by the
-//! block it is in.
+//! and copies what is marked as it was written. A link opens with a click,
+//! its address shown while the mouse is over it, or with a key from what
+//! is marked, iq handing it to the system's opener as the terminal would.
+//! The end follows what is written while the person is at it; scrolled up,
+//! the view stays put as more comes, its top held by the block it is in.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use iq_ui::steps::Entry;
-use iq_ui::{Board, Reading};
+use iq_ui::{Board, Pointed, Reading};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::diagram::Image;
@@ -49,8 +51,32 @@ pub(crate) struct View {
     found: Option<(String, Vec<usize>)>,
     /// The block each row of the conversation showed, as last drawn.
     rows: Vec<Option<usize>>,
+    /// The links each row showed, as last drawn.
+    links: Vec<Vec<Link>>,
     /// The screen's row the conversation began at, as last drawn.
     from: u16,
+    /// Where the mouse is, its column and its row on the screen.
+    pointer: Option<(u16, u16)>,
+    /// The links of what is marked, listed for the person to choose one.
+    listing: Option<Listing>,
+}
+
+/// A link where the conversation shows it: its columns on its row, and
+/// its address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Link {
+    from: usize,
+    to: usize,
+    number: usize,
+    address: String,
+}
+
+/// The links of what is marked, each its text and its address, and the
+/// one chosen.
+#[derive(Debug)]
+struct Listing {
+    links: Vec<(String, String)>,
+    picked: usize,
 }
 
 /// What the conversation shows, laid out.
@@ -68,6 +94,10 @@ pub(crate) struct Shown {
     /// What to tell the person of what they asked: what was found, what
     /// was copied.
     pub(crate) said: Option<String>,
+    /// The address of the link the person opened, for the system's opener.
+    pub(crate) open: Option<String>,
+    /// The link the person points at, for the status line.
+    pub(crate) pointed: Option<Pointed>,
 }
 
 /// Where the conversation is drawn: the screen's rows from `from`, as many
@@ -192,6 +222,36 @@ impl Laid<'_> {
         }
     }
 
+    /// The links place `at` shows, each its text and its address, in the
+    /// order they show: a link folded over lines is one.
+    fn links(&self, at: usize) -> Vec<(String, String)> {
+        let mut links: Vec<(usize, String, String)> = Vec::new();
+        for line in self.lines(at, &mut Vec::new()) {
+            let mut last = None;
+            for span in &line.spans {
+                let Some((number, address, _)) = crate::link::address_of(span.style) else {
+                    last = None;
+                    continue;
+                };
+                match links.iter_mut().find(|(n, ..)| *n == number) {
+                    // Its next span on the line, or the next line of it.
+                    Some((_, text, _)) => {
+                        if last != Some(number) {
+                            text.push(' ');
+                        }
+                        text.push_str(&span.content);
+                    }
+                    None => links.push((number, span.content.to_string(), address)),
+                }
+                last = Some(number);
+            }
+        }
+        links
+            .into_iter()
+            .map(|(_, text, address)| (text.trim().to_owned(), address))
+            .collect()
+    }
+
     /// Whether the mark goes to place `at`: what folds, a diagram.
     fn markable(&self, at: usize) -> bool {
         self.foldable(at) || at > 0 && matches!(self.blocks[at - 1], Block::Diagram { .. })
@@ -284,6 +344,7 @@ impl View {
         let mut missed = false;
         let mut copied = None;
         let mut said = None;
+        let mut open = None;
         let (first, blocks) = history.blocks(window);
         let blocks: Vec<&Block> = blocks.into_iter().flatten().collect();
         for reading in readings {
@@ -300,6 +361,38 @@ impl View {
             };
             // Enlarged, a diagram takes the wheel; a click, Enter or
             // anything else puts it back.
+            // Listed, the links take the arrows, Enter and the numbers;
+            // anything else but the wheel puts them away.
+            if let Some(listing) = &mut self.listing {
+                let last = listing.links.len().saturating_sub(1);
+                let chosen = match reading {
+                    Reading::Mark(by) => {
+                        listing.picked = listing.picked.saturating_add_signed(*by).min(last);
+                        continue;
+                    }
+                    Reading::Toggle | Reading::Open => {
+                        Some(listing.links.get(listing.picked).cloned())
+                    }
+                    Reading::Pick(number) => Some(
+                        number
+                            .checked_sub(1)
+                            .and_then(|at| listing.links.get(at))
+                            .cloned(),
+                    ),
+                    _ => None,
+                };
+                match chosen {
+                    Some(link) => {
+                        open = link.map(|(_, address)| address);
+                        self.listing = None;
+                        continue;
+                    }
+                    None if !matches!(reading, Reading::Scroll(_) | Reading::Page(_)) => {
+                        self.listing = None;
+                    }
+                    None => {}
+                }
+            }
             if let Some((number, first)) = self.zoom {
                 let page = height.saturating_sub(1).max(1) as isize;
                 let by = match reading {
@@ -337,11 +430,19 @@ impl View {
                         self.open(&laid, height, number);
                     }
                 }
-                Reading::Click(_, row) => {
+                Reading::Click(column, row) => {
                     let shown = usize::from(row.saturating_sub(self.from));
                     let clicked = (*row >= self.from)
                         .then(|| self.rows.get(shown).copied().flatten())
                         .flatten();
+                    // On a link, it opens: what holds it is only marked.
+                    if let Some(link) = self.link_at(*column, *row) {
+                        open = Some(link.address.clone());
+                        if clicked.is_some() {
+                            self.mark = clicked;
+                        }
+                        continue;
+                    }
                     match clicked {
                         Some(number) => {
                             self.mark = Some(number);
@@ -392,6 +493,28 @@ impl View {
                         copied = Some(text);
                     }
                 }
+                Reading::Open | Reading::Pick(_) => {
+                    let links = self
+                        .mark
+                        .map(|mark| laid.links(laid.at(mark)))
+                        .unwrap_or_default();
+                    match (reading, links.len()) {
+                        (_, 0) => said = Some("nothing marked holds a link".to_owned()),
+                        (Reading::Pick(number), count) => {
+                            match number.checked_sub(1).and_then(|at| links.get(at)) {
+                                Some((_, address)) => open = Some(address.clone()),
+                                None => {
+                                    said = Some(format!(
+                                        "what is marked holds {count} link{}",
+                                        if count == 1 { "" } else { "s" }
+                                    ));
+                                }
+                            }
+                        }
+                        (_, 1) => open = links.into_iter().next().map(|(_, address)| address),
+                        _ => self.listing = Some(Listing { links, picked: 0 }),
+                    }
+                }
                 Reading::Leave => {
                     self.mark = None;
                     self.found = None;
@@ -434,6 +557,10 @@ impl View {
         shown.missed = missed;
         shown.copied = copied;
         shown.said = said;
+        shown.open = open;
+        // A link's address rides on its spans' background: taken off them,
+        // kept for where each shows.
+        self.links = shown.lines.iter_mut().map(unlinked).collect();
         if let Some((words, _)) = &self.found {
             for line in &mut shown.lines {
                 highlighted(line, words);
@@ -447,7 +574,104 @@ impl View {
                 }
             }
         }
+        if let Some(listing) = self.listing.take() {
+            self.list(&mut shown, &listing, area, p);
+            self.listing = Some(listing);
+        }
+        shown.pointed = self
+            .pointer
+            .and_then(|(column, row)| self.link_at(column, row))
+            .map(|link| Pointed {
+                address: link.address.clone(),
+                more: 0,
+                mouse: true,
+            })
+            .or_else(|| {
+                let (address, more) = match &self.listing {
+                    Some(listing) => (listing.links.get(listing.picked)?.1.clone(), 0),
+                    None => {
+                        let links = laid.links(laid.at(mark?));
+                        let more = links.len().saturating_sub(1);
+                        (links.into_iter().next()?.1, more)
+                    }
+                };
+                Some(Pointed {
+                    address,
+                    more,
+                    mouse: false,
+                })
+            });
         shown
+    }
+
+    /// The mouse is now over the cell at `column` and `row` of the screen.
+    /// Returns whether it points at another link than it did.
+    pub(crate) fn point(&mut self, column: u16, row: u16) -> bool {
+        let at = |view: &View, (column, row): (u16, u16)| {
+            view.link_at(column, row).map(|link| (row, link.from))
+        };
+        let before = self.pointer.and_then(|pointer| at(self, pointer));
+        self.pointer = Some((column, row));
+        before != at(self, (column, row))
+    }
+
+    /// The link the cell at `column` and `row` of the screen showed, as
+    /// last drawn.
+    fn link_at(&self, column: u16, row: u16) -> Option<&Link> {
+        let column = usize::from(column);
+        self.links
+            .get(usize::from(row.checked_sub(self.from)?))?
+            .iter()
+            .find(|link| (link.from..link.to).contains(&column))
+    }
+
+    /// The links listed, over the last rows of the conversation, each a
+    /// row a click opens.
+    fn list(&mut self, shown: &mut Shown, listing: &Listing, area: Area, p: &Palette) {
+        let height = area.height.max(1);
+        let room = height.saturating_sub(1).max(1);
+        let first = listing.picked.saturating_sub(room - 1);
+        let mut lines = vec![Line::from(Span::styled(
+            "  links in what is marked · ↑ ↓ and Enter, its number or a click opens one · Esc",
+            p.fg(p.faint),
+        ))];
+        let mut links = vec![Vec::new()];
+        for (at, (text, address)) in listing.links.iter().enumerate().skip(first).take(room) {
+            let picked = at == listing.picked;
+            let lead = if picked { "› " } else { "  " };
+            lines.push(crate::wrap::fit(
+                vec![
+                    Span::styled(lead, p.bold(p.accent)),
+                    Span::styled(format!("{} ", at + 1), p.fg(p.dim)),
+                    Span::styled(
+                        text.clone(),
+                        if picked { p.bold(p.text) } else { p.fg(p.text) },
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        address.clone(),
+                        p.fg(p.info).add_modifier(Modifier::UNDERLINED),
+                    ),
+                ],
+                area.width,
+            ));
+            links.push(vec![Link {
+                from: 0,
+                to: area.width,
+                number: at + 1,
+                address: address.clone(),
+            }]);
+        }
+        let over = lines.len().min(height);
+        shown.lines.resize(height, Line::default());
+        self.rows.resize(height, None);
+        self.links.resize(height, Vec::new());
+        let start = height - over;
+        for (row, (line, links)) in lines.into_iter().zip(links).take(over).enumerate() {
+            shown.lines[start + row] = line;
+            self.rows[start + row] = None;
+            self.links[start + row] = links;
+        }
     }
 
     /// Opens the block numbered `number`: a diagram enlarged, what is
@@ -633,6 +857,30 @@ impl View {
         }
         self.top = (below > height).then(|| (laid.number(at), row));
     }
+}
+
+/// The links `line` shows, by their columns, their addresses taken off
+/// their spans' background, which the terminal would paint.
+fn unlinked(line: &mut Line<'static>) -> Vec<Link> {
+    let mut links: Vec<Link> = Vec::new();
+    let mut column = 0;
+    for span in &mut line.spans {
+        let width = span.width();
+        if let Some((number, address, plain)) = crate::link::address_of(span.style) {
+            span.style = plain;
+            match links.last_mut() {
+                Some(link) if link.number == number && link.to == column => link.to += width,
+                _ => links.push(Link {
+                    from: column,
+                    to: column + width,
+                    number,
+                    address,
+                }),
+            }
+        }
+        column += width;
+    }
+    links
 }
 
 /// `line` with `words` shown reversed wherever it holds them, whatever
@@ -913,6 +1161,85 @@ mod tests {
             &[Reading::Leave],
         );
         assert!(!left.lines.iter().any(reversed));
+    }
+
+    #[test]
+    fn a_link_opens_with_a_click_or_a_key_its_address_said_first() {
+        let (p, mut board, mut history) = joined();
+        history.set_links(true);
+        said(
+            &mut board,
+            &mut history,
+            &p,
+            "See [the docs](https://example.com/docs) first.\n\nThen [one](https://example.com/1) and [two](https://example.com/2).\n",
+        );
+        let _ = history.take(60, Some("lead"));
+        let mut view = View::default();
+        let first = view.shown(&history, &board, &p, Some("lead"), area(20), &[]);
+        // Underlined, its address off the background the terminal paints.
+        let row = first
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("the docs"))
+            .unwrap();
+        let docs = first.lines[row]
+            .spans
+            .iter()
+            .find(|span| span.content == "the docs")
+            .unwrap();
+        assert!(docs.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(docs.style.bg, None);
+        let column = first.lines[row].to_string().find("the docs").unwrap() as u16;
+        // The mouse over it, the status line says where it leads.
+        assert!(view.point(column + 2, 2 + row as u16));
+        assert!(!view.point(column + 3, 2 + row as u16));
+        let over = view.shown(&history, &board, &p, Some("lead"), area(20), &[]);
+        assert_eq!(
+            over.pointed.as_ref().map(|p| (p.address.as_str(), p.mouse)),
+            Some(("https://example.com/docs", true))
+        );
+        // Clicked, it opens, and nothing else happens.
+        let click = Reading::Click(column + 1, 2 + row as u16);
+        let opened = view.shown(&history, &board, &p, Some("lead"), area(20), &[click]);
+        assert_eq!(opened.open.as_deref(), Some("https://example.com/docs"));
+        assert_eq!(rows(&opened)[row], "▌ See the docs first.");
+        assert_eq!(rows(&opened).len(), rows(&first).len());
+        // Marked, what holds two lists them, to choose one.
+        assert!(view.point(0, 0));
+        let both = opened
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("Then"))
+            .unwrap();
+        let readings = [Reading::Click(0, 2 + both as u16), Reading::Open];
+        let listed = view.shown(&history, &board, &p, Some("lead"), area(20), &readings);
+        assert_eq!(listed.open, None);
+        let listed = rows(&listed);
+        assert!(
+            listed.contains(&"› 1 one  https://example.com/1".to_owned()),
+            "{listed:#?}"
+        );
+        assert!(listed.contains(&"  2 two  https://example.com/2".to_owned()));
+        let chosen = [Reading::Mark(1), Reading::Toggle];
+        let opened = view.shown(&history, &board, &p, Some("lead"), area(20), &chosen);
+        assert_eq!(opened.open.as_deref(), Some("https://example.com/2"));
+        assert!(!rows(&opened).iter().any(|row| row.contains("links in")));
+        // Or by its number, the first said with how many more there are.
+        let pointed = view.shown(&history, &board, &p, Some("lead"), area(20), &[]);
+        let pointed = pointed.pointed.unwrap();
+        assert_eq!(
+            (pointed.address.as_str(), pointed.more),
+            ("https://example.com/1", 1)
+        );
+        let picked = view.shown(
+            &history,
+            &board,
+            &p,
+            Some("lead"),
+            area(20),
+            &[Reading::Pick(2)],
+        );
+        assert_eq!(picked.open.as_deref(), Some("https://example.com/2"));
     }
 
     #[test]
