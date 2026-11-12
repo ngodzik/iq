@@ -108,7 +108,7 @@ impl Para {
 /// source written as code unless it is drawn, with the styles of what is
 /// said of it.
 #[derive(Debug, Clone)]
-enum Block {
+pub(crate) enum Block {
     Para(Para),
     Whole(Line<'static>),
     /// One row, cut to the width: a step said in a few words.
@@ -180,7 +180,12 @@ impl Block {
 
     /// Its lines within `width` columns, on cells of `cell` pixels, the
     /// images they show put in `images`.
-    fn lines(&self, width: usize, cell: (u16, u16), images: &mut Vec<Image>) -> Vec<Line<'static>> {
+    pub(crate) fn lines(
+        &self,
+        width: usize,
+        cell: (u16, u16),
+        images: &mut Vec<Image>,
+    ) -> Vec<Line<'static>> {
         let indent = [Span::raw("  ")];
         match self {
             Block::Para(para) => wrap(&para.body, width, &para.first, &para.rest),
@@ -315,6 +320,11 @@ pub(crate) struct History {
     /// What each chat's window holds, the latest last, as many as
     /// [`KEPT`]: none is the window of a new chat.
     kept: HashMap<Option<String>, VecDeque<Block>>,
+    /// How many of each window's oldest blocks were let go: the number of
+    /// its first kept.
+    dropped: HashMap<Option<String>, usize>,
+    /// Whether iq draws the conversation itself, on the other screen.
+    drawn: bool,
     /// The lines iq opens with, at the top of every window.
     opening: Vec<Para>,
     /// Whether the window on the terminal shows them.
@@ -748,6 +758,9 @@ impl History {
                 }
                 if let Some(kept) = self.kept.remove(&old) {
                     self.kept.insert(new.clone(), kept);
+                }
+                if let Some(dropped) = self.dropped.remove(&old) {
+                    self.dropped.insert(new.clone(), dropped);
                 }
                 if let Some(kind) = self.kinds.remove(&old) {
                     self.kinds.insert(new.clone(), kind);
@@ -1345,17 +1358,23 @@ impl History {
                 .as_slice()
                 .iter()
                 .any(|(other, _)| other.clone().or_else(|| window.clone()) == chat);
-            if chat == window && !self.hurried && last && matches!(block, Block::Folded { .. }) {
+            if chat == window
+                && !self.hurried
+                && !self.drawn
+                && last
+                && matches!(block, Block::Folded { .. })
+            {
                 self.paras.push((given, block));
                 continue;
             }
             if chat == window {
                 lines.extend(block.lines(width, self.cell, &mut self.images));
             }
-            let kept = self.kept.entry(chat).or_default();
+            let kept = self.kept.entry(chat.clone()).or_default();
             kept.push_back(block);
             while kept.len() > KEPT {
                 kept.pop_front();
+                *self.dropped.entry(chat.clone()).or_default() += 1;
             }
         }
         lines
@@ -1414,6 +1433,8 @@ impl History {
         let mut kept = self.kept.remove(&None).unwrap_or_default();
         kept.extend(self.kept.remove(&key).unwrap_or_default());
         self.kept.insert(key.clone(), kept);
+        let dropped = self.dropped.remove(&None).unwrap_or_default();
+        self.dropped.insert(key.clone(), dropped);
         if let Some(kind) = self.kinds.remove(&None) {
             self.kinds.insert(key.clone(), kind);
         }
@@ -1421,6 +1442,35 @@ impl History {
             self.speakers.insert(key, speaker);
         }
         true
+    }
+
+    /// Whether iq draws the conversation itself, on the other screen: a
+    /// diagram folded then waits for nothing, unfolded with a click.
+    pub(crate) fn set_drawn(&mut self, drawn: bool) {
+        self.drawn = drawn;
+    }
+
+    /// The blocks `window` keeps, the oldest first, and the number of the
+    /// first: a block's number stays its own as the oldest are let go.
+    pub(crate) fn blocks(&self, window: Option<&str>) -> (usize, Option<&VecDeque<Block>>) {
+        let key = window.map(str::to_owned);
+        (
+            self.dropped.get(&key).copied().unwrap_or_default(),
+            self.kept.get(&key),
+        )
+    }
+
+    /// What iq opens with, folded within `width` columns.
+    pub(crate) fn opening_lines(&self, width: usize) -> Vec<Line<'static>> {
+        self.opening
+            .iter()
+            .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest))
+            .collect()
+    }
+
+    /// The size of a cell in pixels, as the terminal said it.
+    pub(crate) fn cell(&self) -> (u16, u16) {
+        self.cell
     }
 
     /// `window`'s chat whole, as the person comes to it, folded within

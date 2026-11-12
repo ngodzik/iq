@@ -217,6 +217,22 @@ pub struct Board {
     folded: bool,
     /// Whether the person asked the diagram folded to unfold.
     unfold: bool,
+    /// What the person asked of the conversation iq draws since the
+    /// terminal last took it.
+    readings: Vec<Reading>,
+}
+
+/// What the person asks of the conversation iq draws on the terminal's
+/// other screen (`conversation = "drawn"`), for the terminal to carry out
+/// where it knows what each row shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reading {
+    /// Scroll it by as many rows, up when fewer than none: the wheel, the
+    /// touchpad.
+    Scroll(isize),
+    /// Scroll it by as many of its heights, a row kept: Page Up, Page
+    /// Down.
+    Page(isize),
 }
 
 /// The image a paste is, when it is the path of one alone: a file dropped
@@ -281,7 +297,19 @@ impl Board {
             picking: 0,
             folded: false,
             unfold: false,
+            readings: Vec::new(),
         }
+    }
+
+    /// What the person asked of the conversation iq draws since last
+    /// taken, in order.
+    pub fn take_readings(&mut self) -> Vec<Reading> {
+        std::mem::take(&mut self.readings)
+    }
+
+    /// Whether iq draws the conversation, no page over it.
+    fn drawn(&self) -> bool {
+        self.look.conversation() == crate::look::Conversation::Drawn && self.screen.page().is_none()
     }
 
     /// Says whether a diagram shows folded as the last thing written in
@@ -860,6 +888,12 @@ impl Board {
             }
             return Vec::new();
         }
+        // The conversation iq draws scrolls by its height.
+        if plain && self.drawn() && matches!(chord.key.as_str(), "PageUp" | "PageDown") {
+            let sign = if chord.key == "PageUp" { -1 } else { 1 };
+            self.readings.push(Reading::Page(sign));
+            return Vec::new();
+        }
         // Where nothing is written, the down arrow moves nowhere: it
         // unfolds the diagram folded at the conversation's end.
         if plain
@@ -916,6 +950,8 @@ impl Board {
             let chosen = self.screen.chosen() as isize + lines.signum();
             self.screen
                 .choose(chosen.max(0) as usize, self.chats_by_use().len());
+        } else if self.drawn() {
+            self.readings.push(Reading::Scroll(lines));
         } else {
             self.screen.scroll_by(lines);
         }
@@ -1813,6 +1849,28 @@ fn from_words(request: &str, named: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_conversation_iq_draws_is_scrolled_by_the_wheel_and_the_page_keys() {
+        let look = Look::default().with_conversation(crate::look::Conversation::Drawn);
+        let mut board = Board::new(Keymap::default(), look);
+        board.scroll(-3);
+        key(&mut board, "PageUp");
+        key(&mut board, "PageDown");
+        assert_eq!(
+            board.take_readings(),
+            [Reading::Scroll(-3), Reading::Page(-1), Reading::Page(1)]
+        );
+        // A page over it takes them.
+        key(&mut board, "ctrl+o");
+        board.scroll(2);
+        assert!(board.take_readings().is_empty());
+        // Written to the scrollback, the terminal scrolls it.
+        let mut board = Board::default();
+        board.scroll(-3);
+        key(&mut board, "PageUp");
+        assert!(board.take_readings().is_empty());
+    }
 
     #[test]
     fn the_down_arrow_unfolds_a_diagram_folded_only_where_nothing_is_written() {

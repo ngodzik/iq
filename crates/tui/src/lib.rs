@@ -17,6 +17,7 @@
 
 mod chart;
 mod diagram;
+mod drawn;
 mod graphics;
 mod history;
 mod inline;
@@ -40,6 +41,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use iq_ui::crew::Request;
+use iq_ui::look::Conversation;
 use iq_ui::{Board, Update};
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::MoveTo;
@@ -48,12 +50,14 @@ use ratatui::crossterm::terminal::{Clear, ClearType};
 use ratatui::crossterm::{cursor, queue, terminal};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 pub use crate::diagram::{Draw, Drawn};
 pub use crate::summary::Summarize;
 
 use crate::diagram::Image;
+use crate::drawn::View;
 use crate::graphics::Kitty;
 use crate::history::History;
 use crate::inline::Inline;
@@ -89,14 +93,26 @@ pub fn run(
     draw: Option<Arc<dyn Draw>>,
     summarize: Option<Arc<dyn Summarize>>,
 ) -> io::Result<()> {
-    let tty = Tty::take()?;
+    let mut tty = Tty::take()?;
     let (cols, rows) = terminal::size()?;
-    // What the shell showed goes into the scrollback: iq opens on a clean
-    // screen, the live part at its bottom.
-    let (_, row) = cursor::position()?;
+    let drawn = board.look().conversation() == Conversation::Drawn;
     let mut out = io::stdout();
-    Inline::clear_above(&mut out, row, rows)?;
-    out.flush()?;
+    if drawn {
+        // The conversation iq draws is the other screen's, the mouse
+        // taken: what the shell showed stays where it was.
+        tty.page(true)?;
+    } else {
+        // What the shell showed goes into the scrollback: iq opens on a
+        // clean screen, the live part at its bottom.
+        let (_, row) = cursor::position()?;
+        Inline::clear_above(&mut out, row, rows)?;
+        out.flush()?;
+    }
+    let viewport = if drawn {
+        Rect::new(0, 0, cols, rows)
+    } else {
+        Rect::new(0, rows.saturating_sub(1), cols, 1)
+    };
     let screen = Screen {
         tty,
         out,
@@ -104,9 +120,10 @@ pub fn run(
         terminal: Terminal::with_options(
             CrosstermBackend::new(io::stdout()),
             TerminalOptions {
-                viewport: Viewport::Fixed(Rect::new(0, rows.saturating_sub(1), cols, 1)),
+                viewport: Viewport::Fixed(viewport),
             },
         )?,
+        drawn: drawn.then(View::default),
         paged: false,
         away: None,
         caret: None,
@@ -119,6 +136,7 @@ pub fn run(
     let depth = Depth::detect();
     let p = Palette::new(board.look().theme(), depth);
     let mut history = History::default();
+    history.set_drawn(drawn);
     history.set_links(link::supported(|name| std::env::var(name).ok()));
     history.pictures(screen.kitty.and(draw), cell());
     history.summaries(summarize);
@@ -142,6 +160,9 @@ struct Screen {
     out: io::Stdout,
     inline: Inline,
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    /// The conversation iq draws on the other screen, when the settings
+    /// ask it to.
+    drawn: Option<View>,
     /// Whether a page shows on the other screen.
     paged: bool,
     /// Whether the terminal was resized while a page showed, and made
@@ -381,8 +402,15 @@ impl Iq {
         if open == screen.paged {
             return Ok(false);
         }
-        screen.tty.page(open)?;
         screen.paged = open;
+        // Drawn, the conversation is on the other screen already: a page
+        // is drawn over it, and it again once the page closes.
+        if screen.drawn.is_some() {
+            let (cols, rows) = terminal::size()?;
+            screen.refit(Rect::new(0, 0, cols, rows))?;
+            return Ok(true);
+        }
+        screen.tty.page(open)?;
         if open {
             let (cols, rows) = terminal::size()?;
             screen.refit(Rect::new(0, 0, cols, rows))?;
@@ -425,6 +453,9 @@ impl Iq {
                 pages::draw(frame, board, p, now, &beside);
             })?;
             return Ok(());
+        }
+        if screen.drawn.is_some() {
+            return self.draw_drawn(now);
         }
         let window = window_of(&self.board);
         let width = usize::from(screen.inline.cols().saturating_sub(1)).max(10);
@@ -517,6 +548,57 @@ impl Iq {
         Ok(())
     }
 
+    /// Draws the conversation iq draws itself, as the settings ask, on the
+    /// whole of the other screen: the panes of the agents at work at the
+    /// top, the conversation, then the live part.
+    fn draw_drawn(&mut self, now: u64) -> io::Result<()> {
+        let (cols, rows) = terminal::size()?;
+        let window = window_of(&self.board);
+        let width = usize::from(cols.saturating_sub(1)).max(10);
+        // What waits is kept in its window, as the scrollback would take it.
+        let _ = self.history.take(width, window.as_deref());
+        let _ = self.history.take_images();
+        let readings = self.board.take_readings();
+        let live = Live {
+            board: &self.board,
+            history: &self.history,
+            p: &self.p,
+            now,
+        };
+        let head = live.head_height(rows);
+        let height = live
+            .height(&self.motion, cols)
+            .min(rows.saturating_sub(head + 1));
+        let room = rows.saturating_sub(head + height);
+        let screen = &mut self.screen;
+        let Some(drawn) = screen.drawn.as_mut() else {
+            return Ok(());
+        };
+        let shown = drawn.shown(
+            &self.history,
+            window.as_deref(),
+            width,
+            usize::from(room),
+            &readings,
+        );
+        if let Some(kitty) = screen.kitty {
+            for image in &shown.images {
+                if screen.sent.insert(image.id) {
+                    let sent = kitty.send(image.id, &image.png, image.cols, image.rows);
+                    screen.out.write_all(sent.as_bytes())?;
+                }
+            }
+            screen.out.flush()?;
+        }
+        let motion = &mut self.motion;
+        screen.terminal.draw(|frame| {
+            live.draw_head_in(frame, Rect::new(0, 0, cols, head), motion);
+            frame.render_widget(Paragraph::new(shown.lines), Rect::new(0, head, cols, room));
+            live.draw_in(frame, Rect::new(0, head + room, cols, height), motion);
+        })?;
+        Ok(())
+    }
+
     /// Waits up to `wait` for keys, pastes, the wheel and resizes, and
     /// takes them all. Returns whether any came.
     fn keys(&mut self, wait: Duration) -> io::Result<bool> {
@@ -550,7 +632,9 @@ impl Iq {
                 Event::Resize(cols, rows) => {
                     self.history.set_cell(cell());
                     let narrower = cols < self.screen.inline.cols();
-                    if self.screen.paged {
+                    if self.screen.drawn.is_some() {
+                        self.screen.refit(Rect::new(0, 0, cols, rows))?;
+                    } else if self.screen.paged {
                         self.screen.away = Some(self.screen.away.unwrap_or(false) || narrower);
                         self.screen.refit(Rect::new(0, 0, cols, rows))?;
                     } else if self.screen.inline.head() > 0 {
@@ -603,6 +687,19 @@ impl Iq {
     /// Writes what is left of the conversation and what the session cost,
     /// and leaves the cursor below it, for the shell.
     fn end(&mut self) -> io::Result<()> {
+        if self.screen.drawn.is_some() {
+            // The other screen goes, and the conversation with it: the
+            // shell gets back what it showed, and what the session cost.
+            self.screen.tty.page(false)?;
+            let billed = self.board.crew().billed();
+            let out = &mut self.screen.out;
+            if billed.0 > 0.0 {
+                write!(out, "iq ends: {billed} billed to the provider.\r\n")?;
+            } else {
+                write!(out, "iq ends.\r\n")?;
+            }
+            return out.flush();
+        }
         if self.screen.paged {
             self.screen.tty.page(false)?;
             self.screen.paged = false;

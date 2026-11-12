@@ -88,6 +88,34 @@ impl std::str::FromStr for TurnShown {
     }
 }
 
+/// Where the conversation is, as the settings' `conversation` says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Conversation {
+    /// Written once into the terminal's own scrollback, scrolled,
+    /// selected and searched as the terminal's own output.
+    #[default]
+    Scrollback,
+    /// Drawn by iq on the terminal's other screen, the mouse taken: what
+    /// is folded unfolds in place, a diagram is enlarged with a click, and
+    /// iq scrolls, searches and copies it itself. Leaving iq leaves that
+    /// screen: the conversation stays out of the terminal's scrollback.
+    Drawn,
+}
+
+impl std::str::FromStr for Conversation {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "scrollback" => Ok(Conversation::Scrollback),
+            "drawn" => Ok(Conversation::Drawn),
+            other => Err(format!(
+                "conversation = {other:?} is none iq knows: \"scrollback\" or \"drawn\""
+            )),
+        }
+    }
+}
+
 /// How iq looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Look {
@@ -100,6 +128,8 @@ pub struct Look {
     turn: TurnShown,
     /// Whether a diagram shows folded, as a line, until unfolded.
     diagrams_folded: bool,
+    /// Where the conversation is.
+    conversation: Conversation,
 }
 
 /// How many of a job's latest lines show while it runs, unless the
@@ -123,7 +153,21 @@ impl Look {
             job_lines: JOB_LINES,
             turn: TurnShown::Panes,
             diagrams_folded: false,
+            conversation: Conversation::Scrollback,
         }
+    }
+
+    /// With the conversation where `conversation` says.
+    #[must_use]
+    pub fn with_conversation(mut self, conversation: Conversation) -> Self {
+        self.conversation = conversation;
+        self
+    }
+
+    /// Where the conversation is.
+    #[must_use]
+    pub fn conversation(&self) -> Conversation {
+        self.conversation
     }
 
     /// With diagrams shown folded, as a line the person unfolds with the

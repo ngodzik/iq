@@ -189,12 +189,17 @@ impl Live<'_> {
     /// two to a row, one alone the screen's width, as many as [`PANES`], in
     /// `frame`, whose area is the top of the screen.
     pub(crate) fn draw_head(&self, frame: &mut Frame<'_>, motion: &Motion) {
+        let area = frame.area();
+        self.draw_head_in(frame, area, motion);
+    }
+
+    /// The same, in `area` of `frame`.
+    pub(crate) fn draw_head_in(&self, frame: &mut Frame<'_>, area: Rect, motion: &Motion) {
         let here = self.started();
         let count = here.len().min(PANES);
-        if count == 0 {
+        if count == 0 || area.height == 0 {
             return;
         }
-        let area = frame.area();
         let columns = pane_columns(count);
         let wide = area.width / columns as u16;
         // As tall as the area the screen gave them allows.
@@ -233,6 +238,16 @@ impl Live<'_> {
     /// where the cursor stands, in what the person writes.
     pub(crate) fn draw(&self, frame: &mut Frame<'_>, motion: &mut Motion) -> Option<(u16, u16)> {
         let area = frame.area();
+        self.draw_in(frame, area, motion)
+    }
+
+    /// The same, in `area` of `frame`.
+    pub(crate) fn draw_in(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        motion: &mut Motion,
+    ) -> Option<(u16, u16)> {
         let mut y = area.top();
         let mut cursor = None;
         let mut status_row = None;
