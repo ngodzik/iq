@@ -157,6 +157,23 @@ pub struct ModelChoice {
     pub at: u64,
 }
 
+/// Takes off what the answers of `messages` carry of their model's
+/// reasoning, as its provider signed it: their text stays. Returns whether
+/// any carried it.
+pub(crate) fn forget_reasoning(messages: &mut [Message]) -> bool {
+    let mut forgot = false;
+    for message in messages {
+        if let Message::Assistant {
+            reasoning_signature,
+            ..
+        } = message
+        {
+            forgot |= reasoning_signature.take().is_some();
+        }
+    }
+    forgot
+}
+
 /// Keeps the chats between sessions.
 pub trait Keeper: Send + Sync {
     /// Keeps `chat` as it stands now, in place of what was kept of it.

@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::event::{Event, PERSON};
 use crate::extension::Extension;
-use crate::keep::{Aside, Keeper, ModelChoice, Saved, Shown};
+use crate::keep::{Aside, Keeper, ModelChoice, Saved, Shown, forget_reasoning};
 use crate::place::{Placed, Placer};
 use crate::review;
 use crate::rules::{self, RulesFile};
@@ -705,6 +705,10 @@ struct Member {
     chosen: bool,
     /// Each choice of its model, the latest last.
     models_chosen: Vec<ModelChoice>,
+    /// Whether the reasoning its answers carry is taken off before its
+    /// next turn: its model changed, and only the provider that signed it
+    /// can check it.
+    forget_reasoning: bool,
 }
 
 /// An agent of the crew, as listed.
@@ -985,6 +989,7 @@ where
                 renaming: None,
                 chosen: false,
                 models_chosen: saved.models_chosen,
+                forget_reasoning: false,
             },
         );
         drop(board);
@@ -1518,6 +1523,7 @@ where
                     how: how.to_owned(),
                     at: now(),
                 }],
+                forget_reasoning: false,
             },
         );
         drop(board);
@@ -1745,6 +1751,7 @@ where
             .ok_or_else(|| format!("no agent is named {agent:?}"))?;
         let mut place = None;
         if let Some(member) = board.members.get_mut(&name) {
+            member.forget_reasoning |= member.model != *model;
             member.model = model.clone();
             member.models_chosen.push(ModelChoice {
                 model: model.to_string(),
@@ -2443,8 +2450,11 @@ where
     /// leaves the agent as it was before it.
     async fn turn(self, name: String, prompt: String, number: u64) {
         let (taken, posted_before) = {
-            let board = lock(&self.inner.board);
-            let taken = board.members.get(&name).map(|member| {
+            let mut board = lock(&self.inner.board);
+            let taken = board.members.get_mut(&name).map(|member| {
+                if std::mem::take(&mut member.forget_reasoning) {
+                    forget_reasoning(&mut member.messages);
+                }
                 (
                     member.messages.clone(),
                     member.model.clone(),
@@ -2964,6 +2974,10 @@ where
         // What the last call that answered read: all but the answer it
         // gave, which is read from the next.
         let mut counted = messages.len().saturating_sub(1);
+        // The turns before this one, whose reasoning may be another
+        // model's.
+        let earlier = messages.len();
+        let mut forgotten = false;
         messages.push(Message::user(prompt));
         if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
             member.reason = None;
@@ -3009,6 +3023,22 @@ where
             self.measure(name, model).await;
             let response = match self.ask_model(name, &request).await {
                 Ok(response) => response,
+                // A signature its provider cannot check, written as another
+                // model answered: the call goes again once without them.
+                Err(failed)
+                    if !forgotten
+                        && signature_refused(&failed)
+                        && forget_reasoning(&mut messages[..earlier]) =>
+                {
+                    forgotten = true;
+                    self.report(Event::Notice {
+                        agent: name.to_owned(),
+                        text: "its provider refused the reasoning its earlier answers carry, \
+                               signed for another model: it is called again without it"
+                            .into(),
+                    });
+                    continue;
+                }
                 Err(failed) => {
                     let said = self.failed(name, model, failed, &messages[counted..]);
                     return (messages, Err(said));
@@ -4808,6 +4838,17 @@ fn context_said(context: TokenCount, rises: Option<TokenCount>) -> String {
         None => String::new(),
     };
     format!("(iq: your conversation is {context} tokens now, read again on each call{past}.)")
+}
+
+/// Whether `failed` is a provider refusing a signature of reasoning it
+/// cannot check, rather than one it misses.
+fn signature_refused(failed: &Failure) -> bool {
+    failed.refusal.as_ref().is_some_and(|refusal| {
+        let said = refusal.message.to_lowercase();
+        (400..500).contains(&refusal.status)
+            && said.contains("signature")
+            && !said.contains("missing")
+    })
 }
 
 /// A conversation compacted: its standing instructions, its task and the

@@ -23,6 +23,9 @@ struct Scripted {
     /// How many of each agent's calls are answered before its provider
     /// refuses the others.
     refused: Mutex<HashMap<String, usize>>,
+    /// Whether the provider refuses a call that sends a reasoning back, as
+    /// one refuses another's signature.
+    refuses_signed: Mutex<bool>,
 }
 
 /// What the scripted provider fails with.
@@ -32,6 +35,8 @@ enum Failed {
     Busy,
     /// Refused, whatever is tried again.
     Refused,
+    /// Refused for a signature of reasoning it cannot check.
+    Signed,
 }
 
 impl std::fmt::Display for Failed {
@@ -39,11 +44,15 @@ impl std::fmt::Display for Failed {
         match self {
             Failed::Busy => f.write_str("HTTP 429: TPM quota exhausted, please try again later"),
             Failed::Refused => f.write_str("HTTP 400: Request contains an invalid argument."),
+            Failed::Signed => f.write_str(SIGNED),
         }
     }
 }
 
 impl std::error::Error for Failed {}
+
+/// What a provider says of a signature of reasoning it cannot check.
+const SIGNED: &str = "messages.3.content.0: Invalid `signature` in `thinking` block";
 
 impl Scripted {
     fn new(scripts: &[(&str, Vec<ChatResponse>)]) -> Arc<Self> {
@@ -57,6 +66,7 @@ impl Scripted {
             requests: Mutex::default(),
             busy: Mutex::default(),
             refused: Mutex::default(),
+            refuses_signed: Mutex::default(),
         })
     }
 
@@ -174,6 +184,9 @@ impl ChatModel for Model {
             }
             *left -= 1;
         }
+        if *self.refuses_signed.lock().unwrap() && signed(request) {
+            return Err(Failed::Signed);
+        }
         let next = self
             .scripts
             .lock()
@@ -188,7 +201,7 @@ impl ChatModel for Model {
             Failed::Busy => Some(Busy {
                 after: Some(Duration::from_millis(1)),
             }),
-            Failed::Refused => None,
+            Failed::Refused | Failed::Signed => None,
         }
     }
 
@@ -199,7 +212,32 @@ impl ChatModel for Model {
                 status: 400,
                 message: "Request contains an invalid argument.".into(),
             }),
+            Failed::Signed => Some(iq_core::Refusal {
+                status: 400,
+                message: SIGNED.into(),
+            }),
         }
+    }
+}
+
+/// Whether `request` sends a reasoning back with one of its answers.
+fn signed(request: &ChatRequest) -> bool {
+    request.messages.iter().any(|message| {
+        matches!(
+            message,
+            Message::Assistant {
+                reasoning_signature: Some(_),
+                ..
+            }
+        )
+    })
+}
+
+/// `text`, said with a reasoning its provider signed.
+fn reasoned(text: &str) -> ChatResponse {
+    ChatResponse {
+        reasoning_signature: Some(serde_json::json!("c2lnbmVk")),
+        ..say(text)
     }
 }
 
@@ -1586,6 +1624,63 @@ async fn a_model_the_person_does_not_allow_is_refused_with_those_they_do() {
         "{refused}"
     );
     assert!(f.crew.set_model("lead", &model("lab/quill")).is_ok());
+}
+
+#[tokio::test]
+async fn a_chat_moved_to_another_model_sends_its_reasoning_back_no_more() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![reasoned("First."), reasoned("Second."), say("Third.")],
+        )],
+        Settings::default(),
+    );
+    f.crew.start("lead", &model("lab/sol"), "go".into(), PERSON);
+    f.settled().await;
+    // On the same model, its reasoning goes back with its answer.
+    f.crew.tell("lead", "and then?".into()).unwrap();
+    f.settled().await;
+    assert!(signed(f.model.requests_of("lead").last().unwrap()));
+    // On another, its answers go back without it, their text whole.
+    f.crew.set_model("lead", &model("lab/haiku")).unwrap();
+    f.crew.tell("lead", "and after?".into()).unwrap();
+    f.settled().await;
+    let last = f.model.requests_of("lead").pop().unwrap();
+    assert_eq!(last.model.as_str(), "lab/haiku");
+    assert!(!signed(&last));
+    assert!(format!("{:?}", last.messages).contains("Second."));
+}
+
+#[tokio::test]
+async fn a_reasoning_another_provider_cannot_check_is_left_out_and_the_call_made_again() {
+    let f = fixture(
+        &[("lead", vec![reasoned("First."), say("Second.")])],
+        Settings::default(),
+    );
+    f.crew.start("lead", &model("lab/sol"), "go".into(), PERSON);
+    f.settled().await;
+    *f.model.refuses_signed.lock().unwrap() = true;
+    f.crew.tell("lead", "and then?".into()).unwrap();
+    f.settled().await;
+    let events = f.events();
+    assert!(
+        events.contains(&Event::Done {
+            agent: "lead".into(),
+            outcome: Ok("Second.".into())
+        }),
+        "{events:#?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Notice { text, .. } if text.starts_with("its provider refused the reasoning")
+    )));
+    // Once left out, it is sent no more.
+    let requests = f.model.requests_of("lead");
+    assert_eq!(requests.len(), 3);
+    assert!(signed(&requests[1]) && !signed(&requests[2]));
+    f.crew.tell("lead", "and after?".into()).unwrap();
+    f.settled().await;
+    assert_eq!(f.model.requests_of("lead").len(), 4);
 }
 
 #[tokio::test]
