@@ -2,10 +2,14 @@
 //! known to take them. A link's text is written alone; its address rides on
 //! its spans' background, which iq never paints in the conversation, so
 //! that it survives the folding of lines, and the line's writer turns it
-//! into the hyperlink. Only addresses of the web and of mail are taken,
-//! and none holding what could end the escape it is written in.
+//! into the hyperlink. In the conversation iq draws, which has the mouse,
+//! iq opens it itself, with the system's opener. Only addresses of the web
+//! and of mail are taken, and none holding what could end the escape it is
+//! written in.
 
 use std::collections::HashMap;
+use std::io;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use ratatui::style::{Color, Style};
@@ -82,6 +86,33 @@ pub(crate) fn address_of(style: Style) -> Option<(usize, String, Style)> {
     Some((number, address, plain))
 }
 
+/// Opens `address` as the terminal would on a click: with the system's
+/// opener (`open` on macOS, `xdg-open` elsewhere), apart from iq, nothing
+/// of it reaching the screen, and not waited for. Only an address a link
+/// takes.
+pub(crate) fn open(address: &str) -> io::Result<()> {
+    let address = safe(address)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not an address iq opens"))?;
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut command = Command::new(opener);
+    command
+        .arg(address)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Out of the terminal's group: what it sends iq is not the browser's.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn()?;
+    // Reaped once it is done, so that none is left a zombie.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 /// The escape that opens the hyperlink to `address`, numbered `number` so
 /// that a link folded over lines is one, and the one that closes it.
 pub(crate) fn escapes(number: usize, address: &str) -> (String, &'static str) {
@@ -134,6 +165,8 @@ mod tests {
             assert_eq!(mark(Style::new(), refused), None, "{refused:?}");
         }
         assert_eq!(address_of(Style::new()), None);
+        // Nor opened.
+        assert!(open("javascript:alert(1)").is_err());
         let (open, close) = escapes(3, "https://example.com");
         assert_eq!(open, "\x1b]8;id=iq3;https://example.com\x1b\\");
         assert_eq!(close, "\x1b]8;;\x1b\\");

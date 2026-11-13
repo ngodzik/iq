@@ -3130,6 +3130,29 @@ where
         output
     }
 
+    /// Says how `agent` changed the file at `path`, from `before` to
+    /// `after`, when a line of it changed: never for a file of secrets,
+    /// as it is named or as the file it leads to is, whose lines the
+    /// person allowed written, not shown.
+    fn changed(&self, agent: &str, path: &std::path::Path, before: &str, after: &str) {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let full = self.place_of(agent).gate.workspace().join(path);
+        let real = std::fs::canonicalize(&full).unwrap_or(full);
+        if [path, real.as_path()]
+            .iter()
+            .any(|path| iq_gate::holds_secrets(path, home.as_deref()))
+        {
+            return;
+        }
+        if let Some(diff) = crate::diff::unified(before, after) {
+            self.report(Event::Changed {
+                agent: agent.to_owned(),
+                path: path.display().to_string(),
+                diff,
+            });
+        }
+    }
+
     async fn tool(&self, agent: &str, name: &str, args: &Args) -> Result<String, String> {
         let workspace = self.place_of(agent).gate.workspace().to_path_buf();
         match name {
@@ -3161,7 +3184,16 @@ where
                 let permit = self
                     .act(agent, Action::Write { path: path.clone() })
                     .await?;
+                // What it held, for the person to see what changed: nothing
+                // for a new file, none for one that is not text.
+                let before = match permit.read() {
+                    Ok(bytes) => String::from_utf8(bytes).ok(),
+                    Err(_) => Some(String::new()),
+                };
                 permit.write(content.as_bytes()).map_err(|e| chain(&e))?;
+                if let Some(before) = before {
+                    self.changed(agent, &path, &before, content);
+                }
                 Ok(format!("Wrote {} bytes.", content.len()) + &self.scoped_for(agent, &path))
             }
             "edit_file" => {
@@ -3178,6 +3210,7 @@ where
                     args.flag("all"),
                 )?;
                 permit.write(edited.as_bytes()).map_err(|e| chain(&e))?;
+                self.changed(agent, &path, &text, &edited);
                 // Given once the edit is made: an edit refused would give
                 // them to nobody.
                 Ok(format!("Edited.{}", self.scoped_for(agent, &path)))

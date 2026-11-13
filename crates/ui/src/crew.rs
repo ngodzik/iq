@@ -765,6 +765,8 @@ impl CrewView {
             }
             // Its turn's end says it, with the facts.
             Event::Failed { .. } => {}
+            // What a file holds now is the conversation's to show.
+            Event::Changed { .. } => {}
             Event::Working { agent, prompt } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.working = true;

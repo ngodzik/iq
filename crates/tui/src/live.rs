@@ -189,12 +189,17 @@ impl Live<'_> {
     /// two to a row, one alone the screen's width, as many as [`PANES`], in
     /// `frame`, whose area is the top of the screen.
     pub(crate) fn draw_head(&self, frame: &mut Frame<'_>, motion: &Motion) {
+        let area = frame.area();
+        self.draw_head_in(frame, area, motion);
+    }
+
+    /// The same, in `area` of `frame`.
+    pub(crate) fn draw_head_in(&self, frame: &mut Frame<'_>, area: Rect, motion: &Motion) {
         let here = self.started();
         let count = here.len().min(PANES);
-        if count == 0 {
+        if count == 0 || area.height == 0 {
             return;
         }
-        let area = frame.area();
         let columns = pane_columns(count);
         let wide = area.width / columns as u16;
         // As tall as the area the screen gave them allows.
@@ -233,6 +238,16 @@ impl Live<'_> {
     /// where the cursor stands, in what the person writes.
     pub(crate) fn draw(&self, frame: &mut Frame<'_>, motion: &mut Motion) -> Option<(u16, u16)> {
         let area = frame.area();
+        self.draw_in(frame, area, motion)
+    }
+
+    /// The same, in `area` of `frame`.
+    pub(crate) fn draw_in(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        motion: &mut Motion,
+    ) -> Option<(u16, u16)> {
         let mut y = area.top();
         let mut cursor = None;
         let mut status_row = None;
@@ -303,6 +318,26 @@ impl Live<'_> {
         }
         if let Some(switcher) = self.switcher(motion, width) {
             parts.push(switcher);
+        }
+        // Reading the conversation iq draws: what the keys do there.
+        if self.board.reading() {
+            let p = self.p;
+            // After a click, a letter writes: the keys that are letters
+            // are said only while reading from the keyboard.
+            let (letters, leave) = if self.board.reading_letters() {
+                (" · c copies · n N the matches", "Esc writes again")
+            } else {
+                ("", "Esc or a letter writes again")
+            };
+            let said = format!(
+                "↑ ↓ mark what is folded, a diagram or the end of an answer · Enter unfolds, folds, enlarges, opens a link, goes back up · Home End this answer · Shift ↑ ↓ the answers{letters} · {leave}"
+            );
+            parts.push(Part::Lines(wrap(
+                &[Span::styled(said, p.fg(p.faint))],
+                width.saturating_sub(1),
+                &[Span::raw("  ")],
+                &[Span::raw("  ")],
+            )));
         }
         let listed = self.completions(width);
         if !listed.is_empty() {
@@ -1236,6 +1271,24 @@ impl Live<'_> {
                 format!("{waiting} waiting for you"),
                 p.fg(p.warn),
             ));
+        }
+        // A link pointed at in the conversation iq draws: where it leads,
+        // before it opens.
+        if let Some(pointed) = self.board.pointed() {
+            let how = match (pointed.mouse, pointed.more) {
+                (true, _) => " · a click opens it".to_owned(),
+                (false, 0) => " · Enter opens it".to_owned(),
+                (false, more) => format!(" · and {more} more: Enter lists them"),
+            };
+            left = vec![
+                Span::raw(" "),
+                Span::styled("↗ ", p.fg(p.accent)),
+                Span::styled(
+                    pointed.address.clone(),
+                    p.fg(p.info).add_modifier(Modifier::UNDERLINED),
+                ),
+                Span::styled(how, p.fg(p.faint)),
+            ];
         }
         // On the right, the person, the chat written to and the agents it
         // started, by name while they fit: the other chats are the

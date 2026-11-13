@@ -7,7 +7,7 @@ mod changes;
 mod costs;
 mod keys;
 mod observations;
-mod steps;
+pub(crate) mod steps;
 mod team;
 
 use iq_ui::Board;

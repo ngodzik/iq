@@ -18,7 +18,7 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 19] = [
+pub const COMMANDS: [Spec; 20] = [
     Spec {
         name: "new",
         args: "[model]",
@@ -78,6 +78,11 @@ pub const COMMANDS: [Spec; 19] = [
         name: "internet",
         args: "",
         what: "the internet open to every command, or only to what fetches packages",
+    },
+    Spec {
+        name: "find",
+        args: "<words>",
+        what: "mark what holds them in the conversation iq draws, the newest first; n and N go through them",
     },
     Spec {
         name: "image",
@@ -166,6 +171,8 @@ pub enum Command {
     /// Attach the image at this path to what the person writes; none
     /// attached when none is given.
     Image(Option<String>),
+    /// Mark what holds these words in the conversation iq draws.
+    Find(String),
     /// How hard the agent written to thinks, or the new chat's; none to
     /// be told.
     Effort(Option<iq_core::Effort>),
@@ -232,6 +239,10 @@ pub fn parse(line: &str) -> Result<Command, String> {
             }
         }
         "role" => Ok(Command::Role(rest.to_owned())),
+        "find" | "search" => match rest.trim() {
+            "" => Err("/find takes the words to find".to_owned()),
+            words => Ok(Command::Find(words.to_owned())),
+        },
         "to" => one("agent")?
             .map(|agent| Command::To(agent.trim_start_matches('@').to_owned()))
             .ok_or_else(|| "/to takes the agent to write to".to_owned()),

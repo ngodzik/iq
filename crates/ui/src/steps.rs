@@ -284,6 +284,9 @@ pub struct Steps {
     asked: HashMap<u64, (String, String)>,
     /// What each question waiting asks, to keep it once answered.
     chosen: HashMap<u64, (String, String)>,
+    /// The agents that just changed a file, with the step that changes it
+    /// to come.
+    changed: HashSet<String>,
 }
 
 impl Steps {
@@ -297,15 +300,25 @@ impl Steps {
                 input,
                 output,
                 ok,
-            } => self.step(
-                agent,
-                Step::Tool {
-                    name: name.clone(),
-                    input: input.clone(),
-                    output: output.clone(),
-                    ok: *ok,
-                },
-            ),
+            } => {
+                self.step(
+                    agent,
+                    Step::Tool {
+                        name: name.clone(),
+                        input: input.clone(),
+                        output: output.clone(),
+                        ok: *ok,
+                    },
+                );
+                // A file changed closes the fold, for the conversation
+                // to show the change as it is made.
+                if self.changed.remove(agent) {
+                    self.close(agent);
+                }
+            }
+            Event::Changed { agent, .. } => {
+                self.changed.insert(agent.clone());
+            }
             Event::Asked {
                 id, agent, action, ..
             } => {
@@ -587,6 +600,18 @@ impl Steps {
         self.said.get(at)
     }
 
+    /// The entry numbered `id`, while it is kept: a fold, a message, a job.
+    #[must_use]
+    pub fn entry(&self, id: usize) -> Option<Entry<'_>> {
+        self.fold(id)
+            .map(Entry::Fold)
+            .or_else(|| self.said_by_id(id).map(Entry::Said))
+            .or_else(|| {
+                let at = self.ran.binary_search_by_key(&id, |ran| ran.id).ok()?;
+                self.ran.get(at).map(Entry::Ran)
+            })
+    }
+
     /// The last message between agents kept: the one the event just taken
     /// made, when it made one.
     #[must_use]
@@ -634,6 +659,25 @@ mod tests {
             output: String::new(),
             ok,
         }
+    }
+
+    #[test]
+    fn a_file_changed_closes_the_fold_its_step_ends() {
+        let mut steps = Steps::default();
+        steps.event(&tool("lead", "read_file", true));
+        steps.event(&Event::Changed {
+            agent: "lead".into(),
+            path: "src/main.rs".into(),
+            diff: "@@ -1,1 +1,1 @@\n-a\n+b".into(),
+        });
+        assert!(steps.open("lead").is_some_and(|fold| fold.steps.len() == 1));
+        steps.event(&tool("lead", "edit_file", true));
+        assert!(steps.open("lead").is_none());
+        let fold = steps.folds().last().unwrap();
+        assert!(fold.closed && fold.steps.len() == 2);
+        // The next step starts another.
+        steps.event(&tool("lead", "read_file", true));
+        assert_eq!(steps.open("lead").unwrap().steps.len(), 1);
     }
 
     #[test]

@@ -407,6 +407,22 @@ pub(crate) fn png_size(head: &[u8]) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
+/// The cells an image of `pixels` takes on cells of `cell` pixels across
+/// `width` columns, keeping its shape: as many rows as that takes, at most
+/// `height`, and fewer columns then.
+pub(crate) fn across(pixels: (u32, u32), cell: (u16, u16), width: u16, height: u16) -> (u16, u16) {
+    let (w, h) = (u64::from(pixels.0.max(1)), u64::from(pixels.1.max(1)));
+    let cw = u64::from(cell.0.max(1));
+    let cols = u64::from(width.clamp(1, MAX_CELLS));
+    // Scaled up as much as the width asks: fit keeps to the width.
+    let k = (cols * cw).div_ceil(w).max(1);
+    let scaled = (
+        u32::try_from(w * k).unwrap_or(u32::MAX),
+        u32::try_from(h * k).unwrap_or(u32::MAX),
+    );
+    fit(scaled, cell, width, height)
+}
+
 /// The cells an image of `pixels` takes on cells of `cell` pixels: as many
 /// as its own size needs, at most `width` columns and `height` rows,
 /// keeping its shape.

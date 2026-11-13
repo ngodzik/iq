@@ -217,6 +217,78 @@ pub struct Board {
     folded: bool,
     /// Whether the person asked the diagram folded to unfold.
     unfold: bool,
+    /// What the person asked of the conversation iq draws since the
+    /// terminal last took it.
+    readings: Vec<Reading>,
+    /// Whether the person reads the conversation iq draws, a mark on what
+    /// they chose in it: the arrows and Enter are its, until Escape or
+    /// another key.
+    reading: bool,
+    /// The link the person points at in the conversation iq draws, as the
+    /// terminal last drew it.
+    pointed: Option<Pointed>,
+    /// Whether the conversation iq draws lists links to choose one, as
+    /// the terminal last drew it: the numbers are theirs.
+    listed: bool,
+    /// Whether the person last marked something in the conversation iq
+    /// draws with a click: a letter is then what they start writing,
+    /// never a key.
+    clicked: bool,
+}
+
+/// A link the person points at in the conversation iq draws, the mouse
+/// over it or the mark on what holds it: the status line shows its
+/// address, so that what opens is known before it opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pointed {
+    /// Its address.
+    pub address: String,
+    /// How many more links what is marked holds.
+    pub more: usize,
+    /// Whether the mouse is over it, rather than the mark on what holds
+    /// it.
+    pub mouse: bool,
+}
+
+/// What the person asks of the conversation iq draws on the terminal's
+/// other screen (`conversation = "drawn"`), for the terminal to carry out
+/// where it knows what each row shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reading {
+    /// Scroll it by as many rows, up when fewer than none: the wheel, the
+    /// touchpad.
+    Scroll(isize),
+    /// Scroll it by as many of its heights, a row kept: Page Up, Page
+    /// Down.
+    Page(isize),
+    /// Mark what is folded before what is marked, or after it: `-1`,
+    /// `1`; from the end when nothing is.
+    Mark(isize),
+    /// Unfold what is marked in place, alone, or fold it again; enlarge
+    /// a diagram; go back to the top of an answer; open the link of what
+    /// does none of that, or list its links; open the link chosen of those
+    /// listed.
+    Toggle,
+    /// The cell at this column and row of the screen was clicked: what
+    /// shows there is marked, and unfolded or folded again.
+    Click(u16, u16),
+    /// Mark what holds these words, the newest first, and each of them
+    /// where it shows.
+    Find(String),
+    /// Mark the match before the one marked, or after it: `-1`, `1`.
+    Match(isize),
+    /// Copy what is marked, as it was written.
+    Copy,
+    /// Open the link of this number, from one, of those listed.
+    Pick(usize),
+    /// Go to the top of the answer read: Home.
+    Top,
+    /// Go to its end: End.
+    End,
+    /// Go to the top of the answer before, or after: `-1`, `1`.
+    Answer(isize),
+    /// The person reads no more: the mark goes, and what was found.
+    Leave,
 }
 
 /// The image a paste is, when it is the path of one alone: a file dropped
@@ -281,7 +353,111 @@ impl Board {
             picking: 0,
             folded: false,
             unfold: false,
+            readings: Vec::new(),
+            reading: false,
+            pointed: None,
+            listed: false,
+            clicked: false,
         }
+    }
+
+    /// Whether the person reads the conversation iq draws, the arrows
+    /// moving the mark in it.
+    #[must_use]
+    pub fn reading(&self) -> bool {
+        self.reading
+    }
+
+    /// The link the person points at in the conversation iq draws, as the
+    /// terminal last drew it.
+    #[must_use]
+    pub fn pointed(&self) -> Option<&Pointed> {
+        self.pointed.as_ref()
+    }
+
+    /// Says which link the person points at in the conversation iq draws,
+    /// and whether it lists links to choose one, as the terminal drew it.
+    pub fn set_pointed(&mut self, pointed: Option<Pointed>, listed: bool) {
+        self.pointed = pointed;
+        self.listed = listed;
+    }
+
+    /// The person reads the conversation iq draws no more: a click fell
+    /// outside it.
+    pub fn read_no_more(&mut self) {
+        self.reading = false;
+    }
+
+    /// The cell at `column` and `row` of the screen was clicked: in the
+    /// conversation iq draws, what shows there is marked and unfolded or
+    /// folded again.
+    pub fn click(&mut self, column: u16, row: u16) {
+        if self.drawn() {
+            self.reading = true;
+            self.clicked = true;
+            self.readings.push(Reading::Click(column, row));
+        }
+    }
+
+    /// Whether letters are keys of the conversation iq draws (c copies, n
+    /// and N go through what was found): while the person reads it from
+    /// the keyboard, never after a click, when a letter is what they
+    /// start writing.
+    #[must_use]
+    pub fn reading_letters(&self) -> bool {
+        self.reading && !self.clicked
+    }
+
+    /// What `chord` does while the person reads the conversation iq
+    /// draws: the arrows move the mark, Enter unfolds what it marks or
+    /// folds it again or opens its link, the numbers one of the links
+    /// listed (any other time a number is written), Home and End go
+    /// to the top and the end of the answer read, Shift and the arrows to
+    /// the answer before or after, Escape stops reading. None for another
+    /// key, which stops reading and goes where the person writes.
+    fn reading_key(&mut self, chord: &Chord, typed: Option<char>) -> Option<Vec<Request>> {
+        let plain = !chord.ctrl && !chord.alt && !chord.cmd && !chord.shift;
+        let shifted = chord.shift && !chord.ctrl && !chord.alt && !chord.cmd;
+        let letters = !self.clicked;
+        let reading = match (chord.key.as_str(), typed) {
+            (_, Some('c')) if letters => Reading::Copy,
+            (_, Some('n')) if letters => Reading::Match(-1),
+            (_, Some('N')) if letters => Reading::Match(1),
+            (_, Some(digit @ '1'..='9')) if self.listed => {
+                Reading::Pick(digit as usize - '0' as usize)
+            }
+            _ => match chord.key.as_str() {
+                "Up" if plain => Reading::Mark(-1),
+                "Down" if plain => Reading::Mark(1),
+                "Up" if shifted => Reading::Answer(-1),
+                "Down" if shifted => Reading::Answer(1),
+                "Home" if plain => Reading::Top,
+                "End" if plain => Reading::End,
+                "Enter" if plain => Reading::Toggle,
+                "Escape" if plain => {
+                    self.reading = false;
+                    Reading::Leave
+                }
+                _ => {
+                    self.reading = false;
+                    self.readings.push(Reading::Leave);
+                    return None;
+                }
+            },
+        };
+        self.readings.push(reading);
+        Some(Vec::new())
+    }
+
+    /// What the person asked of the conversation iq draws since last
+    /// taken, in order.
+    pub fn take_readings(&mut self) -> Vec<Reading> {
+        std::mem::take(&mut self.readings)
+    }
+
+    /// Whether iq draws the conversation, no page over it.
+    fn drawn(&self) -> bool {
+        self.look.conversation() == crate::look::Conversation::Drawn && self.screen.page().is_none()
     }
 
     /// Says whether a diagram shows folded as the last thing written in
@@ -797,6 +973,12 @@ impl Board {
             }
             return self.page_key(chord, typed);
         }
+        if self.reading
+            && self.drawn()
+            && let Some(done) = self.reading_key(chord, typed)
+        {
+            return done;
+        }
         if let Some(done) = self.choice_key(chord, typed) {
             return done;
         }
@@ -860,6 +1042,20 @@ impl Board {
             }
             return Vec::new();
         }
+        // Shift and the up arrow start reading the conversation iq draws,
+        // from the last thing folded.
+        if self.drawn() && !self.reading && chord.shift && !chord.ctrl && chord.key == "Up" {
+            self.reading = true;
+            self.clicked = false;
+            self.readings.push(Reading::Mark(-1));
+            return Vec::new();
+        }
+        // The conversation iq draws scrolls by its height.
+        if plain && self.drawn() && matches!(chord.key.as_str(), "PageUp" | "PageDown") {
+            let sign = if chord.key == "PageUp" { -1 } else { 1 };
+            self.readings.push(Reading::Page(sign));
+            return Vec::new();
+        }
         // Where nothing is written, the down arrow moves nowhere: it
         // unfolds the diagram folded at the conversation's end.
         if plain
@@ -916,6 +1112,8 @@ impl Board {
             let chosen = self.screen.chosen() as isize + lines.signum();
             self.screen
                 .choose(chosen.max(0) as usize, self.chats_by_use().len());
+        } else if self.drawn() {
+            self.readings.push(Reading::Scroll(lines));
         } else {
             self.screen.scroll_by(lines);
         }
@@ -1426,6 +1624,15 @@ impl Board {
                 self.attached.clear();
                 self.screen.notice(said, now);
             }
+            Command::Find(words) if self.drawn() => {
+                self.reading = true;
+                self.clicked = false;
+                self.readings.push(Reading::Find(words));
+            }
+            Command::Find(_) => self.screen.notice(
+                "the terminal searches its own scrollback: /find is the conversation iq draws, as the settings' conversation = \"drawn\" asks",
+                now,
+            ),
             Command::Image(Some(path)) => {
                 let path = path.trim().trim_matches(['\'', '"']).to_owned();
                 self.screen
@@ -1813,6 +2020,136 @@ fn from_words(request: &str, named: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_conversation_iq_draws_is_scrolled_by_the_wheel_and_the_page_keys() {
+        let look = Look::default().with_conversation(crate::look::Conversation::Drawn);
+        let mut board = Board::new(Keymap::default(), look);
+        board.scroll(-3);
+        key(&mut board, "PageUp");
+        key(&mut board, "PageDown");
+        assert_eq!(
+            board.take_readings(),
+            [Reading::Scroll(-3), Reading::Page(-1), Reading::Page(1)]
+        );
+        // A page over it takes them.
+        key(&mut board, "ctrl+o");
+        board.scroll(2);
+        assert!(board.take_readings().is_empty());
+        // Written to the scrollback, the terminal scrolls it.
+        let mut board = Board::default();
+        board.scroll(-3);
+        key(&mut board, "PageUp");
+        assert!(board.take_readings().is_empty());
+    }
+
+    #[test]
+    fn reading_the_conversation_iq_draws_the_arrows_move_the_mark_and_enter_unfolds() {
+        let look = Look::default().with_conversation(crate::look::Conversation::Drawn);
+        let mut board = Board::new(Keymap::default(), look);
+        key(&mut board, "shift+up");
+        assert!(board.reading());
+        for chord in [
+            "Up",
+            "Down",
+            "Enter",
+            "shift+up",
+            "shift+down",
+            "Home",
+            "End",
+        ] {
+            key(&mut board, chord);
+        }
+        key(&mut board, "Escape");
+        assert!(!board.reading());
+        assert_eq!(
+            board.take_readings(),
+            [
+                Reading::Mark(-1),
+                Reading::Mark(-1),
+                Reading::Mark(1),
+                Reading::Toggle,
+                Reading::Answer(-1),
+                Reading::Answer(1),
+                Reading::Top,
+                Reading::End,
+                Reading::Leave
+            ]
+        );
+        // A click marks; another key goes where the person writes.
+        board.click(4, 9);
+        assert!(board.reading());
+        board.press(&Chord::plain("h"), Some('h'), 1);
+        assert!(!board.reading());
+        assert_eq!(board.screen().editor().text(), "h");
+        assert_eq!(
+            board.take_readings(),
+            [Reading::Click(4, 9), Reading::Leave]
+        );
+        // A number chooses one of the links listed, and only then: written
+        // any other time, it goes where the person writes.
+        board.click(4, 9);
+        board.set_pointed(None, true);
+        board.press(&Chord::plain("2"), Some('2'), 1);
+        assert_eq!(
+            board.take_readings(),
+            [Reading::Click(4, 9), Reading::Pick(2)]
+        );
+        board.set_pointed(None, false);
+        board.press(&Chord::plain("2"), Some('2'), 1);
+        assert!(!board.reading());
+        assert_eq!(board.screen().editor().text(), "h2");
+        let _ = board.take_readings();
+        // Not reading, the arrows are the editor's.
+        key(&mut board, "Up");
+        assert!(board.take_readings().is_empty());
+        // After a click, a letter is what the person starts writing, never
+        // a key: the c of "cool" copies nothing.
+        board.screen_mut().editor_mut().clear();
+        board.click(4, 9);
+        assert!(board.reading() && !board.reading_letters());
+        board.press(&Chord::plain("c"), Some('c'), 1);
+        assert!(!board.reading());
+        assert_eq!(board.screen().editor().text(), "c");
+        assert_eq!(
+            board.take_readings(),
+            [Reading::Click(4, 9), Reading::Leave]
+        );
+        // Read from the keyboard, it copies.
+        board.screen_mut().editor_mut().clear();
+        key(&mut board, "shift+up");
+        assert!(board.reading_letters());
+        board.press(&Chord::plain("c"), Some('c'), 1);
+        assert_eq!(board.take_readings(), [Reading::Mark(-1), Reading::Copy]);
+        key(&mut board, "Escape");
+        let _ = board.take_readings();
+        // Words found, the matches gone through and what is marked copied.
+        board.screen_mut().editor_mut().clear();
+        board.run(Command::Find("the parser".into()), 1);
+        assert!(board.reading());
+        for c in ['n', 'N', 'c'] {
+            board.press(&Chord::plain(&c.to_string()), Some(c), 1);
+        }
+        assert_eq!(
+            board.take_readings(),
+            [
+                Reading::Find("the parser".into()),
+                Reading::Match(-1),
+                Reading::Match(1),
+                Reading::Copy
+            ]
+        );
+        // Written to the scrollback, the terminal searches it.
+        let mut board = Board::default();
+        board.run(Command::Find("parser".into()), 1);
+        assert!(
+            board
+                .screen()
+                .noticed(1)
+                .unwrap()
+                .contains("own scrollback")
+        );
+    }
 
     #[test]
     fn the_down_arrow_unfolds_a_diagram_folded_only_where_nothing_is_written() {

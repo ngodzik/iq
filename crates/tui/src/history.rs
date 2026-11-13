@@ -51,6 +51,10 @@ const RECALLED: usize = 40;
 /// How many lines of a failed tool's output are written.
 const FAILED_LINES: usize = 3;
 
+/// How many lines of a file's change are written; the conversation iq
+/// draws unfolds the rest in place.
+const CHANGE_LINES: usize = 12;
+
 /// The longest tool input written, in characters.
 pub(crate) const INPUT_CHARS: usize = 160;
 
@@ -108,11 +112,26 @@ impl Para {
 /// source written as code unless it is drawn, with the styles of what is
 /// said of it.
 #[derive(Debug, Clone)]
-enum Block {
+pub(crate) enum Block {
     Para(Para),
+    /// The head of a turn: an agent's name, or what the person wrote. The
+    /// conversation iq draws goes from one to the next.
+    Head {
+        para: Para,
+        person: bool,
+    },
+    /// A line of an agent's text, folded as a paragraph is.
+    Text(Para),
     Whole(Line<'static>),
     /// One row, cut to the width: a step said in a few words.
     Row(Vec<Span<'static>>),
+    /// What stands for the steps' page's entry `id` (a fold of steps, a
+    /// message between agents, a job that ended), which the conversation
+    /// iq draws unfolds in place.
+    Entry {
+        id: usize,
+        blocks: Vec<Block>,
+    },
     Table(Table),
     Diagram {
         diagram: Arc<Diagram>,
@@ -127,6 +146,16 @@ enum Block {
         code: Vec<Block>,
         failed: Style,
         line: Vec<Span<'static>>,
+    },
+    /// A file an agent changed: `head`, its name and how many lines came
+    /// and went, then its lines changed with a few around them, numbered,
+    /// the first [`CHANGE_LINES`] until the person unfolds them, how many
+    /// more said in `faint`; `diff`, what it is copied as.
+    Change {
+        head: Vec<Span<'static>>,
+        rows: Vec<Vec<Span<'static>>>,
+        faint: Style,
+        diff: String,
     },
     /// A command run in the background, in one line never folded: `head`,
     /// then what it does in a few words (the summarizer's, else `instead`,
@@ -146,6 +175,13 @@ enum Block {
     },
 }
 
+/// Whose turn a head begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Speaker {
+    Person,
+    Agent,
+}
+
 impl Block {
     /// A styled line of an agent's text: code at the line's start, whole,
     /// the rest under its block's indent.
@@ -159,8 +195,82 @@ impl Block {
                     .collect::<Vec<_>>(),
             ))
         } else {
-            Block::Para(Para::text(styled))
+            Block::Text(Para::text(styled))
         }
+    }
+
+    /// What it says, as it was written, for the person to copy: a line of
+    /// text without its indent nor folds, a line of code whole, a table's
+    /// rows, a diagram's source, a message's summary or its first lines.
+    pub(crate) fn written(&self) -> String {
+        let spans = |spans: &[Span<'static>]| -> String {
+            spans.iter().map(|span| span.content.as_ref()).collect()
+        };
+        match self {
+            Block::Para(para) | Block::Text(para) | Block::Head { para, .. } => spans(&para.body),
+            Block::Whole(line) => line.to_string(),
+            Block::Row(row) => spans(row).trim().to_owned(),
+            Block::Table(table) => table
+                .lines(usize::MAX / 4, &[])
+                .iter()
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Block::Diagram { code, .. } | Block::Folded { code, .. } => code
+                .iter()
+                .map(Block::written)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Block::Job { head, label, tail } => {
+                format!("{}{}{}", spans(head), label.text(), spans(tail))
+                    .trim()
+                    .to_owned()
+            }
+            Block::Change { diff, .. } => diff.clone(),
+            Block::Summed {
+                summary, instead, ..
+            } => summary.text().unwrap_or_else(|| {
+                instead
+                    .iter()
+                    .map(|para| spans(&para.body))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+            Block::Entry { blocks, .. } => blocks
+                .iter()
+                .map(Block::written)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    /// Whether it is the head of an agent's turn, of the person's, or
+    /// neither.
+    pub(crate) fn head(&self) -> Option<Speaker> {
+        match self {
+            Block::Head { person: true, .. } => Some(Speaker::Person),
+            Block::Head { person: false, .. } => Some(Speaker::Agent),
+            _ => None,
+        }
+    }
+
+    /// A file's change whole, every line of it, within `width` columns;
+    /// none for anything else.
+    pub(crate) fn change_whole(&self, width: usize) -> Option<Vec<Line<'static>>> {
+        let Block::Change { head, rows, .. } = self else {
+            return None;
+        };
+        Some(
+            std::iter::once(head)
+                .chain(rows)
+                .map(|row| fit(row.clone(), width))
+                .collect(),
+        )
+    }
+
+    /// Whether it is a line left empty.
+    pub(crate) fn blank(&self) -> bool {
+        matches!(self, Block::Para(para) if para.first.iter().chain(&para.body).all(|span| span.content.trim().is_empty()))
     }
 
     /// Whether it is a diagram being drawn, which what comes after it waits
@@ -168,9 +278,13 @@ impl Block {
     fn drawing(&self) -> bool {
         match self {
             Block::Diagram { diagram, .. } => diagram.drawing(),
+            Block::Entry { blocks, .. } => blocks.iter().any(Block::drawing),
             Block::Summed { summary, .. } => summary.making(),
             Block::Job { label, .. } => label.making(),
             Block::Para(_)
+            | Block::Change { .. }
+            | Block::Head { .. }
+            | Block::Text(_)
             | Block::Whole(_)
             | Block::Row(_)
             | Block::Table(_)
@@ -180,14 +294,25 @@ impl Block {
 
     /// Its lines within `width` columns, on cells of `cell` pixels, the
     /// images they show put in `images`.
-    fn lines(&self, width: usize, cell: (u16, u16), images: &mut Vec<Image>) -> Vec<Line<'static>> {
+    pub(crate) fn lines(
+        &self,
+        width: usize,
+        cell: (u16, u16),
+        images: &mut Vec<Image>,
+    ) -> Vec<Line<'static>> {
         let indent = [Span::raw("  ")];
         match self {
-            Block::Para(para) => wrap(&para.body, width, &para.first, &para.rest),
+            Block::Para(para) | Block::Text(para) | Block::Head { para, .. } => {
+                wrap(&para.body, width, &para.first, &para.rest)
+            }
             Block::Whole(line) => vec![line.clone()],
             Block::Row(spans) | Block::Folded { line: spans, .. } => {
                 vec![fit(spans.clone(), width)]
             }
+            Block::Entry { blocks, .. } => blocks
+                .iter()
+                .flat_map(|block| block.lines(width, cell, images))
+                .collect(),
             // Too long, the hint to unfold it goes first, then what it does
             // is cut: how it ended always shows.
             Block::Job { head, label, tail } => {
@@ -208,6 +333,26 @@ impl Block {
                 vec![fit(spans, width)]
             }
             Block::Table(table) => table.lines(width, &indent),
+            Block::Change {
+                head, rows, faint, ..
+            } => {
+                let mut lines = vec![fit(head.clone(), width)];
+                lines.extend(
+                    rows.iter()
+                        .take(CHANGE_LINES)
+                        .map(|row| fit(row.clone(), width)),
+                );
+                if rows.len() > CHANGE_LINES {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(
+                            format!("… {} more lines", rows.len() - CHANGE_LINES),
+                            *faint,
+                        ),
+                    ]));
+                }
+                lines
+            }
             Block::Summed {
                 summary,
                 instead,
@@ -315,6 +460,11 @@ pub(crate) struct History {
     /// What each chat's window holds, the latest last, as many as
     /// [`KEPT`]: none is the window of a new chat.
     kept: HashMap<Option<String>, VecDeque<Block>>,
+    /// How many of each window's oldest blocks were let go: the number of
+    /// its first kept.
+    dropped: HashMap<Option<String>, usize>,
+    /// Whether iq draws the conversation itself, on the other screen.
+    drawn: bool,
     /// The lines iq opens with, at the top of every window.
     opening: Vec<Para>,
     /// Whether the window on the terminal shows them.
@@ -333,6 +483,9 @@ pub(crate) struct History {
     /// What to say after the person's next message to an agent: the models
     /// they named in it.
     after: HashMap<String, String>,
+    /// The files each agent changed since its steps were last written,
+    /// written under them.
+    changes: HashMap<String, Vec<Block>>,
     /// The number of each agent's last fold of steps written.
     told: HashMap<String, usize>,
     /// Where the line saying an agent joined waits to be written: one that
@@ -552,8 +705,25 @@ impl History {
             // part shows as it grows. What the agent wrote so far comes
             // before it. A question waits in its box with its choices, and
             // becomes a step once answered; iq's notice is a step too.
-            Event::Tool { agent, .. }
-            | Event::Reviewed { agent, .. }
+            Event::Tool { agent, .. } => {
+                self.finish(agent, board, p);
+                // A file changed: the fold it closed is written now, with
+                // the change.
+                if self
+                    .changes
+                    .get(agent)
+                    .is_some_and(|changes| !changes.is_empty())
+                {
+                    self.folds(agent, board, p);
+                }
+            }
+            Event::Changed { agent, path, diff } => {
+                if !self.in_pane(agent, board) {
+                    let change = change(path, diff, p);
+                    self.changes.entry(agent.clone()).or_default().push(change);
+                }
+            }
+            Event::Reviewed { agent, .. }
             | Event::Choose { agent, .. }
             | Event::Notice { agent, .. } => {
                 self.finish(agent, board, p);
@@ -681,13 +851,14 @@ impl History {
                     ),
                 ];
                 let unfold = board.keys().chord(Action::Steps);
-                if let (Some(ran), Some(unfold)) = (board.steps().latest_ran(), unfold) {
+                let ran = board.steps().latest_ran().map(|ran| ran.id);
+                if let (Some(ran), Some(unfold)) = (ran, unfold) {
                     tail.push(Span::styled(
-                        format!("  {unfold} unfolds #{}", ran.id),
+                        format!("  {unfold} unfolds #{ran}"),
                         p.fg(p.faint),
                     ));
                 }
-                self.push_job(Block::Job {
+                let job = Block::Job {
                     head: vec![
                         Span::raw("  "),
                         Span::styled("⚙ ", p.fg(colour)),
@@ -695,6 +866,13 @@ impl History {
                     ],
                     label,
                     tail,
+                };
+                self.push_job(match ran {
+                    Some(id) => Block::Entry {
+                        id,
+                        blocks: vec![job],
+                    },
+                    None => job,
                 });
             }
             // A line once it waits for those it started: how long, the live
@@ -748,6 +926,9 @@ impl History {
                 }
                 if let Some(kept) = self.kept.remove(&old) {
                     self.kept.insert(new.clone(), kept);
+                }
+                if let Some(dropped) = self.dropped.remove(&old) {
+                    self.dropped.insert(new.clone(), dropped);
                 }
                 if let Some(kind) = self.kinds.remove(&old) {
                     self.kinds.insert(new.clone(), kind);
@@ -1037,10 +1218,13 @@ impl History {
             ));
         }
         body.extend(inline(text.trim(), p.fg(p.text), p, self.links));
-        self.push(Para {
-            first: vec![Span::styled("› ", p.bold(p.accent))],
-            rest: vec![Span::raw("  ")],
-            body,
+        self.push_block(Block::Head {
+            para: Para {
+                first: vec![Span::styled("› ", p.bold(p.accent))],
+                rest: vec![Span::raw("  ")],
+                body,
+            },
+            person: true,
         });
         if let Some(said) = self.after.remove(agent) {
             self.push(Para::indented("  ", vec![Span::styled(said, p.fg(p.info))]));
@@ -1064,18 +1248,25 @@ impl History {
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         let short = lines.len() <= MESSAGE_LINES
             && lines.iter().all(|line| line.chars().count() <= LINE_CHARS);
-        match (&self.summarizer.0, id) {
+        let said = match (&self.summarizer.0, id) {
             (Some(summarize), Some(id)) if !short => {
                 let summary = Summary::new(from, to, text, Arc::clone(summarize));
                 self.summaries.insert(id, Arc::clone(&summary));
-                self.push_block(Block::Summed {
+                vec![Block::Summed {
                     summary,
                     instead: first_lines(text, INDENT, p, MESSAGE_LINES),
                     indent: INDENT.to_owned(),
                     style: p.fg(p.dim),
-                });
+                }]
             }
-            _ => self.lines_of(text, INDENT, p, MESSAGE_LINES),
+            _ => first_lines(text, INDENT, p, MESSAGE_LINES)
+                .into_iter()
+                .map(Block::Para)
+                .collect(),
+        };
+        match id {
+            Some(id) => self.push_block(Block::Entry { id, blocks: said }),
+            None => said.into_iter().for_each(|block| self.push_block(block)),
         }
     }
 
@@ -1120,55 +1311,76 @@ impl History {
         self.told
             .insert(agent.to_owned(), new.last().map_or(told, |fold| fold.id));
         self.named(agent, board, p);
-        for fold in new {
-            self.fold(fold, board, p);
+        let changes = self.changes.remove(agent).unwrap_or_default();
+        let last = new.len() - 1;
+        for (at, fold) in new.into_iter().enumerate() {
+            // The one step that changed a file: the change stands for it.
+            let alone = at == last
+                && !changes.is_empty()
+                && matches!(fold.steps.as_slice(), [Step::Tool { ok: true, .. }]);
+            if !alone {
+                self.fold(fold, board, p);
+            }
+        }
+        for change in changes {
+            self.push_step_block(change);
         }
     }
 
     /// Writes `fold`: of one step, that step; of more, their count and the
     /// key that unfolds them.
     fn fold(&mut self, fold: &Fold, board: &Board, p: &Palette) {
-        match fold.steps.as_slice() {
-            [] => {}
+        let blocks = match fold.steps.as_slice() {
+            [] => return,
             [step @ Step::Tool { output, ok, .. }] => {
                 let (first, body) = step_line(step, p);
-                self.push_step(Para {
+                let mut blocks = vec![Block::Para(Para {
                     first,
                     rest: vec![Span::raw("    ")],
                     body,
-                });
+                })];
                 if !ok {
-                    for line in output
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .take(FAILED_LINES)
-                    {
-                        self.push_step(Para::indented(
-                            "    ",
-                            vec![Span::styled(cut(&short(line), LINE_CHARS), p.fg(p.faint))],
-                        ));
-                    }
+                    blocks.extend(
+                        output
+                            .lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .take(FAILED_LINES)
+                            .map(|line| {
+                                Block::Para(Para::indented(
+                                    "    ",
+                                    vec![Span::styled(
+                                        cut(&short(line), LINE_CHARS),
+                                        p.fg(p.faint),
+                                    )],
+                                ))
+                            }),
+                    );
                 }
+                blocks
             }
             // A verdict, an answer, a question, a notice: one row, whole
             // on the steps' page.
             [step] => {
                 let (mut first, body) = step_line(step, p);
                 first.extend(body);
-                self.push_step_block(Block::Row(first));
+                vec![Block::Row(first)]
             }
             _ => {
                 let unfold = board
                     .keys()
                     .chord(Action::Steps)
                     .map(|chord| chord.to_string());
-                self.push_step(Para {
+                vec![Block::Para(Para {
                     first: vec![Span::raw("  "), Span::styled("▸ ", p.fg(p.faint))],
                     rest: vec![Span::raw("    ")],
                     body: counted(fold, unfold.as_deref(), p),
-                });
+                })]
             }
-        }
+        };
+        self.push_step_block(Block::Entry {
+            id: fold.id,
+            blocks,
+        });
     }
 
     /// `agent`'s name and model, when another spoke last.
@@ -1185,14 +1397,17 @@ impl History {
             format!("  {beside}")
         };
         self.blank();
-        self.push(Para::indented(
-            "",
-            vec![
-                Span::styled("● ", p.fg(tint)),
-                Span::styled(name, p.bold(tint)),
-                Span::styled(beside, p.fg(p.faint)),
-            ],
-        ));
+        self.push_block(Block::Head {
+            para: Para::indented(
+                "",
+                vec![
+                    Span::styled("● ", p.fg(tint)),
+                    Span::styled(name, p.bold(tint)),
+                    Span::styled(beside, p.fg(p.faint)),
+                ],
+            ),
+            person: false,
+        });
         self.set_speaker(Some(agent.to_owned()));
     }
 
@@ -1345,17 +1560,23 @@ impl History {
                 .as_slice()
                 .iter()
                 .any(|(other, _)| other.clone().or_else(|| window.clone()) == chat);
-            if chat == window && !self.hurried && last && matches!(block, Block::Folded { .. }) {
+            if chat == window
+                && !self.hurried
+                && !self.drawn
+                && last
+                && matches!(block, Block::Folded { .. })
+            {
                 self.paras.push((given, block));
                 continue;
             }
             if chat == window {
                 lines.extend(block.lines(width, self.cell, &mut self.images));
             }
-            let kept = self.kept.entry(chat).or_default();
+            let kept = self.kept.entry(chat.clone()).or_default();
             kept.push_back(block);
             while kept.len() > KEPT {
                 kept.pop_front();
+                *self.dropped.entry(chat.clone()).or_default() += 1;
             }
         }
         lines
@@ -1414,6 +1635,8 @@ impl History {
         let mut kept = self.kept.remove(&None).unwrap_or_default();
         kept.extend(self.kept.remove(&key).unwrap_or_default());
         self.kept.insert(key.clone(), kept);
+        let dropped = self.dropped.remove(&None).unwrap_or_default();
+        self.dropped.insert(key.clone(), dropped);
         if let Some(kind) = self.kinds.remove(&None) {
             self.kinds.insert(key.clone(), kind);
         }
@@ -1421,6 +1644,35 @@ impl History {
             self.speakers.insert(key, speaker);
         }
         true
+    }
+
+    /// Whether iq draws the conversation itself, on the other screen: a
+    /// diagram folded then waits for nothing, unfolded with a click.
+    pub(crate) fn set_drawn(&mut self, drawn: bool) {
+        self.drawn = drawn;
+    }
+
+    /// The blocks `window` keeps, the oldest first, and the number of the
+    /// first: a block's number stays its own as the oldest are let go.
+    pub(crate) fn blocks(&self, window: Option<&str>) -> (usize, Option<&VecDeque<Block>>) {
+        let key = window.map(str::to_owned);
+        (
+            self.dropped.get(&key).copied().unwrap_or_default(),
+            self.kept.get(&key),
+        )
+    }
+
+    /// What iq opens with, folded within `width` columns.
+    pub(crate) fn opening_lines(&self, width: usize) -> Vec<Line<'static>> {
+        self.opening
+            .iter()
+            .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest))
+            .collect()
+    }
+
+    /// The size of a cell in pixels, as the terminal said it.
+    pub(crate) fn cell(&self) -> (u16, u16) {
+        self.cell
     }
 
     /// `window`'s chat whole, as the person comes to it, folded within
@@ -1670,6 +1922,113 @@ fn first_lines(text: &str, first: &str, p: &Palette, most: usize) -> Vec<Para> {
         .collect()
 }
 
+/// How the file at `path` changed, as `diff`, a unified diff, says it:
+/// its name and how many lines came and went, then each line numbered as
+/// it stands in the file, those added green, those removed red.
+fn change(path: &str, diff: &str, p: &Palette) -> Block {
+    enum Kind {
+        Kept,
+        Added,
+        Removed,
+        Apart,
+        Said,
+    }
+    // Where a part of it begins, in the old file and the new.
+    let begins = |line: &str| -> Option<(usize, usize)> {
+        let rest = line.strip_prefix("@@ -")?;
+        let (old, rest) = rest.split_once(" +")?;
+        let new = rest.split_once(" @@")?.0;
+        let start = |part: &str| part.split(',').next()?.parse::<usize>().ok();
+        Some((start(old)?, start(new)?))
+    };
+    let mut lines: Vec<(Kind, usize, String)> = Vec::new();
+    let (mut old, mut new) = (0, 0);
+    for line in diff.lines() {
+        if let Some((from_old, from_new)) = begins(line) {
+            if !lines.is_empty() {
+                lines.push((Kind::Apart, 0, String::new()));
+            }
+            (old, new) = (from_old, from_new);
+            continue;
+        }
+        // Written as iq writes code: tabs as spaces, no control character.
+        let text = |rest: &str| -> String {
+            rest.replace('\t', "    ")
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect()
+        };
+        match line.split_at_checked(1) {
+            Some(("+", rest)) => {
+                lines.push((Kind::Added, new, text(rest)));
+                new += 1;
+            }
+            Some(("-", rest)) => {
+                lines.push((Kind::Removed, old, text(rest)));
+                old += 1;
+            }
+            Some((" ", rest)) => {
+                lines.push((Kind::Kept, new, text(rest)));
+                (old, new) = (old + 1, new + 1);
+            }
+            Some(("\\", rest)) => lines.push((Kind::Said, 0, text(rest.trim()))),
+            _ => {}
+        }
+    }
+    let count = |kind: fn(&Kind) -> bool| lines.iter().filter(|(k, ..)| kind(k)).count();
+    let added = count(|kind| matches!(kind, Kind::Added));
+    let removed = count(|kind| matches!(kind, Kind::Removed));
+    let mut head = vec![
+        Span::styled("  ✎ ", p.fg(p.info)),
+        Span::styled(short(path), p.fg(p.text)),
+    ];
+    if added > 0 {
+        head.push(Span::styled(format!("  +{added}"), p.fg(p.ok)));
+    }
+    if removed > 0 {
+        head.push(Span::styled(format!("  -{removed}"), p.fg(p.bad)));
+    }
+    let width = lines
+        .iter()
+        .map(|(_, number, _)| number.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let rows = lines
+        .into_iter()
+        .map(|(kind, number, text)| {
+            let (sign, style) = match kind {
+                Kind::Added => ("+", p.fg(p.ok)),
+                Kind::Removed => ("-", p.fg(p.bad)),
+                Kind::Kept => (" ", p.fg(p.dim)),
+                Kind::Apart => {
+                    return vec![
+                        Span::raw("    "),
+                        Span::styled(format!("{:>width$}", "⋮"), p.fg(p.faint)),
+                    ];
+                }
+                Kind::Said => {
+                    return vec![
+                        Span::raw("    "),
+                        Span::styled(format!("… {text}"), p.fg(p.faint)),
+                    ];
+                }
+            };
+            vec![
+                Span::raw("    "),
+                Span::styled(format!("{number:>width$} "), p.fg(p.faint)),
+                Span::styled(format!("{sign} "), style),
+                Span::styled(text, style),
+            ]
+        })
+        .collect();
+    Block::Change {
+        head,
+        rows,
+        faint: p.fg(p.faint),
+        diff: diff.to_owned(),
+    }
+}
+
 /// The number a message has on the steps' page, as its head ends: the
 /// way to it whole.
 fn numbered(id: Option<usize>, p: &Palette) -> Vec<Span<'static>> {
@@ -1689,6 +2048,7 @@ fn agent_of(event: &Event) -> Option<&str> {
         | Event::Text { agent, .. }
         | Event::Spent { agent, .. }
         | Event::Tool { agent, .. }
+        | Event::Changed { agent, .. }
         | Event::Asked { agent, .. }
         | Event::Reviewed { agent, .. }
         | Event::Done { agent, .. }
@@ -3091,6 +3451,88 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("still waiting: {lines:?}");
+    }
+
+    #[test]
+    fn a_file_changed_is_written_as_it_is_with_its_lines_added_and_removed() {
+        let p = Palette::new(Theme::Ink, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        let tool = |name: &str, input: &str| Event::Tool {
+            agent: "lead".into(),
+            name: name.into(),
+            input: input.into(),
+            output: "Edited.".into(),
+            ok: true,
+        };
+        let changed = |path: &str, diff: &str| Event::Changed {
+            agent: "lead".into(),
+            path: path.into(),
+            diff: diff.into(),
+        };
+        let new: String = (1..=20).map(|n| format!("\n+line {n}")).collect();
+        for event in [
+            Event::Joined {
+                agent: "lead".into(),
+                model: "m".into(),
+                by: PERSON.into(),
+            },
+            Event::Working {
+                agent: "lead".into(),
+                prompt: "fix it".into(),
+            },
+            tool("read_file", "src/a.rs"),
+            changed(
+                "src/a.rs",
+                "@@ -9,3 +9,3 @@\n fn a() {\n-    old();\n+    new();\n }",
+            ),
+            tool("edit_file", "src/a.rs"),
+        ] {
+            crew(&mut board, &mut history, event, &p);
+        }
+        // Written as it is made, under the steps it closes.
+        let lines = settled(&mut history, "lead");
+        let at = lines
+            .iter()
+            .position(|line| line.contains("2 steps"))
+            .expect("the steps before it");
+        assert_eq!(
+            lines[at + 1..at + 6],
+            [
+                "  ✎ src/a.rs  +1  -1",
+                "     9   fn a() {",
+                "    10 -     old();",
+                "    10 +     new();",
+                "    11   }",
+            ]
+        );
+        // A file written alone: the change stands for its step, its first
+        // lines written.
+        for event in [
+            changed("src/new.rs", &format!("@@ -0,0 +1,20 @@{new}")),
+            tool("write_file", "src/new.rs"),
+        ] {
+            crew(&mut board, &mut history, event, &p);
+        }
+        let lines = settled(&mut history, "lead");
+        assert!(
+            !lines.iter().any(|line| line.contains("write_file")),
+            "{lines:#?}"
+        );
+        let head = lines
+            .iter()
+            .position(|line| line == "  ✎ src/new.rs  +20")
+            .unwrap();
+        assert_eq!(lines[head + 1], "     1 + line 1");
+        assert_eq!(lines[head + 12], "    12 + line 12");
+        assert_eq!(lines[head + 13], "    … 8 more lines");
+        // Green added, red removed.
+        let p2 = Palette::new(Theme::Ink, Depth::True);
+        let Block::Change { rows, .. } = change("x", "@@ -1,1 +1,1 @@\n-a\n+b", &p2) else {
+            panic!("a change");
+        };
+        assert_eq!(rows[0][3].style, p2.fg(p2.bad));
+        assert_eq!(rows[1][3].style, p2.fg(p2.ok));
     }
 
     #[test]
