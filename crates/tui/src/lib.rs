@@ -76,6 +76,10 @@ const STILL: Duration = Duration::from_millis(250);
 /// How often the live part is drawn again anyway, for its clocks.
 const CLOCK: Duration = Duration::from_secs(1);
 
+/// How soon after the terminal got the focus a click only gave it: the
+/// click that brought the person back to iq's window.
+const FOCUSING: Duration = Duration::from_millis(500);
+
 /// Runs iq in the terminal until the person quits or iq is asked to stop:
 /// `board` as the settings made it, what `feed` brings, what the person
 /// asks of the crew sent on `requests`, the diagrams agents write drawn by
@@ -150,6 +154,7 @@ pub fn run(
         depth,
         p,
         requests,
+        focused: None,
     };
     let ran = iq.run(&feed);
     let ended = iq.end();
@@ -278,6 +283,8 @@ struct Iq {
     depth: Depth,
     p: Palette,
     requests: Sender<Request>,
+    /// When the terminal last said it got the focus.
+    focused: Option<Instant>,
 }
 
 impl Iq {
@@ -693,6 +700,14 @@ impl Iq {
                 return Ok(changed);
             }
             let event = event::read()?;
+            match &event {
+                Event::FocusGained => {
+                    self.focused = Some(Instant::now());
+                    continue;
+                }
+                Event::FocusLost => continue,
+                _ => {}
+            }
             if let Event::Mouse(mouse) = &event
                 && mouse.kind == MouseEventKind::Moved
             {
@@ -714,7 +729,15 @@ impl Iq {
                     MouseEventKind::ScrollUp => self.board.scroll(-3),
                     MouseEventKind::ScrollDown => self.board.scroll(3),
                     MouseEventKind::Down(MouseButton::Left) => {
-                        self.board.click(mouse.column, mouse.row);
+                        // The click that gave the terminal the focus gives
+                        // it and does nothing more: the person came back.
+                        let focusing = self
+                            .focused
+                            .take()
+                            .is_some_and(|at| at.elapsed() < FOCUSING);
+                        if !focusing {
+                            self.board.click(mouse.column, mouse.row);
+                        }
                     }
                     _ => {}
                 },

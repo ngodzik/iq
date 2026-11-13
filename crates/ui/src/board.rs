@@ -566,9 +566,20 @@ impl Board {
         Some(recall)
     }
 
+    /// The person goes to another chat, or a new one: the reading of the
+    /// conversation they leave ends with it.
+    fn leave_reading(&mut self) {
+        if self.reading {
+            self.reading = false;
+            self.readings.push(Reading::Leave);
+        }
+        self.clicked = false;
+    }
+
     /// Writes to `agent` from now on; a chat of an earlier session is
     /// recalled as the person comes back to it.
     fn write_to(&mut self, agent: &str) {
+        self.leave_reading();
         self.screen.talk_to(agent);
         if self.unrecalled.remove(agent) {
             let recall = Recall {
@@ -1233,6 +1244,7 @@ impl Board {
                     }
                     (_, Some('n'), _) => {
                         self.chose = true;
+                        self.leave_reading();
                         self.screen.new_chat(self.crew.lead());
                         self.screen.close();
                     }
@@ -1340,6 +1352,7 @@ impl Board {
             Action::Switch => self.switch(now),
             Action::NewChat => {
                 self.chose = true;
+                self.leave_reading();
                 let lead = self.crew.lead().to_owned();
                 self.screen.new_chat(&lead);
                 self.screen.close();
@@ -1533,6 +1546,7 @@ impl Board {
                     },
                 };
                 self.chose = true;
+                self.leave_reading();
                 self.screen.new_chat(&model);
                 if let Some(chat) = self.screen.new_chat_mut() {
                     how.clone_into(&mut chat.how);
@@ -2040,6 +2054,33 @@ mod tests {
         let mut board = Board::default();
         board.scroll(-3);
         key(&mut board, "PageUp");
+        assert!(board.take_readings().is_empty());
+    }
+
+    #[test]
+    fn going_to_another_chat_or_a_new_one_leaves_the_reading_of_the_last() {
+        let look = Look::default().with_conversation(crate::look::Conversation::Drawn);
+        let mut board = Board::new(Keymap::default(), look);
+        joined(&mut board, "one", PERSON);
+        joined(&mut board, "two", PERSON);
+        board.screen_mut().talk_to("one");
+        // Marked by a click, then another chat chosen in the switcher.
+        board.click(4, 9);
+        board.act(Action::Switch, 1);
+        key(&mut board, "enter");
+        assert!(!board.reading());
+        assert_eq!(
+            board.take_readings(),
+            [Reading::Click(4, 9), Reading::Leave]
+        );
+        // Read from the keyboard, then a new chat.
+        key(&mut board, "shift+up");
+        board.act(Action::NewChat, 1);
+        assert!(!board.reading());
+        assert_eq!(board.take_readings(), [Reading::Mark(-1), Reading::Leave]);
+        // Not reading, a chat chosen says nothing to the conversation.
+        board.act(Action::Switch, 1);
+        key(&mut board, "enter");
         assert!(board.take_readings().is_empty());
     }
 

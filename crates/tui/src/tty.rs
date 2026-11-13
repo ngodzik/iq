@@ -3,7 +3,8 @@
 //! bracketed, so that a pasted line is never sent; its keys told apart
 //! where the terminal can (Shift-Enter from Enter); the mouse taken only on
 //! a page, so that the conversation is selected and scrolled as the
-//! terminal's own output. iq watches the terminal itself for its keys: once
+//! terminal's own output, and the terminal's focus told there, for the
+//! click that gives it to be told apart. iq watches the terminal itself for its keys: once
 //! its window is closed, crossterm would read it forever and find nothing.
 
 use std::fs::File;
@@ -17,8 +18,9 @@ use nix::sys::select::{FD_SETSIZE, FdSet, select};
 use nix::sys::time::{TimeVal, TimeValLike};
 
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::{cursor, execute, queue};
@@ -87,13 +89,24 @@ impl Tty {
     }
 
     /// Shows a page on the terminal's other screen, the mouse taken for
-    /// its wheel, or goes back to the conversation, as it was.
+    /// its wheel and the focus told, or goes back to the conversation, as
+    /// it was.
     pub(crate) fn page(&mut self, on: bool) -> io::Result<()> {
         let mut out = io::stdout();
         if on {
-            execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+            execute!(
+                out,
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableFocusChange
+            )?;
         } else {
-            execute!(out, DisableMouseCapture, LeaveAlternateScreen)?;
+            execute!(
+                out,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            )?;
         }
         PAGED.store(on, Ordering::SeqCst);
         Ok(())
@@ -144,7 +157,12 @@ fn watchable(fd: BorrowedFd<'_>) -> bool {
 fn give_back() {
     let mut out = io::stdout();
     if PAGED.swap(false, Ordering::SeqCst) {
-        let _ = queue!(out, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = queue!(
+            out,
+            DisableFocusChange,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
     if ENHANCED.swap(false, Ordering::SeqCst) {
         let _ = queue!(out, PopKeyboardEnhancementFlags);
