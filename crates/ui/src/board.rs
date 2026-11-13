@@ -136,7 +136,7 @@ const OFFERED: usize = 8;
 const NAMED_IN_MESSAGE: &str = "named in the message";
 
 /// The same, when it is the settings' lead.
-const SETTINGS_MODEL: &str = "the settings' model";
+const SETTINGS_MODEL: &str = iq_agent::SETTINGS_MODEL;
 
 /// How many of the person's chats the switcher shows at once.
 pub const SWITCH_ROWS: usize = 5;

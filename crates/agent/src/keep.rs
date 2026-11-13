@@ -7,6 +7,12 @@ use std::path::PathBuf;
 use iq_core::{Effort, Message, Usd};
 use serde::{Deserialize, Serialize};
 
+use crate::PERSON;
+
+/// How a chat came to run on the model the settings name for the person's
+/// chats: chosen by none, it follows them as they change.
+pub const SETTINGS_MODEL: &str = "the settings' model";
+
 /// An agent and its conversation, as kept.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Saved {
@@ -57,6 +63,34 @@ pub struct Saved {
     pub set_apart: Vec<String>,
     /// Its conversation, the standing instructions first.
     pub messages: Vec<Message>,
+}
+
+impl Saved {
+    /// Whether the chat runs on the model the settings name, as the person
+    /// started it: they chose none for it, and it follows the settings as
+    /// they change.
+    #[must_use]
+    pub fn follows_settings(&self) -> bool {
+        self.by == PERSON
+            && self
+                .models_chosen
+                .last()
+                .is_none_or(|choice| choice.how == SETTINGS_MODEL)
+    }
+
+    /// Moves the chat to `model`, which `by` chose as `how` says at `at`,
+    /// from its next turn: its answers keep their text, not the reasoning
+    /// their provider signed, which another provider cannot check.
+    pub fn move_to(&mut self, model: &str, by: &str, how: &str, at: u64) {
+        forget_reasoning(&mut self.messages);
+        model.clone_into(&mut self.model);
+        self.models_chosen.push(ModelChoice {
+            model: model.to_owned(),
+            by: by.to_owned(),
+            how: how.to_owned(),
+            at,
+        });
+    }
 }
 
 /// One thing the person was shown of an agent beside its conversation,

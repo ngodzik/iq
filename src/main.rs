@@ -403,6 +403,13 @@ fn resume_chats(
             if let Some(by) = names.get(&found.chat.by) {
                 found.chat.by.clone_from(by);
             }
+            if let Ok(lead) = settings.lead() {
+                said.extend(chats::on_the_lead(
+                    &mut found.chat,
+                    lead.as_str(),
+                    iq_ui::now(),
+                ));
+            }
             if !allowed.is_empty() && !allowed.iter().any(|a| a.as_str() == found.chat.model) {
                 said.push(format!(
                     "{} runs on {}, which allowed_models leaves out: /model gives it another",
@@ -918,7 +925,7 @@ async fn work(
         if cli.model.is_some() {
             "--model"
         } else {
-            "the settings' model"
+            iq_agent::SETTINGS_MODEL
         },
     );
     let mut tally = terminal::Tally::default();
