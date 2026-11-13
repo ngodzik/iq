@@ -170,6 +170,11 @@ pub struct Settings {
     /// How many tokens an agent's conversation grows between two words to
     /// it of its size, which it compacts as its skills say; 0 for none.
     pub context_every: u64,
+    /// The tokens an agent's conversation should stay under: past them, it
+    /// is told at once to finish its request and compact before it
+    /// answers, and again as each turn begins past them. None: where its
+    /// model's price rises, when the provider says; 0 never.
+    pub compact_at: Option<u64>,
     /// How many actions of one agent the reviewer refuses in a row before
     /// the next is asked of the person instead; 0 never.
     pub refusals: u32,
@@ -216,6 +221,7 @@ impl Default for Settings {
             steps: 200,
             rules: Vec::new(),
             context_every: CONTEXT_EVERY,
+            compact_at: None,
             refusals: REFUSALS,
             reviewer_effort: Effort::Low,
             command_timeout: COMMAND_TIMEOUT,
@@ -2892,28 +2898,35 @@ where
     /// What `agent` on `model` is told of its conversation's size, once it
     /// grew by the settings' step since it was last told: how much each
     /// call reads, and where its model's price rises, when the provider
-    /// says. Counted as told.
-    async fn context_note(&self, agent: &str, model: &ModelId) -> Option<String> {
-        let step = self.inner.settings.context_every;
-        if step == 0 {
-            return None;
-        }
-        let context = {
-            let mut board = lock(&self.inner.board);
-            let member = board.members.get_mut(agent)?;
-            if member.context < member.told + step {
-                return None;
-            }
-            member.told = member.context;
-            member.context
-        };
+    /// says. Past the size it should stay under, it is told at once, and
+    /// again at the `first` call of each turn, to compact. Counted as told.
+    async fn context_note(&self, agent: &str, model: &ModelId, first: bool) -> Option<String> {
+        let settings = &self.inner.settings;
         let rises = self
             .inner
             .provider
             .pricing(model)
             .await
             .and_then(|pricing| pricing.rises_at());
-        Some(context_said(TokenCount(context), rises))
+        let limit = match settings.compact_at {
+            Some(0) => None,
+            Some(at) => Some(TokenCount(at)),
+            None => rises,
+        };
+        let step = settings.context_every;
+        let context = {
+            let mut board = lock(&self.inner.board);
+            let member = board.members.get_mut(agent)?;
+            let grew = step > 0 && member.context >= member.told + step;
+            let over = limit.is_some_and(|limit| member.context >= limit.0);
+            let told_over = limit.is_some_and(|limit| member.told >= limit.0);
+            if !grew && !(over && (first || !told_over)) {
+                return None;
+            }
+            member.told = member.context;
+            member.context
+        };
+        Some(context_said(TokenCount(context), rises, limit))
     }
 
     /// Sends `request` for `agent`, again while its provider is out of
@@ -3019,11 +3032,11 @@ where
             member.reason = None;
         }
         let mut urged = false;
-        for _ in 0..self.inner.settings.steps {
+        for step in 0..self.inner.settings.steps {
             if let Some(news) = self.unread(name) {
                 messages.push(Message::user(news));
             }
-            if let Some(note) = self.context_note(name, model).await {
+            if let Some(note) = self.context_note(name, model, step == 0).await {
                 messages.push(Message::user(note));
             }
             if let Some(said) = self.lighten(name, &mut messages) {
@@ -3376,6 +3389,18 @@ where
             "job" => {
                 let id = args.number("id").ok_or("`id` names the job")?;
                 Ok(self.job(agent, id, args.flag("stop")))
+            }
+            "look_back" => {
+                let query = args.value()["query"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|query| !query.is_empty());
+                let from = args.number("from").and_then(|n| usize::try_from(n).ok());
+                Ok(lock(&self.inner.board)
+                    .members
+                    .get(agent)
+                    .map(|member| crate::look_back::found(&member.compacted_away, query, from))
+                    .unwrap_or_default())
             }
             "reread" => {
                 let id = args.number("id").ok_or("`id` names the result")?;
@@ -4888,8 +4913,13 @@ fn free_name(board: &Board, base: &str, taken: &[String]) -> String {
 }
 
 /// What an agent is told of its conversation's size: `context` tokens read
-/// on each call, and where its model's price rises, when known.
-fn context_said(context: TokenCount, rises: Option<TokenCount>) -> String {
+/// on each call, and where its model's price rises, when known; past
+/// `limit`, what it does about it.
+fn context_said(
+    context: TokenCount,
+    rises: Option<TokenCount>,
+    limit: Option<TokenCount>,
+) -> String {
     let past = match rises {
         Some(rises) if context >= rises => {
             format!(": past the {rises} where your model's price per token rises")
@@ -4897,7 +4927,14 @@ fn context_said(context: TokenCount, rises: Option<TokenCount>) -> String {
         Some(rises) => format!("; your model's price per token rises once a call reads {rises}"),
         None => String::new(),
     };
-    format!("(iq: your conversation is {context} tokens now, read again on each call{past}.)")
+    let ask = match limit {
+        Some(limit) if context >= limit => format!(
+            " It should stay under {limit}: finish the request you work on, then call `compact` \
+             before you answer. What your summary leaves out stays reachable with `look_back`."
+        ),
+        _ => String::new(),
+    };
+    format!("(iq: your conversation is {context} tokens now, read again on each call{past}.{ask})")
 }
 
 /// Whether `failed` is a provider refusing a signature of reasoning it
@@ -4922,7 +4959,8 @@ fn compacted(
     let mut kept: Vec<Message> = messages.first().cloned().into_iter().collect();
     kept.push(Message::user(format!(
         "{task}\n\n(iq: what came after, as you summed it up when you compacted your \
-         conversation:)\n\n{summary}"
+         conversation:)\n\n{summary}\n\n(iq: what your summary leaves out is kept: `look_back` \
+         finds it by its words, or reads it on from a number.)"
     )));
     if let Some(answer) = answer.filter(|answer| !answer.trim().is_empty()) {
         kept.push(Message::Assistant {
@@ -5209,13 +5247,20 @@ mod tests {
     #[test]
     fn an_agent_is_told_where_its_models_price_rises() {
         assert_eq!(
-            context_said(TokenCount(200_000), Some(TokenCount(272_000))),
+            context_said(TokenCount(200_000), Some(TokenCount(272_000)), None),
             "(iq: your conversation is 200.0k tokens now, read again on each call; your model's \
              price per token rises once a call reads 272.0k.)"
         );
         assert!(
-            context_said(TokenCount(280_000), Some(TokenCount(272_000)))
+            context_said(TokenCount(280_000), Some(TokenCount(272_000)), None)
                 .ends_with(": past the 272.0k where your model's price per token rises.)")
+        );
+        // Past the size it should stay under, it is asked to compact.
+        assert_eq!(
+            context_said(TokenCount(120_000), None, Some(TokenCount(100_000))),
+            "(iq: your conversation is 120.0k tokens now, read again on each call. It should \
+             stay under 100.0k: finish the request you work on, then call `compact` before you \
+             answer. What your summary leaves out stays reachable with `look_back`.)"
         );
     }
 }

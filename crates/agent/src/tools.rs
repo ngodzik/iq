@@ -129,6 +129,21 @@ pub(crate) fn work() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "look_back".into(),
+            description: "Finds again what your compactions replaced, which your summary may \
+                          leave out: its messages, numbered, those holding all the words of \
+                          `query`, or those on from the number `from`, or both; each cut past \
+                          4,000 characters, 24,000 in all, saying where to read on."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Words the messages hold, all of them, in any case."},
+                    "from": {"type": "integer", "description": "The number of the first message to give."},
+                },
+            }),
+        },
+        ToolSpec {
             name: "wake_me".into(),
             description:
                 "Wakes you after `seconds` (ten at least, an hour at most), with `why`: to \
@@ -205,9 +220,10 @@ pub fn board() -> Vec<ToolSpec> {
             name: "compact".into(),
             description: "Replaces your conversation with a summary you write, so that each \
                           call reads less: when your skills or your task say, or when you are \
-                          told it grew past where your model's price rises. Finish the request \
+                          told it grew past the size it should stay under. Finish the request \
                           you work on first, call it last, then answer: from your next turn, \
-                          your conversation is your task and this summary."
+                          your conversation is your task and this summary, and what it leaves \
+                          out stays reachable with `look_back`."
                 .into(),
             parameters: json!({
                 "type": "object",

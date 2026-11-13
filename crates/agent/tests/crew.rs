@@ -1957,6 +1957,70 @@ async fn an_agent_is_told_its_conversation_grows_and_compacts_it_once_its_reques
 }
 
 #[tokio::test]
+async fn an_agent_past_the_size_it_should_stay_under_is_asked_to_compact_and_finds_the_rest_again()
+{
+    let list = || calls("list_agents", serde_json::json!({}));
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                reading(30_000, list()),
+                reading(55_000, list()),
+                reading(56_000, say("Done.")),
+                reading(
+                    57_000,
+                    calls(
+                        "compact",
+                        serde_json::json!({"summary": "Listed the agents twice."}),
+                    ),
+                ),
+                say("Compacted."),
+                calls(
+                    "look_back",
+                    serde_json::json!({"query": "list_agents", "from": 1}),
+                ),
+                say("Found it."),
+            ],
+        )],
+        Settings {
+            compact_at: Some(50_000),
+            ..Settings::default()
+        },
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "list them".into(), PERSON);
+    f.settled().await;
+    f.crew.tell("lead", "go on".into()).unwrap();
+    f.settled().await;
+    f.crew.tell("lead", "what did you list?".into()).unwrap();
+    f.settled().await;
+    let requests = f.model.requests_of("lead");
+    let asked = |at: usize| {
+        format!("{:?}", requests[at].messages)
+            .matches(
+                "It should stay under 50.0k: finish the request you work on, then call `compact`",
+            )
+            .count()
+    };
+    // Its size said as it grew by the step, then at once as it passed the
+    // limit, and again as its next turn began past it; not at each call.
+    assert!(format!("{:?}", requests[1].messages).contains("(iq: your conversation is 30.0k"));
+    assert_eq!((asked(1), asked(2), asked(3), asked(4)), (0, 1, 2, 2));
+    // What its compaction replaced, found again by its words.
+    let found = format!("{:?}", requests[6].messages);
+    assert!(
+        found.contains("entries holding all of \\\"list_agents\\\" of the"),
+        "{found}"
+    );
+    assert!(found.contains("(you called list_agents"), "{found}");
+    // Its summary says where the rest is.
+    assert!(
+        found.contains("`look_back` finds it by its words"),
+        "{found}"
+    );
+}
+
+#[tokio::test]
 async fn what_a_compaction_replaced_is_kept_and_the_chat_comes_back_as_it_was_shown() {
     let compact = |summary: &str| calls("compact", serde_json::json!({ "summary": summary }));
     let f = fixture(
