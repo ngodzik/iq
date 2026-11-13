@@ -732,7 +732,8 @@ impl History {
                 self.finish(agent, board, p);
             }
             Event::Chosen { .. } => {}
-            Event::Asked { .. } | Event::Answered { .. } => {}
+            // Said in its chat by a notice, and in the status line.
+            Event::Asked { .. } | Event::Answered { .. } | Event::Skills { .. } => {}
             // A job's end, told its agent by iq: the job's own line says it,
             // never its whole command.
             Event::Posted { from, text, .. } if from == IQ && text.starts_with("Job ") => {}
@@ -2083,8 +2084,11 @@ fn agent_of(event: &Event) -> Option<&str> {
         | Event::Notice { agent, .. } => Some(agent),
         Event::Posted { from, .. } => Some(from),
         Event::Renamed { to, .. } => Some(to),
-        Event::Answered { .. } | Event::Chosen { .. } => None,
-        Event::Turn { chat, .. } => Some(chat),
+        Event::Answered { .. } | Event::Chosen { .. } | Event::Skills { chat: None } => None,
+        Event::Turn { chat, .. }
+        | Event::Skills {
+            chat: Some(chat), ..
+        } => Some(chat),
     }
 }
 
@@ -3129,6 +3133,7 @@ mod tests {
                 action: "git push".into(),
                 reason: "it leaves the machine".into(),
                 widens: true,
+                preview: None,
             },
         );
         run(

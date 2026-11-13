@@ -536,17 +536,23 @@ impl Settings {
             .collect()
     }
 
-    /// The folders of the person's skills: `~/` in `home`, others in
-    /// `workspace`.
-    pub(crate) fn skill_folders(&self, home: &Path, workspace: &Path) -> Vec<PathBuf> {
-        let mut folders: Vec<PathBuf> = self
-            .skills
+    /// The folders of the person's own skills, as the settings list them,
+    /// without the project's: those the person may open to a chat's
+    /// agents, which may change a project's as any of its files.
+    pub(crate) fn own_skill_folders(&self, home: &Path, workspace: &Path) -> Vec<PathBuf> {
+        self.skills
             .clone()
             .unwrap_or_else(|| SKILLS.map(str::to_owned).to_vec())
             .iter()
             .filter(|folder| !folder.trim().is_empty())
             .map(|folder| placed(folder.trim(), home, workspace))
-            .collect();
+            .collect()
+    }
+
+    /// The folders of the person's skills: `~/` in `home`, others in
+    /// `workspace`.
+    pub(crate) fn skill_folders(&self, home: &Path, workspace: &Path) -> Vec<PathBuf> {
+        let mut folders = self.own_skill_folders(home, workspace);
         // The project's own after the person's, whose skills win where both
         // hold one of the same name.
         let project = workspace.join(PROJECT_SKILLS);

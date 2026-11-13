@@ -574,7 +574,28 @@ struct Board {
     /// The agents retired, the latest last: done with their task, their
     /// names free again.
     retired: Vec<Retired>,
+    /// The chat the person opened their skills to, while they are open.
+    skills: Option<Opened>,
 }
+
+/// The person's skills, open to the agents of one chat.
+#[derive(Debug, Clone)]
+struct Opened {
+    chat: String,
+    /// The chat's turn they serve once it began: the one under way as they
+    /// opened, else the next.
+    turn: Option<u64>,
+}
+
+/// What an agent is told as the person opens their skills to it.
+const SKILLS_OPEN: &str = "(iq: the person opened their skills to you until this turn ends: \
+    the Markdown files under {folders} can be read with `read_file`, and each change you make to \
+    one with `write_file` or `edit_file` is asked of the person, who sees it before allowing it. \
+    Nothing else of those folders opens. Change only what the person asked.)";
+
+/// What it is told as they shut again.
+const SKILLS_SHUT: &str =
+    "(iq: the person's skills are shut again: their files hold secrets to you, as before.)";
 
 /// A question an agent put to the agent that started it, waiting for its
 /// answer.
@@ -623,6 +644,22 @@ impl Board {
                 .members
                 .values()
                 .any(|member| member.renaming.as_deref() == Some(name))
+    }
+
+    /// Whether one of the agents of `chat` works.
+    fn works(&self, chat: &str) -> bool {
+        self.members.iter().any(|(name, member)| {
+            member.turn.as_ref().is_some_and(|turn| !turn.is_finished())
+                && self.chat_of(name) == chat
+        })
+    }
+
+    /// Whether the person's skills are open to `agent`, as the agent of
+    /// the chat they opened them to.
+    fn skills_open(&self, agent: &str) -> bool {
+        self.skills
+            .as_ref()
+            .is_some_and(|opened| opened.chat == self.chat_of(agent))
     }
 
     /// The name of the chat `agent` is part of, as it shows: its own when
@@ -719,6 +756,8 @@ struct Member {
     /// next turn: its model changed, and only the provider that signed it
     /// can check it.
     forget_reasoning: bool,
+    /// Whether it was told the person's skills are open to it.
+    skills_told: bool,
     /// The messages its compactions replaced, in order.
     compacted_away: Vec<Message>,
     /// How many of its messages, after its standing instructions, its last
@@ -1008,6 +1047,7 @@ where
                 chosen: false,
                 models_chosen: saved.models_chosen,
                 forget_reasoning: false,
+                skills_told: false,
                 compacted_away: saved.compacted_away,
                 compacted_head: saved.compacted_head,
             },
@@ -1549,6 +1589,7 @@ where
                     at: now(),
                 }],
                 forget_reasoning: false,
+                skills_told: false,
                 compacted_away: Vec::new(),
                 compacted_head: 0,
             },
@@ -2316,13 +2357,8 @@ where
             let idle = {
                 let board = lock(&self.inner.board);
                 let chat = board.chat_of(to);
-                (
-                    chat.clone(),
-                    !board.members.iter().any(|(name, member)| {
-                        member.turn.as_ref().is_some_and(|turn| !turn.is_finished())
-                            && board.chat_of(name) == chat
-                    }),
-                )
+                let works = board.works(&chat);
+                (chat, !works)
             };
             if idle.1 {
                 self.new_turn(&idle.0);
@@ -2594,6 +2630,7 @@ where
         {
             self.wake(&name, news);
         }
+        self.skills_served(&name);
     }
 
     /// Retires `agent`, and its team with it, once done: the first of its
@@ -3039,6 +3076,9 @@ where
             if let Some(note) = self.context_note(name, model, step == 0).await {
                 messages.push(Message::user(note));
             }
+            if let Some(note) = self.skills_note(name) {
+                messages.push(Message::user(note));
+            }
             if let Some(said) = self.lighten(name, &mut messages) {
                 self.report(Event::Notice {
                     agent: name.to_owned(),
@@ -3261,7 +3301,9 @@ where
                 let path: std::path::PathBuf = args.text("path")?.into();
                 let content = args.text("content")?;
                 let permit = self
-                    .act(agent, Action::Write { path: path.clone() })
+                    .act_showing(agent, Action::Write { path: path.clone() }, || {
+                        self.preview(agent, &path, |_| Some(content.to_owned()))
+                    })
                     .await?;
                 // What it held, for the person to see what changed: nothing
                 // for a new file, none for one that is not text.
@@ -3277,17 +3319,21 @@ where
             }
             "edit_file" => {
                 let path: std::path::PathBuf = args.text("path")?.into();
-                let permit = self
-                    .act(agent, Action::Write { path: path.clone() })
-                    .await?;
-                let bytes = permit.read().map_err(|e| chain(&e))?;
-                let text = String::from_utf8(bytes).map_err(|_| "the file is not text")?;
-                let edited = tools::replaced(
-                    &text,
+                let (old, new, all) = (
                     args.text("old_text")?,
                     args.text("new_text")?,
                     args.flag("all"),
-                )?;
+                );
+                let permit = self
+                    .act_showing(agent, Action::Write { path: path.clone() }, || {
+                        self.preview(agent, &path, |text| {
+                            tools::replaced(text, old, new, all).ok()
+                        })
+                    })
+                    .await?;
+                let bytes = permit.read().map_err(|e| chain(&e))?;
+                let text = String::from_utf8(bytes).map_err(|_| "the file is not text")?;
+                let edited = tools::replaced(&text, old, new, all)?;
                 permit.write(edited.as_bytes()).map_err(|e| chain(&e))?;
                 self.changed(agent, &path, &text, &edited);
                 // Given once the edit is made: an edit refused would give
@@ -3566,23 +3612,183 @@ where
     /// The gate denied it, whoever answers for the person refused it, or
     /// the audit log could not be written.
     pub async fn act(&self, agent: &str, action: Action) -> Result<Permit, String> {
+        self.act_showing(agent, action, || None).await
+    }
+
+    /// The same, `preview` saying what the action changes, for the person
+    /// asked to allow it.
+    async fn act_showing(
+        &self,
+        agent: &str,
+        action: Action,
+        preview: impl FnOnce() -> Option<String> + Send,
+    ) -> Result<Permit, String> {
+        let skills = lock(&self.inner.board).skills_open(agent);
         let judged = self
             .place_of(agent)
             .gate
-            .judge(action)
+            .judge_with(action, skills)
             .map_err(|e| chain(&e))?;
         match judged {
             Judged::Allowed(permit) => Ok(permit),
             Judged::Denied { reason } => Err(refusal("the gate", &reason, false)),
-            Judged::Asked { reason, pending } => self.ask(agent, reason, pending).await,
+            Judged::Asked { reason, pending } => {
+                let preview = preview();
+                self.ask(agent, reason, pending, preview).await
+            }
         }
+    }
+
+    /// What the file at `path` becomes as `after` makes it from what it
+    /// holds, as a unified diff, for the person asked to allow it: none
+    /// when `agent` may not read it, or it is not text. One not there
+    /// holds nothing yet.
+    fn preview(
+        &self,
+        agent: &str,
+        path: &std::path::Path,
+        after: impl FnOnce(&str) -> Option<String>,
+    ) -> Option<String> {
+        let skills = lock(&self.inner.board).skills_open(agent);
+        let read = Action::Read {
+            path: path.to_path_buf(),
+        };
+        let before = match self.place_of(agent).gate.judge_with(read, skills).ok()? {
+            Judged::Allowed(permit) => match permit.read() {
+                Ok(bytes) => String::from_utf8(bytes).ok()?,
+                Err(_) => String::new(),
+            },
+            Judged::Asked { .. } | Judged::Denied { .. } => return None,
+        };
+        crate::diff::unified(&before, &after(&before)?)
+    }
+
+    /// Opens the person's skills to the agents of `agent`'s chat until the
+    /// turn they serve ends (the one under way, else the next), or shuts
+    /// them. They are open to one chat at a time: opened to another, they
+    /// shut for the one before.
+    ///
+    /// # Errors
+    ///
+    /// No agent of that name, or no folder of skills to open.
+    pub fn open_skills(&self, agent: &str, open: bool) -> Result<(), String> {
+        if open && self.inner.place.gate.skill_folders().is_empty() {
+            return Err("no folder of skills is set".into());
+        }
+        let (chat, works) = {
+            let board = lock(&self.inner.board);
+            let name = board
+                .named(agent)
+                .ok_or_else(|| format!("no agent is named {agent:?}"))?;
+            let chat = board.chat_of(&name);
+            let works = board.works(&chat);
+            (chat, works)
+        };
+        let number = lock(&self.inner.turns)
+            .get(&chat)
+            .map_or(0, |turn| turn.number);
+        let before = {
+            let mut board = lock(&self.inner.board);
+            let before = board.skills.take();
+            if open {
+                board.skills = Some(Opened {
+                    chat: chat.clone(),
+                    turn: works.then_some(number),
+                });
+            }
+            before
+        };
+        if let Some(before) = before.filter(|before| !open || before.chat != chat) {
+            self.report(Event::Notice {
+                agent: before.chat.clone(),
+                text: "your skills are shut again".into(),
+            });
+        }
+        if open {
+            let until = if works {
+                "its turn under way ends"
+            } else {
+                "its next turn ends"
+            };
+            self.report(Event::Notice {
+                agent: chat.clone(),
+                text: format!(
+                    "your skills are open to this chat's agents until {until}: their Markdown \
+                     files read, each change asked of you"
+                ),
+            });
+        }
+        self.report(Event::Skills {
+            chat: open.then_some(chat),
+        });
+        Ok(())
+    }
+
+    /// Shuts the person's skills once the turn they serve ended: none of
+    /// the agents of `agent`'s chat works.
+    fn skills_served(&self, agent: &str) {
+        let shut = {
+            let mut board = lock(&self.inner.board);
+            let chat = board.chat_of(agent);
+            let served = board
+                .skills
+                .as_ref()
+                .is_some_and(|opened| opened.chat == chat && opened.turn.is_some());
+            if served && !board.works(&chat) {
+                board.skills.take()
+            } else {
+                None
+            }
+        };
+        if let Some(opened) = shut {
+            self.skills_shut(&opened.chat, "the turn they were opened for ended");
+        }
+    }
+
+    /// Says that the person's skills, open to `chat`, shut, and why.
+    fn skills_shut(&self, chat: &str, why: &str) {
+        self.report(Event::Notice {
+            agent: chat.to_owned(),
+            text: format!("your skills are shut again: {why}"),
+        });
+        self.report(Event::Skills { chat: None });
+    }
+
+    /// What `agent` is told of the person's skills, when they opened to it
+    /// or shut again since it was last told.
+    fn skills_note(&self, agent: &str) -> Option<String> {
+        let mut board = lock(&self.inner.board);
+        let open = board.skills_open(agent);
+        let member = board.members.get_mut(agent)?;
+        if member.skills_told == open {
+            return None;
+        }
+        member.skills_told = open;
+        drop(board);
+        if !open {
+            return Some(SKILLS_SHUT.to_owned());
+        }
+        let folders: Vec<String> = self
+            .place_of(agent)
+            .gate
+            .skill_folders()
+            .iter()
+            .map(|folder| folder.display().to_string())
+            .collect();
+        Some(SKILLS_OPEN.replace("{folders}", &folders.join(", ")))
     }
 
     /// Asks the reviewer, the autopilot being on and the action one it may
     /// answer, else the person. After as many refusals in a row as the
     /// settings say, an agent's next action goes to the person: the
     /// reviewer and the agent are not getting anywhere.
-    async fn ask(&self, agent: &str, reason: String, pending: Pending) -> Result<Permit, String> {
+    async fn ask(
+        &self,
+        agent: &str,
+        reason: String,
+        pending: Pending,
+        preview: Option<String>,
+    ) -> Result<Permit, String> {
         let action = describe(pending.action());
         // The reviewer answers what stays within the sandbox, what only
         // reaches the internet and what runs on the machine when the
@@ -3658,6 +3864,7 @@ where
             action,
             reason: reason.clone(),
             widens: pending.widens(),
+            preview,
         });
         let answer = tokio::time::timeout(self.inner.settings.patience, answer).await;
         lock(&self.inner.questions).remove(&id);
@@ -4277,6 +4484,25 @@ where
             number,
             ask_at: self.inner.settings.turn_ask,
         });
+        // The skills opened while the chat rested serve this turn; any
+        // other turn of the chat is a later one, past theirs.
+        let stale = {
+            let mut board = lock(&self.inner.board);
+            match &mut board.skills {
+                Some(opened) if opened.chat == chat => match opened.turn {
+                    None => {
+                        opened.turn = Some(number);
+                        false
+                    }
+                    Some(served) => served != number,
+                },
+                _ => false,
+            }
+        };
+        if stale {
+            lock(&self.inner.board).skills = None;
+            self.skills_shut(chat, "a later turn began");
+        }
     }
 
     /// Whether `agent` may call its model again in its chat's turn: past

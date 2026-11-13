@@ -73,17 +73,7 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
             }
         }
         Event::Changed { agent, path, diff } => {
-            const SHOWN: usize = 40;
-            let mut lines: Vec<String> = diff
-                .lines()
-                .take(SHOWN)
-                .map(|line| format!("    {line}"))
-                .collect();
-            let more = diff.lines().count().saturating_sub(SHOWN);
-            if more > 0 {
-                lines.push(format!("    … {more} more lines"));
-            }
-            writeln!(out, "  ✎ {agent} changed {path}\n{}", lines.join("\n"))
+            writeln!(out, "  ✎ {agent} changed {path}\n{}", shown_diff(diff))
         }
         Event::Asked {
             id,
@@ -91,15 +81,20 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
             action,
             reason,
             widens,
+            preview,
         } => {
             let beyond = if *widens {
                 " It reaches beyond the sandbox."
             } else {
                 ""
             };
+            let change = preview
+                .as_deref()
+                .map(|diff| format!("\n{}", shown_diff(diff)))
+                .unwrap_or_default();
             return Some((
                 *id,
-                format!("\n? {agent} asks to {action}: held because {reason}.{beyond}"),
+                format!("\n? {agent} asks to {action}: held because {reason}.{beyond}{change}"),
             ));
         }
         Event::Answered { approved, .. } => {
@@ -132,7 +127,10 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
             "  ⚙ {agent} runs job {id} in the background: {}",
             iq_ui::shell::few_words(line, 72)
         ),
-        Event::JobOutput { .. } | Event::Turn { .. } | Event::Window { .. } => Ok(()),
+        Event::JobOutput { .. }
+        | Event::Turn { .. }
+        | Event::Window { .. }
+        | Event::Skills { .. } => Ok(()),
         Event::JobEnded {
             agent, id, said, ..
         } => {
@@ -219,4 +217,19 @@ pub(crate) fn ask(question: &str) -> bool {
         return false;
     }
     matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
+/// The first lines of `diff`, indented, and how many it leaves out.
+fn shown_diff(diff: &str) -> String {
+    const SHOWN: usize = 40;
+    let mut lines: Vec<String> = diff
+        .lines()
+        .take(SHOWN)
+        .map(|line| format!("    {line}"))
+        .collect();
+    let more = diff.lines().count().saturating_sub(SHOWN);
+    if more > 0 {
+        lines.push(format!("    … {more} more lines"));
+    }
+    lines.join("\n")
 }

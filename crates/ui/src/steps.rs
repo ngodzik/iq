@@ -409,6 +409,7 @@ impl Steps {
             Event::Waiting { .. }
             | Event::Turn { .. }
             | Event::Window { .. }
+            | Event::Skills { .. }
             | Event::JobOutput { .. } => {}
             Event::JobStarted { id, line, .. } => {
                 self.jobs.insert(*id, line.clone());
@@ -747,6 +748,7 @@ mod tests {
             action: "git push".into(),
             reason: "it leaves the machine".into(),
             widens: true,
+            preview: None,
         });
         steps.event(&Event::Answered {
             id: 7,

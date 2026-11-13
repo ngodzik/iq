@@ -86,6 +86,14 @@ pub enum Request {
     /// Give every command the internet, or only what a rule gives it to
     /// and what the person allows.
     Internet(bool),
+    /// Open the person's skills to the agents of `agent`'s chat, or shut
+    /// them.
+    Skills {
+        /// An agent of the chat.
+        agent: String,
+        /// Whether they open.
+        open: bool,
+    },
     /// Stop a command run in the background.
     StopJob {
         /// Its number.
@@ -518,6 +526,9 @@ pub struct Question {
     pub reason: String,
     /// Whether it gives more than the sandbox holds.
     pub widens: bool,
+    /// What a file written becomes, as a unified diff, when the agent may
+    /// read it.
+    pub preview: Option<String>,
 }
 
 /// The crew as the window holds it.
@@ -538,6 +549,8 @@ pub struct CrewView {
     jobs: Vec<JobView>,
     autopilot: bool,
     internet: bool,
+    /// The chat the person's skills are open to, while they are.
+    skills: Option<String>,
     /// The lead's model and the reviewer's, as the program starts them.
     lead: String,
     reviewer: String,
@@ -710,6 +723,12 @@ impl CrewView {
     #[must_use]
     pub fn internet(&self) -> bool {
         self.internet
+    }
+
+    /// The chat the person's skills are open to, while they are.
+    #[must_use]
+    pub fn skills(&self) -> Option<&str> {
+        self.skills.as_deref()
     }
 
     /// Opens the internet to every command, or closes it to all but what a
@@ -936,12 +955,14 @@ impl CrewView {
                     });
                 }
             }
+            Event::Skills { chat } => self.skills = chat,
             Event::Asked {
                 id,
                 agent,
                 action,
                 reason,
                 widens,
+                preview,
             } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.thread.push(Entry::Asked {
@@ -957,6 +978,7 @@ impl CrewView {
                     action,
                     reason,
                     widens,
+                    preview,
                 });
             }
             Event::Answered { id, approved } => {
@@ -1128,6 +1150,7 @@ mod tests {
             action: "run `git push`".into(),
             reason: "it publishes commits".into(),
             widens: true,
+            preview: None,
         });
         assert_eq!(crew.questions().len(), 1);
         assert_eq!(

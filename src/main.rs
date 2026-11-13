@@ -290,10 +290,13 @@ const MCP_GRANTS: &str = "mcp-auth";
 
 /// The gate of the current folder, as the settings open it.
 fn settings_gate(settings: &Settings) -> Result<Gate> {
-    gate(
+    let workspace = std::env::current_dir().context("reading the current folder")?;
+    gate_in(
+        &workspace,
         settings.internet,
         settings.autopilot_internet(),
         settings.autopilot_host(),
+        settings.own_skill_folders(&home_dir()?, &workspace),
     )
 }
 
@@ -1393,6 +1396,11 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     };
                     let _ = told.send(Update::Notice(said));
                 }
+                Request::Skills { agent, open } => {
+                    if let Err(why) = working.open_skills(&agent, open) {
+                        let _ = told.send(Update::Notice(format!("Your skills stay shut: {why}")));
+                    }
+                }
                 Request::Model { agent, model } => {
                     let said = match ModelId::new(&model)
                         .map_err(|error| error.to_string())
@@ -1581,16 +1589,19 @@ fn gate(internet: bool, reviewer_internet: bool, reviewer_host: bool) -> Result<
         internet,
         reviewer_internet,
         reviewer_host,
+        Vec::new(),
     )
 }
 
-/// The gate of `workspace`, as [`gate`]'s. Rules are never read from the
+/// The gate of `workspace`, as [`gate`]'s, the person's `skills` among
+/// what they may open to a chat. Rules are never read from the
 /// workspace: a command could write them there.
 fn gate_in(
     workspace: &Path,
     internet: bool,
     reviewer_internet: bool,
     reviewer_host: bool,
+    skills: Vec<PathBuf>,
 ) -> Result<Gate> {
     let folder = home_folder()?;
     let mut gate = Gate::builder(workspace)
@@ -1598,7 +1609,8 @@ fn gate_in(
         .scratch(scratch::folder(&cache_folder(&home_dir()?), &project()))
         .internet(internet)
         .reviewer_internet(reviewer_internet)
-        .reviewer_host(reviewer_host);
+        .reviewer_host(reviewer_host)
+        .skills(skills);
     let rules = folder.join("rules.toml");
     if rules.exists() {
         let text = std::fs::read_to_string(&rules)

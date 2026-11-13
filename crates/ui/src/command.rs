@@ -18,7 +18,7 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 20] = [
+pub const COMMANDS: [Spec; 21] = [
     Spec {
         name: "new",
         args: "[model]",
@@ -78,6 +78,11 @@ pub const COMMANDS: [Spec; 20] = [
         name: "internet",
         args: "",
         what: "the internet open to every command, or only to what fetches packages",
+    },
+    Spec {
+        name: "skills",
+        args: "",
+        what: "your skills open to this chat's agents until its turn ends, each change asked of you; again shuts them",
     },
     Spec {
         name: "find",
@@ -166,6 +171,9 @@ pub enum Command {
     Autopilot,
     /// The internet open to every command, or not.
     Internet,
+    /// The person's skills open to the agents of the chat written to, or
+    /// shut.
+    Skills,
     /// How each MCP server is.
     Mcp,
     /// Attach the image at this path to what the person writes; none
@@ -256,6 +264,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "keys" | "help" => bare(Command::Keys),
         "autopilot" => bare(Command::Autopilot),
         "internet" => bare(Command::Internet),
+        "skills" => bare(Command::Skills),
         "mcp" => bare(Command::Mcp),
         "image" => Ok(Command::Image(
             Some(rest.trim().to_owned()).filter(|path| !path.is_empty()),

@@ -151,6 +151,10 @@ pub enum Event {
         /// Whether it gives more than the sandbox holds: the network, a
         /// file outside the workspace, where code runs later.
         widens: bool,
+        /// What a file written or edited becomes, as a unified diff of its
+        /// lines, when the agent may read the file: the person sees the
+        /// change before they allow it.
+        preview: Option<String>,
     },
     /// The person answered, or nobody did in time.
     Answered {
@@ -283,6 +287,12 @@ pub enum Event {
         /// What.
         text: String,
     },
+    /// The person's skills open to the agents of a chat, until the turn
+    /// they serve ends, or shut.
+    Skills {
+        /// The chat, while they are open.
+        chat: Option<String>,
+    },
 }
 
 impl Event {
@@ -340,6 +350,11 @@ impl Event {
             Event::Waiting { agent, on } => {
                 renamed(agent);
                 on.iter_mut().for_each(renamed);
+            }
+            Event::Skills { chat } => {
+                if let Some(chat) = chat {
+                    renamed(chat);
+                }
             }
         }
     }

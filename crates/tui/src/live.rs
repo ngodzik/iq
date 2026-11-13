@@ -849,6 +849,12 @@ impl Live<'_> {
             ));
         }
         lines.push(Line::from(keys));
+        // The change itself, before it is allowed: its lines added and
+        // removed, the longest cut; under the keys, which a screen too
+        // short for all of it keeps.
+        if let Some(diff) = &question.preview {
+            lines.extend(previewed(diff, inner, p));
+        }
         let tint = agent_tint(self.board, &question.agent, p);
         // Named as in its chat's window when it is this one's; else by its
         // whole name, its chat's first.
@@ -1224,6 +1230,22 @@ impl Live<'_> {
         let crew = self.board.crew();
         let mut left: Vec<Span<'static>> = vec![Span::raw(" ")];
         let sep = || Span::styled(" · ", p.fg(p.faint));
+        // The person's skills open: said first, in the colour of danger,
+        // for as long as they are, so that nobody wonders a turn later.
+        if let Some(chat) = crew.skills() {
+            let danger = p.bold(p.bad);
+            left.push(Span::styled("⚠ SKILLS OPEN", danger));
+            if self.window().as_deref() != Some(chat) {
+                left.push(Span::styled(format!(" to {chat}"), p.fg(p.bad)));
+            }
+            let shuts = self
+                .board
+                .keys()
+                .chord(Action::Skills)
+                .map_or("/skills".to_owned(), |chord| chord.to_string());
+            left.push(Span::styled(format!(" · {shuts} shuts"), p.fg(p.bad)));
+            left.push(sep());
+        }
         if crew.autopilot() {
             left.push(Span::styled("⏵⏵ autopilot", p.fg(p.accent)));
         } else {
@@ -1362,6 +1384,40 @@ impl Live<'_> {
 /// A key as a hint writes it, short: `Esc` for Escape.
 pub(crate) fn hint(key: &str) -> String {
     key.replace("Escape", "Esc")
+}
+
+/// How many lines of a change asked of the person its question shows.
+const PREVIEWED: usize = 40;
+
+/// The lines of `diff`, a change asked of the person, as its question
+/// shows them at `width`: added in the colour of what is well, removed in
+/// that of what is not, the rest dim, each cut to the width; past
+/// [`PREVIEWED`], how many more there are.
+fn previewed(diff: &str, width: usize, p: &Palette) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = diff
+        .lines()
+        .take(PREVIEWED)
+        .map(|line| {
+            let tint = match line.chars().next() {
+                Some('+') => p.ok,
+                Some('-') => p.bad,
+                Some('@' | '\\') => p.faint,
+                _ => p.dim,
+            };
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(cut(line, width.saturating_sub(2)), p.fg(tint)),
+            ])
+        })
+        .collect();
+    let more = diff.lines().count().saturating_sub(PREVIEWED);
+    if more > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  … {more} more lines"),
+            p.fg(p.faint),
+        )));
+    }
+    lines
 }
 
 /// `text` folded into rows of `width` columns at its new lines and where
@@ -1650,6 +1706,48 @@ mod tests {
         assert!(!rows.iter().any(|row| row.contains("│ two")));
     }
 
+    #[test]
+    fn the_skills_open_are_said_first_in_the_status_line_for_as_long_as_they_are() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        for agent in ["lead", "other"] {
+            crew(
+                &mut board,
+                &mut history,
+                Event::Joined {
+                    agent: agent.into(),
+                    model: "lab/m".into(),
+                    by: PERSON.into(),
+                },
+                &p,
+            );
+        }
+        board.screen_mut().talk_to("lead");
+        let skills = |chat: Option<&str>| Event::Skills {
+            chat: chat.map(str::to_owned),
+        };
+        crew(&mut board, &mut history, skills(Some("lead")), &p);
+        let rows = drawn(&board, &history, 100);
+        let status = rows.last().unwrap();
+        assert!(
+            status.starts_with(" ⚠ SKILLS OPEN · Ctrl-B shuts · "),
+            "{status}"
+        );
+        // Written to another chat, the one they are open to is named.
+        board.screen_mut().talk_to("other");
+        let rows = drawn(&board, &history, 100);
+        assert!(
+            rows.last()
+                .unwrap()
+                .starts_with(" ⚠ SKILLS OPEN to lead · Ctrl-B shuts"),
+            "{rows:#?}"
+        );
+        crew(&mut board, &mut history, skills(None), &p);
+        let rows = drawn(&board, &history, 100);
+        assert!(!rows.last().unwrap().contains("SKILLS"));
+    }
+
     fn drawn(board: &Board, history: &History, width: u16) -> Vec<String> {
         let p = Palette::new(Theme::Graphite, Depth::True);
         let mut motion = Motion::default();
@@ -1764,6 +1862,9 @@ mod tests {
                 action: "run `git push`".into(),
                 reason: "it publishes commits".into(),
                 widens: true,
+                preview: Some(
+                    "@@ -1,2 +1,2 @@\n # Review\n-Read the diff.\n+Read the whole diff.".into(),
+                ),
             },
             &p,
         );
@@ -1775,9 +1876,16 @@ mod tests {
         // Its chat's own agent, by its model, in its window.
         assert!(rows[1].contains("claude-opus-5-5 asks"), "{}", rows[1]);
         assert!(rows[2].contains("run `git push`"));
+        let keys = rows
+            .iter()
+            .position(|r| r.contains("Ctrl-Y allow  Ctrl-R refuse"))
+            .unwrap();
+        // The change asked, under the keys, which a short screen keeps.
+        assert!(rows[keys + 1].contains("@@ -1,2 +1,2 @@"), "{rows:#?}");
+        assert!(rows[keys + 3].contains("-Read the diff."), "{rows:#?}");
         assert!(
-            rows.iter()
-                .any(|r| r.contains("Ctrl-Y allow  Ctrl-R refuse"))
+            rows[keys + 4].contains("+Read the whole diff."),
+            "{rows:#?}"
         );
         let status = rows.last().unwrap();
         assert!(status.contains("1 waiting for you"));

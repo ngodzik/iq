@@ -1377,6 +1377,20 @@ impl Board {
             Action::Theme => self.look.next_theme(),
             Action::Autopilot => return Some(self.crew.toggle_autopilot()),
             Action::Internet => return Some(self.crew.toggle_internet()),
+            Action::Skills => {
+                let Talk::To(agent) = self.screen.talk().clone() else {
+                    self.screen
+                        .notice("Your skills open to a chat: write to one first", now);
+                    return None;
+                };
+                let Some(chat) = self.crew.chat_of(&agent) else {
+                    self.screen.notice(self.no_agent(&agent), now);
+                    return None;
+                };
+                // Open to this chat, they shut; else they open to it.
+                let open = self.crew.skills() != Some(chat.as_str());
+                return Some(Request::Skills { agent, open });
+            }
             Action::Allow | Action::Refuse => {
                 // The agents' questions first: they hold work.
                 if let Some(id) = self.crew.questions().first().map(|q| q.id) {
@@ -1626,6 +1640,7 @@ impl Board {
             Command::Keys => open(self, Page::Keys),
             Command::Autopilot => return self.act(Action::Autopilot, now).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet, now).into_iter().collect(),
+            Command::Skills => return self.act(Action::Skills, now).into_iter().collect(),
             Command::Mcp => return vec![Request::Mcp],
             Command::Image(None) => {
                 let said = match self.attached.len() {
@@ -1916,6 +1931,18 @@ impl Board {
                             text: text.clone(),
                         });
                     }
+                    // Said at once, whatever the chat written to: the
+                    // chat's own notice waits among its steps.
+                    Event::Skills { chat } if chat.as_deref() != self.crew.skills() => {
+                        let said = match chat {
+                            Some(chat) => format!(
+                                "Your skills are open to the agents of {chat} until its turn \
+                                 ends: each change of one is asked of you"
+                            ),
+                            None => "Your skills are shut again".to_owned(),
+                        };
+                        self.screen.notice(said, crate::now());
+                    }
                     _ => {}
                 }
                 self.crew.event(event);
@@ -2055,6 +2082,46 @@ mod tests {
         board.scroll(-3);
         key(&mut board, "PageUp");
         assert!(board.take_readings().is_empty());
+    }
+
+    #[test]
+    fn the_skills_open_to_the_chat_written_to_and_shut_the_same_way() {
+        let mut board = Board::default();
+        // No chat yet: none to open them to.
+        assert!(key(&mut board, "ctrl+b").is_empty());
+        joined(&mut board, "lead", PERSON);
+        joined(&mut board, "lead/review", "lead");
+        board.screen_mut().talk_to("lead/review");
+        assert_eq!(
+            key(&mut board, "ctrl+b"),
+            [Request::Skills {
+                agent: "lead/review".into(),
+                open: true
+            }]
+        );
+        board.update(Update::Crew(Event::Skills {
+            chat: Some("lead".into()),
+        }));
+        assert_eq!(board.crew().skills(), Some("lead"));
+        // Said at once.
+        assert!(
+            board
+                .screen()
+                .noticed(1)
+                .is_some_and(|said| said.starts_with("Your skills are open to the agents of lead")),
+            "{:?}",
+            board.screen().noticed(1)
+        );
+        // Open to its chat, the command shuts them.
+        board.screen_mut().talk_to("lead");
+        board.screen_mut().editor_mut().set("/skills");
+        assert_eq!(
+            key(&mut board, "enter"),
+            [Request::Skills {
+                agent: "lead".into(),
+                open: false
+            }]
+        );
     }
 
     #[test]
@@ -2986,6 +3053,7 @@ mod tests {
                 action: "run x".into(),
                 reason: "it reaches the internet".into(),
                 widens: true,
+                preview: None,
             }));
         }
         assert_eq!(

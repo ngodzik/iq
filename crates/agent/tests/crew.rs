@@ -446,8 +446,12 @@ async fn a_file_written_or_edited_is_said_with_how_its_lines_changed() {
         ]
     );
     // Never for a file of secrets, whose lines the person allowed written
-    // but not shown.
+    // but not shown, nor as they were asked.
     assert!(!changed.iter().any(|(path, _)| path.contains(".env")));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Asked { action, preview: None, .. } if action.contains(".env")
+    )));
     // Said before the step that wrote it.
     let at = |name: &str| {
         events
@@ -460,6 +464,138 @@ async fn a_file_written_or_edited_is_said_with_how_its_lines_changed() {
         .position(|event| matches!(event, Event::Changed { .. }))
         .unwrap();
     assert!(first < at("write_file"));
+}
+
+#[tokio::test]
+async fn the_skills_open_to_one_chat_for_a_turn_each_change_shown_and_asked_of_the_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let (home, root) = (base.join("home"), base.join("work"));
+    let skills = home.join(".iq/skills");
+    std::fs::create_dir_all(skills.join("review")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let skill = skills.join("review/SKILL.md");
+    std::fs::write(&skill, "# Review\nRead the diff.\n").unwrap();
+    let path = skill.display().to_string();
+    let read = || calls("read_file", serde_json::json!({ "path": path }));
+    let scripted = Scripted::new(&[
+        (
+            "lead",
+            vec![
+                say("Ready."),
+                read(),
+                calls(
+                    "edit_file",
+                    serde_json::json!({"path": path, "old_text": "Read the diff.", "new_text": "Read the whole diff."}),
+                ),
+                say("Changed it."),
+                read(),
+                say("Shut."),
+            ],
+        ),
+        ("other", vec![say("Ready."), read(), say("Denied.")]),
+    ]);
+    let gate = Gate::builder(&root)
+        .home(Some(home.clone()))
+        .skills([skills.clone()])
+        .build()
+        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&events);
+    let crew = Crew::new(
+        Model(Arc::clone(&scripted)),
+        gate,
+        Helper::new("/nonexistent", Vec::<String>::new()),
+        Settings::default(),
+        Arc::new(move |event| kept.lock().unwrap().push(event)),
+    );
+    let settled = || async {
+        tokio::time::timeout(Duration::from_secs(10), crew.settled())
+            .await
+            .unwrap();
+    };
+    crew.start("lead", &model("lab/m"), "hello".into(), PERSON);
+    crew.start("other", &model("lab/m"), "hello".into(), PERSON);
+    settled().await;
+    // Opened while the chat rests: they serve its next turn, the autopilot
+    // on or not, every change the person's.
+    crew.open_skills("lead", true).unwrap();
+    crew.set_autopilot(true);
+    crew.tell("lead", "make the review read the whole diff".into())
+        .unwrap();
+    let asked = loop {
+        let found = events.lock().unwrap().iter().find_map(|event| match event {
+            Event::Asked { id, preview, .. } => Some((*id, preview.clone())),
+            _ => None,
+        });
+        if let Some(found) = found {
+            break found;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    // The change shown before it is allowed.
+    assert_eq!(
+        asked.1.as_deref(),
+        Some("@@ -1,2 +1,2 @@\n # Review\n-Read the diff.\n+Read the whole diff.")
+    );
+    crew.answer(asked.0, true);
+    settled().await;
+    assert_eq!(
+        std::fs::read_to_string(&skill).unwrap(),
+        "# Review\nRead the whole diff.\n"
+    );
+    let seen = scripted.seen_by("lead");
+    assert!(
+        seen.contains(
+            "the person opened their skills to you until this turn ends: the Markdown files under"
+        ),
+        "{seen}"
+    );
+    assert!(seen.contains("# Review"), "{seen}");
+    // Their turn ended, they shut, said each time.
+    let said: Vec<Event> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, Event::Skills { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        said,
+        [
+            Event::Skills {
+                chat: Some("lead".into())
+            },
+            Event::Skills { chat: None }
+        ]
+    );
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        Event::Notice { agent, text } if agent == "lead" && text == "your skills are shut again: the turn they were opened for ended"
+    )));
+    // Shut, read no more, the agent told.
+    crew.tell("lead", "read it again".into()).unwrap();
+    settled().await;
+    let seen = scripted.seen_by("lead");
+    assert!(
+        seen.contains("the person's skills are shut again"),
+        "{seen}"
+    );
+    assert!(seen.contains("it holds secrets"), "{seen}");
+    // Open to one chat, never to another's agents.
+    crew.open_skills("lead", true).unwrap();
+    crew.tell("other", "read the skill".into()).unwrap();
+    settled().await;
+    let seen = scripted.seen_by("other");
+    assert!(seen.contains("it holds secrets"), "{seen}");
+    assert!(!seen.contains("opened their skills"), "{seen}");
+    // Shut by the person at once.
+    crew.open_skills("lead", false).unwrap();
+    assert_eq!(
+        events.lock().unwrap().last(),
+        Some(&Event::Skills { chat: None })
+    );
+    assert!(crew.open_skills("nobody", true).is_err());
 }
 
 #[tokio::test]
