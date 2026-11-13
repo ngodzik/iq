@@ -435,6 +435,13 @@ impl Gate {
         self.internet.store(open, Ordering::Relaxed);
     }
 
+    /// Whether `path` holds secrets, as its name or its folder in the
+    /// gate's home says: what it says of a file is never shown.
+    #[must_use]
+    pub fn holds_secrets(&self, path: &Path) -> bool {
+        paths::secret(path, self.bounds.home.as_deref())
+    }
+
     /// The folders of the person's skills, as they open.
     pub fn skill_folders(&self) -> &[PathBuf] {
         &self.skills

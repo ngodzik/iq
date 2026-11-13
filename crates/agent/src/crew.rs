@@ -3253,13 +3253,25 @@ where
     /// `after`, when a line of it changed: never for a file of secrets,
     /// as it is named or as the file it leads to is, whose lines the
     /// person allowed written, not shown.
-    fn changed(&self, agent: &str, path: &std::path::Path, before: &str, after: &str) {
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let full = self.place_of(agent).gate.workspace().join(path);
-        let real = std::fs::canonicalize(&full).unwrap_or(full);
+    fn changed(
+        &self,
+        agent: &str,
+        path: &std::path::Path,
+        permit: &Permit,
+        before: &str,
+        after: &str,
+    ) {
+        let gate = self.place_of(agent).gate.clone();
+        // Where the gate judged it written: `~/` read as the home, a link
+        // followed.
+        let written = match permit.action() {
+            Action::Write { path } => path.clone(),
+            _ => gate.workspace().join(path),
+        };
+        let real = std::fs::canonicalize(&written).unwrap_or(written);
         if [path, real.as_path()]
             .iter()
-            .any(|path| iq_gate::holds_secrets(path, home.as_deref()))
+            .any(|path| gate.holds_secrets(path))
         {
             return;
         }
@@ -3313,7 +3325,7 @@ where
                 };
                 permit.write(content.as_bytes()).map_err(|e| chain(&e))?;
                 if let Some(before) = before {
-                    self.changed(agent, &path, &before, content);
+                    self.changed(agent, &path, &permit, &before, content);
                 }
                 Ok(format!("Wrote {} bytes.", content.len()) + &self.scoped_for(agent, &path))
             }
@@ -3335,7 +3347,7 @@ where
                 let text = String::from_utf8(bytes).map_err(|_| "the file is not text")?;
                 let edited = tools::replaced(&text, old, new, all)?;
                 permit.write(edited.as_bytes()).map_err(|e| chain(&e))?;
-                self.changed(agent, &path, &text, &edited);
+                self.changed(agent, &path, &permit, &text, &edited);
                 // Given once the edit is made: an edit refused would give
                 // them to nobody.
                 Ok(format!("Edited.{}", self.scoped_for(agent, &path)))

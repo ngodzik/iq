@@ -476,7 +476,8 @@ async fn the_skills_open_to_one_chat_for_a_turn_each_change_shown_and_asked_of_t
     std::fs::create_dir_all(&root).unwrap();
     let skill = skills.join("review/SKILL.md");
     std::fs::write(&skill, "# Review\nRead the diff.\n").unwrap();
-    let path = skill.display().to_string();
+    // Named as the person would, from their home.
+    let path = "~/.iq/skills/review/SKILL.md".to_owned();
     let read = || calls("read_file", serde_json::json!({ "path": path }));
     let scripted = Scripted::new(&[
         (
@@ -543,6 +544,15 @@ async fn the_skills_open_to_one_chat_for_a_turn_each_change_shown_and_asked_of_t
     assert_eq!(
         std::fs::read_to_string(&skill).unwrap(),
         "# Review\nRead the whole diff.\n"
+    );
+    // Shown as it was asked, not again once written: a file of secrets
+    // named from the home is one still.
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, Event::Changed { .. }))
     );
     let seen = scripted.seen_by("lead");
     assert!(
