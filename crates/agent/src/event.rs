@@ -189,6 +189,9 @@ pub enum Event {
         question: String,
         /// What it offers, two to four.
         choices: Vec<String>,
+        /// Who raised it, when the agent asks for agents it started: their
+        /// names, through whom, and what each spent.
+        raised: Option<String>,
     },
     /// The person answered a question with choices, or nobody did.
     Chosen {

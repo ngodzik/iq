@@ -3,8 +3,6 @@
 //! key the person presses is taken here, so that what it does is tested
 //! without a terminal.
 
-use std::collections::HashMap;
-
 use iq_agent::{Event, PERSON};
 
 use crate::command::{self, Command, Completion};
@@ -214,27 +212,12 @@ pub struct Board {
     attached: Vec<std::path::PathBuf>,
     /// The choice picked in the question with choices shown.
     picking: usize,
-    /// The images of the diagrams drawn in each chat's window, the latest
-    /// last: none for a new chat's.
-    diagrams: HashMap<Option<String>, Vec<std::path::PathBuf>>,
-    /// How the diagram page shows one of them.
-    picture: Picture,
+    /// Whether a diagram shows folded as the last thing written, for the
+    /// down arrow to unfold.
+    folded: bool,
+    /// Whether the person asked the diagram folded to unfold.
+    unfold: bool,
 }
-
-/// How the diagram page shows a diagram: which, from the latest; how much
-/// it is enlarged; and how far it is moved, in tenths of what shows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Picture {
-    /// Which diagram, from the latest: 0 for it.
-    pub back: usize,
-    /// How many times it is enlarged, from one.
-    pub zoom: u32,
-    /// How far it is moved right, then down.
-    pub moved: (i32, i32),
-}
-
-/// The most a diagram is enlarged.
-const ZOOM_MOST: u32 = 8;
 
 /// The image a paste is, when it is the path of one alone: a file dropped
 /// on the terminal pastes its path, quoted, escaped or as a `file://`
@@ -296,90 +279,21 @@ impl Board {
             switching: None,
             attached: Vec::new(),
             picking: 0,
-            diagrams: HashMap::new(),
-            picture: Picture::default(),
+            folded: false,
+            unfold: false,
         }
     }
 
-    /// The diagram drawn as the image at `image` was written in `chat`'s
-    /// window.
-    pub fn drawn_diagram(&mut self, chat: Option<String>, image: std::path::PathBuf) {
-        let drawn = self.diagrams.entry(chat).or_default();
-        if drawn.last() != Some(&image) {
-            drawn.retain(|seen| *seen != image);
-            drawn.push(image);
-        }
+    /// Says whether a diagram shows folded as the last thing written in
+    /// the chat written to: the down arrow, where nothing is written,
+    /// unfolds it.
+    pub fn set_folded(&mut self, folded: bool) {
+        self.folded = folded;
     }
 
-    /// The diagram the page shows, and how: of the chat written to.
-    #[must_use]
-    pub fn picture(&self) -> Option<(&std::path::Path, Picture)> {
-        let window = self
-            .screen
-            .talking_to()
-            .and_then(|agent| self.crew.chat_of(agent));
-        let drawn = self.diagrams.get(&window)?;
-        let at = drawn.len().checked_sub(1 + self.picture.back)?;
-        Some((&drawn[at], self.picture))
-    }
-
-    /// What a key does on the diagram page: `+` and `-` enlarge it or less,
-    /// the arrows move it, `[` and `]` go to an earlier diagram or a later,
-    /// `0` shows it whole again, `o` opens it in the system's viewer.
-    fn diagram_key(&mut self, chord: &Chord, typed: Option<char>) -> Vec<Request> {
-        let count = self
-            .screen
-            .talking_to()
-            .and_then(|agent| self.crew.chat_of(agent))
-            .map_or_else(
-                || self.diagrams.get(&None),
-                |chat| self.diagrams.get(&Some(chat)),
-            )
-            .map_or(0, Vec::len);
-        let mut picture = self.picture;
-        let reach = |zoom: u32| (zoom as i32 - 1) * 5;
-        match (chord.key.as_str(), typed) {
-            (_, Some('+' | '=')) => picture.zoom = (picture.zoom.max(1) + 1).min(ZOOM_MOST),
-            (_, Some('-')) => picture.zoom = picture.zoom.max(2) - 1,
-            (_, Some('0')) => {
-                picture.zoom = 1;
-                picture.moved = (0, 0);
-            }
-            ("Left", _) => picture.moved.0 -= 1,
-            ("Right", _) => picture.moved.0 += 1,
-            ("Up", _) => picture.moved.1 -= 1,
-            ("Down", _) => picture.moved.1 += 1,
-            (_, Some('[')) if picture.back + 1 < count => {
-                picture = Picture {
-                    back: picture.back + 1,
-                    ..Picture::default()
-                };
-            }
-            (_, Some(']')) if picture.back > 0 => {
-                picture = Picture {
-                    back: picture.back - 1,
-                    ..Picture::default()
-                };
-            }
-            (_, Some('o')) => {
-                return self
-                    .picture()
-                    .map(|(path, _)| Request::Open {
-                        path: path.to_path_buf(),
-                    })
-                    .into_iter()
-                    .collect();
-            }
-            _ => {}
-        }
-        picture.zoom = picture.zoom.max(1);
-        let most = reach(picture.zoom);
-        picture.moved = (
-            picture.moved.0.clamp(-most, most),
-            picture.moved.1.clamp(-most, most),
-        );
-        self.picture = picture;
-        Vec::new()
+    /// Whether the person asked the diagram folded to unfold, once.
+    pub fn take_unfold(&mut self) -> bool {
+        std::mem::take(&mut self.unfold)
     }
 
     /// The question with choices the person answers where they write: the
@@ -466,8 +380,14 @@ impl Board {
 
     /// The chat whose last exchanges the conversation writes again, once:
     /// one of an earlier session the person comes back to.
+    /// Its thread's steps are made into folds then, numbered as live ones
+    /// are, for the conversation to name them and their page to unfold.
     pub fn take_recall(&mut self) -> Option<Recall> {
-        self.recall.take()
+        let recall = self.recall.take()?;
+        if let Some(view) = self.crew.agent(&recall.agent) {
+            self.steps.recall(&recall.agent, &view.thread);
+        }
+        Some(recall)
     }
 
     /// Writes to `agent` from now on; a chat of an earlier session is
@@ -520,6 +440,16 @@ impl Board {
         others.sort_by_key(|view| std::cmp::Reverse(view.worked));
         chats.extend(others.into_iter().map(|view| (view, None)));
         chats
+    }
+
+    /// The person's chats as their page lists them, the one used last
+    /// first, as the switcher has them.
+    #[must_use]
+    pub fn chats_listed(&self) -> Vec<&crate::crew::AgentView> {
+        self.chats_by_use()
+            .into_iter()
+            .map(|(view, _)| view)
+            .collect()
     }
 
     /// The switcher, while it is open.
@@ -930,6 +860,17 @@ impl Board {
             }
             return Vec::new();
         }
+        // Where nothing is written, the down arrow moves nowhere: it
+        // unfolds the diagram folded at the conversation's end.
+        if plain
+            && !chord.shift
+            && chord.key == "Down"
+            && self.folded
+            && self.screen.editor().is_empty()
+        {
+            self.unfold = true;
+            return Vec::new();
+        }
         if chord.key == "Enter" && !chord.ctrl && !chord.cmd {
             let editor = self.screen.editor_mut();
             if chord.shift || chord.alt {
@@ -974,7 +915,7 @@ impl Board {
         } else if self.screen.page() == Some(&Page::Team) {
             let chosen = self.screen.chosen() as isize + lines.signum();
             self.screen
-                .choose(chosen.max(0) as usize, self.crew.listed().len());
+                .choose(chosen.max(0) as usize, self.chats_by_use().len());
         } else {
             self.screen.scroll_by(lines);
         }
@@ -989,14 +930,11 @@ impl Board {
         let Some(page) = self.screen.page().cloned() else {
             return Vec::new();
         };
-        if page == Page::Diagram {
-            return self.diagram_key(chord, typed);
-        }
         let letter = typed.map(|c| c.to_ascii_lowercase());
         let step = self.screen.rows().saturating_sub(2).max(1) as isize;
         let agents = match page {
             Page::Map => self.map_rows(),
-            _ => self.crew.listed().len(),
+            _ => self.chats_by_use().len(),
         };
         let chosen = self.screen.chosen();
         if page == Page::Steps
@@ -1083,18 +1021,11 @@ impl Board {
                 self.lens = lens;
             }
             Page::Team => {
-                let (agent, retired) = self
-                    .crew
-                    .listed()
+                let agent = self
+                    .chats_by_use()
                     .get(self.screen.chosen())
-                    .map_or((None, false), |(_, a)| (Some(a.name.clone()), a.retired));
+                    .map(|(chat, _)| chat.name.clone());
                 match (key, letter, agent) {
-                    // One retired is read, never written to.
-                    ("Enter" | "Right", _, Some(agent)) | (_, Some('w' | 'v'), Some(agent))
-                        if retired =>
-                    {
-                        self.screen.open(Page::Thread(agent));
-                    }
                     ("Enter", _, Some(agent)) | (_, Some('w'), Some(agent)) => {
                         self.chose_to(&agent);
                         self.screen.close();
@@ -1112,7 +1043,7 @@ impl Board {
             }
             Page::Map => return self.map_key(key, letter),
             Page::Thread(_) if key == "Left" => self.screen.close(),
-            Page::Thread(_) | Page::Keys | Page::Changes | Page::Steps | Page::Diagram => {}
+            Page::Thread(_) | Page::Keys | Page::Changes | Page::Steps => {}
         }
         Vec::new()
     }
@@ -1484,22 +1415,6 @@ impl Board {
             Command::Autopilot => return self.act(Action::Autopilot, now).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet, now).into_iter().collect(),
             Command::Mcp => return vec![Request::Mcp],
-            Command::Diagram => {
-                if self.picture.zoom == 0 || self.picture().is_none() {
-                    self.picture = Picture {
-                        zoom: 1,
-                        ..Picture::default()
-                    };
-                }
-                if self.picture().is_some() {
-                    open(self, Page::Diagram);
-                } else {
-                    self.screen.notice(
-                        "no diagram is drawn in this chat: they are, in Kitty, once the settings' mermaid says so",
-                        now,
-                    );
-                }
-            }
             Command::Image(None) => {
                 let said = match self.attached.len() {
                     0 => "/image takes the path of an image to attach".to_owned(),
@@ -1900,56 +1815,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_last_diagram_of_the_chat_is_shown_alone_enlarged_moved_and_opened() {
+    fn the_down_arrow_unfolds_a_diagram_folded_only_where_nothing_is_written() {
         let mut board = Board::default();
-        started(&mut board, "lab/lead");
-        board.update(Update::Crew(Event::Joined {
-            agent: "lead".into(),
-            model: "lab/lead".into(),
-            by: PERSON.into(),
-        }));
-        board.screen_mut().talk_to("lead");
-        board.run(Command::Diagram, 1);
-        assert_eq!(board.screen().page(), None, "no diagram yet");
-        for image in ["/cache/a/diagram.png", "/cache/b/diagram.png"] {
-            board.drawn_diagram(Some("lead".into()), image.into());
-        }
-        board.run(Command::Diagram, 2);
-        assert_eq!(board.screen().page(), Some(&Page::Diagram));
-        let shown = |board: &Board| {
-            board
-                .picture()
-                .map(|(path, view)| (path.to_path_buf(), view))
-        };
-        let (path, view) = shown(&board).unwrap();
-        assert_eq!(path, std::path::PathBuf::from("/cache/b/diagram.png"));
-        assert_eq!((view.zoom, view.moved), (1, (0, 0)));
-        let press =
-            |board: &mut Board, c: char| board.press(&Chord::plain(&c.to_string()), Some(c), 3);
-        press(&mut board, '+');
-        press(&mut board, '+');
-        key(&mut board, "right");
-        assert_eq!(shown(&board).unwrap().1.zoom, 3);
-        assert_eq!(shown(&board).unwrap().1.moved, (1, 0));
-        // Moved no further than enlarged, nor smaller than whole.
-        for _ in 0..20 {
-            key(&mut board, "left");
-            press(&mut board, '-');
-        }
-        assert_eq!(shown(&board).unwrap().1.zoom, 1);
-        assert_eq!(shown(&board).unwrap().1.moved, (0, 0));
-        // An earlier one, then opened in the viewer.
-        press(&mut board, '[');
-        assert_eq!(
-            shown(&board).unwrap().0,
-            std::path::PathBuf::from("/cache/a/diagram.png")
-        );
-        assert_eq!(
-            press(&mut board, 'o'),
-            vec![Request::Open {
-                path: "/cache/a/diagram.png".into()
-            }]
-        );
+        key(&mut board, "Down");
+        assert!(!board.take_unfold());
+        board.set_folded(true);
+        write(&mut board, "draft");
+        key(&mut board, "Down");
+        assert!(!board.take_unfold());
+        board.screen_mut().editor_mut().clear();
+        key(&mut board, "Down");
+        assert!(board.take_unfold());
+        assert!(!board.take_unfold());
     }
 
     #[test]
@@ -1969,6 +1846,7 @@ mod tests {
                 agent: agent.into(),
                 question: "Which one?".into(),
                 choices: vec!["a".into(), "b".into(), "c".into()],
+                raised: None,
             }));
         };
         ask(&mut board, 1, "lead");
@@ -2756,12 +2634,20 @@ mod tests {
         board.screen_mut().talk_to("helper");
         assert_eq!(key(&mut board, "escape"), vec![]);
         assert_eq!(key(&mut board, "shift+tab"), vec![Request::Autopilot(true)]);
-        // On the team's page, the agent chosen is written to.
+        // On the chats' page, the chat chosen is written to: the agents a
+        // chat started are not listed there.
+        joined(&mut board, "docs", PERSON);
         key(&mut board, "ctrl+t");
+        let listed: Vec<&str> = board
+            .chats_listed()
+            .iter()
+            .map(|chat| chat.name.as_str())
+            .collect();
+        assert_eq!(listed, ["lead", "docs"]);
         key(&mut board, "down");
         key(&mut board, "enter");
         assert_eq!(board.screen().page(), None);
-        assert_eq!(board.screen().talking_to(), Some("helper"));
+        assert_eq!(board.screen().talking_to(), Some("docs"));
     }
 
     #[test]

@@ -165,15 +165,8 @@ impl Live<'_> {
         };
         let mut lines = vec![map.head(&chat, width)];
         lines.extend(map.rows(&chat, width, None, false, true));
-        let resting = self
-            .board
-            .crew()
-            .agents()
-            .iter()
-            .filter(|a| !a.working && a.name != chat)
-            .filter(|a| chat_of(self.board, &a.name).as_ref() == Some(&chat))
-            .count();
-        let finished = iq_ui::map::finished(self.board.crew(), &chat);
+        let (agents, finished) = iq_ui::map::of_turn(self.board.crew(), &chat);
+        let resting = agents.iter().filter(|a| !a.working).count();
         if resting + finished > 0 {
             let see = self
                 .board
@@ -286,6 +279,12 @@ impl Live<'_> {
     fn parts(&self, motion: &Motion, width: u16) -> Vec<Part> {
         let width = usize::from(width);
         let mut parts = Vec::new();
+        // A diagram folded at the conversation's end, where it is written.
+        if let Some(mut line) = self.history.folded(self.window().as_deref()) {
+            let p = self.p;
+            line.push(Span::styled("  ↓ unfolds", p.fg(p.faint)));
+            parts.push(Part::Lines(vec![fit(line, width)]));
+        }
         parts.extend(self.working(motion, width));
         if let Some(question) = self.question(width) {
             parts.push(question);
@@ -457,28 +456,15 @@ impl Live<'_> {
         )))
     }
 
-    /// Every agent the chat written to started, at work or resting, each
-    /// with its model and who started it, in a line or two: those the
-    /// panes leave out, and those at rest, are seen too.
+    /// The agents the chat written to started that its turn under way
+    /// concerns, at work or resting, each with its model and who started
+    /// it, in a line or two: those the panes leave out, and those at rest,
+    /// are seen too. Once nothing of the chat works, nothing.
     fn crew_line(&self, width: usize) -> Option<Part> {
         let p = self.p;
         let window = self.window()?;
-        let mut agents: Vec<&iq_ui::crew::AgentView> = self
-            .board
-            .crew()
-            .agents()
-            .iter()
-            .filter(|a| a.name != window)
-            .filter(|a| chat_of(self.board, &a.name).as_ref() == Some(&window))
-            .collect();
         // Those done with their task, retired: counted, not listed.
-        let finished = self
-            .board
-            .crew()
-            .finished()
-            .iter()
-            .filter(|a| a.name.split('/').next() == Some(window.as_str()))
-            .count();
+        let (mut agents, finished) = iq_ui::map::of_turn(self.board.crew(), &window);
         if agents.is_empty() && finished == 0 {
             return None;
         }
@@ -519,8 +505,8 @@ impl Live<'_> {
             let see = self
                 .board
                 .keys()
-                .chord(Action::Team)
-                .map(|chord| format!(", {chord} lists them"))
+                .chord(Action::Map)
+                .map(|chord| format!(", {chord} maps them"))
                 .unwrap_or_default();
             spans.push(Span::styled(
                 format!("{finished} finished{see}"),
@@ -750,6 +736,15 @@ impl Live<'_> {
             &pad,
             &pad,
         );
+        // Who raised it, for "go on" or "stop" to be an informed answer.
+        if let Some(raised) = &choice.raised {
+            lines.extend(wrap(
+                &[Span::styled(raised.clone(), p.fg(p.faint))],
+                inner,
+                &pad,
+                &pad,
+            ));
+        }
         let picked = self
             .board
             .picking()
@@ -1456,7 +1451,12 @@ mod tests {
             listed.trim_end(),
             "  ◦ writer sage by fix at work · tests quick by writer resting"
         );
-        // Done with its task, it is counted at the end, not listed.
+        // Done with its task in this turn, it is counted at the end, not
+        // listed.
+        board.update(Update::Crew(Event::Working {
+            agent: "fix/tests".into(),
+            prompt: "test it".into(),
+        }));
         board.update(Update::Crew(Event::Retired {
             agent: "fix/tests".into(),
         }));
@@ -1467,10 +1467,21 @@ mod tests {
             .unwrap_or_else(|| panic!("{rows:#?}"));
         assert_eq!(
             listed.trim_end(),
-            "  ◦ writer sage by fix at work · 1 finished, Ctrl-T lists them"
+            "  ◦ writer sage by fix at work · 1 finished, Ctrl-G maps them"
         );
         // Another chat's agents are not this one's.
         board.screen_mut().talk_to("docs");
+        assert!(
+            !drawn(&board, &history, 100)
+                .iter()
+                .any(|row| row.contains("◦ "))
+        );
+        // Once nothing of the chat works, its turn is over: the line goes.
+        board.screen_mut().talk_to("fix");
+        board.update(Update::Crew(Event::Done {
+            agent: "fix/writer".into(),
+            outcome: Ok("written".into()),
+        }));
         assert!(
             !drawn(&board, &history, 100)
                 .iter()
@@ -2091,7 +2102,11 @@ mod tests {
             head[0].ends_with('╮') && head[0].chars().count() == 80,
             "{head:#?}"
         );
-        let rows = drawn(&board, &history, 80).join("\n");
+        // How long, read off the clock, may be past a second.
+        let rows =
+            drawn(&board, &history, 80)
+                .join("\n")
+                .replacen("reviewer · 1s", "reviewer · 0s", 1);
         assert!(rows.contains("⠋ sage waiting for reviewer · 0s"), "{rows}");
         // And the conversation says so, once.
         let written: Vec<String> = history
@@ -2128,6 +2143,7 @@ mod tests {
                 agent: "deploy".into(),
                 question: "Which environment?".into(),
                 choices: vec!["staging".into(), "production".into()],
+                raised: None,
             },
             &p,
         );
@@ -2137,14 +2153,30 @@ mod tests {
         assert!(rows.contains("│ Which environment?"), "{rows}");
         assert!(rows.contains("│ ▸ 1. staging"), "{rows}");
         assert!(rows.contains("│   2. production"), "{rows}");
-        // Its question is in the conversation, its answer to come below it.
+        // While it waits, it is in its box alone; answered, a step of the
+        // agent's fold, written with it.
+        assert!(history.take(80, Some("deploy")).is_empty());
+        for event in [
+            Event::Chosen {
+                id: 1,
+                answer: Some("staging".into()),
+            },
+            Event::Done {
+                agent: "deploy".into(),
+                outcome: Ok(String::new()),
+            },
+        ] {
+            crew(&mut board, &mut history, event, &p);
+        }
         let written: Vec<String> = history
             .take(80, Some("deploy"))
             .iter()
             .map(ToString::to_string)
             .collect();
         assert!(
-            written.iter().any(|l| l.trim() == "? Which environment?"),
+            written
+                .iter()
+                .any(|l| l.trim() == "? Which environment? → staging"),
             "{written:#?}"
         );
     }

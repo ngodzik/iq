@@ -43,8 +43,6 @@ pub(crate) struct Seen<'a> {
     pub(crate) now: u64,
     /// The columns it has.
     pub(crate) width: usize,
-    /// Whether the terminal shows images, Kitty.
-    pub(crate) images: bool,
     /// The summary of the message between agents of a number, once made.
     pub(crate) summed: &'a dyn Fn(usize) -> Option<String>,
     /// What moves: the spinners, the messages' sparks.
@@ -99,9 +97,9 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String, Option<
     let (lines, foot) = match page {
         Page::Team => (
             team::lines(seen),
-            "↑↓ choose · Enter write to it · v its thread · n a new chat",
+            "↑↓ choose · Enter write to it · → its whole thread · n a new chat",
         ),
-        Page::Thread(agent) => (team::thread(seen, agent), "↑↓ scroll · ← the team"),
+        Page::Thread(agent) => (team::thread(seen, agent), "↑↓ scroll · ← the chats"),
         Page::Costs => (costs::lines(seen), "← → the period · ↑↓ scroll"),
         Page::Observations => (
             observations::lines(seen),
@@ -114,10 +112,6 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String, Option<
         ),
         Page::Changes => return (changes::lines(seen), changes::foot(seen), None),
         Page::Steps => (Vec::new(), ""),
-        Page::Diagram => (
-            diagram(seen),
-            "+ − enlarge · ← → ↑ ↓ move · 0 whole · [ ] an earlier, a later · o your viewer",
-        ),
     };
     (lines, foot.to_owned(), None)
 }
@@ -158,27 +152,6 @@ fn map(seen: &Seen<'_>) -> Vec<Line<'static>> {
     lines
 }
 
-/// What the diagram page says beside the image: what it is, and, where
-/// the terminal shows no image, how to see it.
-fn diagram(seen: &Seen<'_>) -> Vec<Line<'static>> {
-    let p = seen.p;
-    let mut lines = Vec::new();
-    match seen.board.picture() {
-        None => seen.said(&mut lines, "no diagram is drawn in this chat", p.dim),
-        Some(_) if !seen.images => seen.said(
-            &mut lines,
-            "the diagram shows here in Kitty alone: o opens it in your viewer",
-            p.dim,
-        ),
-        Some((path, picture)) => seen.said(
-            &mut lines,
-            &format!("{} · ×{}", path.display(), picture.zoom.max(1)),
-            p.faint,
-        ),
-    }
-    lines
-}
-
 /// Draws the page open over the whole screen, and keeps its scroll
 /// within its lines. Returns where its body is, under its heading and
 /// above its foot.
@@ -187,7 +160,6 @@ pub(crate) fn draw(
     board: &mut Board,
     p: &Palette,
     now: u64,
-    images: bool,
     beside: &Beside<'_>,
 ) -> Rect {
     let Some(page) = board.screen().page().cloned() else {
@@ -199,7 +171,6 @@ pub(crate) fn draw(
         p,
         now,
         width: usize::from(area.width),
-        images,
         summed: beside.summed,
         motion: beside.motion,
         labels: beside.labels,

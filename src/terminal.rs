@@ -145,7 +145,7 @@ pub(crate) fn show(event: &Event, tally: &mut Tally) -> Option<(u64, String)> {
 
 /// Prints what a plugin said that the person reads: its words, and the line
 /// that sets a place's variables in a terminal there. What it shows on the
-/// status line and the Team page is for iq's own terminal.
+/// status line and the chats' page is for iq's own terminal.
 pub(crate) fn heard(update: &iq_ui::Update) {
     use iq_ui::plugins::Told;
     let mut out = std::io::stdout().lock();
@@ -172,8 +172,16 @@ pub(crate) fn heard(update: &iq_ui::Update) {
 /// Asks the person `question` on the terminal, `agent`'s, offering
 /// `choices` by number; their own words when they write something else,
 /// none when they write nothing.
-pub(crate) fn choose(agent: &str, question: &str, choices: &[String]) -> Option<String> {
+pub(crate) fn choose(
+    agent: &str,
+    question: &str,
+    choices: &[String],
+    raised: Option<&str>,
+) -> Option<String> {
     println!("\n? {agent} asks: {question}");
+    if let Some(raised) = raised {
+        println!("  ({raised})");
+    }
     for (at, choice) in choices.iter().enumerate() {
         println!("  {}. {choice}", at + 1);
     }

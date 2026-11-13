@@ -136,7 +136,7 @@ pub enum FromPlugin {
         /// A shell line setting them, run after `cd` to the folder.
         enter: Option<String>,
     },
-    /// What the Team page shows under a chat, in place of what it showed
+    /// What the chats' page shows under a chat, in place of what it showed
     /// before; none for nothing.
     Lines {
         /// The chat.

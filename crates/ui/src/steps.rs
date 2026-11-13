@@ -1,15 +1,20 @@
 //! What the agents do between two of their lines of text: the tools they
-//! call, what the person and the reviewer allow or refuse them. An agent's
+//! call, what the person and the autopilot allow or refuse them, the
+//! questions the person answered them, what iq told of them. An agent's
 //! steps make one fold from its last line to its next: while it works, the
 //! last of them show as they come; once it writes again, or its turn ends,
 //! the fold closes and only its count is said, the steps kept to be
 //! unfolded on their page. And what the agents write to each other (the
 //! task one is started on, a message, an answer), which the conversation
-//! sums up and their page gives whole, numbered with the folds.
+//! sums up and their page gives whole, numbered with the folds. A chat of
+//! an earlier session that comes back has its thread's steps made into
+//! folds the same, each kept with where it begins in the thread.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use iq_agent::{Event, PERSON};
+
+use crate::crew::Entry as Kept;
 
 /// How many folds are kept, the oldest forgotten first.
 const KEPT: usize = 500;
@@ -39,7 +44,7 @@ pub enum Step {
         /// Whether it was allowed.
         approved: bool,
     },
-    /// What the reviewer answered for the person.
+    /// What the autopilot answered for the person.
     Reviewed {
         /// The action.
         action: String,
@@ -47,6 +52,19 @@ pub enum Step {
         approved: bool,
         /// Why.
         why: String,
+    },
+    /// A question it asked the person to choose an answer to, and what
+    /// they answered.
+    Question {
+        /// The question.
+        question: String,
+        /// Their answer; none when they gave none.
+        answer: Option<String>,
+    },
+    /// What iq told of its work: its conversation made lighter, compacted.
+    Notice {
+        /// What.
+        text: String,
     },
 }
 
@@ -57,17 +75,91 @@ impl Step {
         match self {
             Step::Tool { ok, .. } => !ok,
             Step::Answered { approved, .. } | Step::Reviewed { approved, .. } => !approved,
+            Step::Question { .. } | Step::Notice { .. } => false,
         }
     }
 
-    /// What it is called in a count of steps: its tool, or who answered.
+    /// What it is called in a count of steps: its tool, who answered and
+    /// how, a question, a notice.
     #[must_use]
     pub fn kind(&self) -> &str {
         match self {
             Step::Tool { name, .. } => name,
-            Step::Answered { .. } => "asked you",
-            Step::Reviewed { .. } => "reviewed",
+            Step::Answered { approved: true, .. } => "you allowed",
+            Step::Answered {
+                approved: false, ..
+            } => "you refused",
+            Step::Reviewed { approved: true, .. } => "autopilot allowed",
+            Step::Reviewed {
+                approved: false, ..
+            } => "autopilot refused",
+            Step::Question { .. } => "question",
+            Step::Notice { .. } => "notice",
         }
+    }
+
+    /// What it was, whole, as its fold unfolded gives it: the whole
+    /// command, the whole reason, the whole question, the whole notice.
+    #[must_use]
+    pub fn whole(&self) -> String {
+        match self {
+            Step::Tool { name, input, .. } => format!("{name} {input}"),
+            Step::Answered { action, .. } => format!("{} {action}", self.kind()),
+            Step::Reviewed { action, why, .. } => format!("{} {action}\n{why}", self.kind()),
+            Step::Question { question, answer } => {
+                format!("{question}\n→ {}", answer.as_deref().unwrap_or("no answer"))
+            }
+            Step::Notice { text } => text.clone(),
+        }
+    }
+
+    /// The step a chat's thread kept, when it is one.
+    fn of(entry: &Kept) -> Option<Step> {
+        Some(match entry {
+            Kept::Tool {
+                name,
+                input,
+                output,
+                ok,
+            } => Step::Tool {
+                name: name.clone(),
+                input: input.clone(),
+                output: output.clone(),
+                ok: *ok,
+            },
+            Kept::Reviewed {
+                action,
+                approved,
+                why,
+            } => Step::Reviewed {
+                action: action.clone(),
+                approved: *approved,
+                why: why.clone(),
+            },
+            Kept::Asked {
+                action,
+                answer: Some(approved),
+                ..
+            } => Step::Answered {
+                action: action.clone(),
+                approved: *approved,
+            },
+            Kept::Asked {
+                action,
+                answer: None,
+                ..
+            } => Step::Notice {
+                text: format!("asked you, unanswered: {action}"),
+            },
+            Kept::Chose { question, answer } => Step::Question {
+                question: question.clone(),
+                answer: answer.clone(),
+            },
+            Kept::Notice(text) => Step::Notice { text: text.clone() },
+            Kept::Prompt(_) | Kept::Text(_) | Kept::Message { .. } | Kept::Done(_) => {
+                return None;
+            }
+        })
     }
 }
 
@@ -82,6 +174,9 @@ pub struct Fold {
     pub steps: Vec<Step>,
     /// Whether the agent went on to something else.
     pub closed: bool,
+    /// Where it begins in its agent's thread, for one made from a chat
+    /// that came back.
+    pub begins: Option<usize>,
 }
 
 impl Fold {
@@ -184,8 +279,11 @@ pub struct Steps {
     tasked: HashSet<String>,
     /// Each agent's fold being made, by its number.
     open: HashMap<String, usize>,
-    /// What each question waiting asks, to keep it once answered.
+    /// What each action waiting for the person is, to keep it once
+    /// answered.
     asked: HashMap<u64, (String, String)>,
+    /// What each question waiting asks, to keep it once answered.
+    chosen: HashMap<u64, (String, String)>,
 }
 
 impl Steps {
@@ -252,8 +350,29 @@ impl Steps {
             Event::TextStart { agent }
             | Event::Done { agent, .. }
             | Event::Failed { agent, .. }
-            | Event::Retired { agent }
-            | Event::Notice { agent, .. } => self.close(agent),
+            | Event::Retired { agent } => self.close(agent),
+            Event::Notice { agent, text } => {
+                self.step(agent, Step::Notice { text: text.clone() });
+            }
+            Event::Choose {
+                id,
+                agent,
+                question,
+                ..
+            } => {
+                self.chosen.insert(*id, (agent.clone(), question.clone()));
+            }
+            Event::Chosen { id, answer } => {
+                if let Some((agent, question)) = self.chosen.remove(id) {
+                    self.step(
+                        &agent,
+                        Step::Question {
+                            question,
+                            answer: answer.clone(),
+                        },
+                    );
+                }
+            }
             Event::Placed {
                 agent,
                 said: Some(_),
@@ -271,8 +390,6 @@ impl Steps {
             // It waits, for its agents or the person: what it did before
             // is still its fold.
             Event::Waiting { .. }
-            | Event::Choose { .. }
-            | Event::Chosen { .. }
             | Event::Turn { .. }
             | Event::Window { .. }
             | Event::JobOutput { .. } => {}
@@ -331,7 +448,7 @@ impl Steps {
                 if let Some(open) = self.open.remove(from) {
                     self.open.insert(to.clone(), open);
                 }
-                for (agent, _) in self.asked.values_mut() {
+                for (agent, _) in self.asked.values_mut().chain(self.chosen.values_mut()) {
                     if agent == from {
                         agent.clone_from(to);
                     }
@@ -355,17 +472,13 @@ impl Steps {
             Some(id) => *id,
             None => {
                 self.last += 1;
-                self.folds.push_back(Fold {
+                self.push_fold(Fold {
                     id: self.last,
                     agent: agent.to_owned(),
                     steps: Vec::new(),
                     closed: false,
+                    begins: None,
                 });
-                while self.folds.len() > KEPT {
-                    if let Some(gone) = self.folds.pop_front() {
-                        self.open.retain(|_, id| *id != gone.id);
-                    }
-                }
                 self.open.insert(agent.to_owned(), self.last);
                 self.last
             }
@@ -373,6 +486,51 @@ impl Steps {
         if let Some(fold) = self.fold_mut(id) {
             fold.steps.push(step);
         }
+    }
+
+    /// Keeps `fold`, the oldest forgotten past [`KEPT`].
+    fn push_fold(&mut self, fold: Fold) {
+        self.folds.push_back(fold);
+        while self.folds.len() > KEPT {
+            if let Some(gone) = self.folds.pop_front() {
+                self.open.retain(|_, id| *id != gone.id);
+            }
+        }
+    }
+
+    /// Makes the steps of `thread`, `agent`'s as a chat of an earlier
+    /// session kept it, into folds as they were made live: each run of
+    /// them between two other entries one fold, closed, numbered after the
+    /// others and kept with where it begins in the thread.
+    pub fn recall(&mut self, agent: &str, thread: &[Kept]) {
+        let mut at = 0;
+        while at < thread.len() {
+            let steps: Vec<Step> = thread[at..].iter().map_while(Step::of).collect();
+            if steps.is_empty() {
+                at += 1;
+                continue;
+            }
+            let begins = at;
+            at += steps.len();
+            self.last += 1;
+            self.push_fold(Fold {
+                id: self.last,
+                agent: agent.to_owned(),
+                steps,
+                closed: true,
+                begins: Some(begins),
+            });
+        }
+    }
+
+    /// `agent`'s fold made from its thread that begins at `at`, as a chat
+    /// that came back has one.
+    #[must_use]
+    pub fn begun(&self, agent: &str, at: usize) -> Option<&Fold> {
+        self.folds
+            .iter()
+            .rev()
+            .find(|fold| fold.agent == agent && fold.begins == Some(at))
     }
 
     /// Closes `agent`'s fold, when it has one being made.
@@ -553,7 +711,7 @@ mod tests {
             lead.kinds(),
             [
                 ("read_file".to_owned(), 2),
-                ("asked you".to_owned(), 1),
+                ("you refused".to_owned(), 1),
                 ("edit_file".to_owned(), 1)
             ]
         );
@@ -580,6 +738,62 @@ mod tests {
         });
         assert!(steps.folds().all(|fold| fold.closed));
         assert_eq!(steps.folds().count(), 3);
+    }
+
+    #[test]
+    fn a_notice_and_an_answered_question_are_steps_and_a_thread_comes_back_folded() {
+        let mut steps = Steps::default();
+        steps.event(&tool("lead", "read_file", true));
+        steps.event(&Event::Notice {
+            agent: "lead".into(),
+            text: "compacted".into(),
+        });
+        steps.event(&Event::Choose {
+            id: 3,
+            agent: "lead".into(),
+            question: "Go on?".into(),
+            choices: vec!["yes".into(), "no".into()],
+            raised: None,
+        });
+        steps.event(&Event::Chosen {
+            id: 3,
+            answer: None,
+        });
+        let lead = steps.open("lead").unwrap();
+        assert_eq!(
+            lead.kinds(),
+            [
+                ("read_file".to_owned(), 1),
+                ("notice".to_owned(), 1),
+                ("question".to_owned(), 1)
+            ]
+        );
+        assert_eq!(lead.steps[2].whole(), "Go on?\n→ no answer");
+        // A thread kept: each run of steps between two other entries one
+        // fold, closed, with where it begins.
+        let thread = [
+            Kept::Prompt("Message from person: go".into()),
+            Kept::Tool {
+                name: "run".into(),
+                input: "make".into(),
+                output: String::new(),
+                ok: true,
+            },
+            Kept::Notice("compacted".into()),
+            Kept::Text("Built.".into()),
+            Kept::Asked {
+                id: 1,
+                action: "git push".into(),
+                reason: "it leaves the machine".into(),
+                answer: Some(false),
+            },
+        ];
+        steps.recall("old", &thread);
+        let first = steps.begun("old", 1).unwrap();
+        assert_eq!((first.id, first.steps.len(), first.closed), (2, 2, true));
+        let second = steps.begun("old", 4).unwrap();
+        assert_eq!(second.kinds(), [("you refused".to_owned(), 1)]);
+        assert!(steps.begun("old", 2).is_none());
     }
 
     #[test]

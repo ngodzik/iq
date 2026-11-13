@@ -104,7 +104,7 @@ impl Action {
         match self {
             Action::Switch => "go to another chat, the one used last first; again for the next",
             Action::NewChat => "start a new chat",
-            Action::Team => "the crew: each agent, what it does and spends",
+            Action::Team => "your chats, to choose one or read its whole thread",
             Action::Costs => "the costs: by model, by kind of task, over time",
             Action::Observations => "what the work went to, over time",
             Action::Keys => "this list",

@@ -3,7 +3,9 @@
 //! each fold under its number and its agent, a line for each step; each
 //! message under its number, its writer and its reader, summed up. The
 //! entry chosen shows whole as Enter says, and folds again: a fold's
-//! tools with what they returned, a message as it was written.
+//! steps whole (the whole command, the whole reason, the whole question,
+//! the whole notice) and what its tools returned, a message as it was
+//! written.
 
 use iq_ui::steps::{Entry, Step};
 use ratatui::text::{Line, Span};
@@ -64,7 +66,16 @@ pub(super) fn lines(seen: &Seen<'_>) -> (Vec<Line<'static>>, Option<usize>) {
                 lines.push(Line::from(head));
                 for step in &fold.steps {
                     let (first, body) = step_line(step, p);
-                    lines.extend(wrap(&body, width, &first, &[Span::raw("    ")]));
+                    if whole {
+                        let indent = [Span::raw("    ")];
+                        for (at, line) in step.whole().lines().enumerate() {
+                            let said = [Span::styled(short(line), p.fg(p.text))];
+                            let head = if at == 0 { first.as_slice() } else { &indent };
+                            lines.extend(wrap(&said, width, head, &indent));
+                        }
+                    } else {
+                        lines.extend(wrap(&body, width, &first, &[Span::raw("    ")]));
+                    }
                     if let Step::Tool { output, ok, .. } = step {
                         let shown = match (whole, ok) {
                             (true, _) => OUTPUT_LINES,
@@ -203,7 +214,6 @@ mod tests {
             p: &p,
             now: 0,
             width: 80,
-            images: false,
             summed,
             motion: &crate::motion::Motion::default(),
             labels: &|_| None,

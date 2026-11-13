@@ -66,12 +66,6 @@ pub enum Request {
         /// The images the person attached to it, by their paths.
         images: Vec<std::path::PathBuf>,
     },
-    /// Open the image at `path`, a diagram drawn, in the system's viewer:
-    /// the person's own action.
-    Open {
-        /// The image.
-        path: std::path::PathBuf,
-    },
     /// Answer a question with choices: a choice, or the person's own words;
     /// none when they gave none.
     Choose {
@@ -272,6 +266,9 @@ pub struct Choice {
     pub question: String,
     /// What it offers.
     pub choices: Vec<String>,
+    /// Who raised it, when the agent asks for agents it started: their
+    /// names, through whom, and what each spent.
+    pub raised: Option<String>,
 }
 
 /// An agent of the crew, as shown.
@@ -654,44 +651,6 @@ impl CrewView {
         self.agents.iter().filter(|a| a.by == PERSON)
     }
 
-    /// Every agent as the Team page lists them, each with how deep it
-    /// stands: the person's chats in the order they joined, each followed
-    /// by the agents it started, theirs under them; then any whose starter
-    /// is gone.
-    #[must_use]
-    pub fn listed(&self) -> Vec<(usize, &AgentView)> {
-        fn under<'a>(
-            agents: &[&'a AgentView],
-            by: &str,
-            depth: usize,
-            listed: &mut Vec<(usize, &'a AgentView)>,
-        ) {
-            for &agent in agents.iter().filter(|a| a.by == by) {
-                if listed.iter().any(|(_, seen)| std::ptr::eq(*seen, agent)) {
-                    continue;
-                }
-                listed.push((depth, agent));
-                // A retired agent's name may be another's now.
-                if !agent.retired {
-                    under(agents, &agent.name, depth + 1, listed);
-                }
-            }
-        }
-        // Those at work or resting first, then those retired.
-        let all: Vec<&AgentView> = self.agents.iter().chain(&self.finished).collect();
-        let mut listed = Vec::new();
-        under(&all, PERSON, 0, &mut listed);
-        for &agent in &all {
-            if !listed.iter().any(|(_, seen)| std::ptr::eq(*seen, agent)) {
-                listed.push((0, agent));
-                if !agent.retired {
-                    under(&all, &agent.name, 1, &mut listed);
-                }
-            }
-        }
-        listed
-    }
-
     /// A chat of an earlier session came back: its task, when it last
     /// worked, and its thread as it was kept.
     pub fn back(&mut self, back: Back) {
@@ -944,11 +903,13 @@ impl CrewView {
                 agent,
                 question,
                 choices,
+                raised,
             } => self.choices.push(Choice {
                 id,
                 agent,
                 question,
                 choices,
+                raised,
             }),
             Event::Chosen { id, answer } => {
                 if let Some(at) = self.choices.iter().position(|c| c.id == id) {
@@ -1258,27 +1219,12 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_a_chat_started_are_listed_under_it_and_follow_its_name() {
+    fn the_agents_a_chat_started_follow_its_name() {
         let mut crew = CrewView::default();
         joined(&mut crew, "lead", PERSON);
         joined(&mut crew, "fix", PERSON);
         joined(&mut crew, "review", "lead");
         joined(&mut crew, "helper", "review");
-        let listed = |crew: &CrewView| -> Vec<(usize, String)> {
-            crew.listed()
-                .into_iter()
-                .map(|(depth, a)| (depth, a.name.clone()))
-                .collect()
-        };
-        assert_eq!(
-            listed(&crew),
-            [
-                (0, "lead".to_owned()),
-                (1, "review".to_owned()),
-                (2, "helper".to_owned()),
-                (0, "fix".to_owned()),
-            ]
-        );
         let chats: Vec<&str> = crew.chats().map(|a| a.name.as_str()).collect();
         assert_eq!(chats, ["lead", "fix"]);
         crew.event(Event::Renamed {
@@ -1286,7 +1232,7 @@ mod tests {
             to: "login".into(),
         });
         assert_eq!(crew.agent("review").unwrap().by, "login");
-        assert_eq!(listed(&crew)[0], (0, "login".to_owned()));
+        assert_eq!(crew.chat_of("helper").as_deref(), Some("login"));
         // A chat that comes back brings what it was asked and its thread.
         crew.back(Back {
             agent: "fix".into(),

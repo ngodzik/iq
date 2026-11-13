@@ -102,6 +102,37 @@ fn under<'a>(
     }
 }
 
+/// The agents `chat` started that its turn under way concerns, and how
+/// many of them finished in it: those at work, those that worked since
+/// the turn began, those just started that wait for their first message.
+/// None once nothing of the chat works: what earlier turns started is the
+/// whole map's to show.
+#[must_use]
+pub fn of_turn<'a>(crew: &'a CrewView, chat: &str) -> (Vec<&'a AgentView>, usize) {
+    let ours = |agent: &AgentView| crew.chat_of(&agent.name).as_deref() == Some(chat);
+    let under_way = crew
+        .agents()
+        .iter()
+        .any(|agent| agent.working && (agent.name == chat || ours(agent)));
+    if !under_way {
+        return (Vec::new(), 0);
+    }
+    let since = crew.turn(chat).map_or(0, |turn| turn.since);
+    let agents = crew
+        .agents()
+        .iter()
+        .filter(|agent| agent.name != chat && ours(agent))
+        .filter(|agent| agent.working || agent.worked.is_none_or(|at| at >= since))
+        .collect();
+    let finished = crew
+        .finished()
+        .iter()
+        .filter(|agent| agent.name.split('/').next() == Some(chat))
+        .filter(|agent| agent.worked.is_some_and(|at| at >= since))
+        .count();
+    (agents, finished)
+}
+
 /// How many of `chat`'s agents finished, retired: the count at the map's
 /// foot.
 #[must_use]

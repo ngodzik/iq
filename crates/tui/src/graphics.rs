@@ -27,10 +27,6 @@ pub(crate) fn detect(var: impl Fn(&str) -> Option<String>) -> Option<Kitty> {
         .then(|| Kitty { tmux: set("TMUX") })
 }
 
-/// The number of the diagram page's placement of an image, apart from the
-/// conversation's.
-const PAGE: u32 = 7;
-
 /// The character Kitty shows an image under.
 const PLACEHOLDER: char = '\u{10EEEE}';
 
@@ -365,49 +361,6 @@ impl Kitty {
         out
     }
 
-    /// What makes the terminal keep `png` as image `id`, showing it
-    /// nowhere yet.
-    pub(crate) fn transmit(&self, id: u32, png: &[u8]) -> String {
-        let data = STANDARD.encode(png);
-        let chunks: Vec<&[u8]> = data.as_bytes().chunks(4096).collect();
-        let mut out = String::new();
-        for (i, chunk) in chunks.iter().enumerate() {
-            let more = u8::from(i + 1 < chunks.len());
-            let keys = if i == 0 {
-                format!("a=t,f=100,t=d,i={id},q=2,m={more}")
-            } else {
-                format!("q=2,m={more}")
-            };
-            out.push_str(&self.wrap(&format!(
-                "\x1b_G{keys};{}\x1b\\",
-                String::from_utf8_lossy(chunk)
-            )));
-        }
-        out
-    }
-
-    /// What shows the part `crop` of image `id` (left, top, width and
-    /// height, in pixels) on `cols` by `rows` cells from the cursor, as the
-    /// diagram page's own placement, the cursor left where it is.
-    pub(crate) fn place_in(
-        &self,
-        id: u32,
-        crop: (u32, u32, u32, u32),
-        cols: u16,
-        rows: u16,
-    ) -> String {
-        let (x, y, w, h) = crop;
-        self.wrap(&format!(
-            "\x1b_Ga=p,i={id},p={PAGE},x={x},y={y},w={w},h={h},c={cols},r={rows},C=1,q=2\x1b\\"
-        ))
-    }
-
-    /// What takes the diagram page's placement of image `id` away, its
-    /// image kept.
-    pub(crate) fn unplace(&self, id: u32) -> String {
-        self.wrap(&format!("\x1b_Ga=d,d=i,i={id},p={PAGE},q=2\x1b\\"))
-    }
-
     /// `escape` as tmux passes it on: inside its own, each escape character
     /// doubled.
     fn wrap(&self, escape: &str) -> String {
@@ -509,21 +462,6 @@ mod tests {
         assert_eq!(escapes[2], "\x1b_Ga=p,U=1,i=7,p=1,c=10,r=4,q=2");
         let wrapped = Kitty { tmux: true }.send(2, &[1], 1, 1);
         assert!(wrapped.starts_with("\x1bPtmux;\x1b\x1b_Ga=t"));
-    }
-
-    #[test]
-    fn the_diagram_page_places_a_part_of_an_image_and_takes_it_away() {
-        let kitty = Kitty { tmux: false };
-        assert_eq!(
-            kitty.place_in(5, (10, 20, 300, 150), 60, 15),
-            "\x1b_Ga=p,i=5,p=7,x=10,y=20,w=300,h=150,c=60,r=15,C=1,q=2\x1b\\"
-        );
-        assert_eq!(kitty.unplace(5), "\x1b_Ga=d,d=i,i=5,p=7,q=2\x1b\\");
-        assert!(
-            kitty
-                .transmit(5, &[0; 10])
-                .starts_with("\x1b_Ga=t,f=100,t=d,i=5,q=2,m=0;")
-        );
     }
 
     #[test]

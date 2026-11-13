@@ -75,7 +75,9 @@ pub(crate) fn work() -> Vec<ToolSpec> {
                           what fetches packages and sources (npm install, cargo fetch, pip \
                           install, git fetch); ask for it for another command with `network`, \
                           which waits for the person unless they opened it to every command. \
-                          What needs the machine itself, with the person's own services and \
+                          A git command that reaches a remote over ssh (fetch, pull, push, \
+                          ls-remote) needs the person's keys, which the sandbox keeps out: run \
+                          it with `host`. What needs the machine itself, with the person's own services and \
                           credentials (the container daemon, a cluster, the forge's command \
                           line, a cloud's), is known and runs there once approved; for \
                           another command that needs the machine, as a make target starting \
@@ -247,8 +249,11 @@ pub fn board() -> Vec<ToolSpec> {
             description: "Asks the person a question with two to four choices, which they pick \
                           with a digit or the arrows, or answer in their own words; waits for \
                           their answer. For a choice that is theirs to make: an option, an \
-                          environment, whether to start again. Not for leave to act, which the \
-                          tools ask themselves."
+                          environment, whether to start again; and when you do not know whether \
+                          to go on: past your part, your brief or its budget, or with what you \
+                          found of uncertain worth against what going on costs. From an agent \
+                          another started, it goes to that agent, which answers it or puts it to \
+                          the person. Not for leave to act, which the tools ask themselves."
                 .into(),
             parameters: json!({
                 "type": "object",

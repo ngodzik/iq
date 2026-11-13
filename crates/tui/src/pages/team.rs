@@ -1,7 +1,8 @@
-//! The crew's page: the person's chats, each with the agents it started
-//! under it, who started each, what it does and what it spent, what it was
-//! first asked and when it last worked, the one chosen marked; and an
-//! agent's whole thread, written as the conversation writes it.
+//! The person's chats, to choose one from: each with its model, how it
+//! stands, what it spent, what it was first asked and when it last worked,
+//! the one used last first, the one chosen marked; and a chat's whole
+//! thread, written as the conversation writes it. What the agents a chat
+//! started do is read on the steps' page and the map.
 
 use iq_agent::PERSON;
 use iq_ui::crew::Entry;
@@ -12,16 +13,16 @@ use crate::history::{agent_tint, short};
 use crate::markdown::{Markdown, Out, code};
 use crate::wrap::{cut, wrap};
 
-/// The agents, one a line.
+/// The chats, one a line, what tells them apart under each.
 pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
     let p = seen.p;
     let board = seen.board;
     let mut lines = Vec::new();
-    let agents = board.crew().agents();
-    if agents.is_empty() {
+    let chats = board.chats_listed();
+    if chats.is_empty() {
         seen.said(
             &mut lines,
-            "No agent has joined yet: write a task, and the first one starts.",
+            "No chat yet: write a task, and the first one starts.",
             p.dim,
         );
         return lines;
@@ -29,65 +30,69 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
     lines.push(Line::default());
     let chosen = board.screen().chosen();
     let talking = board.screen().talking_to();
-    let listed = board.crew().listed();
-    let name_width = listed
+    let name_width = chats
         .iter()
-        .map(|(depth, a)| a.name.chars().count() + 2 * depth)
+        .map(|chat| chat.name.chars().count())
         .max()
         .unwrap_or(0)
         + 2;
-    let model_width = agents
+    let model_width = chats
         .iter()
-        .map(|a| a.model.chars().count())
+        .map(|chat| chat.model.chars().count())
         .max()
         .unwrap_or(0)
         + 2;
     let now = iq_ui::now();
-    for (at, (depth, agent)) in listed.iter().enumerate() {
-        let tint = agent_tint(board, &agent.name, p);
+    for (at, chat) in chats.iter().enumerate() {
+        let tint = agent_tint(board, &chat.name, p);
         let on = at == chosen;
-        let depth = *depth;
-        let nested = "  ".repeat(depth);
-        let state = if agent.retired {
-            ("finished".to_owned(), p.faint)
-        } else if agent.working {
+        let state = if chat.working {
             ("working".to_owned(), p.accent)
         } else {
-            match agent.thread.last() {
+            match chat.thread.last() {
                 Some(Entry::Done(Err(_))) => ("stopped".to_owned(), p.bad),
                 Some(Entry::Done(Ok(_))) => ("done".to_owned(), p.ok),
                 _ => ("resting".to_owned(), p.faint),
             }
         };
-        let spent = match agent.context().0 {
+        let spent = match chat.context().0 {
             0 => "·".to_owned(),
-            _ => format!("{} · context {}", agent.billed, agent.context()),
+            _ => format!("{} · context {}", chat.billed, chat.context()),
         };
-        let by = if agent.by == PERSON {
-            "by you".to_owned()
-        } else {
-            format!("by {}", agent.by)
-        };
-        let named = format!("{nested}{}", agent.name);
         let mut spans = vec![
             Span::styled(if on { " ▸ " } else { "   " }, p.fg(p.accent)),
-            Span::styled(if depth > 0 { "◦ " } else { "● " }, p.fg(tint)),
+            Span::styled("● ", p.fg(tint)),
             Span::styled(
-                format!("{named:<name_width$}"),
+                format!("{:<name_width$}", chat.name),
                 if on { p.bold(tint) } else { p.fg(p.text) },
             ),
-            Span::styled(format!("{:<model_width$}", agent.model), p.fg(p.dim)),
+            Span::styled(format!("{:<model_width$}", chat.model), p.fg(p.dim)),
             Span::styled(format!("{:<10}", state.0), p.fg(state.1)),
-            Span::styled(format!("{spent:<22}"), p.fg(p.text)),
-            Span::styled(by, p.fg(p.faint)),
+            Span::styled(spent, p.fg(p.text)),
         ];
-        if Some(agent.name.as_str()) == talking {
+        let at_work = board
+            .crew()
+            .agents()
+            .iter()
+            .filter(|agent| {
+                agent.working
+                    && agent.by != PERSON
+                    && board.crew().chat_of(&agent.name).as_deref() == Some(chat.name.as_str())
+            })
+            .count();
+        if at_work > 0 {
+            spans.push(Span::styled(
+                format!("  {at_work} of its agents at work",),
+                p.fg(p.accent),
+            ));
+        }
+        if Some(chat.name.as_str()) == talking {
             spans.push(Span::styled("  you write to it", p.fg(p.accent)));
         }
         let waiting = board
             .questions()
             .iter()
-            .filter(|q| q.agent == agent.name)
+            .filter(|q| board.crew().chat_of(&q.agent).as_deref() == Some(chat.name.as_str()))
             .count();
         if waiting > 0 {
             spans.push(Span::styled(
@@ -96,22 +101,19 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
             ));
         }
         lines.push(Line::from(spans));
-        let under = format!("       {nested}");
+        let under = "       ";
         // What it was first asked, and when it last worked: what tells
         // one chat from another.
-        if !agent.task.trim().is_empty() || agent.worked.is_some() {
-            let worked = agent
+        if !chat.task.trim().is_empty() || chat.worked.is_some() {
+            let worked = chat
                 .worked
                 .map(|at| format!("at work {} · ", iq_ui::ago(at, now)))
                 .unwrap_or_default();
             let room = seen
                 .width
                 .saturating_sub(under.chars().count() + worked.chars().count() + 3);
-            let asked = first_line(given(&agent.task));
-            let mut said = vec![
-                Span::raw(under.clone()),
-                Span::styled(worked, p.fg(p.faint)),
-            ];
+            let asked = first_line(given(&chat.task));
+            let mut said = vec![Span::raw(under), Span::styled(worked, p.fg(p.faint))];
             if !asked.is_empty() {
                 said.push(Span::styled(
                     format!("“{}”", cut(&asked, room)),
@@ -120,9 +122,7 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
             }
             lines.push(Line::from(said));
         }
-        if let Some(place) = &agent.place
-            && depth == 0
-        {
+        if let Some(place) = &chat.place {
             lines.push(Line::from(Span::styled(
                 format!(
                     "{under}in {}",
@@ -135,67 +135,11 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
             )));
         }
         // What the person's plugins say of it: its containers, say.
-        for said in seen.board.plugins().lines(&agent.name) {
+        for said in seen.board.plugins().lines(&chat.name) {
             lines.push(Line::from(Span::styled(
                 format!(
                     "{under}{}",
                     cut(said, seen.width.saturating_sub(under.chars().count() + 2))
-                ),
-                p.fg(p.dim),
-            )));
-        }
-    }
-    if let Some((_, agent)) = listed.get(chosen) {
-        seen.heading(
-            &mut lines,
-            "Lately",
-            &format!("{}'s last steps", agent.name),
-        );
-        let steps: Vec<&Entry> = agent
-            .thread
-            .iter()
-            .filter(|e| !matches!(e, Entry::Text(t) if t.trim().is_empty()))
-            .filter(|e| !matches!(e, Entry::Message { from, .. } if from == PERSON))
-            .collect();
-        for entry in steps.iter().rev().take(8).rev() {
-            let said = match entry {
-                Entry::Prompt(text) => format!("› {}", first_line(given(text))),
-                Entry::Text(text) => first_line(text),
-                Entry::Tool {
-                    name, input, ok, ..
-                } => {
-                    format!("{} {name} {}", if *ok { "▸" } else { "✗" }, short(input))
-                }
-                Entry::Reviewed {
-                    action, approved, ..
-                } => {
-                    format!(
-                        "⏵⏵ {} {}",
-                        if *approved { "allowed" } else { "refused" },
-                        short(action)
-                    )
-                }
-                Entry::Asked { action, answer, .. } => match answer {
-                    Some(true) => format!("✓ you allowed {}", short(action)),
-                    Some(false) => format!("✗ refused {}", short(action)),
-                    None => format!("? asks to {}", short(action)),
-                },
-                Entry::Message { from, to, text } => {
-                    format!("✉ {from} → {to}: {}", first_line(text))
-                }
-                Entry::Notice(text) => format!("! {text}"),
-                Entry::Done(Ok(_)) => "✔ done".to_owned(),
-                Entry::Done(Err(error)) => format!("✘ stopped: {error}"),
-                Entry::Chose { question, answer } => format!(
-                    "? {} → {}",
-                    first_line(question),
-                    answer.as_deref().unwrap_or("no answer")
-                ),
-            };
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "   {}",
-                    cut(&said.replace('\n', " "), seen.width.saturating_sub(4))
                 ),
                 p.fg(p.dim),
             )));
@@ -308,7 +252,7 @@ pub(super) fn thread(seen: &Seen<'_>, agent: &str) -> Vec<Line<'static>> {
                 };
                 lines.extend(wrap(
                     &[Span::styled(
-                        format!("the reviewer {word} {}: {why}", short(action)),
+                        format!("autopilot {word} {}: {why}", short(action)),
                         p.fg(colour),
                     )],
                     width,
@@ -399,4 +343,53 @@ fn given(text: &str) -> &str {
 /// The first line of `text`, trimmed.
 fn first_line(text: &str) -> String {
     text.trim().lines().next().unwrap_or_default().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::{Depth, Palette};
+    use iq_agent::Event;
+    use iq_ui::look::Theme;
+    use iq_ui::{Board, Update};
+
+    #[test]
+    fn the_chats_are_listed_alone_with_how_many_of_their_agents_work() {
+        let mut board = Board::default();
+        for (agent, by) in [
+            ("login", PERSON),
+            ("docs", PERSON),
+            ("login/review", "login"),
+        ] {
+            board.update(Update::Crew(Event::Joined {
+                agent: agent.into(),
+                model: "lab/m".into(),
+                by: by.into(),
+            }));
+        }
+        board.update(Update::Crew(Event::Working {
+            agent: "login/review".into(),
+            prompt: "review it".into(),
+        }));
+        let p = Palette::new(Theme::Ink, Depth::True);
+        let seen = Seen {
+            board: &board,
+            p: &p,
+            now: 0,
+            width: 100,
+            summed: &|_| None,
+            motion: &crate::motion::Motion::default(),
+            labels: &|_| None,
+            writing: &|_| None,
+        };
+        let rows: Vec<String> = lines(&seen).iter().map(ToString::to_string).collect();
+        let chats: Vec<&String> = rows.iter().filter(|row| row.contains("● ")).collect();
+        assert_eq!(chats.len(), 2, "{rows:#?}");
+        assert!(
+            chats
+                .iter()
+                .any(|row| row.contains("login") && row.contains("1 of its agents at work"))
+        );
+        assert!(!rows.iter().any(|row| row.contains("login/review")));
+    }
 }

@@ -98,6 +98,8 @@ pub struct Look {
     job_lines: usize,
     /// What shows a turn of several agents.
     turn: TurnShown,
+    /// Whether a diagram shows folded, as a line, until unfolded.
+    diagrams_folded: bool,
 }
 
 /// How many of a job's latest lines show while it runs, unless the
@@ -120,7 +122,22 @@ impl Look {
             steps: crate::steps::SHOWN,
             job_lines: JOB_LINES,
             turn: TurnShown::Panes,
+            diagrams_folded: false,
         }
+    }
+
+    /// With diagrams shown folded, as a line the person unfolds with the
+    /// down arrow while it is the last thing written, when `folded`.
+    #[must_use]
+    pub fn with_diagrams_folded(mut self, folded: bool) -> Self {
+        self.diagrams_folded = folded;
+        self
+    }
+
+    /// Whether diagrams show folded.
+    #[must_use]
+    pub fn diagrams_folded(&self) -> bool {
+        self.diagrams_folded
     }
 
     /// With a turn of several agents shown as `turn` says.

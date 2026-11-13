@@ -634,7 +634,8 @@ mod tests {
             labels: &|_| None,
             writing: &|_| None,
         };
-        let head = text(&map.head("fix", 120));
+        // How long it has run, read off the clock, may be past a second.
+        let head = text(&map.head("fix", 120)).replacen(" · 1s · ", " · 0s · ", 1);
         assert!(
             head.starts_with(" turn 7 · 0s · $0.81 of $1.00 ▕███████░░▏"),
             "{head}"

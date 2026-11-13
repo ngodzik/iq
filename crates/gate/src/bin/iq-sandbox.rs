@@ -5,10 +5,13 @@
 
 fn main() {
     let mut args = std::env::args_os().skip(1).peekable();
-    let error = if args.peek().is_some_and(|arg| arg == iq_gate::HOLD_FLAG) {
-        iq_gate::hold_network()
-    } else {
-        iq_gate::sandboxed(args)
+    let error = match args.peek() {
+        Some(arg) if arg == iq_gate::HOLD_FLAG => iq_gate::hold_network(),
+        Some(arg) if arg == iq_gate::DETACH_FLAG => {
+            args.next();
+            iq_gate::detached(args)
+        }
+        _ => iq_gate::sandboxed(args),
     };
     eprintln!("{}", iq_gate::helper_failure(&error));
     std::process::exit(125);
