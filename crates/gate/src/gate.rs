@@ -92,6 +92,9 @@ pub struct Gate {
     reviewer_host: Arc<AtomicBool>,
     /// The variables the person's programs gave each place's commands.
     given: Given,
+    /// The folders of the person's skills, resolved: their Markdown files
+    /// open to an agent while the person opens them.
+    skills: Vec<PathBuf>,
 }
 
 /// Builds a [`Gate`].
@@ -107,9 +110,20 @@ pub struct GateBuilder {
     internet: bool,
     reviewer_internet: bool,
     reviewer_host: bool,
+    skills: Vec<PathBuf>,
 }
 
 impl GateBuilder {
+    /// The folders of the person's skills, which they may open to the
+    /// agents of a chat for a while ([`Gate::judge_with`]): their Markdown
+    /// files read, each change asked of the person alone. Shut, they are
+    /// what they are, a folder of secrets often.
+    #[must_use]
+    pub fn skills(mut self, folders: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.skills.extend(folders);
+        self
+    }
+
     /// Lets a reviewer let a command run on the machine itself, outside
     /// the sandbox, following the policy the person wrote for it. What
     /// changes what others share still waits for the person.
@@ -230,6 +244,12 @@ impl GateBuilder {
             reviewer_internet: Arc::new(AtomicBool::new(self.reviewer_internet)),
             reviewer_host: Arc::new(AtomicBool::new(self.reviewer_host)),
             given: Given::default(),
+            // Resolved as the paths judged are, a link on the way followed.
+            skills: self
+                .skills
+                .iter()
+                .map(|folder| paths::resolve(folder, Path::new("/")))
+                .collect(),
         })
     }
 }
@@ -248,6 +268,7 @@ impl Gate {
             internet: false,
             reviewer_internet: false,
             reviewer_host: false,
+            skills: Vec::new(),
         }
     }
 
@@ -288,6 +309,7 @@ impl Gate {
             reviewer_internet: Arc::clone(&self.reviewer_internet),
             reviewer_host: Arc::clone(&self.reviewer_host),
             given: self.given.clone(),
+            skills: self.skills.clone(),
         })
     }
 
@@ -413,6 +435,27 @@ impl Gate {
         self.internet.store(open, Ordering::Relaxed);
     }
 
+    /// Whether `path` holds secrets, as its name or its folder in the
+    /// gate's home says: what it says of a file is never shown.
+    #[must_use]
+    pub fn holds_secrets(&self, path: &Path) -> bool {
+        paths::secret(path, self.bounds.home.as_deref())
+    }
+
+    /// The folders of the person's skills, as they open.
+    pub fn skill_folders(&self) -> &[PathBuf] {
+        &self.skills
+    }
+
+    /// Whether `path`, resolved, is a Markdown file of the person's skills
+    /// whose name says nothing of secrets.
+    fn skill(&self, path: &Path) -> bool {
+        path.extension()
+            .is_some_and(|ending| ending.eq_ignore_ascii_case("md"))
+            && self.skills.iter().any(|folder| path.starts_with(folder))
+            && !paths::secret(path, None)
+    }
+
     /// The workspace, resolved.
     pub fn workspace(&self) -> &Path {
         &self.bounds.workspace
@@ -461,16 +504,41 @@ impl Gate {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn judge(&self, action: Action) -> Result<Judged, GateError> {
+        self.judge_with(action, false)
+    }
+
+    /// Judges `action` as [`judge`](Self::judge) does, the person's skills
+    /// open when `skills` says: a Markdown file of their folders is read,
+    /// and each change of one asked of the person alone, never a
+    /// reviewer, whose policy is one of them. Nothing else of the folders
+    /// opens: a file whose name says it holds secrets, a link leading out
+    /// of them.
+    ///
+    /// # Errors
+    ///
+    /// The audit log cannot be written.
+    pub fn judge_with(&self, action: Action, skills: bool) -> Result<Judged, GateError> {
         let workspace = &self.bounds.workspace;
         let (action, verdict) = match action {
             Action::Read { path } => {
                 let path = paths::resolve(&self.homed(&path), workspace);
-                let verdict = self.reading(&path);
+                let verdict = if skills && self.skill(&path) {
+                    Verdict::Allow
+                } else {
+                    self.reading(&path)
+                };
                 (Action::Read { path }, verdict)
             }
             Action::Write { path } => {
                 let path = paths::resolve(&self.homed(&path), workspace);
-                let verdict = self.writing(&path);
+                let verdict = if skills && self.skill(&path) {
+                    Verdict::Ask {
+                        reason: "it changes one of your skills".to_owned(),
+                        scope: Scope::Beyond,
+                    }
+                } else {
+                    self.writing(&path)
+                };
                 (Action::Write { path }, verdict)
             }
             Action::Run {
@@ -997,6 +1065,69 @@ mod tests {
             .unwrap(),
             Judged::Denied { .. }
         ));
+    }
+
+    #[test]
+    fn the_skills_open_only_when_asked_their_markdown_alone_and_each_change_the_persons() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let skills = home.join(".iq/skills");
+        std::fs::create_dir_all(skills.join("review")).unwrap();
+        std::fs::write(skills.join("review/SKILL.md"), "# Review\n").unwrap();
+        std::fs::write(skills.join("run.sh"), "echo\n").unwrap();
+        std::fs::write(home.join(".iq/settings.toml"), "theme = \"ink\"\n").unwrap();
+        // A link among them leads to a secret: it stays one.
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/notes.md"), "a key\n").unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh/notes.md"), skills.join("keys.md")).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let gate = Gate::builder(work.path())
+            .home(Some(home.clone()))
+            .skills([skills.clone()])
+            .build()
+            .unwrap();
+        assert_eq!(gate.skill_folders(), std::slice::from_ref(&skills));
+        let judge = |action: Action, open: bool| reason(&gate.judge_with(action, open).unwrap());
+        let read = |path: &Path| Action::Read { path: path.into() };
+        let write = |path: &Path| Action::Write { path: path.into() };
+        let skill = skills.join("review/SKILL.md");
+        // Shut, a folder of secrets as any other.
+        assert_eq!(judge(read(&skill), false).0, "denied");
+        // Open, its Markdown is read, and a change asked of the person.
+        assert_eq!(judge(read(&skill), true).0, "allowed");
+        let Judged::Asked {
+            reason: why,
+            pending,
+        } = gate.judge_with(write(&skill), true).unwrap()
+        else {
+            panic!("a change of a skill is asked");
+        };
+        assert_eq!(why, "it changes one of your skills");
+        assert_eq!(pending.scope(), Scope::Beyond);
+        gate.set_reviewer_host(true);
+        gate.set_reviewer_internet(true);
+        assert!(matches!(
+            gate.approve(pending, Approver::Reviewer),
+            Err(GateError::Widens)
+        ));
+        // Nothing else opens with them.
+        assert_eq!(judge(read(&skills.join("run.sh")), true).0, "denied");
+        assert_eq!(
+            judge(read(&home.join(".iq/settings.toml")), true).0,
+            "denied"
+        );
+        assert_eq!(judge(read(&skills.join("keys.md")), true).0, "denied");
+        assert_eq!(
+            judge(read(&skills.join("review/../../settings.toml")), true).0,
+            "denied"
+        );
+        // A gate for another place opens the same.
+        let other = tempfile::tempdir().unwrap();
+        let within = gate.within(other.path(), Vec::new()).unwrap();
+        assert_eq!(
+            reason(&within.judge_with(read(&skill), true).unwrap()).0,
+            "allowed"
+        );
     }
 
     #[test]

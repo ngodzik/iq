@@ -197,6 +197,21 @@ impl Keeper for Chats {
     }
 }
 
+/// Moves `chat` to `lead`, the settings' lead, at `at`, when it follows
+/// the settings and runs on another: the person changed their lead since.
+/// Returns what the person is told of it.
+pub(crate) fn on_the_lead(chat: &mut Saved, lead: &str, at: u64) -> Option<String> {
+    if !chat.follows_settings() || chat.model == lead {
+        return None;
+    }
+    let was = chat.model.clone();
+    chat.move_to(lead, iq_agent::PERSON, iq_agent::SETTINGS_MODEL, at);
+    Some(format!(
+        "{} answers on {lead}, the settings' lead, from its next turn (it was on {was})",
+        chat.name
+    ))
+}
+
 /// Where the agents retired are kept, under a project's chats.
 const RETIRED: &str = "retired";
 
@@ -253,7 +268,52 @@ mod tests {
             }],
             set_apart: vec!["the whole of an old result".to_owned()],
             messages: vec![Message::system("be brief"), Message::user("fix it")],
+            compacted_away: Vec::new(),
+            compacted_head: 0,
         }
+    }
+
+    #[test]
+    fn a_chat_on_the_settings_model_follows_them_and_one_chosen_stays() {
+        let mut chat = saved("fix");
+        chat.models_chosen[0].how = iq_agent::SETTINGS_MODEL.to_owned();
+        chat.messages.push(Message::Assistant {
+            content: Some("Fixed.".into()),
+            tool_calls: Vec::new(),
+            reasoning_signature: Some(serde_json::json!("c2lnbmVk")),
+        });
+        assert_eq!(
+            on_the_lead(&mut chat, "lab/haiku", 9).as_deref(),
+            Some(
+                "fix answers on lab/haiku, the settings' lead, from its next turn (it was on lab/model)"
+            )
+        );
+        assert_eq!(chat.model, "lab/haiku");
+        let last = chat.models_chosen.last().unwrap();
+        assert_eq!((last.how.as_str(), last.at), (iq_agent::SETTINGS_MODEL, 9));
+        // Its answers go on without the reasoning another model signed.
+        assert!(chat.messages.iter().all(|message| !matches!(
+            message,
+            Message::Assistant {
+                reasoning_signature: Some(_),
+                ..
+            }
+        )));
+        // On the lead, and once it was moved, it stays.
+        assert_eq!(on_the_lead(&mut chat, "lab/haiku", 10), None);
+        assert_eq!(chat.models_chosen.len(), 2);
+        // A model the person chose for it stays, as does an agent's.
+        let mut chosen = saved("chosen");
+        chosen.models_chosen[0].how = "/model".to_owned();
+        assert_eq!(on_the_lead(&mut chosen, "lab/haiku", 9), None);
+        let mut started = saved("lead/tests");
+        started.by = "lead".to_owned();
+        started.models_chosen.clear();
+        assert_eq!(on_the_lead(&mut started, "lab/haiku", 9), None);
+        // One kept before choices were, the settings'.
+        let mut older = saved("older");
+        older.models_chosen.clear();
+        assert!(on_the_lead(&mut older, "lab/haiku", 9).is_some());
     }
 
     #[test]

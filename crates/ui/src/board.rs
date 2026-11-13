@@ -136,7 +136,7 @@ const OFFERED: usize = 8;
 const NAMED_IN_MESSAGE: &str = "named in the message";
 
 /// The same, when it is the settings' lead.
-const SETTINGS_MODEL: &str = "the settings' model";
+const SETTINGS_MODEL: &str = iq_agent::SETTINGS_MODEL;
 
 /// How many of the person's chats the switcher shows at once.
 pub const SWITCH_ROWS: usize = 5;
@@ -566,9 +566,20 @@ impl Board {
         Some(recall)
     }
 
+    /// The person goes to another chat, or a new one: the reading of the
+    /// conversation they leave ends with it.
+    fn leave_reading(&mut self) {
+        if self.reading {
+            self.reading = false;
+            self.readings.push(Reading::Leave);
+        }
+        self.clicked = false;
+    }
+
     /// Writes to `agent` from now on; a chat of an earlier session is
     /// recalled as the person comes back to it.
     fn write_to(&mut self, agent: &str) {
+        self.leave_reading();
         self.screen.talk_to(agent);
         if self.unrecalled.remove(agent) {
             let recall = Recall {
@@ -1233,6 +1244,7 @@ impl Board {
                     }
                     (_, Some('n'), _) => {
                         self.chose = true;
+                        self.leave_reading();
                         self.screen.new_chat(self.crew.lead());
                         self.screen.close();
                     }
@@ -1340,6 +1352,7 @@ impl Board {
             Action::Switch => self.switch(now),
             Action::NewChat => {
                 self.chose = true;
+                self.leave_reading();
                 let lead = self.crew.lead().to_owned();
                 self.screen.new_chat(&lead);
                 self.screen.close();
@@ -1364,6 +1377,20 @@ impl Board {
             Action::Theme => self.look.next_theme(),
             Action::Autopilot => return Some(self.crew.toggle_autopilot()),
             Action::Internet => return Some(self.crew.toggle_internet()),
+            Action::Skills => {
+                let Talk::To(agent) = self.screen.talk().clone() else {
+                    self.screen
+                        .notice("Your skills open to a chat: write to one first", now);
+                    return None;
+                };
+                let Some(chat) = self.crew.chat_of(&agent) else {
+                    self.screen.notice(self.no_agent(&agent), now);
+                    return None;
+                };
+                // Open to this chat, they shut; else they open to it.
+                let open = self.crew.skills() != Some(chat.as_str());
+                return Some(Request::Skills { agent, open });
+            }
             Action::Allow | Action::Refuse => {
                 // The agents' questions first: they hold work.
                 if let Some(id) = self.crew.questions().first().map(|q| q.id) {
@@ -1533,6 +1560,7 @@ impl Board {
                     },
                 };
                 self.chose = true;
+                self.leave_reading();
                 self.screen.new_chat(&model);
                 if let Some(chat) = self.screen.new_chat_mut() {
                     how.clone_into(&mut chat.how);
@@ -1612,6 +1640,7 @@ impl Board {
             Command::Keys => open(self, Page::Keys),
             Command::Autopilot => return self.act(Action::Autopilot, now).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet, now).into_iter().collect(),
+            Command::Skills => return self.act(Action::Skills, now).into_iter().collect(),
             Command::Mcp => return vec![Request::Mcp],
             Command::Image(None) => {
                 let said = match self.attached.len() {
@@ -1902,6 +1931,18 @@ impl Board {
                             text: text.clone(),
                         });
                     }
+                    // Said at once, whatever the chat written to: the
+                    // chat's own notice waits among its steps.
+                    Event::Skills { chat } if chat.as_deref() != self.crew.skills() => {
+                        let said = match chat {
+                            Some(chat) => format!(
+                                "Your skills are open to the agents of {chat} until its turn \
+                                 ends: each change of one is asked of you"
+                            ),
+                            None => "Your skills are shut again".to_owned(),
+                        };
+                        self.screen.notice(said, crate::now());
+                    }
                     _ => {}
                 }
                 self.crew.event(event);
@@ -2040,6 +2081,73 @@ mod tests {
         let mut board = Board::default();
         board.scroll(-3);
         key(&mut board, "PageUp");
+        assert!(board.take_readings().is_empty());
+    }
+
+    #[test]
+    fn the_skills_open_to_the_chat_written_to_and_shut_the_same_way() {
+        let mut board = Board::default();
+        // No chat yet: none to open them to.
+        assert!(key(&mut board, "ctrl+b").is_empty());
+        joined(&mut board, "lead", PERSON);
+        joined(&mut board, "lead/review", "lead");
+        board.screen_mut().talk_to("lead/review");
+        assert_eq!(
+            key(&mut board, "ctrl+b"),
+            [Request::Skills {
+                agent: "lead/review".into(),
+                open: true
+            }]
+        );
+        board.update(Update::Crew(Event::Skills {
+            chat: Some("lead".into()),
+        }));
+        assert_eq!(board.crew().skills(), Some("lead"));
+        // Said at once.
+        assert!(
+            board
+                .screen()
+                .noticed(1)
+                .is_some_and(|said| said.starts_with("Your skills are open to the agents of lead")),
+            "{:?}",
+            board.screen().noticed(1)
+        );
+        // Open to its chat, the command shuts them.
+        board.screen_mut().talk_to("lead");
+        board.screen_mut().editor_mut().set("/skills");
+        assert_eq!(
+            key(&mut board, "enter"),
+            [Request::Skills {
+                agent: "lead".into(),
+                open: false
+            }]
+        );
+    }
+
+    #[test]
+    fn going_to_another_chat_or_a_new_one_leaves_the_reading_of_the_last() {
+        let look = Look::default().with_conversation(crate::look::Conversation::Drawn);
+        let mut board = Board::new(Keymap::default(), look);
+        joined(&mut board, "one", PERSON);
+        joined(&mut board, "two", PERSON);
+        board.screen_mut().talk_to("one");
+        // Marked by a click, then another chat chosen in the switcher.
+        board.click(4, 9);
+        board.act(Action::Switch, 1);
+        key(&mut board, "enter");
+        assert!(!board.reading());
+        assert_eq!(
+            board.take_readings(),
+            [Reading::Click(4, 9), Reading::Leave]
+        );
+        // Read from the keyboard, then a new chat.
+        key(&mut board, "shift+up");
+        board.act(Action::NewChat, 1);
+        assert!(!board.reading());
+        assert_eq!(board.take_readings(), [Reading::Mark(-1), Reading::Leave]);
+        // Not reading, a chat chosen says nothing to the conversation.
+        board.act(Action::Switch, 1);
+        key(&mut board, "enter");
         assert!(board.take_readings().is_empty());
     }
 
@@ -2945,6 +3053,7 @@ mod tests {
                 action: "run x".into(),
                 reason: "it reaches the internet".into(),
                 widens: true,
+                preview: None,
             }));
         }
         assert_eq!(

@@ -12,6 +12,7 @@
 //! turn_cost_ask = 1.0                    # dollars a chat's turn may spend (its agents, those they started, the autopilot, the summaries) before you are asked whether it goes on, then as much again each time; unset, never asked
 //! effort = "high"                        # how hard the models think; /effort changes an agent's
 //! context_every = 25000                  # tokens an agent's conversation grows between two words to it of its size; 0 never
+//! compact_at = 100000                    # tokens an agent's conversation should stay under: past them, it is told at once to finish its request and call `compact` before it answers, and again as each turn begins past them, what its summary leaves out found again with `look_back`; unset, where its model's price rises when the provider says; 0 never
 //! light_from = 40000                     # tokens an agent's calls read past which its old tool results (all but the latest six, the long ones) are set apart, each replaced by a line saying what it was, `reread` reading it again; again each time they grow as much, so that the provider's cache breaks seldom; 0 never
 //! autopilot = false
 //! autopilot_internet = true              # the reviewer also answers what only reaches the internet
@@ -152,6 +153,9 @@ pub(crate) struct Settings {
     /// How many tokens an agent's conversation grows between two words to
     /// it of its size.
     context_every: Option<u64>,
+    /// The tokens an agent's conversation should stay under; unset, where
+    /// its model's price rises; 0 never.
+    compact_at: Option<u64>,
     /// The tokens an agent's calls read past which its old tool results
     /// are set apart; 0 never.
     light_from: Option<u64>,
@@ -532,17 +536,23 @@ impl Settings {
             .collect()
     }
 
-    /// The folders of the person's skills: `~/` in `home`, others in
-    /// `workspace`.
-    pub(crate) fn skill_folders(&self, home: &Path, workspace: &Path) -> Vec<PathBuf> {
-        let mut folders: Vec<PathBuf> = self
-            .skills
+    /// The folders of the person's own skills, as the settings list them,
+    /// without the project's: those the person may open to a chat's
+    /// agents, which may change a project's as any of its files.
+    pub(crate) fn own_skill_folders(&self, home: &Path, workspace: &Path) -> Vec<PathBuf> {
+        self.skills
             .clone()
             .unwrap_or_else(|| SKILLS.map(str::to_owned).to_vec())
             .iter()
             .filter(|folder| !folder.trim().is_empty())
             .map(|folder| placed(folder.trim(), home, workspace))
-            .collect();
+            .collect()
+    }
+
+    /// The folders of the person's skills: `~/` in `home`, others in
+    /// `workspace`.
+    pub(crate) fn skill_folders(&self, home: &Path, workspace: &Path) -> Vec<PathBuf> {
+        let mut folders = self.own_skill_folders(home, workspace);
         // The project's own after the person's, whose skills win where both
         // hold one of the same name.
         let project = workspace.join(PROJECT_SKILLS);
@@ -738,6 +748,7 @@ impl Settings {
             )?),
             effort: self.effort,
             context_every: self.context_every.unwrap_or(iq_agent::CONTEXT_EVERY),
+            compact_at: self.compact_at,
             refusals: self.autopilot_refusals.unwrap_or(iq_agent::REFUSALS),
             reviewer_effort: self
                 .autopilot_effort
@@ -845,6 +856,11 @@ mod tests {
         assert_eq!(set.crew().unwrap().context_every, iq_agent::CONTEXT_EVERY);
         let quiet: Settings = toml::from_str("context_every = 0").unwrap();
         assert_eq!(quiet.crew().unwrap().context_every, 0);
+        // Where a conversation should stay under: unset, its model's price
+        // says.
+        assert_eq!(set.crew().unwrap().compact_at, None);
+        let under: Settings = toml::from_str("compact_at = 100000").unwrap();
+        assert_eq!(under.crew().unwrap().compact_at, Some(100_000));
         assert!(set.autopilot && set.internet);
         assert!(!set.worktree);
         assert_eq!(set.worktree_from(), "HEAD");

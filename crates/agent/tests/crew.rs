@@ -23,6 +23,9 @@ struct Scripted {
     /// How many of each agent's calls are answered before its provider
     /// refuses the others.
     refused: Mutex<HashMap<String, usize>>,
+    /// Whether the provider refuses a call that sends a reasoning back, as
+    /// one refuses another's signature.
+    refuses_signed: Mutex<bool>,
 }
 
 /// What the scripted provider fails with.
@@ -32,6 +35,8 @@ enum Failed {
     Busy,
     /// Refused, whatever is tried again.
     Refused,
+    /// Refused for a signature of reasoning it cannot check.
+    Signed,
 }
 
 impl std::fmt::Display for Failed {
@@ -39,11 +44,15 @@ impl std::fmt::Display for Failed {
         match self {
             Failed::Busy => f.write_str("HTTP 429: TPM quota exhausted, please try again later"),
             Failed::Refused => f.write_str("HTTP 400: Request contains an invalid argument."),
+            Failed::Signed => f.write_str(SIGNED),
         }
     }
 }
 
 impl std::error::Error for Failed {}
+
+/// What a provider says of a signature of reasoning it cannot check.
+const SIGNED: &str = "messages.3.content.0: Invalid `signature` in `thinking` block";
 
 impl Scripted {
     fn new(scripts: &[(&str, Vec<ChatResponse>)]) -> Arc<Self> {
@@ -57,6 +66,7 @@ impl Scripted {
             requests: Mutex::default(),
             busy: Mutex::default(),
             refused: Mutex::default(),
+            refuses_signed: Mutex::default(),
         })
     }
 
@@ -174,6 +184,9 @@ impl ChatModel for Model {
             }
             *left -= 1;
         }
+        if *self.refuses_signed.lock().unwrap() && signed(request) {
+            return Err(Failed::Signed);
+        }
         let next = self
             .scripts
             .lock()
@@ -188,7 +201,7 @@ impl ChatModel for Model {
             Failed::Busy => Some(Busy {
                 after: Some(Duration::from_millis(1)),
             }),
-            Failed::Refused => None,
+            Failed::Refused | Failed::Signed => None,
         }
     }
 
@@ -199,7 +212,32 @@ impl ChatModel for Model {
                 status: 400,
                 message: "Request contains an invalid argument.".into(),
             }),
+            Failed::Signed => Some(iq_core::Refusal {
+                status: 400,
+                message: SIGNED.into(),
+            }),
         }
+    }
+}
+
+/// Whether `request` sends a reasoning back with one of its answers.
+fn signed(request: &ChatRequest) -> bool {
+    request.messages.iter().any(|message| {
+        matches!(
+            message,
+            Message::Assistant {
+                reasoning_signature: Some(_),
+                ..
+            }
+        )
+    })
+}
+
+/// `text`, said with a reasoning its provider signed.
+fn reasoned(text: &str) -> ChatResponse {
+    ChatResponse {
+        reasoning_signature: Some(serde_json::json!("c2lnbmVk")),
+        ..say(text)
     }
 }
 
@@ -408,8 +446,12 @@ async fn a_file_written_or_edited_is_said_with_how_its_lines_changed() {
         ]
     );
     // Never for a file of secrets, whose lines the person allowed written
-    // but not shown.
+    // but not shown, nor as they were asked.
     assert!(!changed.iter().any(|(path, _)| path.contains(".env")));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Asked { action, preview: None, .. } if action.contains(".env")
+    )));
     // Said before the step that wrote it.
     let at = |name: &str| {
         events
@@ -422,6 +464,163 @@ async fn a_file_written_or_edited_is_said_with_how_its_lines_changed() {
         .position(|event| matches!(event, Event::Changed { .. }))
         .unwrap();
     assert!(first < at("write_file"));
+}
+
+#[tokio::test]
+async fn the_skills_open_to_one_chat_for_a_turn_each_change_shown_and_asked_of_the_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let (home, root) = (base.join("home"), base.join("work"));
+    let skills = home.join(".iq/skills");
+    std::fs::create_dir_all(skills.join("review")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let skill = skills.join("review/SKILL.md");
+    std::fs::write(&skill, "# Review\nRead the diff.\n").unwrap();
+    // Named as the person would, from their home.
+    let path = "~/.iq/skills/review/SKILL.md".to_owned();
+    let read = || calls("read_file", serde_json::json!({ "path": path }));
+    let scripted = Scripted::new(&[
+        (
+            "lead",
+            vec![
+                say("Ready."),
+                read(),
+                calls(
+                    "edit_file",
+                    serde_json::json!({"path": path, "old_text": "Read the diff.", "new_text": "Read the whole diff."}),
+                ),
+                say("Changed it."),
+                read(),
+                say("Shut."),
+            ],
+        ),
+        ("other", vec![say("Ready."), read(), say("Denied.")]),
+    ]);
+    let gate = Gate::builder(&root)
+        .home(Some(home.clone()))
+        .skills([skills.clone()])
+        .build()
+        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&events);
+    let crew = Crew::new(
+        Model(Arc::clone(&scripted)),
+        gate,
+        Helper::new("/nonexistent", Vec::<String>::new()),
+        Settings::default(),
+        Arc::new(move |event| kept.lock().unwrap().push(event)),
+    );
+    let settled = || async {
+        tokio::time::timeout(Duration::from_secs(10), crew.settled())
+            .await
+            .unwrap();
+    };
+    let kept = Arc::new(Kept::default());
+    crew.set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
+    crew.start("lead", &model("lab/m"), "hello".into(), PERSON);
+    crew.start("other", &model("lab/m"), "hello".into(), PERSON);
+    settled().await;
+    // Opened while the chat rests: they serve its next turn, the autopilot
+    // on or not, every change the person's.
+    crew.open_skills("lead", true).unwrap();
+    crew.set_autopilot(true);
+    crew.tell("lead", "make the review read the whole diff".into())
+        .unwrap();
+    let asked = loop {
+        let found = events.lock().unwrap().iter().find_map(|event| match event {
+            Event::Asked { id, preview, .. } => Some((*id, preview.clone())),
+            _ => None,
+        });
+        if let Some(found) = found {
+            break found;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    // The change shown before it is allowed.
+    assert_eq!(
+        asked.1.as_deref(),
+        Some("@@ -1,2 +1,2 @@\n # Review\n-Read the diff.\n+Read the whole diff.")
+    );
+    crew.answer(asked.0, true);
+    settled().await;
+    assert_eq!(
+        std::fs::read_to_string(&skill).unwrap(),
+        "# Review\nRead the whole diff.\n"
+    );
+    // Shown as it was asked, not again once written: a file of secrets
+    // named from the home is one still.
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, Event::Changed { .. }))
+    );
+    let seen = scripted.seen_by("lead");
+    assert!(
+        seen.contains(
+            "the person opened their skills to you until this turn ends: the Markdown files under"
+        ),
+        "{seen}"
+    );
+    assert!(seen.contains("# Review"), "{seen}");
+    // Their turn ended, they shut, said each time.
+    let said: Vec<Event> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, Event::Skills { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        said,
+        [
+            Event::Skills {
+                chat: Some("lead".into())
+            },
+            Event::Skills { chat: None }
+        ]
+    );
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        Event::Notice { agent, text } if agent == "lead" && text == "your skills are shut again: the turn they were opened for ended"
+    )));
+    // Shut, read no more, the agent told.
+    crew.tell("lead", "read it again".into()).unwrap();
+    settled().await;
+    let seen = scripted.seen_by("lead");
+    assert!(
+        seen.contains("the person's skills are shut again"),
+        "{seen}"
+    );
+    assert!(seen.contains("it holds secrets"), "{seen}");
+    // Open to one chat, never to another's agents.
+    crew.open_skills("lead", true).unwrap();
+    crew.tell("other", "read the skill".into()).unwrap();
+    settled().await;
+    let seen = scripted.seen_by("other");
+    assert!(seen.contains("it holds secrets"), "{seen}");
+    assert!(!seen.contains("opened their skills"), "{seen}");
+    // Shut by the person at once.
+    crew.open_skills("lead", false).unwrap();
+    assert_eq!(
+        events.lock().unwrap().last(),
+        Some(&Event::Skills { chat: None })
+    );
+    assert!(crew.open_skills("nobody", true).is_err());
+    // Said in the chat where it came: after the answer of the turn before.
+    let saved = kept.0.lock().unwrap()["lead"].clone();
+    let opened = saved
+        .aside
+        .iter()
+        .find(|aside| matches!(&aside.shown, iq_agent::Shown::Notice { text } if text.starts_with("your skills are open")))
+        .unwrap();
+    let answer = saved
+        .history()
+        .iter()
+        .position(|message| matches!(message, Message::Assistant { content: Some(text), .. } if text == "Ready."))
+        .unwrap();
+    assert_eq!(opened.after, answer + 1);
 }
 
 #[tokio::test]
@@ -1589,6 +1788,63 @@ async fn a_model_the_person_does_not_allow_is_refused_with_those_they_do() {
 }
 
 #[tokio::test]
+async fn a_chat_moved_to_another_model_sends_its_reasoning_back_no_more() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![reasoned("First."), reasoned("Second."), say("Third.")],
+        )],
+        Settings::default(),
+    );
+    f.crew.start("lead", &model("lab/sol"), "go".into(), PERSON);
+    f.settled().await;
+    // On the same model, its reasoning goes back with its answer.
+    f.crew.tell("lead", "and then?".into()).unwrap();
+    f.settled().await;
+    assert!(signed(f.model.requests_of("lead").last().unwrap()));
+    // On another, its answers go back without it, their text whole.
+    f.crew.set_model("lead", &model("lab/haiku")).unwrap();
+    f.crew.tell("lead", "and after?".into()).unwrap();
+    f.settled().await;
+    let last = f.model.requests_of("lead").pop().unwrap();
+    assert_eq!(last.model.as_str(), "lab/haiku");
+    assert!(!signed(&last));
+    assert!(format!("{:?}", last.messages).contains("Second."));
+}
+
+#[tokio::test]
+async fn a_reasoning_another_provider_cannot_check_is_left_out_and_the_call_made_again() {
+    let f = fixture(
+        &[("lead", vec![reasoned("First."), say("Second.")])],
+        Settings::default(),
+    );
+    f.crew.start("lead", &model("lab/sol"), "go".into(), PERSON);
+    f.settled().await;
+    *f.model.refuses_signed.lock().unwrap() = true;
+    f.crew.tell("lead", "and then?".into()).unwrap();
+    f.settled().await;
+    let events = f.events();
+    assert!(
+        events.contains(&Event::Done {
+            agent: "lead".into(),
+            outcome: Ok("Second.".into())
+        }),
+        "{events:#?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Notice { text, .. } if text.starts_with("its provider refused the reasoning")
+    )));
+    // Once left out, it is sent no more.
+    let requests = f.model.requests_of("lead");
+    assert_eq!(requests.len(), 3);
+    assert!(signed(&requests[1]) && !signed(&requests[2]));
+    f.crew.tell("lead", "and after?".into()).unwrap();
+    f.settled().await;
+    assert_eq!(f.model.requests_of("lead").len(), 4);
+}
+
+#[tokio::test]
 async fn an_agent_names_a_model_whole_as_the_provider_lists_it() {
     let f = fixture(
         &[(
@@ -1859,6 +2115,161 @@ async fn an_agent_is_told_its_conversation_grows_and_compacts_it_once_its_reques
     assert!(seen.contains("list them") && seen.contains("Listed the agents; the tests remain."));
     assert!(seen.contains("Done.") && seen.contains("now the tests"));
     assert!(!seen.contains("call-list_agents"));
+}
+
+#[tokio::test]
+async fn an_agent_past_the_size_it_should_stay_under_is_asked_to_compact_and_finds_the_rest_again()
+{
+    let list = || calls("list_agents", serde_json::json!({}));
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                reading(30_000, list()),
+                reading(55_000, list()),
+                reading(56_000, say("Done.")),
+                reading(
+                    57_000,
+                    calls(
+                        "compact",
+                        serde_json::json!({"summary": "Listed the agents twice."}),
+                    ),
+                ),
+                say("Compacted."),
+                calls(
+                    "look_back",
+                    serde_json::json!({"query": "list_agents", "from": 1}),
+                ),
+                say("Found it."),
+            ],
+        )],
+        Settings {
+            compact_at: Some(50_000),
+            ..Settings::default()
+        },
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "list them".into(), PERSON);
+    f.settled().await;
+    f.crew.tell("lead", "go on".into()).unwrap();
+    f.settled().await;
+    f.crew.tell("lead", "what did you list?".into()).unwrap();
+    f.settled().await;
+    let requests = f.model.requests_of("lead");
+    let asked = |at: usize| {
+        format!("{:?}", requests[at].messages)
+            .matches(
+                "It should stay under 50.0k: finish the request you work on, then call `compact`",
+            )
+            .count()
+    };
+    // Its size said as it grew by the step, then at once as it passed the
+    // limit, and again as its next turn began past it; not at each call.
+    assert!(format!("{:?}", requests[1].messages).contains("(iq: your conversation is 30.0k"));
+    assert_eq!((asked(1), asked(2), asked(3), asked(4)), (0, 1, 2, 2));
+    // What its compaction replaced, found again by its words.
+    let found = format!("{:?}", requests[6].messages);
+    assert!(
+        found.contains("entries holding all of \\\"list_agents\\\" of the"),
+        "{found}"
+    );
+    assert!(found.contains("(you called list_agents"), "{found}");
+    // Its summary says where the rest is.
+    assert!(
+        found.contains("`look_back` finds it by its words"),
+        "{found}"
+    );
+}
+
+#[tokio::test]
+async fn what_a_compaction_replaced_is_kept_and_the_chat_comes_back_as_it_was_shown() {
+    let compact = |summary: &str| calls("compact", serde_json::json!({ "summary": summary }));
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls("list_agents", serde_json::json!({})),
+                compact("Listed the agents."),
+                say("Done."),
+                compact("Listed them, then the tests."),
+                say("Tested."),
+                say("And now?"),
+            ],
+        )],
+        Settings::default(),
+    );
+    let kept = Arc::new(Kept::default());
+    f.crew
+        .set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
+    f.crew
+        .start("lead", &model("lab/sol"), "list them".into(), PERSON);
+    f.settled().await;
+    f.crew.set_model("lead", &model("lab/haiku")).unwrap();
+    f.crew.tell("lead", "now the tests".into()).unwrap();
+    f.settled().await;
+    f.crew.tell("lead", "and then?".into()).unwrap();
+    f.settled().await;
+    let saved = kept.0.lock().unwrap()["lead"].clone();
+    // Its conversation is its last summary; what both compactions replaced
+    // is kept, the first summary and its answer again left out.
+    let said = |messages: &[Message]| -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(text) => Some(format!("user: {}", text.lines().next().unwrap_or(""))),
+                Message::Assistant {
+                    content: Some(text),
+                    ..
+                } => Some(format!("answer: {text}")),
+                Message::Assistant { tool_calls, .. } => {
+                    Some(format!("call: {}", tool_calls[0].name))
+                }
+                Message::Tool { .. } => Some("result".into()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(saved.compacted_head, 2);
+    let history = saved.history();
+    assert_eq!(
+        said(&history),
+        [
+            "user: list them",
+            "call: list_agents",
+            "result",
+            "call: compact",
+            "result",
+            "answer: Done.",
+            "user: Message from person: now the tests",
+            "call: compact",
+            "result",
+            "answer: Tested.",
+            "user: Message from person: and then?",
+            "answer: And now?",
+        ]
+    );
+    // What was set aside stands where it came in the whole: the model of
+    // each turn before it, each compaction's notice after its answer.
+    let placed: Vec<(usize, String)> = saved
+        .aside
+        .iter()
+        .filter_map(|aside| match &aside.shown {
+            iq_agent::Shown::Model { model } => Some((aside.after, format!("on {model}"))),
+            iq_agent::Shown::Notice { text } if text.starts_with("compacted") => {
+                Some((aside.after, "compacted".into()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        placed,
+        [
+            (1, "on lab/sol".into()),
+            (7, "compacted".into()),
+            (7, "on lab/haiku".into()),
+            (11, "compacted".into()),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -2697,11 +3108,14 @@ async fn a_provider_s_refusal_is_kept_and_told_to_the_starter_as_iq_s_facts() {
         told.contains("This is iq's account of what happened"),
         "{told}"
     );
-    // Kept with its chat, once.
+    // Kept with its chat, once, after the model its turn answered on.
     let saved = kept.0.lock().unwrap()["lead/review"].clone();
-    assert_eq!(saved.aside.len(), 1, "{:?}", saved.aside);
+    assert_eq!(saved.aside.len(), 2, "{:?}", saved.aside);
+    assert!(
+        matches!(&saved.aside[0].shown, iq_agent::Shown::Model { model } if model == "lab/quill")
+    );
     assert!(matches!(
-        &saved.aside[0].shown,
+        &saved.aside[1].shown,
         iq_agent::Shown::Failed { status: Some(400), model, calls: 1, .. } if model == "lab/quill"
     ));
     assert_eq!((saved.calls, saved.spent), (1, Usd(0.001)));
@@ -3078,6 +3492,7 @@ async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
         .aside
         .iter()
         .map(|aside| aside.shown.clone())
+        .filter(|shown| !matches!(shown, iq_agent::Shown::Model { .. }))
         .collect();
     assert_eq!(
         shown,
@@ -3089,7 +3504,7 @@ async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
             answer: Some("staging".into()),
         }]
     );
-    let aside = &kept.0.lock().unwrap()["lead"].aside[0];
+    let aside = &kept.0.lock().unwrap()["lead"].aside[1];
     // In its first turn, after its call to ask.
     assert_eq!((aside.turn, aside.after), (1, 3));
     assert!(

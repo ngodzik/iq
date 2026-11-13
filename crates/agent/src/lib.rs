@@ -22,6 +22,7 @@ mod diff;
 mod event;
 mod extension;
 mod keep;
+mod look_back;
 mod make;
 mod once;
 mod place;
@@ -36,7 +37,7 @@ pub use crew::{
 };
 pub use event::{Event, PERSON};
 pub use extension::{Called, Extension};
-pub use keep::{Aside, Keeper, ModelChoice, Saved, Shown};
+pub use keep::{Aside, Keeper, ModelChoice, SETTINGS_MODEL, Saved, Shown};
 pub use once::{Asked, ask_once};
 pub use place::{Placed, Placer};
 pub use rules::{RulesFile, with_imports};

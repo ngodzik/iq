@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::event::{Event, PERSON};
 use crate::extension::Extension;
-use crate::keep::{Aside, Keeper, ModelChoice, Saved, Shown};
+use crate::keep::{Aside, Keeper, ModelChoice, Saved, Shown, forget_reasoning, placed};
 use crate::place::{Placed, Placer};
 use crate::review;
 use crate::rules::{self, RulesFile};
@@ -170,6 +170,11 @@ pub struct Settings {
     /// How many tokens an agent's conversation grows between two words to
     /// it of its size, which it compacts as its skills say; 0 for none.
     pub context_every: u64,
+    /// The tokens an agent's conversation should stay under: past them, it
+    /// is told at once to finish its request and compact before it
+    /// answers, and again as each turn begins past them. None: where its
+    /// model's price rises, when the provider says; 0 never.
+    pub compact_at: Option<u64>,
     /// How many actions of one agent the reviewer refuses in a row before
     /// the next is asked of the person instead; 0 never.
     pub refusals: u32,
@@ -216,6 +221,7 @@ impl Default for Settings {
             steps: 200,
             rules: Vec::new(),
             context_every: CONTEXT_EVERY,
+            compact_at: None,
             refusals: REFUSALS,
             reviewer_effort: Effort::Low,
             command_timeout: COMMAND_TIMEOUT,
@@ -479,6 +485,10 @@ struct AsideLog {
     turn: u64,
     /// How many messages its conversation holds, as far as told.
     messages: usize,
+    /// How many messages its compactions replaced, and how many its last
+    /// wrote: where its conversation stands in what it was.
+    away: usize,
+    head: usize,
     /// What was set aside, in order.
     kept: Vec<Aside>,
 }
@@ -564,7 +574,28 @@ struct Board {
     /// The agents retired, the latest last: done with their task, their
     /// names free again.
     retired: Vec<Retired>,
+    /// The chat the person opened their skills to, while they are open.
+    skills: Option<Opened>,
 }
+
+/// The person's skills, open to the agents of one chat.
+#[derive(Debug, Clone)]
+struct Opened {
+    chat: String,
+    /// The chat's turn they serve once it began: the one under way as they
+    /// opened, else the next.
+    turn: Option<u64>,
+}
+
+/// What an agent is told as the person opens their skills to it.
+const SKILLS_OPEN: &str = "(iq: the person opened their skills to you until this turn ends: \
+    the Markdown files under {folders} can be read with `read_file`, and each change you make to \
+    one with `write_file` or `edit_file` is asked of the person, who sees it before allowing it. \
+    Nothing else of those folders opens. Change only what the person asked.)";
+
+/// What it is told as they shut again.
+const SKILLS_SHUT: &str =
+    "(iq: the person's skills are shut again: their files hold secrets to you, as before.)";
 
 /// A question an agent put to the agent that started it, waiting for its
 /// answer.
@@ -613,6 +644,22 @@ impl Board {
                 .members
                 .values()
                 .any(|member| member.renaming.as_deref() == Some(name))
+    }
+
+    /// Whether one of the agents of `chat` works.
+    fn works(&self, chat: &str) -> bool {
+        self.members.iter().any(|(name, member)| {
+            member.turn.as_ref().is_some_and(|turn| !turn.is_finished())
+                && self.chat_of(name) == chat
+        })
+    }
+
+    /// Whether the person's skills are open to `agent`, as the agent of
+    /// the chat they opened them to.
+    fn skills_open(&self, agent: &str) -> bool {
+        self.skills
+            .as_ref()
+            .is_some_and(|opened| opened.chat == self.chat_of(agent))
     }
 
     /// The name of the chat `agent` is part of, as it shows: its own when
@@ -705,6 +752,17 @@ struct Member {
     chosen: bool,
     /// Each choice of its model, the latest last.
     models_chosen: Vec<ModelChoice>,
+    /// Whether the reasoning its answers carry is taken off before its
+    /// next turn: its model changed, and only the provider that signed it
+    /// can check it.
+    forget_reasoning: bool,
+    /// Whether it was told the person's skills are open to it.
+    skills_told: bool,
+    /// The messages its compactions replaced, in order.
+    compacted_away: Vec<Message>,
+    /// How many of its messages, after its standing instructions, its last
+    /// compaction wrote.
+    compacted_head: usize,
 }
 
 /// An agent of the crew, as listed.
@@ -901,6 +959,8 @@ where
                     .map(|log| log.kept.clone())
                     .unwrap_or_default(),
                 messages,
+                compacted_away: member.compacted_away.clone(),
+                compacted_head: member.compacted_head,
             }
         };
         keeper.keep(&saved);
@@ -950,6 +1010,7 @@ where
         if messages.len() == 1 {
             messages.push(Message::user(saved.task.clone()));
         }
+        let length = messages.len();
         let read = board.messages.len();
         let own = !Arc::ptr_eq(&place, &self.inner.place);
         let workspace = place.gate.workspace().to_path_buf();
@@ -985,8 +1046,15 @@ where
                 renaming: None,
                 chosen: false,
                 models_chosen: saved.models_chosen,
+                forget_reasoning: false,
+                skills_told: false,
+                compacted_away: saved.compacted_away,
+                compacted_head: saved.compacted_head,
             },
         );
+        let (away, head) = board.members.get(&name).map_or((0, 0), |member| {
+            (member.compacted_away.len(), member.compacted_head)
+        });
         drop(board);
         let log = AsideLog {
             turn: saved
@@ -995,7 +1063,9 @@ where
                 .map(|aside| aside.turn)
                 .max()
                 .unwrap_or(0),
-            messages: 0,
+            messages: length,
+            away,
+            head,
             kept: saved.aside,
         };
         lock(&self.inner.aside).insert(name.clone(), log);
@@ -1518,6 +1588,10 @@ where
                     how: how.to_owned(),
                     at: now(),
                 }],
+                forget_reasoning: false,
+                skills_told: false,
+                compacted_away: Vec::new(),
+                compacted_head: 0,
             },
         );
         drop(board);
@@ -1745,6 +1819,7 @@ where
             .ok_or_else(|| format!("no agent is named {agent:?}"))?;
         let mut place = None;
         if let Some(member) = board.members.get_mut(&name) {
+            member.forget_reasoning |= member.model != *model;
             member.model = model.clone();
             member.models_chosen.push(ModelChoice {
                 model: model.to_string(),
@@ -2282,13 +2357,8 @@ where
             let idle = {
                 let board = lock(&self.inner.board);
                 let chat = board.chat_of(to);
-                (
-                    chat.clone(),
-                    !board.members.iter().any(|(name, member)| {
-                        member.turn.as_ref().is_some_and(|turn| !turn.is_finished())
-                            && board.chat_of(name) == chat
-                    }),
-                )
+                let works = board.works(&chat);
+                (chat, !works)
             };
             if idle.1 {
                 self.new_turn(&idle.0);
@@ -2443,8 +2513,11 @@ where
     /// leaves the agent as it was before it.
     async fn turn(self, name: String, prompt: String, number: u64) {
         let (taken, posted_before) = {
-            let board = lock(&self.inner.board);
-            let taken = board.members.get(&name).map(|member| {
+            let mut board = lock(&self.inner.board);
+            let taken = board.members.get_mut(&name).map(|member| {
+                if std::mem::take(&mut member.forget_reasoning) {
+                    forget_reasoning(&mut member.messages);
+                }
                 (
                     member.messages.clone(),
                     member.model.clone(),
@@ -2456,6 +2529,8 @@ where
         let Some((messages, model, by)) = taken else {
             return;
         };
+        self.set_length(&name, messages.len());
+        self.answers_on(&name, &model);
         let (messages, outcome) = self.own_turn(&name, &model, messages, prompt, number).await;
         let mut compacted_from = None;
         let mut board = lock(&self.inner.board);
@@ -2470,10 +2545,24 @@ where
                     // Its summary may not hold them: given again as it
                     // touches their files.
                     member.rules_given.clear();
-                    compacted(&messages, &member.task, &summary, outcome.as_ref().ok())
+                    // What it replaces is kept, but for what the last
+                    // compaction wrote, which this one sums up again.
+                    let replaced = messages
+                        .get(1 + member.compacted_head..)
+                        .unwrap_or_default();
+                    member.compacted_away.extend_from_slice(replaced);
+                    let kept = compacted(&messages, &member.task, &summary, outcome.as_ref().ok());
+                    member.compacted_head = kept.len().saturating_sub(1);
+                    kept
                 }
                 None => messages,
             };
+            // What is set aside from now stands after its answer.
+            if let Some(log) = lock(&self.inner.aside).get_mut(&name) {
+                log.messages = member.messages.len();
+                log.away = member.compacted_away.len();
+                log.head = member.compacted_head;
+            }
             // It rests from now: what is posted to it wakes it.
             member.turn = None;
             renamed.clone_from(&member.renaming);
@@ -2542,6 +2631,7 @@ where
         {
             self.wake(&name, news);
         }
+        self.skills_served(&name);
     }
 
     /// Retires `agent`, and its team with it, once done: the first of its
@@ -2846,28 +2936,35 @@ where
     /// What `agent` on `model` is told of its conversation's size, once it
     /// grew by the settings' step since it was last told: how much each
     /// call reads, and where its model's price rises, when the provider
-    /// says. Counted as told.
-    async fn context_note(&self, agent: &str, model: &ModelId) -> Option<String> {
-        let step = self.inner.settings.context_every;
-        if step == 0 {
-            return None;
-        }
-        let context = {
-            let mut board = lock(&self.inner.board);
-            let member = board.members.get_mut(agent)?;
-            if member.context < member.told + step {
-                return None;
-            }
-            member.told = member.context;
-            member.context
-        };
+    /// says. Past the size it should stay under, it is told at once, and
+    /// again at the `first` call of each turn, to compact. Counted as told.
+    async fn context_note(&self, agent: &str, model: &ModelId, first: bool) -> Option<String> {
+        let settings = &self.inner.settings;
         let rises = self
             .inner
             .provider
             .pricing(model)
             .await
             .and_then(|pricing| pricing.rises_at());
-        Some(context_said(TokenCount(context), rises))
+        let limit = match settings.compact_at {
+            Some(0) => None,
+            Some(at) => Some(TokenCount(at)),
+            None => rises,
+        };
+        let step = settings.context_every;
+        let context = {
+            let mut board = lock(&self.inner.board);
+            let member = board.members.get_mut(agent)?;
+            let grew = step > 0 && member.context >= member.told + step;
+            let over = limit.is_some_and(|limit| member.context >= limit.0);
+            let told_over = limit.is_some_and(|limit| member.told >= limit.0);
+            if !grew && !(over && (first || !told_over)) {
+                return None;
+            }
+            member.told = member.context;
+            member.context
+        };
+        Some(context_said(TokenCount(context), rises, limit))
     }
 
     /// Sends `request` for `agent`, again while its provider is out of
@@ -2964,16 +3061,23 @@ where
         // What the last call that answered read: all but the answer it
         // gave, which is read from the next.
         let mut counted = messages.len().saturating_sub(1);
+        // The turns before this one, whose reasoning may be another
+        // model's.
+        let earlier = messages.len();
+        let mut forgotten = false;
         messages.push(Message::user(prompt));
         if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
             member.reason = None;
         }
         let mut urged = false;
-        for _ in 0..self.inner.settings.steps {
+        for step in 0..self.inner.settings.steps {
             if let Some(news) = self.unread(name) {
                 messages.push(Message::user(news));
             }
-            if let Some(note) = self.context_note(name, model).await {
+            if let Some(note) = self.context_note(name, model, step == 0).await {
+                messages.push(Message::user(note));
+            }
+            if let Some(note) = self.skills_note(name) {
                 messages.push(Message::user(note));
             }
             if let Some(said) = self.lighten(name, &mut messages) {
@@ -3009,6 +3113,22 @@ where
             self.measure(name, model).await;
             let response = match self.ask_model(name, &request).await {
                 Ok(response) => response,
+                // A signature its provider cannot check, written as another
+                // model answered: the call goes again once without them.
+                Err(failed)
+                    if !forgotten
+                        && signature_refused(&failed)
+                        && forget_reasoning(&mut messages[..earlier]) =>
+                {
+                    forgotten = true;
+                    self.report(Event::Notice {
+                        agent: name.to_owned(),
+                        text: "its provider refused the reasoning its earlier answers carry, \
+                               signed for another model: it is called again without it"
+                            .into(),
+                    });
+                    continue;
+                }
                 Err(failed) => {
                     let said = self.failed(name, model, failed, &messages[counted..]);
                     return (messages, Err(said));
@@ -3134,13 +3254,25 @@ where
     /// `after`, when a line of it changed: never for a file of secrets,
     /// as it is named or as the file it leads to is, whose lines the
     /// person allowed written, not shown.
-    fn changed(&self, agent: &str, path: &std::path::Path, before: &str, after: &str) {
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let full = self.place_of(agent).gate.workspace().join(path);
-        let real = std::fs::canonicalize(&full).unwrap_or(full);
+    fn changed(
+        &self,
+        agent: &str,
+        path: &std::path::Path,
+        permit: &Permit,
+        before: &str,
+        after: &str,
+    ) {
+        let gate = self.place_of(agent).gate.clone();
+        // Where the gate judged it written: `~/` read as the home, a link
+        // followed.
+        let written = match permit.action() {
+            Action::Write { path } => path.clone(),
+            _ => gate.workspace().join(path),
+        };
+        let real = std::fs::canonicalize(&written).unwrap_or(written);
         if [path, real.as_path()]
             .iter()
-            .any(|path| iq_gate::holds_secrets(path, home.as_deref()))
+            .any(|path| gate.holds_secrets(path))
         {
             return;
         }
@@ -3182,7 +3314,9 @@ where
                 let path: std::path::PathBuf = args.text("path")?.into();
                 let content = args.text("content")?;
                 let permit = self
-                    .act(agent, Action::Write { path: path.clone() })
+                    .act_showing(agent, Action::Write { path: path.clone() }, || {
+                        self.preview(agent, &path, |_| Some(content.to_owned()))
+                    })
                     .await?;
                 // What it held, for the person to see what changed: nothing
                 // for a new file, none for one that is not text.
@@ -3192,25 +3326,29 @@ where
                 };
                 permit.write(content.as_bytes()).map_err(|e| chain(&e))?;
                 if let Some(before) = before {
-                    self.changed(agent, &path, &before, content);
+                    self.changed(agent, &path, &permit, &before, content);
                 }
                 Ok(format!("Wrote {} bytes.", content.len()) + &self.scoped_for(agent, &path))
             }
             "edit_file" => {
                 let path: std::path::PathBuf = args.text("path")?.into();
-                let permit = self
-                    .act(agent, Action::Write { path: path.clone() })
-                    .await?;
-                let bytes = permit.read().map_err(|e| chain(&e))?;
-                let text = String::from_utf8(bytes).map_err(|_| "the file is not text")?;
-                let edited = tools::replaced(
-                    &text,
+                let (old, new, all) = (
                     args.text("old_text")?,
                     args.text("new_text")?,
                     args.flag("all"),
-                )?;
+                );
+                let permit = self
+                    .act_showing(agent, Action::Write { path: path.clone() }, || {
+                        self.preview(agent, &path, |text| {
+                            tools::replaced(text, old, new, all).ok()
+                        })
+                    })
+                    .await?;
+                let bytes = permit.read().map_err(|e| chain(&e))?;
+                let text = String::from_utf8(bytes).map_err(|_| "the file is not text")?;
+                let edited = tools::replaced(&text, old, new, all)?;
                 permit.write(edited.as_bytes()).map_err(|e| chain(&e))?;
-                self.changed(agent, &path, &text, &edited);
+                self.changed(agent, &path, &permit, &text, &edited);
                 // Given once the edit is made: an edit refused would give
                 // them to nobody.
                 Ok(format!("Edited.{}", self.scoped_for(agent, &path)))
@@ -3310,6 +3448,18 @@ where
             "job" => {
                 let id = args.number("id").ok_or("`id` names the job")?;
                 Ok(self.job(agent, id, args.flag("stop")))
+            }
+            "look_back" => {
+                let query = args.value()["query"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|query| !query.is_empty());
+                let from = args.number("from").and_then(|n| usize::try_from(n).ok());
+                Ok(lock(&self.inner.board)
+                    .members
+                    .get(agent)
+                    .map(|member| crate::look_back::found(&member.compacted_away, query, from))
+                    .unwrap_or_default())
             }
             "reread" => {
                 let id = args.number("id").ok_or("`id` names the result")?;
@@ -3475,23 +3625,183 @@ where
     /// The gate denied it, whoever answers for the person refused it, or
     /// the audit log could not be written.
     pub async fn act(&self, agent: &str, action: Action) -> Result<Permit, String> {
+        self.act_showing(agent, action, || None).await
+    }
+
+    /// The same, `preview` saying what the action changes, for the person
+    /// asked to allow it.
+    async fn act_showing(
+        &self,
+        agent: &str,
+        action: Action,
+        preview: impl FnOnce() -> Option<String> + Send,
+    ) -> Result<Permit, String> {
+        let skills = lock(&self.inner.board).skills_open(agent);
         let judged = self
             .place_of(agent)
             .gate
-            .judge(action)
+            .judge_with(action, skills)
             .map_err(|e| chain(&e))?;
         match judged {
             Judged::Allowed(permit) => Ok(permit),
             Judged::Denied { reason } => Err(refusal("the gate", &reason, false)),
-            Judged::Asked { reason, pending } => self.ask(agent, reason, pending).await,
+            Judged::Asked { reason, pending } => {
+                let preview = preview();
+                self.ask(agent, reason, pending, preview).await
+            }
         }
+    }
+
+    /// What the file at `path` becomes as `after` makes it from what it
+    /// holds, as a unified diff, for the person asked to allow it: none
+    /// when `agent` may not read it, or it is not text. One not there
+    /// holds nothing yet.
+    fn preview(
+        &self,
+        agent: &str,
+        path: &std::path::Path,
+        after: impl FnOnce(&str) -> Option<String>,
+    ) -> Option<String> {
+        let skills = lock(&self.inner.board).skills_open(agent);
+        let read = Action::Read {
+            path: path.to_path_buf(),
+        };
+        let before = match self.place_of(agent).gate.judge_with(read, skills).ok()? {
+            Judged::Allowed(permit) => match permit.read() {
+                Ok(bytes) => String::from_utf8(bytes).ok()?,
+                Err(_) => String::new(),
+            },
+            Judged::Asked { .. } | Judged::Denied { .. } => return None,
+        };
+        crate::diff::unified(&before, &after(&before)?)
+    }
+
+    /// Opens the person's skills to the agents of `agent`'s chat until the
+    /// turn they serve ends (the one under way, else the next), or shuts
+    /// them. They are open to one chat at a time: opened to another, they
+    /// shut for the one before.
+    ///
+    /// # Errors
+    ///
+    /// No agent of that name, or no folder of skills to open.
+    pub fn open_skills(&self, agent: &str, open: bool) -> Result<(), String> {
+        if open && self.inner.place.gate.skill_folders().is_empty() {
+            return Err("no folder of skills is set".into());
+        }
+        let (chat, works) = {
+            let board = lock(&self.inner.board);
+            let name = board
+                .named(agent)
+                .ok_or_else(|| format!("no agent is named {agent:?}"))?;
+            let chat = board.chat_of(&name);
+            let works = board.works(&chat);
+            (chat, works)
+        };
+        let number = lock(&self.inner.turns)
+            .get(&chat)
+            .map_or(0, |turn| turn.number);
+        let before = {
+            let mut board = lock(&self.inner.board);
+            let before = board.skills.take();
+            if open {
+                board.skills = Some(Opened {
+                    chat: chat.clone(),
+                    turn: works.then_some(number),
+                });
+            }
+            before
+        };
+        if let Some(before) = before.filter(|before| !open || before.chat != chat) {
+            self.report(Event::Notice {
+                agent: before.chat.clone(),
+                text: "your skills are shut again".into(),
+            });
+        }
+        if open {
+            let until = if works {
+                "its turn under way ends"
+            } else {
+                "its next turn ends"
+            };
+            self.report(Event::Notice {
+                agent: chat.clone(),
+                text: format!(
+                    "your skills are open to this chat's agents until {until}: their Markdown \
+                     files read, each change asked of you"
+                ),
+            });
+        }
+        self.report(Event::Skills {
+            chat: open.then_some(chat),
+        });
+        Ok(())
+    }
+
+    /// Shuts the person's skills once the turn they serve ended: none of
+    /// the agents of `agent`'s chat works.
+    fn skills_served(&self, agent: &str) {
+        let shut = {
+            let mut board = lock(&self.inner.board);
+            let chat = board.chat_of(agent);
+            let served = board
+                .skills
+                .as_ref()
+                .is_some_and(|opened| opened.chat == chat && opened.turn.is_some());
+            if served && !board.works(&chat) {
+                board.skills.take()
+            } else {
+                None
+            }
+        };
+        if let Some(opened) = shut {
+            self.skills_shut(&opened.chat, "the turn they were opened for ended");
+        }
+    }
+
+    /// Says that the person's skills, open to `chat`, shut, and why.
+    fn skills_shut(&self, chat: &str, why: &str) {
+        self.report(Event::Notice {
+            agent: chat.to_owned(),
+            text: format!("your skills are shut again: {why}"),
+        });
+        self.report(Event::Skills { chat: None });
+    }
+
+    /// What `agent` is told of the person's skills, when they opened to it
+    /// or shut again since it was last told.
+    fn skills_note(&self, agent: &str) -> Option<String> {
+        let mut board = lock(&self.inner.board);
+        let open = board.skills_open(agent);
+        let member = board.members.get_mut(agent)?;
+        if member.skills_told == open {
+            return None;
+        }
+        member.skills_told = open;
+        drop(board);
+        if !open {
+            return Some(SKILLS_SHUT.to_owned());
+        }
+        let folders: Vec<String> = self
+            .place_of(agent)
+            .gate
+            .skill_folders()
+            .iter()
+            .map(|folder| folder.display().to_string())
+            .collect();
+        Some(SKILLS_OPEN.replace("{folders}", &folders.join(", ")))
     }
 
     /// Asks the reviewer, the autopilot being on and the action one it may
     /// answer, else the person. After as many refusals in a row as the
     /// settings say, an agent's next action goes to the person: the
     /// reviewer and the agent are not getting anywhere.
-    async fn ask(&self, agent: &str, reason: String, pending: Pending) -> Result<Permit, String> {
+    async fn ask(
+        &self,
+        agent: &str,
+        reason: String,
+        pending: Pending,
+        preview: Option<String>,
+    ) -> Result<Permit, String> {
         let action = describe(pending.action());
         // The reviewer answers what stays within the sandbox, what only
         // reaches the internet and what runs on the machine when the
@@ -3567,6 +3877,7 @@ where
             action,
             reason: reason.clone(),
             widens: pending.widens(),
+            preview,
         });
         let answer = tokio::time::timeout(self.inner.settings.patience, answer).await;
         lock(&self.inner.questions).remove(&id);
@@ -4186,6 +4497,25 @@ where
             number,
             ask_at: self.inner.settings.turn_ask,
         });
+        // The skills opened while the chat rested serve this turn; any
+        // other turn of the chat is a later one, past theirs.
+        let stale = {
+            let mut board = lock(&self.inner.board);
+            match &mut board.skills {
+                Some(opened) if opened.chat == chat => match opened.turn {
+                    None => {
+                        opened.turn = Some(number);
+                        false
+                    }
+                    Some(served) => served != number,
+                },
+                _ => false,
+            }
+        };
+        if stale {
+            lock(&self.inner.board).skills = None;
+            self.skills_shut(chat, "a later turn began");
+        }
     }
 
     /// Whether `agent` may call its model again in its chat's turn: past
@@ -4383,12 +4713,36 @@ where
             _ => return,
         };
         let log = aside.entry(agent.clone()).or_default();
-        let (turn, after) = (log.turn, log.messages);
+        let (turn, after) = (log.turn, placed(log.messages, log.away, log.head));
         log.kept.push(Aside {
             at: now(),
             turn,
             after,
             shown,
+        });
+    }
+
+    /// Sets aside the model `agent`'s turn about to begin answers on, when
+    /// it is not the one set aside last: its thread, as it comes back,
+    /// names the model of each turn.
+    fn answers_on(&self, agent: &str, model: &ModelId) {
+        let mut aside = lock(&self.inner.aside);
+        let log = aside.entry(agent.to_owned()).or_default();
+        let last = log.kept.iter().rev().find_map(|kept| match &kept.shown {
+            Shown::Model { model } => Some(model.as_str()),
+            _ => None,
+        });
+        if last == Some(model.as_str()) {
+            return;
+        }
+        let after = placed(log.messages, log.away, log.head);
+        log.kept.push(Aside {
+            at: now(),
+            turn: log.turn,
+            after,
+            shown: Shown::Model {
+                model: model.to_string(),
+            },
         });
     }
 
@@ -4798,8 +5152,13 @@ fn free_name(board: &Board, base: &str, taken: &[String]) -> String {
 }
 
 /// What an agent is told of its conversation's size: `context` tokens read
-/// on each call, and where its model's price rises, when known.
-fn context_said(context: TokenCount, rises: Option<TokenCount>) -> String {
+/// on each call, and where its model's price rises, when known; past
+/// `limit`, what it does about it.
+fn context_said(
+    context: TokenCount,
+    rises: Option<TokenCount>,
+    limit: Option<TokenCount>,
+) -> String {
     let past = match rises {
         Some(rises) if context >= rises => {
             format!(": past the {rises} where your model's price per token rises")
@@ -4807,7 +5166,25 @@ fn context_said(context: TokenCount, rises: Option<TokenCount>) -> String {
         Some(rises) => format!("; your model's price per token rises once a call reads {rises}"),
         None => String::new(),
     };
-    format!("(iq: your conversation is {context} tokens now, read again on each call{past}.)")
+    let ask = match limit {
+        Some(limit) if context >= limit => format!(
+            " It should stay under {limit}: finish the request you work on, then call `compact` \
+             before you answer. What your summary leaves out stays reachable with `look_back`."
+        ),
+        _ => String::new(),
+    };
+    format!("(iq: your conversation is {context} tokens now, read again on each call{past}.{ask})")
+}
+
+/// Whether `failed` is a provider refusing a signature of reasoning it
+/// cannot check, rather than one it misses.
+fn signature_refused(failed: &Failure) -> bool {
+    failed.refusal.as_ref().is_some_and(|refusal| {
+        let said = refusal.message.to_lowercase();
+        (400..500).contains(&refusal.status)
+            && said.contains("signature")
+            && !said.contains("missing")
+    })
 }
 
 /// A conversation compacted: its standing instructions, its task and the
@@ -4821,7 +5198,8 @@ fn compacted(
     let mut kept: Vec<Message> = messages.first().cloned().into_iter().collect();
     kept.push(Message::user(format!(
         "{task}\n\n(iq: what came after, as you summed it up when you compacted your \
-         conversation:)\n\n{summary}"
+         conversation:)\n\n{summary}\n\n(iq: what your summary leaves out is kept: `look_back` \
+         finds it by its words, or reads it on from a number.)"
     )));
     if let Some(answer) = answer.filter(|answer| !answer.trim().is_empty()) {
         kept.push(Message::Assistant {
@@ -5108,13 +5486,20 @@ mod tests {
     #[test]
     fn an_agent_is_told_where_its_models_price_rises() {
         assert_eq!(
-            context_said(TokenCount(200_000), Some(TokenCount(272_000))),
+            context_said(TokenCount(200_000), Some(TokenCount(272_000)), None),
             "(iq: your conversation is 200.0k tokens now, read again on each call; your model's \
              price per token rises once a call reads 272.0k.)"
         );
         assert!(
-            context_said(TokenCount(280_000), Some(TokenCount(272_000)))
+            context_said(TokenCount(280_000), Some(TokenCount(272_000)), None)
                 .ends_with(": past the 272.0k where your model's price per token rises.)")
+        );
+        // Past the size it should stay under, it is asked to compact.
+        assert_eq!(
+            context_said(TokenCount(120_000), None, Some(TokenCount(100_000))),
+            "(iq: your conversation is 120.0k tokens now, read again on each call. It should \
+             stay under 100.0k: finish the request you work on, then call `compact` before you \
+             answer. What your summary leaves out stays reachable with `look_back`.)"
         );
     }
 }

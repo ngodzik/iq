@@ -37,6 +37,9 @@ pub enum Action {
     Autopilot,
     /// The internet open to every command, or only to what fetches packages.
     Internet,
+    /// The person's skills open to the agents of the chat written to until
+    /// its turn ends, or shut.
+    Skills,
     /// Allows what an agent asks, the oldest question first.
     Allow,
     /// Refuses it.
@@ -56,7 +59,7 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order the list of shortcuts gives them.
-    pub const ALL: [Action; 16] = [
+    pub const ALL: [Action; 17] = [
         Action::Switch,
         Action::NewChat,
         Action::Team,
@@ -66,6 +69,7 @@ impl Action {
         Action::Theme,
         Action::Autopilot,
         Action::Internet,
+        Action::Skills,
         Action::Allow,
         Action::Refuse,
         Action::Changes,
@@ -88,6 +92,7 @@ impl Action {
             Action::Theme => "theme",
             Action::Autopilot => "autopilot",
             Action::Internet => "internet",
+            Action::Skills => "skills",
             Action::Allow => "allow",
             Action::Refuse => "refuse",
             Action::Changes => "changes",
@@ -111,6 +116,9 @@ impl Action {
             Action::Theme => "the next theme",
             Action::Autopilot => "the autopilot",
             Action::Internet => "the internet open to every command",
+            Action::Skills => {
+                "your skills open to the agents of this chat until its turn ends; again shuts them"
+            }
             Action::Allow => "allow what an agent asks",
             Action::Refuse => "refuse it",
             Action::Changes => "what a sync would send, line by line",
@@ -133,6 +141,9 @@ impl Action {
             // Seldom wanted: the commands do them, `/theme`, `/internet`.
             Action::Theme | Action::Internet => "",
             Action::Autopilot => "shift+tab",
+            // B for the brief the skills are; a terminal multiplexer may
+            // keep it, `/skills` does the same.
+            Action::Skills => "ctrl+b",
             Action::Allow => "ctrl+y",
             Action::Refuse => "ctrl+r",
             Action::Changes => "ctrl+d",

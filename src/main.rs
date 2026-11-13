@@ -290,10 +290,13 @@ const MCP_GRANTS: &str = "mcp-auth";
 
 /// The gate of the current folder, as the settings open it.
 fn settings_gate(settings: &Settings) -> Result<Gate> {
-    gate(
+    let workspace = std::env::current_dir().context("reading the current folder")?;
+    gate_in(
+        &workspace,
         settings.internet,
         settings.autopilot_internet(),
         settings.autopilot_host(),
+        settings.own_skill_folders(&home_dir()?, &workspace),
     )
 }
 
@@ -403,6 +406,13 @@ fn resume_chats(
             if let Some(by) = names.get(&found.chat.by) {
                 found.chat.by.clone_from(by);
             }
+            if let Ok(lead) = settings.lead() {
+                said.extend(chats::on_the_lead(
+                    &mut found.chat,
+                    lead.as_str(),
+                    iq_ui::now(),
+                ));
+            }
             if !allowed.is_empty() && !allowed.iter().any(|a| a.as_str() == found.chat.model) {
                 said.push(format!(
                     "{} runs on {}, which allowed_models leaves out: /model gives it another",
@@ -422,7 +432,7 @@ fn resume_chats(
             .get(&found.chat.by)
             .cloned()
             .unwrap_or_else(|| found.chat.by.clone());
-        let thread = iq_ui::crew::past_with(&found.chat.messages, &found.chat.aside);
+        let thread = iq_ui::crew::past_with(&found.chat.history(), &found.chat.aside);
         let _ = tell.send(Update::Finished(iq_ui::crew::Finished {
             agent: found.chat.name,
             model: found.chat.model,
@@ -497,7 +507,7 @@ fn resume_one(
         }
         (None, _) => None,
     };
-    let thread = iq_ui::crew::past_with(&found.chat.messages, &found.chat.aside);
+    let thread = iq_ui::crew::past_with(&found.chat.history(), &found.chat.aside);
     let (task, written, by) = (
         found.chat.task.clone(),
         found.chat.written,
@@ -918,7 +928,7 @@ async fn work(
         if cli.model.is_some() {
             "--model"
         } else {
-            "the settings' model"
+            iq_agent::SETTINGS_MODEL
         },
     );
     let mut tally = terminal::Tally::default();
@@ -1386,6 +1396,11 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     };
                     let _ = told.send(Update::Notice(said));
                 }
+                Request::Skills { agent, open } => {
+                    if let Err(why) = working.open_skills(&agent, open) {
+                        let _ = told.send(Update::Notice(format!("Your skills stay shut: {why}")));
+                    }
+                }
                 Request::Model { agent, model } => {
                     let said = match ModelId::new(&model)
                         .map_err(|error| error.to_string())
@@ -1574,16 +1589,19 @@ fn gate(internet: bool, reviewer_internet: bool, reviewer_host: bool) -> Result<
         internet,
         reviewer_internet,
         reviewer_host,
+        Vec::new(),
     )
 }
 
-/// The gate of `workspace`, as [`gate`]'s. Rules are never read from the
+/// The gate of `workspace`, as [`gate`]'s, the person's `skills` among
+/// what they may open to a chat. Rules are never read from the
 /// workspace: a command could write them there.
 fn gate_in(
     workspace: &Path,
     internet: bool,
     reviewer_internet: bool,
     reviewer_host: bool,
+    skills: Vec<PathBuf>,
 ) -> Result<Gate> {
     let folder = home_folder()?;
     let mut gate = Gate::builder(workspace)
@@ -1591,7 +1609,8 @@ fn gate_in(
         .scratch(scratch::folder(&cache_folder(&home_dir()?), &project()))
         .internet(internet)
         .reviewer_internet(reviewer_internet)
-        .reviewer_host(reviewer_host);
+        .reviewer_host(reviewer_host)
+        .skills(skills);
     let rules = folder.join("rules.toml");
     if rules.exists() {
         let text = std::fs::read_to_string(&rules)
