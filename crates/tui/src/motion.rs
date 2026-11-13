@@ -31,6 +31,13 @@ const FLIGHT: Duration = Duration::from_millis(900);
 /// How long a mark glows once a spark lands.
 const GLOW: Duration = Duration::from_millis(700);
 
+/// How long the map draws an arc between two agents that wrote to each
+/// other, neither having started the other.
+const ARC: Duration = Duration::from_secs(4);
+
+/// The most of a message's first words an arc says.
+const ARC_WORDS: usize = 40;
+
 /// Where a spark runs from or to: the person, or an agent.
 pub(crate) const YOU: &str = "you";
 
@@ -42,12 +49,24 @@ struct Flight {
     since: Instant,
 }
 
+/// A message between two agents, as the map draws it a moment: its
+/// writer, its reader, its first words.
+#[derive(Debug, Clone)]
+pub(crate) struct Arc {
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) words: String,
+    since: Instant,
+}
+
 /// What moves.
 pub(crate) struct Motion {
     started: Instant,
     flights: Vec<Flight>,
     /// When each mark last had a spark land on it.
     landed: HashMap<String, Instant>,
+    /// The messages between agents the map draws a moment.
+    arcs: Vec<Arc>,
 }
 
 impl Default for Motion {
@@ -57,6 +76,7 @@ impl Default for Motion {
             started: now,
             flights: Vec::new(),
             landed: HashMap::new(),
+            arcs: Vec::new(),
         }
     }
 }
@@ -113,6 +133,57 @@ impl Motion {
             to: mark(&post.to),
             since: Instant::now(),
         });
+        let agent = |name: &str| name != iq_agent::PERSON && name != "iq" && name != "all";
+        if agent(&post.from) && agent(&post.to) {
+            let words: String = post.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            self.arcs.push(Arc {
+                from: post.from.clone(),
+                to: post.to.clone(),
+                words: crate::wrap::cut(&words, ARC_WORDS),
+                since: Instant::now(),
+            });
+        }
+    }
+
+    /// The sparks on their way, each with how far it ran, from 0 to 1,
+    /// eased: for the map to draw them along its tree.
+    pub(crate) fn sparks(&self) -> Vec<(&str, &str, f32)> {
+        self.flights
+            .iter()
+            .map(|flight| {
+                let t = (flight.since.elapsed().as_secs_f32() / FLIGHT.as_secs_f32()).min(1.0);
+                (
+                    flight.from.as_str(),
+                    flight.to.as_str(),
+                    t * t * (3.0 - 2.0 * t),
+                )
+            })
+            .collect()
+    }
+
+    /// The messages between agents the map draws now.
+    pub(crate) fn arcs(&self) -> &[Arc] {
+        &self.arcs
+    }
+
+    /// Lets go of what is done moving, sparks landed, arcs drawn long
+    /// enough, whatever draws them: a page shows no status line to land
+    /// them.
+    pub(crate) fn tick(&mut self) {
+        let now = Instant::now();
+        let landed: Vec<String> = self
+            .flights
+            .iter()
+            .filter(|flight| flight.since.elapsed() >= FLIGHT)
+            .map(|flight| flight.to.clone())
+            .collect();
+        self.flights
+            .retain(|flight| flight.since.elapsed() < FLIGHT);
+        for mark in landed {
+            self.landed.insert(mark, now);
+        }
+        self.landed.retain(|_, at| at.elapsed() < GLOW);
+        self.arcs.retain(|arc| arc.since.elapsed() < ARC);
     }
 
     /// How a mark glows now, from 0 to 1: once a spark landed on it.
@@ -172,7 +243,7 @@ impl Motion {
 
     /// Whether anything moves: the terminal is then drawn often.
     pub(crate) fn moving(&self) -> bool {
-        !self.flights.is_empty() || !self.landed.is_empty()
+        !self.flights.is_empty() || !self.landed.is_empty() || !self.arcs.is_empty()
     }
 }
 
@@ -181,6 +252,40 @@ mod tests {
     use super::*;
     use crate::theme::Depth;
     use iq_ui::look::Theme;
+
+    #[test]
+    fn a_message_between_agents_draws_an_arc_a_moment_and_nothing_moves_after() {
+        let mut motion = Motion::default();
+        motion.posted(&Post {
+            from: "fix/core".into(),
+            to: "fix/front".into(),
+            text: "is the new field\nmigrated?".into(),
+        });
+        motion.posted(&Post {
+            from: "fix".into(),
+            to: iq_agent::PERSON.into(),
+            text: "done".into(),
+        });
+        let arcs = motion.arcs();
+        assert_eq!(arcs.len(), 1, "the person's is no arc");
+        assert_eq!(arcs[0].words, "is the new field migrated?");
+        assert_eq!(motion.sparks().len(), 2);
+        assert!(motion.moving());
+        // Long after, all is let go, even with no status line drawn.
+        for arc in &mut motion.arcs {
+            arc.since -= ARC;
+        }
+        for flight in &mut motion.flights {
+            flight.since -= FLIGHT;
+        }
+        motion.tick();
+        assert!(motion.sparks().is_empty() && motion.arcs().is_empty());
+        for at in motion.landed.values_mut() {
+            *at -= GLOW;
+        }
+        motion.tick();
+        assert!(!motion.moving());
+    }
 
     #[test]
     fn a_spark_leaves_its_writer_and_lands_on_its_reader() {

@@ -2,6 +2,8 @@
 //! the questions waiting for the person, the messages on the board, and
 //! what the person writes.
 
+use std::collections::HashMap;
+
 use iq_agent::{Event, PERSON, Pattern};
 use iq_core::{Effort, Message, TokenCount, Usd};
 
@@ -90,6 +92,11 @@ pub enum Request {
     /// Give every command the internet, or only what a rule gives it to
     /// and what the person allows.
     Internet(bool),
+    /// Stop a command run in the background.
+    StopJob {
+        /// Its number.
+        id: u64,
+    },
     /// Stop an agent's turn.
     Stop {
         /// The agent.
@@ -189,6 +196,56 @@ pub enum Entry {
     },
 }
 
+/// What a chat's turn spent so far, from when the person wrote to it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TurnView {
+    /// Its number, from 1, in this session.
+    pub number: u64,
+    /// When it began, in seconds since 1970.
+    pub since: u64,
+    /// What it spent, as far as prices are known.
+    pub total: Usd,
+    /// What each who spent in it spent, in the order they first did: its
+    /// agents, the autopilot's model, the summaries.
+    pub by: Vec<TurnSpending>,
+    /// What it may spend before the person is asked whether it goes on;
+    /// none never.
+    pub ask_at: Option<Usd>,
+}
+
+/// What a model read this session, and how much of it came from the
+/// provider's cache: what tells whether the cache serves it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CacheView {
+    /// The model.
+    pub model: String,
+    /// Its calls.
+    pub calls: u64,
+    /// The tokens they read.
+    pub read: u64,
+    /// Of those, what came from the cache, as far as told.
+    pub cached: u64,
+    /// Whether the provider told what came from the cache at all.
+    pub told: bool,
+}
+
+/// What one spent in a chat's turn.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TurnSpending {
+    /// Who: an agent, `reviewer`, `summaries`.
+    pub who: String,
+    /// The model it called last.
+    pub model: String,
+    /// Its calls.
+    pub calls: u64,
+    /// What they cost.
+    pub spent: Usd,
+    /// The tokens they read.
+    pub read: u64,
+    /// Of those, what came from the provider's cache, as far as told.
+    pub cached: u64,
+}
+
 /// A command an agent left to run in the background, while it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobView {
@@ -200,6 +257,8 @@ pub struct JobView {
     pub line: String,
     /// Since when, in seconds since 1970.
     pub since: u64,
+    /// The latest lines it wrote, the latest last.
+    pub tail: Vec<String>,
 }
 
 /// A question with choices an agent asks the person.
@@ -245,6 +304,13 @@ pub struct AgentView {
     pub worked: Option<u64>,
     /// Whom it waits for, while it waits for the agents it started.
     pub waiting: Option<Waiting>,
+    /// Whether it is done with the task another gave it: off the board,
+    /// its name free for the next, what it did still read here.
+    pub retired: bool,
+    /// The tokens past which a call of its model costs more, when told.
+    pub rises: Option<u64>,
+    /// The most its model reads at once, when told.
+    pub most: Option<u64>,
 }
 
 /// An agent waiting for the agents it started to write.
@@ -254,6 +320,24 @@ pub struct Waiting {
     pub on: Vec<String>,
     /// Since when, in seconds since 1970.
     pub since: u64,
+}
+
+/// An agent retired in an earlier session, shown again with its chat:
+/// what it did, read only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Finished {
+    /// Its name as it retired.
+    pub agent: String,
+    /// Its model.
+    pub model: String,
+    /// Who started it, by the name it has now.
+    pub by: String,
+    /// What it was asked.
+    pub task: String,
+    /// When it last worked, in seconds since 1970.
+    pub worked: u64,
+    /// What it was given, said and did, oldest first.
+    pub thread: Vec<Entry>,
 }
 
 /// A chat of an earlier session, back on the board as it was kept.
@@ -285,7 +369,11 @@ pub struct Back {
 /// let kept = [
 ///     Message::system("You are lead"),
 ///     Message::user("fix the login"),
-///     Message::Assistant { content: Some("Fixed.".into()), tool_calls: Vec::new() },
+///     Message::Assistant {
+///         content: Some("Fixed.".into()),
+///         tool_calls: Vec::new(),
+///         reasoning_signature: None,
+///     },
 /// ];
 /// assert_eq!(
 ///     past(&kept),
@@ -294,41 +382,114 @@ pub struct Back {
 /// ```
 #[must_use]
 pub fn past(messages: &[Message]) -> Vec<Entry> {
-    let returned: std::collections::HashMap<&str, &str> = messages
+    past_with(messages, &[])
+}
+
+/// What each tool call of `messages` returned, by the call's id.
+fn returned(messages: &[Message]) -> std::collections::HashMap<&str, &str> {
+    messages
         .iter()
         .filter_map(|message| match message {
             Message::Tool { call_id, content } => Some((call_id.as_str(), content.as_str())),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+/// What `message` puts in the thread, the tools' calls with what they
+/// `returned`.
+fn entries(message: &Message, returned: &std::collections::HashMap<&str, &str>) -> Vec<Entry> {
     let mut thread = Vec::new();
-    for message in messages {
-        match message {
-            Message::User(text) if !text.starts_with("(iq: ") && !text.starts_with(URGED) => {
-                thread.push(Entry::Prompt(text.clone()));
-            }
-            Message::Assistant {
-                content,
-                tool_calls,
-            } => {
-                if let Some(text) = content.as_ref().filter(|t| !t.trim().is_empty()) {
-                    thread.push(Entry::Text(text.clone()));
-                }
-                for call in tool_calls {
-                    let output = returned.get(call.id.as_str()).copied().unwrap_or_default();
-                    let input = iq_agent::tool_input(&call.arguments);
-                    thread.push(Entry::Tool {
-                        name: call.name.clone(),
-                        input,
-                        output: output.to_owned(),
-                        ok: !output.starts_with("Error: "),
-                    });
-                }
-            }
-            _ => {}
+    match message {
+        Message::User(text) if !text.starts_with("(iq: ") && !text.starts_with(URGED) => {
+            thread.push(Entry::Prompt(text.clone()));
         }
+        Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
+            if let Some(text) = content.as_ref().filter(|t| !t.trim().is_empty()) {
+                thread.push(Entry::Text(text.clone()));
+            }
+            for call in tool_calls {
+                let output = returned.get(call.id.as_str()).copied().unwrap_or_default();
+                let input = iq_agent::tool_input(&call.arguments);
+                thread.push(Entry::Tool {
+                    name: call.name.clone(),
+                    input,
+                    output: output.to_owned(),
+                    ok: !output.starts_with("Error: "),
+                });
+            }
+        }
+        _ => {}
     }
     thread
+}
+
+/// The same, with what the person was shown beside it (iq's notices, the
+/// questions and their answers, what the gate asked and the autopilot
+/// answered, the errors), each where it came among the messages.
+#[must_use]
+pub fn past_with(messages: &[Message], aside: &[iq_agent::Aside]) -> Vec<Entry> {
+    let returned = returned(messages);
+    let mut thread = Vec::new();
+    let mut aside = aside.iter().peekable();
+    for at in 0..=messages.len() {
+        while let Some(shown) = aside.next_if(|shown| shown.after <= at) {
+            thread.push(set_aside(&shown.shown));
+        }
+        if let Some(message) = messages.get(at) {
+            thread.extend(entries(message, &returned));
+        }
+    }
+    thread.extend(aside.map(|shown| set_aside(&shown.shown)));
+    thread
+}
+
+/// What was set aside, as the thread shows it.
+fn set_aside(shown: &iq_agent::Shown) -> Entry {
+    use iq_agent::Shown;
+    match shown {
+        Shown::Notice { text } => Entry::Notice(text.clone()),
+        Shown::Question {
+            question, answer, ..
+        } => Entry::Chose {
+            question: question.clone(),
+            answer: answer.clone(),
+        },
+        Shown::Asked {
+            id,
+            action,
+            reason,
+            approved,
+        } => Entry::Asked {
+            id: *id,
+            action: action.clone(),
+            reason: reason.clone(),
+            answer: *approved,
+        },
+        Shown::Reviewed {
+            action,
+            approved,
+            why,
+        } => Entry::Reviewed {
+            action: action.clone(),
+            approved: *approved,
+            why: why.clone(),
+        },
+        Shown::Failed {
+            model,
+            status,
+            message,
+            ..
+        } => Entry::Done(Err(match status {
+            Some(status) => format!("{model} answered HTTP {status}: {message}"),
+            None => format!("{model} could not be reached: {message}"),
+        })),
+        Shown::Error { text } => Entry::Done(Err(text.clone())),
+    }
 }
 
 /// How iq urges on an agent that answered with nothing.
@@ -362,6 +523,13 @@ pub struct Question {
 #[derive(Debug, Clone, Default)]
 pub struct CrewView {
     agents: Vec<AgentView>,
+    /// The agents retired, the latest last.
+    finished: Vec<AgentView>,
+    /// Each chat's turn, the one under way or its last, by its chat.
+    turns: HashMap<String, TurnView>,
+    /// What each model read this session, and from the cache, in the order
+    /// they were first called.
+    cached: Vec<CacheView>,
     questions: Vec<Question>,
     /// The questions with choices waiting for the person, the oldest first.
     choices: Vec<Choice>,
@@ -416,6 +584,36 @@ impl CrewView {
         &self.agents
     }
 
+    /// What each model read this session, and from the cache.
+    #[must_use]
+    pub fn cached(&self) -> &[CacheView] {
+        &self.cached
+    }
+
+    /// The turn of `chat` under way, or its last.
+    #[must_use]
+    pub fn turn(&self, chat: &str) -> Option<&TurnView> {
+        self.turns.get(chat)
+    }
+
+    /// What every agent's calls were billed this session, those retired
+    /// with the others.
+    #[must_use]
+    pub fn billed(&self) -> Usd {
+        let mut billed = Usd(0.0);
+        for agent in self.agents.iter().chain(&self.finished) {
+            billed += agent.billed;
+        }
+        billed
+    }
+
+    /// The agents retired, done with the task another gave them, the
+    /// latest last.
+    #[must_use]
+    pub fn finished(&self) -> &[AgentView] {
+        &self.finished
+    }
+
     /// The agent named `name`.
     #[must_use]
     pub fn agent(&self, name: &str) -> Option<&AgentView> {
@@ -463,25 +661,32 @@ impl CrewView {
     #[must_use]
     pub fn listed(&self) -> Vec<(usize, &AgentView)> {
         fn under<'a>(
-            agents: &'a [AgentView],
+            agents: &[&'a AgentView],
             by: &str,
             depth: usize,
             listed: &mut Vec<(usize, &'a AgentView)>,
         ) {
-            for agent in agents.iter().filter(|a| a.by == by) {
-                if listed.iter().any(|(_, seen)| seen.name == agent.name) {
+            for &agent in agents.iter().filter(|a| a.by == by) {
+                if listed.iter().any(|(_, seen)| std::ptr::eq(*seen, agent)) {
                     continue;
                 }
                 listed.push((depth, agent));
-                under(agents, &agent.name, depth + 1, listed);
+                // A retired agent's name may be another's now.
+                if !agent.retired {
+                    under(agents, &agent.name, depth + 1, listed);
+                }
             }
         }
+        // Those at work or resting first, then those retired.
+        let all: Vec<&AgentView> = self.agents.iter().chain(&self.finished).collect();
         let mut listed = Vec::new();
-        under(&self.agents, PERSON, 0, &mut listed);
-        for agent in &self.agents {
-            if !listed.iter().any(|(_, seen)| seen.name == agent.name) {
+        under(&all, PERSON, 0, &mut listed);
+        for &agent in &all {
+            if !listed.iter().any(|(_, seen)| std::ptr::eq(*seen, agent)) {
                 listed.push((0, agent));
-                under(&self.agents, &agent.name, 1, &mut listed);
+                if !agent.retired {
+                    under(&all, &agent.name, 1, &mut listed);
+                }
             }
         }
         listed
@@ -495,6 +700,29 @@ impl CrewView {
             view.worked = Some(back.worked);
             view.thread = back.thread;
         }
+    }
+
+    /// An agent retired in an earlier session, shown with its chat.
+    pub fn finished_back(&mut self, finished: Finished) {
+        self.finished.push(AgentView {
+            name: finished.agent,
+            model: finished.model,
+            answered: String::new(),
+            by: finished.by,
+            working: false,
+            thread: finished.thread,
+            // Billed in an earlier session, not this one's.
+            billed: Usd(0.0),
+            reads: Vec::new(),
+            effort: None,
+            place: None,
+            task: finished.task,
+            worked: Some(finished.worked),
+            waiting: None,
+            retired: true,
+            rises: None,
+            most: None,
+        });
     }
 
     /// The questions waiting for the person, oldest first.
@@ -562,8 +790,22 @@ impl CrewView {
                     task: String::new(),
                     worked: None,
                     waiting: None,
+                    retired: false,
+                    rises: None,
+                    most: None,
                 });
             }
+            Event::Retired { agent } => {
+                if let Some(at) = self.agents.iter().position(|a| a.name == agent) {
+                    let mut view = self.agents.remove(at);
+                    view.retired = true;
+                    view.working = false;
+                    view.waiting = None;
+                    self.finished.push(view);
+                }
+            }
+            // Its turn's end says it, with the facts.
+            Event::Failed { .. } => {}
             Event::Working { agent, prompt } => {
                 if let Some(view) = self.agent_mut(&agent) {
                     view.working = true;
@@ -587,12 +829,75 @@ impl CrewView {
                     }
                 }
             }
+            // The same turn said again: the person let it go on.
+            Event::Turn {
+                chat,
+                number,
+                ask_at,
+            } => match self.turns.get_mut(&chat) {
+                Some(turn) if turn.number == number => turn.ask_at = ask_at,
+                _ => {
+                    self.turns.insert(
+                        chat,
+                        TurnView {
+                            number,
+                            since: crate::now(),
+                            ask_at,
+                            ..TurnView::default()
+                        },
+                    );
+                }
+            },
+            Event::Window { agent, rises, most } => {
+                if let Some(view) = self.agent_mut(&agent) {
+                    view.rises = rises;
+                    view.most = most;
+                }
+            }
             Event::Spent {
                 agent,
                 model,
                 cost,
                 usage,
+                cache,
+                chat,
             } => {
+                let at = match self.cached.iter().position(|seen| seen.model == model) {
+                    Some(at) => at,
+                    None => {
+                        self.cached.push(CacheView {
+                            model: model.clone(),
+                            ..CacheView::default()
+                        });
+                        self.cached.len() - 1
+                    }
+                };
+                let seen = &mut self.cached[at];
+                seen.calls += 1;
+                seen.read += usage.input.0;
+                seen.cached += cache.map_or(0, |cache| cache.read.0);
+                seen.told |= cache.is_some();
+                if let Some(turn) = chat.and_then(|chat| self.turns.get_mut(&chat)) {
+                    let at = match turn.by.iter().position(|spent| spent.who == agent) {
+                        Some(at) => at,
+                        None => {
+                            turn.by.push(TurnSpending {
+                                who: agent.clone(),
+                                ..TurnSpending::default()
+                            });
+                            turn.by.len() - 1
+                        }
+                    };
+                    let spending = &mut turn.by[at];
+                    spending.model.clone_from(&model);
+                    spending.calls += 1;
+                    spending.read += usage.input.0;
+                    spending.cached += cache.map_or(0, |cache| cache.read.0);
+                    if let Some(cost) = cost {
+                        spending.spent += cost;
+                        turn.total += cost;
+                    }
+                }
                 if let Some(view) = self.agent_mut(&agent) {
                     if !model.is_empty() {
                         view.answered = model;
@@ -626,7 +931,13 @@ impl CrewView {
                 id,
                 line,
                 since: crate::now(),
+                tail: Vec::new(),
             }),
+            Event::JobOutput { id, tail, .. } => {
+                if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
+                    job.tail = tail;
+                }
+            }
             Event::JobEnded { id, .. } => self.jobs.retain(|job| job.id != id),
             Event::Choose {
                 id,
@@ -739,6 +1050,11 @@ impl CrewView {
                 }
             }
             Event::Renamed { from, to } => {
+                for view in &mut self.finished {
+                    if view.by == from {
+                        view.by.clone_from(&to);
+                    }
+                }
                 for view in &mut self.agents {
                     if view.name == from {
                         view.name.clone_from(&to);
@@ -803,6 +1119,13 @@ impl CrewView {
     fn agent_mut(&mut self, name: &str) -> Option<&mut AgentView> {
         self.agents.iter_mut().find(|a| a.name == name)
     }
+
+    /// A retired agent of that name, the latest, to read what it did once
+    /// another took its name.
+    #[must_use]
+    pub fn retired(&self, name: &str) -> Option<&AgentView> {
+        self.finished.iter().rev().find(|a| a.name == name)
+    }
 }
 
 #[cfg(test)]
@@ -852,6 +1175,11 @@ mod tests {
             id: 7,
             approved: true,
         });
+        crew.event(Event::Turn {
+            chat: "lead".into(),
+            number: 1,
+            ask_at: None,
+        });
         for (cost, read) in [(0.25, 1200), (1.0, 1800)] {
             crew.event(Event::Spent {
                 agent: "lead".into(),
@@ -861,8 +1189,42 @@ mod tests {
                     output: TokenCount(300),
                 },
                 cost: Some(Usd(cost)),
+                cache: Some(iq_core::CacheUse {
+                    read: TokenCount(1000),
+                    written: None,
+                    rewrite_extra: None,
+                }),
+                chat: Some("lead".into()),
             });
         }
+        // The reviewer's call for it, counted in its chat's turn.
+        crew.event(Event::Spent {
+            agent: "reviewer".into(),
+            model: "lab/quick".into(),
+            usage: iq_core::Usage::default(),
+            cost: Some(Usd(0.01)),
+            cache: None,
+            chat: Some("lead".into()),
+        });
+        let turn = crew.turn("lead").unwrap();
+        assert_eq!(turn.number, 1);
+        assert_eq!(turn.total, Usd(1.26));
+        let by: Vec<(&str, u64, u64, u64)> = turn
+            .by
+            .iter()
+            .map(|spent| (spent.who.as_str(), spent.calls, spent.read, spent.cached))
+            .collect();
+        assert_eq!(by, [("lead", 2, 3000, 2000), ("reviewer", 1, 0, 0)]);
+        // What each model read, and from the cache, over the session.
+        let cached: Vec<(&str, u64, u64, bool)> = crew
+            .cached()
+            .iter()
+            .map(|seen| (seen.model.as_str(), seen.read, seen.cached, seen.told))
+            .collect();
+        assert_eq!(
+            cached,
+            [("m", 3000, 2000, true), ("lab/quick", 0, 0, false)]
+        );
         let lead = crew.agent("lead").unwrap();
         assert!(lead.working);
         assert_eq!(lead.thread[1], Entry::Text("Hello".into()));
@@ -942,6 +1304,65 @@ mod tests {
     }
 
     #[test]
+    fn what_was_set_aside_comes_back_where_it_stood() {
+        let kept = [
+            Message::system("You are lead"),
+            Message::user("deploy"),
+            Message::Assistant {
+                content: Some("Asking.".into()),
+                tool_calls: Vec::new(),
+                reasoning_signature: None,
+            },
+        ];
+        let aside = |after: usize, shown: iq_agent::Shown| iq_agent::Aside {
+            at: 1,
+            turn: 1,
+            after,
+            shown,
+        };
+        let thread = past_with(
+            &kept,
+            &[
+                aside(
+                    2,
+                    iq_agent::Shown::Question {
+                        id: 1,
+                        question: "Which one?".into(),
+                        choices: vec!["a".into(), "b".into()],
+                        answered: true,
+                        answer: Some("b".into()),
+                    },
+                ),
+                aside(
+                    9,
+                    iq_agent::Shown::Failed {
+                        model: "lab/quill".into(),
+                        status: Some(400),
+                        message: "Request contains an invalid argument.".into(),
+                        context: 190_000,
+                        calls: 8,
+                        spent: iq_core::Usd(0.78),
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            thread,
+            [
+                Entry::Prompt("deploy".into()),
+                Entry::Chose {
+                    question: "Which one?".into(),
+                    answer: Some("b".into())
+                },
+                Entry::Text("Asking.".into()),
+                Entry::Done(Err(
+                    "lab/quill answered HTTP 400: Request contains an invalid argument.".into()
+                )),
+            ]
+        );
+    }
+
+    #[test]
     fn a_kept_conversation_becomes_a_thread_without_iq_s_own_words() {
         let kept = [
             Message::system("You are lead"),
@@ -954,6 +1375,7 @@ mod tests {
                     name: "run".into(),
                     arguments: r#"{"command":"make test"}"#.into(),
                 }],
+                reasoning_signature: None,
             },
             Message::Tool {
                 call_id: "c1".into(),
@@ -962,6 +1384,7 @@ mod tests {
             Message::Assistant {
                 content: Some("Blocked.".into()),
                 tool_calls: Vec::new(),
+                reasoning_signature: None,
             },
         ];
         assert_eq!(

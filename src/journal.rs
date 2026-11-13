@@ -606,6 +606,8 @@ mod tests {
                     output: TokenCount(100),
                 },
                 cost: Some(Usd(0.01)),
+                cache: None,
+                chat: Some("lead".into()),
             },
             Event::Done {
                 agent: "lead".into(),

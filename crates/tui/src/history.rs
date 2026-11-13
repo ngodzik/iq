@@ -32,7 +32,7 @@ use crate::markdown::{Markdown, Out, Styled, code, inline};
 use crate::summary::{Summarize, Summary};
 use crate::table::Table;
 use crate::theme::Palette;
-use crate::wrap::{cut, wrap};
+use crate::wrap::{cut, fit, wrap};
 
 /// How many lines of a message between agents are written, when no model
 /// sums it up.
@@ -113,6 +113,14 @@ enum Block {
         said: Style,
         failed: Style,
     },
+    /// A command run in the background, in one line never folded: `head`,
+    /// then what it does in a few words (the summarizer's, else `instead`,
+    /// read from the line), then `tail`.
+    Job {
+        head: Vec<Span<'static>>,
+        label: Label,
+        tail: Vec<Span<'static>>,
+    },
     /// A message between agents summed up, under `indent`, in `style`; its
     /// first lines, `instead`, until it is, or when it cannot be.
     Summed {
@@ -146,6 +154,7 @@ impl Block {
         match self {
             Block::Diagram { diagram, .. } => diagram.drawing(),
             Block::Summed { summary, .. } => summary.making(),
+            Block::Job { label, .. } => label.making(),
             Block::Para(_) | Block::Whole(_) | Block::Table(_) => false,
         }
     }
@@ -157,6 +166,25 @@ impl Block {
         match self {
             Block::Para(para) => wrap(&para.body, width, &para.first, &para.rest),
             Block::Whole(line) => vec![line.clone()],
+            // Too long, the hint to unfold it goes first, then what it does
+            // is cut: how it ended always shows.
+            Block::Job { head, label, tail } => {
+                let used = |spans: &[Span<'static>]| crate::wrap::spans_width(spans);
+                let said = label.span();
+                let mut tail = tail.clone();
+                if tail.len() > 3
+                    && width < used(head) + crate::wrap::width(&said.content) + used(&tail)
+                {
+                    tail.truncate(3);
+                }
+                let room = width
+                    .saturating_sub(used(head) + used(&tail))
+                    .max(LABEL_LEAST);
+                let mut spans = head.clone();
+                spans.push(Span::styled(cut(&said.content, room), said.style));
+                spans.extend(tail);
+                vec![fit(spans, width)]
+            }
             Block::Table(table) => table.lines(width, &indent),
             Block::Summed {
                 summary,
@@ -308,8 +336,9 @@ pub(crate) struct History {
     /// The questions with choices asked, by number: the agent that asked,
     /// and the window the answer goes in.
     chosen: HashMap<u64, (String, Option<String>)>,
-    /// The commands left to run in the background, by number.
-    jobs: HashMap<u64, String>,
+    /// The commands left to run in the background, by number: what they
+    /// do in a few words, and since when they run.
+    jobs: HashMap<u64, (Label, Instant)>,
     /// The diagrams shown as images since last asked, each with the chat
     /// whose window shows it and the file its image is kept in.
     drawn: Vec<(Option<String>, std::path::PathBuf)>,
@@ -392,7 +421,7 @@ impl History {
                 Span::styled("q", p.bold(p.accent.mix(p.info, 0.6))),
                 Span::styled("  experimental", p.fg(p.dim)),
                 Span::styled(
-                    format!(" · lead {lead} · reviewer {reviewer}"),
+                    format!(" · lead {lead} · autopilot {reviewer}"),
                     p.fg(p.faint),
                 ),
             ],
@@ -522,6 +551,9 @@ impl History {
                 self.finish(agent, board, p);
             }
             Event::Asked { .. } | Event::Answered { .. } => {}
+            // A job's end, told its agent by iq: the job's own line says it,
+            // never its whole command.
+            Event::Posted { from, text, .. } if from == IQ && text.starts_with("Job ") => {}
             Event::Posted { from, to, text } => {
                 if from == PERSON {
                     if board.crew().agent(to).is_some_and(|view| view.by != PERSON) {
@@ -632,34 +664,60 @@ impl History {
             }
             // A command left to run, and how it ended: the live part says
             // meanwhile for how long it has run.
+            // A job in a line as it starts and as it ends, never its whole
+            // command: the steps' page gives it, with its output's end.
             Event::JobStarted { agent, id, line } => {
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
-                self.jobs.insert(*id, line.clone());
-                self.push_step(Para {
-                    first: vec![Span::raw("  "), Span::styled("⚙ ", p.fg(p.info))],
-                    rest: vec![Span::raw("    ")],
-                    body: vec![
-                        Span::styled(format!("job {id} in the background: "), p.fg(p.dim)),
-                        Span::styled(short(line), p.fg(p.text)),
+                let label = Label::new(agent, line, self.summarizer.0.as_ref(), p);
+                self.jobs.insert(*id, (label.clone(), Instant::now()));
+                self.push_job(Block::Job {
+                    head: vec![
+                        Span::raw("  "),
+                        Span::styled("⚙ ", p.fg(p.info)),
+                        Span::styled(format!("job {id} · "), p.fg(p.dim)),
                     ],
+                    label,
+                    tail: Vec::new(),
                 });
             }
-            Event::JobEnded { agent, id, said } => {
+            Event::JobOutput { .. } => {}
+            Event::JobEnded {
+                agent, id, said, ..
+            } => {
                 self.header(agent, board, p);
-                let line = self.jobs.remove(id).unwrap_or_default();
-                let colour = if said == "exit status 0" {
-                    p.ok
-                } else {
-                    p.warn
+                let (label, since) = self
+                    .jobs
+                    .remove(id)
+                    .unwrap_or_else(|| (Label::new(agent, "", None, p), Instant::now()));
+                let (ended, colour) = match said.strip_prefix("exit status ") {
+                    Some("0") => ("ended 0".to_owned(), p.ok),
+                    Some(code) => (format!("ended {code}"), p.warn),
+                    None => (said.clone(), p.warn),
                 };
-                self.push_step(Para {
-                    first: vec![Span::raw("  "), Span::styled("⚙ ", p.fg(colour))],
-                    rest: vec![Span::raw("    ")],
-                    body: vec![
-                        Span::styled(format!("job {id} ended, {said}: "), p.fg(p.dim)),
-                        Span::styled(short(&line), p.fg(p.text)),
+                let mut tail = vec![
+                    Span::styled(" · ", p.fg(p.faint)),
+                    Span::styled(ended, p.fg(colour)),
+                    Span::styled(
+                        format!(" · {}", seconds(since.elapsed().as_secs())),
+                        p.fg(p.faint),
+                    ),
+                ];
+                let unfold = board.keys().chord(Action::Steps);
+                if let (Some(ran), Some(unfold)) = (board.steps().latest_ran(), unfold) {
+                    tail.push(Span::styled(
+                        format!("  {unfold} unfolds #{}", ran.id),
+                        p.fg(p.faint),
+                    ));
+                }
+                self.push_job(Block::Job {
+                    head: vec![
+                        Span::raw("  "),
+                        Span::styled("⚙ ", p.fg(colour)),
+                        Span::styled(format!("job {id} · "), p.fg(p.dim)),
                     ],
+                    label,
+                    tail,
                 });
             }
             // A line once it waits for those it started: how long, the live
@@ -677,6 +735,12 @@ impl History {
                     ],
                 ));
             }
+            // Its turn's end says it, with the facts; the agents line
+            // counts those retired.
+            Event::Failed { .. }
+            | Event::Retired { .. }
+            | Event::Turn { .. }
+            | Event::Window { .. } => {}
             Event::Notice { agent, text } => {
                 self.finish(agent, board, p);
                 self.header(agent, board, p);
@@ -832,6 +896,8 @@ impl History {
                         .and_then(|rest| rest.split_once(": "))
                     {
                         Some((PERSON, said)) => self.person(said, agent, board, p),
+                        // A job's end: its own line said it.
+                        Some((IQ, said)) if said.starts_with("Job ") => {}
                         Some((from, said)) => {
                             self.set_speaker(None);
                             self.push(Para::indented(
@@ -1492,6 +1558,20 @@ impl History {
         self.kinds.insert(self.at.clone(), Kind::Text);
     }
 
+    /// Puts a job's line in the window, as a step.
+    fn push_job(&mut self, block: Block) {
+        if self.kind() == Some(Kind::Text) {
+            self.blank();
+        }
+        self.push_block(block);
+        self.kinds.insert(self.at.clone(), Kind::Steps);
+    }
+
+    /// What the job `id` does in a few words, while it runs.
+    pub(crate) fn job_label(&self, id: u64) -> Option<String> {
+        self.jobs.get(&id).map(|(label, _)| label.text())
+    }
+
     /// Puts a line of an agent's steps in the window, a line left between
     /// it and the text before.
     fn push_step(&mut self, para: Para) {
@@ -1584,10 +1664,15 @@ fn agent_of(event: &Event) -> Option<&str> {
         | Event::Choose { agent, .. }
         | Event::JobStarted { agent, .. }
         | Event::JobEnded { agent, .. }
+        | Event::JobOutput { agent, .. }
+        | Event::Failed { agent, .. }
+        | Event::Window { agent, .. }
+        | Event::Retired { agent }
         | Event::Notice { agent, .. } => Some(agent),
         Event::Posted { from, .. } => Some(from),
         Event::Renamed { to, .. } => Some(to),
         Event::Answered { .. } | Event::Chosen { .. } => None,
+        Event::Turn { chat, .. } => Some(chat),
     }
 }
 
@@ -1642,12 +1727,19 @@ pub(crate) fn step_line(step: &Step, p: &Palette) -> (Vec<Span<'static>>, Vec<Sp
             } else {
                 ("✗ ", p.bad)
             };
+            // A long command in a few words: its page gives it whole.
+            let said =
+                if name == "run" && (input.contains('\n') || input.chars().count() > INPUT_CHARS) {
+                    iq_ui::shell::few_words(input, INPUT_CHARS)
+                } else {
+                    one(input)
+                };
             (
                 vec![Span::raw("  "), Span::styled(mark, p.fg(tint))],
                 vec![
                     Span::styled(name.clone(), p.fg(p.text)),
                     Span::raw(" "),
-                    Span::styled(one(input), p.fg(p.dim)),
+                    Span::styled(said, p.fg(p.dim)),
                 ],
             )
         }
@@ -1766,6 +1858,71 @@ pub(crate) fn short(text: &str) -> String {
     })
 }
 
+/// Who writes iq's own messages to an agent: a job that ended, a wake.
+const IQ: &str = "iq";
+
+/// The longest of the few words a job is said in.
+const LABEL_CHARS: usize = 72;
+
+/// The fewest columns left to what a job does, on a narrow screen.
+const LABEL_LEAST: usize = 12;
+
+/// What a command does in a few words: the summarizer's once made, read
+/// from the line itself until then, or without one.
+#[derive(Debug, Clone)]
+pub(crate) struct Label {
+    summary: Option<Arc<Summary>>,
+    instead: String,
+    style: Style,
+}
+
+impl Label {
+    /// What `agent`'s `line` does, asked of `summarize` when there is one
+    /// and the line is long enough to need it.
+    fn new(agent: &str, line: &str, summarize: Option<&Arc<dyn Summarize>>, p: &Palette) -> Label {
+        let instead = iq_ui::shell::few_words(line, LABEL_CHARS);
+        let long = line.contains('\n') || line.chars().count() > LABEL_CHARS;
+        Label {
+            summary: summarize
+                .filter(|_| long)
+                .map(|summarize| Summary::labelled(agent, line, Arc::clone(summarize))),
+            instead: if instead.is_empty() {
+                cut(&short(line).replace('\n', " "), LABEL_CHARS)
+            } else {
+                instead
+            },
+            style: p.fg(p.text),
+        }
+    }
+
+    /// Whether the summarizer's words are still waited for.
+    fn making(&self) -> bool {
+        self.summary
+            .as_ref()
+            .is_some_and(|summary| summary.making())
+    }
+
+    /// Its words.
+    fn text(&self) -> String {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.text())
+            .and_then(|said| {
+                said.lines()
+                    .find(|l| !l.trim().is_empty())
+                    .map(str::to_owned)
+            })
+            .map_or_else(
+                || self.instead.clone(),
+                |said| cut(said.trim(), LABEL_CHARS),
+            )
+    }
+
+    fn span(&self) -> Span<'static> {
+        Span::styled(self.text(), self.style)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1852,6 +2009,82 @@ mod tests {
         assert_eq!(after.last().map(String::as_str), Some("  after it"));
         let images = history.take_images();
         assert_eq!((images.len(), images[0].cols, images[0].rows), (1, 20, 5));
+    }
+
+    #[test]
+    fn an_answer_streamed_in_any_chunks_has_one_empty_row_between_blocks() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let answer = "Done:\n- the parser\n- its tests\n\n### Next\nThe docs.\n";
+        let expected = [
+            "● lead",
+            "  Done:",
+            "",
+            "  • the parser",
+            "  • its tests",
+            "",
+            "  Next",
+            "",
+            "  The docs.",
+        ];
+        let rows = |chunks: &[&str]| -> Vec<String> {
+            let mut board = Board::default();
+            let mut history = History::default();
+            crew(
+                &mut board,
+                &mut history,
+                Event::Joined {
+                    agent: "lead".into(),
+                    model: "lab/lead".into(),
+                    by: PERSON.into(),
+                },
+                &p,
+            );
+            for chunk in chunks {
+                crew(
+                    &mut board,
+                    &mut history,
+                    Event::Text {
+                        agent: "lead".into(),
+                        text: (*chunk).into(),
+                    },
+                    &p,
+                );
+            }
+            crew(
+                &mut board,
+                &mut history,
+                Event::Done {
+                    agent: "lead".into(),
+                    outcome: Ok(answer.into()),
+                },
+                &p,
+            );
+            history
+                .take(60, Some("lead"))
+                .iter()
+                .map(|l| l.to_string().trim_end().to_owned())
+                .skip_while(String::is_empty)
+                .collect()
+        };
+        // Cut at every place, once and twice.
+        let at: Vec<usize> = answer.char_indices().map(|(i, _)| i).skip(1).collect();
+        for &one in &at {
+            let shown = rows(&[&answer[..one], &answer[one..]]);
+            assert_eq!(
+                shown[..expected.len()],
+                expected,
+                "cut at {one}: {shown:#?}"
+            );
+            for &two in at.iter().filter(|&&two| two > one).step_by(5) {
+                let shown = rows(&[&answer[..one], &answer[one..two], &answer[two..]]);
+                assert_eq!(shown[..expected.len()], expected, "cut at {one}, {two}");
+            }
+        }
+        // An answer whose model left empty lines everywhere, and new lines
+        // as Windows writes them.
+        let loose = "Done:\r\n\r\n\r\n- the parser\r\n\r\n- its tests\r\n\r\n\r\n\r\n### Next\r\n\r\nThe docs.\r\n";
+        let shown = rows(&[loose]);
+        assert_eq!(shown[..expected.len()], expected, "{shown:#?}");
     }
 
     #[test]
@@ -2397,6 +2630,99 @@ mod tests {
                 text.lines().count()
             ))
         }
+
+        fn label(&self, agent: &str, line: &str) -> Option<String> {
+            assert_eq!(agent, "lead");
+            Some(format!(
+                "patches {} lines, then checks",
+                line.lines().count()
+            ))
+        }
+    }
+
+    #[test]
+    fn a_job_is_one_short_line_as_it_starts_and_as_it_ends_never_its_script() {
+        let p = Palette::new(Theme::Ink, Depth::True);
+        let script = "cat > src/hook.py <<'PY'\nimport secret_body\nPY\ncargo fmt && cargo test -q";
+        for summed in [false, true] {
+            let mut board = Board::default();
+            let mut history = History::default();
+            if summed {
+                history.summaries(Some(Arc::new(Sums)));
+            }
+            for event in [
+                Event::Joined {
+                    agent: "lead".into(),
+                    model: "m".into(),
+                    by: PERSON.into(),
+                },
+                Event::JobStarted {
+                    agent: "lead".into(),
+                    id: 12,
+                    line: script.into(),
+                },
+                Event::JobOutput {
+                    agent: "lead".into(),
+                    id: 12,
+                    tail: vec!["test a ... ok".into()],
+                },
+                Event::JobEnded {
+                    agent: "lead".into(),
+                    id: 12,
+                    said: "exit status 0".into(),
+                    output: "test result: ok".into(),
+                },
+                // What iq tells the agent of it, its command whole.
+                Event::Posted {
+                    from: "iq".into(),
+                    to: "lead".into(),
+                    text: format!("Job 12, `{script}`, ended: exit status 0."),
+                },
+            ] {
+                crew(&mut board, &mut history, event, &p);
+            }
+            let written = settled(&mut history, "lead");
+            let jobs: Vec<&String> = written.iter().filter(|l| l.contains("⚙")).collect();
+            let label = if summed {
+                "patches 4 lines, then checks"
+            } else {
+                "cat, cargo fmt, cargo test · src/hook.py"
+            };
+            assert_eq!(jobs.len(), 2, "{written:#?}");
+            assert_eq!(jobs[0].trim_end(), format!("  ⚙ job 12 · {label}"));
+            assert!(
+                jobs[1].starts_with(&format!("  ⚙ job 12 · {label} · ended 0 · 0s")),
+                "{}",
+                jobs[1]
+            );
+            // Wide enough, it says where it unfolds.
+            let wide = written_at(&mut board, &mut history, 120);
+            let ended = wide.iter().rev().find(|l| l.contains("⚙")).unwrap();
+            assert!(
+                ended.ends_with(&format!("{label} · ended 0 · 0s  Ctrl-X unfolds #1")),
+                "{ended}"
+            );
+            // Narrow, what it does is cut first, how it ended kept.
+            let narrow = written_at(&mut board, &mut history, 50);
+            let ended = narrow.iter().rev().find(|l| l.contains("⚙")).unwrap();
+            assert!(ended.trim_end().ends_with("· ended 0 · 0s"), "{ended}");
+            assert!(!written.iter().any(|l| l.contains("secret_body")));
+            // Its page gives it whole.
+            let ran = board.steps().latest_ran().unwrap();
+            assert_eq!(
+                (ran.line.as_str(), ran.output.as_str()),
+                (script, "test result: ok")
+            );
+        }
+    }
+
+    /// The lead's window written again `width` wide.
+    fn written_at(_board: &mut Board, history: &mut History, width: usize) -> Vec<String> {
+        history
+            .window(width, Some("lead"))
+            .iter()
+            .map(ToString::to_string)
+            .collect()
     }
 
     /// What `history` writes in `window` once nothing waits any more.

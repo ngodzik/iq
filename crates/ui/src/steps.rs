@@ -124,13 +124,34 @@ pub struct Said {
     pub task: bool,
 }
 
-/// One of the steps' page's entries: a fold, or a message between agents.
+/// A command an agent left to run in the background, once it ended: the
+/// conversation says it in a line, its page gives it whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ran {
+    /// Its number, counted with the folds'.
+    pub id: usize,
+    /// The agent.
+    pub agent: String,
+    /// The job's own number, as its agent names it.
+    pub job: u64,
+    /// The command line, whole.
+    pub line: String,
+    /// How it ended.
+    pub said: String,
+    /// The end of what it wrote.
+    pub output: String,
+}
+
+/// One of the steps' page's entries: a fold, a message between agents, a
+/// job that ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry<'a> {
     /// An agent's steps between two of its lines.
     Fold(&'a Fold),
     /// What one agent wrote to another.
     Said(&'a Said),
+    /// A command run in the background.
+    Ran(&'a Ran),
 }
 
 impl Entry<'_> {
@@ -140,6 +161,7 @@ impl Entry<'_> {
         match self {
             Entry::Fold(fold) => fold.id,
             Entry::Said(said) => said.id,
+            Entry::Ran(ran) => ran.id,
         }
     }
 }
@@ -150,6 +172,10 @@ pub struct Steps {
     folds: VecDeque<Fold>,
     /// What agents wrote to each other, the oldest first.
     said: VecDeque<Said>,
+    /// The jobs that ended, the oldest first.
+    ran: VecDeque<Ran>,
+    /// The command line of each job running, by its number.
+    jobs: HashMap<u64, String>,
     /// The number of the last fold or message made.
     last: usize,
     /// Who started each agent another started.
@@ -225,6 +251,8 @@ impl Steps {
             }
             Event::TextStart { agent }
             | Event::Done { agent, .. }
+            | Event::Failed { agent, .. }
+            | Event::Retired { agent }
             | Event::Notice { agent, .. } => self.close(agent),
             Event::Placed {
                 agent,
@@ -245,8 +273,32 @@ impl Steps {
             Event::Waiting { .. }
             | Event::Choose { .. }
             | Event::Chosen { .. }
-            | Event::JobStarted { .. }
-            | Event::JobEnded { .. } => {}
+            | Event::Turn { .. }
+            | Event::Window { .. }
+            | Event::JobOutput { .. } => {}
+            Event::JobStarted { id, line, .. } => {
+                self.jobs.insert(*id, line.clone());
+            }
+            Event::JobEnded {
+                agent,
+                id,
+                said,
+                output,
+            } => {
+                let line = self.jobs.remove(id).unwrap_or_default();
+                self.last += 1;
+                self.ran.push_back(Ran {
+                    id: self.last,
+                    agent: agent.clone(),
+                    job: *id,
+                    line,
+                    said: said.clone(),
+                    output: output.clone(),
+                });
+                while self.ran.len() > KEPT {
+                    self.ran.pop_front();
+                }
+            }
             Event::Renamed { from, to } => {
                 for fold in &mut self.folds {
                     if fold.agent == *from {
@@ -258,6 +310,11 @@ impl Steps {
                         if name == from {
                             name.clone_from(to);
                         }
+                    }
+                }
+                for ran in &mut self.ran {
+                    if ran.agent == *from {
+                        ran.agent.clone_from(to);
                     }
                 }
                 for by in self.started.values_mut() {
@@ -379,7 +436,14 @@ impl Steps {
         self.said.back()
     }
 
-    /// Every fold and message kept, in the order they came.
+    /// The job that ended last: the one the event just taken ended, when
+    /// it ended one.
+    #[must_use]
+    pub fn latest_ran(&self) -> Option<&Ran> {
+        self.ran.back()
+    }
+
+    /// Every fold, message and job kept, in the order they came.
     #[must_use]
     pub fn entries(&self) -> Vec<Entry<'_>> {
         let mut entries: Vec<Entry<'_>> = self
@@ -387,6 +451,7 @@ impl Steps {
             .iter()
             .map(Entry::Fold)
             .chain(self.said.iter().map(Entry::Said))
+            .chain(self.ran.iter().map(Entry::Ran))
             .collect();
         entries.sort_by_key(Entry::id);
         entries

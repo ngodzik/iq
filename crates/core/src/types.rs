@@ -313,6 +313,11 @@ pub enum Message {
         content: Option<String>,
         /// Calls to run before the conversation continues.
         tool_calls: Vec<ToolCall>,
+        /// What the provider gave with the answer to be sent back with it,
+        /// as it came: a signature of the model's reasoning, which Gemini
+        /// asks again with its calls of tools when it thinks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_signature: Option<serde_json::Value>,
     },
     /// The result of one tool call.
     Tool {
@@ -455,6 +460,17 @@ impl std::str::FromStr for Effort {
     }
 }
 
+/// What a provider said as it refused a call: its status and its own
+/// words, for the person and the agents to be told as they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The HTTP status it answered with.
+    pub status: u16,
+    /// What it said, as it said it: the message of its error, else its
+    /// answer, cut.
+    pub message: String,
+}
+
 /// A model's answer and what it cost.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatResponse {
@@ -469,6 +485,9 @@ pub struct ChatResponse {
     pub cost: Option<Usd>,
     /// What it read from the prompt cache and wrote to it, when known.
     pub cache: Option<CacheUse>,
+    /// What the provider gave with the answer to be sent back with it, as
+    /// it came: a signature of the model's reasoning.
+    pub reasoning_signature: Option<serde_json::Value>,
 }
 
 impl ChatResponse {
@@ -477,6 +496,7 @@ impl ChatResponse {
         Message::Assistant {
             content: self.content.clone(),
             tool_calls: self.tool_calls.clone(),
+            reasoning_signature: self.reasoning_signature.clone(),
         }
     }
 }

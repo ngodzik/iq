@@ -61,6 +61,8 @@ pub enum Page {
     Steps,
     /// A diagram of the chat alone, at its whole size, zoomed and moved.
     Diagram,
+    /// The map of the turn of the chat written to.
+    Map,
 }
 
 impl Page {
@@ -76,6 +78,7 @@ impl Page {
             Page::Changes => "What a sync would send".to_owned(),
             Page::Steps => "Steps and messages".to_owned(),
             Page::Diagram => "Diagram".to_owned(),
+            Page::Map => "The turn".to_owned(),
         }
     }
 }
@@ -114,6 +117,8 @@ pub struct Screen {
     follow: bool,
     /// The entries of the steps' page shown whole, by their numbers.
     unfolded: std::collections::BTreeSet<usize>,
+    /// Whether the map shows the agents finished, rather than their count.
+    finished: bool,
     /// The names asked for agents that have not joined yet.
     starting: Vec<String>,
     /// A word to the person, and when it was said.
@@ -137,6 +142,7 @@ impl Default for Screen {
             step: None,
             follow: false,
             unfolded: std::collections::BTreeSet::new(),
+            finished: false,
             starting: Vec::new(),
             notice: None,
             quit_asked: None,
@@ -275,6 +281,17 @@ impl Screen {
     #[must_use]
     pub fn chosen(&self) -> usize {
         self.chosen
+    }
+
+    /// Whether the map shows the agents finished, rather than their count.
+    #[must_use]
+    pub fn finished_shown(&self) -> bool {
+        self.finished
+    }
+
+    /// Shows the agents finished on the map, or folds them again.
+    pub fn show_finished(&mut self) {
+        self.finished = !self.finished;
     }
 
     /// Chooses the agent at `at` on the team's page, within `count`.

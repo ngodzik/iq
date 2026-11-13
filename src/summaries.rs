@@ -3,7 +3,9 @@
 //! the agent it is for reads the message whole. Each summary is one call
 //! to the provider, its cost counted as any call's.
 
-use iq_agent::{Asked, Report, ask_once};
+use std::sync::Arc;
+
+use iq_agent::{Asked, Event, Report, ask_once};
 use iq_core::{Effort, ModelId};
 use iq_llm::OpenAiCompatible;
 
@@ -20,6 +22,15 @@ const SUMMING: &str = "You sum up for a person what one agent of a coding harnes
     what is asked or answered, and what matters in it (a decision, a file, a number, what failed). \
     Write in the message's own language, plainly, with no preamble and no heading. The message \
     follows, after who wrote it to whom.";
+
+/// What the summarizer's model is told to say what a command does.
+const LABELLING: &str = "You say in a few words what a shell command line of a coding agent \
+    does, for a person who follows its work: at most ten words, verbs first, plainly, no quotes, \
+    no full stop, in English. Say what it does (patches a hook and its tests, then runs the \
+    checks), never how. The command line follows.";
+
+/// The longest command line given whole to the summarizer to label.
+const LABELLED_MOST: usize = 8_000;
 
 /// Sums up the messages between agents with one model of the provider.
 pub(crate) struct Summaries {
@@ -47,9 +58,30 @@ impl Summaries {
     }
 }
 
+impl Summaries {
+    /// Where the cost of a summary for the agent `agent` goes: counted in
+    /// its chat's turn.
+    fn costs_for(&self, agent: &str) -> Report {
+        let costs = Arc::clone(&self.costs);
+        let served = chat_of(agent);
+        Arc::new(move |mut event: Event| {
+            if let Event::Spent { chat, .. } = &mut event {
+                *chat = Some(served.clone());
+            }
+            costs(event);
+        })
+    }
+}
+
+/// The chat of the agent `agent`, as its name says it.
+fn chat_of(agent: &str) -> String {
+    agent.split('/').next().unwrap_or(agent).to_owned()
+}
+
 impl iq_tui::Summarize for Summaries {
     fn summarize(&self, from: &str, to: &str, text: &str) -> Option<String> {
         let asked = format!("From {from} to {to}:\n\n{}", within(text, SUMMED_MOST));
+        let costs = self.costs_for(from);
         let answer = self.handle.block_on(ask_once(
             &self.provider,
             &self.model,
@@ -58,7 +90,23 @@ impl iq_tui::Summarize for Summaries {
             Asked {
                 agent: SUMMARIZER,
                 effort: Effort::Low,
-                costs: &self.costs,
+                costs: &costs,
+            },
+        ));
+        answer.ok().filter(|said| !said.trim().is_empty())
+    }
+
+    fn label(&self, agent: &str, line: &str) -> Option<String> {
+        let costs = self.costs_for(agent);
+        let answer = self.handle.block_on(ask_once(
+            &self.provider,
+            &self.model,
+            LABELLING,
+            within(line, LABELLED_MOST),
+            Asked {
+                agent: SUMMARIZER,
+                effort: Effort::Low,
+                costs: &costs,
             },
         ));
         answer.ok().filter(|said| !said.trim().is_empty())

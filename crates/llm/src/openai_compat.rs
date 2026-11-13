@@ -40,6 +40,9 @@ pub struct OpenAiCompatible {
     known: Arc<Mutex<Option<HashMap<String, Known>>>>,
     /// How long what Claude's marks write stays in the cache.
     cache_ttl: CacheTtl,
+    /// The models iq marks for the cache itself, by words of their names:
+    /// Claude's unless told otherwise; the others are left to the router.
+    marked: Vec<String>,
 }
 
 impl fmt::Debug for OpenAiCompatible {
@@ -49,6 +52,7 @@ impl fmt::Debug for OpenAiCompatible {
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
             .field("cache_ttl", &self.cache_ttl)
+            .field("marked", &self.marked)
             .finish()
     }
 }
@@ -72,7 +76,27 @@ impl OpenAiCompatible {
             api_key,
             known: Arc::new(Mutex::new(None)),
             cache_ttl: CacheTtl::default(),
+            marked: vec![CLAUDE.to_owned()],
         }
+    }
+
+    /// The same provider, marking for the cache itself the models whose
+    /// names hold one of `words` (`claude`, `gemini`, `glm`), the others
+    /// left to the router's own caching; none for none.
+    #[must_use]
+    pub fn with_cache_marks(mut self, words: Vec<String>) -> Self {
+        self.marked = words
+            .into_iter()
+            .map(|word| word.trim().to_lowercase())
+            .filter(|word| !word.is_empty())
+            .collect();
+        self
+    }
+
+    /// Whether iq marks `model`'s requests for the cache itself.
+    fn marks(&self, model: &ModelId) -> bool {
+        let name = model.as_str().to_lowercase();
+        self.marked.iter().any(|word| name.contains(word.as_str()))
     }
 
     /// The same provider, keeping what Claude's cache marks write for
@@ -180,12 +204,14 @@ impl ChatModel for OpenAiCompatible {
             // Claude caches only what is marked, at its provider (Bedrock,
             // Vertex): Requesty's own marks go on the largest blocks and can
             // leave the end of a growing conversation out, so iq
-            // places them. Other models are left to Requesty.
-            let claude = is_claude(&request.model);
-            if claude {
+            // places them. Other models are left to Requesty, unless the
+            // settings name them too: Gemini on Vertex, whose explicit
+            // cache Requesty also makes on the largest blocks.
+            let marked = self.marks(&request.model);
+            if marked {
                 mark_cache(&mut payload, self.cache_ttl);
             }
-            payload["requesty"] = json!({"auto_cache": !claude});
+            payload["requesty"] = json!({"auto_cache": !marked});
         }
         // A connection that could not be made is tried again, twice, after a
         // pause: the request never left, so it cannot be billed twice. Any
@@ -223,6 +249,10 @@ impl ChatModel for OpenAiCompatible {
 
     fn busy(&self, error: &LlmError) -> Option<iq_core::Busy> {
         error.busy()
+    }
+
+    fn refusal(&self, error: &LlmError) -> Option<iq_core::Refusal> {
+        error.refusal()
     }
 }
 
@@ -400,11 +430,9 @@ fn try_again_in(body: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs_f64(seconds))
 }
 
-/// Whether `model` is one of Anthropic's, whatever route serves it, such
-/// as `bedrock/claude-opus-5-5`.
-fn is_claude(model: &ModelId) -> bool {
-    model.as_str().contains("claude")
-}
+/// What Claude's models' names hold, which iq marks for the cache unless
+/// told otherwise.
+const CLAUDE: &str = "claude";
 
 /// Marks the system message and the last message with text as cached
 /// until there, for a provider that caches only what is marked: the system
@@ -452,8 +480,13 @@ fn wire_message(message: &Message) -> Value {
         Message::Assistant {
             content,
             tool_calls,
+            reasoning_signature,
         } => {
             let mut m = json!({"role": "assistant", "content": content});
+            // Sent back as it came, which the model may ask for.
+            if let Some(signature) = reasoning_signature {
+                m["reasoning_signature"] = signature.clone();
+            }
             if !tool_calls.is_empty() {
                 m["tool_calls"] = tool_calls
                     .iter()
@@ -508,6 +541,9 @@ struct WireMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<WireToolCall>,
+    /// A signature of the model's reasoning, as Requesty gives Gemini's.
+    #[serde(default)]
+    reasoning_signature: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -645,6 +681,7 @@ fn parse_completion(url: &str, body: &str) -> Result<ChatResponse, LlmError> {
         usage,
         cost,
         cache,
+        reasoning_signature: choice.message.reasoning_signature.filter(|s| !s.is_null()),
     })
 }
 
@@ -804,6 +841,78 @@ mod tests {
         assert_eq!(response.cost, Some(Usd(0.00042)));
     }
 
+    #[test]
+    fn a_refusal_is_told_in_the_provider_s_own_words() {
+        let refused = |body: &str| {
+            LlmError::Status {
+                url: URL.into(),
+                status: 400,
+                body: body.into(),
+                after: None,
+            }
+            .refusal()
+            .unwrap()
+        };
+        let said = refused(
+            r#"{"error": {"code": 400, "message": "Request contains an invalid argument.", "status": "INVALID_ARGUMENT"}}"#,
+        );
+        assert_eq!(said.status, 400);
+        assert_eq!(said.message, "Request contains an invalid argument.");
+        assert_eq!(
+            refused(r#"{"error": "no such model"}"#).message,
+            "no such model"
+        );
+        assert_eq!(refused("  Bad Gateway\n").message, "Bad Gateway");
+        let long = refused(&"x".repeat(2_000)).message;
+        assert_eq!(long.chars().count(), crate::error::SAID_CHARS + 1);
+        let unreached = LlmError::NoKey { url: URL.into() };
+        assert!(unreached.refusal().is_none());
+    }
+
+    #[test]
+    fn a_reasoning_signature_is_kept_and_sent_back_as_it_came() {
+        // As Requesty gives Gemini's answer with tool calls, thinking.
+        let body = r#"{
+            "choices": [{"message": {"role": "assistant", "content": null,
+                "reasoning_signature": "c2lnbmVk/+==",
+                "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}}]},
+                "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2}
+        }"#;
+        let response = parse_completion(URL, body).unwrap();
+        assert_eq!(response.reasoning_signature, Some(json!("c2lnbmVk/+==")));
+        let request = ChatRequest {
+            model: ModelId::new("google/gemini").unwrap(),
+            messages: vec![Message::user("go"), response.to_message()],
+            tools: Vec::new(),
+            effort: None,
+        };
+        let sent = wire_request(&request);
+        assert_eq!(
+            sent["messages"][1]["reasoning_signature"],
+            json!("c2lnbmVk/+==")
+        );
+        // Kept with the chat as it is.
+        let kept = serde_json::to_string(&response.to_message()).unwrap();
+        let back: Message = serde_json::from_str(&kept).unwrap();
+        assert_eq!(back, response.to_message());
+        // None, nothing sent, nor kept.
+        let plain = parse_completion(URL, r#"{"choices": [{"message": {"content": "ok"}}]}"#)
+            .unwrap()
+            .to_message();
+        let request = ChatRequest {
+            messages: vec![plain.clone()],
+            ..request
+        };
+        assert!(
+            wire_request(&request)["messages"][0]
+                .get("reasoning_signature")
+                .is_none()
+        );
+        assert!(!serde_json::to_string(&plain).unwrap().contains("signature"));
+    }
+
     #[tokio::test]
     async fn without_a_key_nothing_is_sent_and_the_error_says_what_to_do() {
         // Nothing listens on port 9: had a request been sent, the error would
@@ -834,6 +943,7 @@ mod tests {
                         name: "read_file".into(),
                         arguments: "{}".into(),
                     }],
+                    reasoning_signature: None,
                 },
                 Message::Tool {
                     call_id: "call_1".into(),
@@ -895,8 +1005,20 @@ mod tests {
     #[test]
     fn claude_gets_marks_on_its_system_message_and_last_text() {
         let model = ModelId::new("bedrock/claude-opus-5-5").unwrap();
-        assert!(is_claude(&model));
-        assert!(!is_claude(&ModelId::new("deepseek/deepseek-chat").unwrap()));
+        let provider = OpenAiCompatible::without_key(URL);
+        assert!(provider.marks(&model));
+        let gemini = ModelId::new("vertex/google/gemini-pro").unwrap();
+        assert!(!provider.marks(&gemini));
+        // As the settings ask, Gemini's too, by a word of their names.
+        let marking =
+            provider.with_cache_marks(vec![" Gemini".into(), "claude".into(), String::new()]);
+        assert!(marking.marks(&gemini) && marking.marks(&model));
+        assert!(!marking.marks(&ModelId::new("z-ai/glm-5").unwrap()));
+        assert!(
+            !OpenAiCompatible::without_key(URL)
+                .with_cache_marks(Vec::new())
+                .marks(&model)
+        );
         let request = ChatRequest {
             model,
             messages: vec![
@@ -909,6 +1031,7 @@ mod tests {
                         name: "read_file".into(),
                         arguments: "{}".into(),
                     }],
+                    reasoning_signature: None,
                 },
                 Message::Tool {
                     call_id: "call_1".into(),

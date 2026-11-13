@@ -88,4 +88,35 @@ impl LlmError {
             _ => None,
         }
     }
+
+    /// What the provider said, when it refused the call with a status: the
+    /// message of its error as JSON gives it (`{"error": {"message": …}}`,
+    /// or `{"error": "…"}`), else its answer, cut to 600 characters.
+    #[must_use]
+    pub fn refusal(&self) -> Option<iq_core::Refusal> {
+        let LlmError::Status { status, body, .. } = self else {
+            return None;
+        };
+        let json: Option<serde_json::Value> = serde_json::from_str(body).ok();
+        let said = json.as_ref().and_then(|json| {
+            let error = json.get("error")?;
+            error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| error.as_str())
+                .map(str::to_owned)
+        });
+        let message = said.unwrap_or_else(|| body.trim().to_owned());
+        let message = match message.char_indices().nth(SAID_CHARS) {
+            Some((at, _)) => format!("{}…", &message[..at]),
+            None => message,
+        };
+        Some(iq_core::Refusal {
+            status: *status,
+            message,
+        })
+    }
 }
+
+/// The most of a provider's words kept of its refusal.
+pub(crate) const SAID_CHARS: usize = 600;

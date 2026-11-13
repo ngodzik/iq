@@ -14,6 +14,7 @@ use crate::keys::{Action, Chord, Keymap};
 use crate::look::Look;
 use crate::observations::{By, Span};
 use crate::screen::{Page, Screen, Talk};
+use crate::steps::Step;
 
 /// A message on the board, for the terminal to show it travel.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +58,8 @@ pub enum Update {
     Crew(Event),
     /// A chat of an earlier session came back, as it was kept.
     Back(Back),
+    /// An agent retired in an earlier session, shown with its chat.
+    Finished(crate::crew::Finished),
     /// The calls iq kept of earlier sessions, oldest first.
     Kept(Vec<Spent>),
     /// iq is asked to stop: the terminal is given back, the agents
@@ -971,7 +974,7 @@ impl Board {
         } else if self.screen.page() == Some(&Page::Team) {
             let chosen = self.screen.chosen() as isize + lines.signum();
             self.screen
-                .choose(chosen.max(0) as usize, self.crew.agents().len());
+                .choose(chosen.max(0) as usize, self.crew.listed().len());
         } else {
             self.screen.scroll_by(lines);
         }
@@ -991,7 +994,10 @@ impl Board {
         }
         let letter = typed.map(|c| c.to_ascii_lowercase());
         let step = self.screen.rows().saturating_sub(2).max(1) as isize;
-        let agents = self.crew.agents().len();
+        let agents = match page {
+            Page::Map => self.map_rows(),
+            _ => self.crew.listed().len(),
+        };
         let chosen = self.screen.chosen();
         if page == Page::Steps
             && let Some(done) = self.steps_key(chord.key.as_str(), letter)
@@ -1000,10 +1006,10 @@ impl Board {
         }
         match (chord.key.as_str(), letter) {
             (_, Some('q')) => self.screen.close(),
-            ("Up", _) | (_, Some('k')) if page == Page::Team => {
+            ("Up", _) | (_, Some('k')) if matches!(page, Page::Team | Page::Map) => {
                 self.screen.choose(chosen.saturating_sub(1), agents);
             }
-            ("Down", _) | (_, Some('j')) if page == Page::Team => {
+            ("Down", _) | (_, Some('j')) if matches!(page, Page::Team | Page::Map) => {
                 self.screen.choose(chosen + 1, agents);
             }
             ("Up", _) | (_, Some('k')) => self.screen.scroll_by(-1),
@@ -1077,12 +1083,18 @@ impl Board {
                 self.lens = lens;
             }
             Page::Team => {
-                let agent = self
+                let (agent, retired) = self
                     .crew
                     .listed()
                     .get(self.screen.chosen())
-                    .map(|(_, a)| a.name.clone());
+                    .map_or((None, false), |(_, a)| (Some(a.name.clone()), a.retired));
                 match (key, letter, agent) {
+                    // One retired is read, never written to.
+                    ("Enter" | "Right", _, Some(agent)) | (_, Some('w' | 'v'), Some(agent))
+                        if retired =>
+                    {
+                        self.screen.open(Page::Thread(agent));
+                    }
                     ("Enter", _, Some(agent)) | (_, Some('w'), Some(agent)) => {
                         self.chose_to(&agent);
                         self.screen.close();
@@ -1098,10 +1110,90 @@ impl Board {
                     _ => {}
                 }
             }
+            Page::Map => return self.map_key(key, letter),
             Page::Thread(_) if key == "Left" => self.screen.close(),
             Page::Thread(_) | Page::Keys | Page::Changes | Page::Steps | Page::Diagram => {}
         }
         Vec::new()
+    }
+
+    /// The chat the person writes to, as the map shows its turn.
+    #[must_use]
+    pub fn chat_shown(&self) -> Option<String> {
+        let agent = self.screen.talking_to()?;
+        Some(self.crew.chat_of(agent).unwrap_or_else(|| agent.to_owned()))
+    }
+
+    /// How many rows the map shows now.
+    fn map_rows(&self) -> usize {
+        self.chat_shown().map_or(0, |chat| {
+            crate::map::rows(
+                &self.crew,
+                &chat,
+                self.screen.finished_shown(),
+                crate::now(),
+            )
+            .len()
+        })
+    }
+
+    /// What the map's own keys do on its row chosen: Enter or → reads an
+    /// agent's thread, or a job's command whole; `w` writes to an agent; `s`
+    /// stops it, or the job; `f` unfolds the agents finished, or folds them.
+    fn map_key(&mut self, key: &str, letter: Option<char>) -> Vec<Request> {
+        if letter == Some('f') {
+            self.screen.show_finished();
+            return Vec::new();
+        }
+        let Some(chat) = self.chat_shown() else {
+            return Vec::new();
+        };
+        let chosen = {
+            let rows = crate::map::rows(
+                &self.crew,
+                &chat,
+                self.screen.finished_shown(),
+                crate::now(),
+            );
+            rows.get(self.screen.chosen()).map(|row| match row.kind {
+                crate::map::Kind::Agent(agent) => Err((agent.name.clone(), agent.retired)),
+                crate::map::Kind::Job(job) => Ok((job.agent.clone(), job.id)),
+            })
+        };
+        match (key, letter, chosen) {
+            ("Enter" | "Right", _, Some(Err((agent, _)))) => self.screen.open(Page::Thread(agent)),
+            ("Enter" | "Right", _, Some(Ok((agent, id)))) => self.open_job(&agent, id),
+            (_, Some('w'), Some(Err((agent, false)))) => {
+                self.chose_to(&agent);
+                self.screen.close();
+            }
+            (_, Some('s'), Some(Err((agent, false)))) => {
+                return self.crew.stop(&agent).into_iter().collect();
+            }
+            (_, Some('s'), Some(Ok((_, id)))) => return vec![Request::StopJob { id }],
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// Opens the steps' page on the fold where `agent` left the job `id`
+    /// to run, whole: its command as it wrote it.
+    fn open_job(&mut self, agent: &str, id: u64) {
+        let started = format!("Job {id} runs");
+        let fold = self.steps.folds().rev().find(|fold| {
+            fold.agent == agent
+                && fold.steps.iter().any(|step| {
+                    matches!(step, Step::Tool { name, output, .. }
+                        if name == "run" && output.starts_with(&started))
+                })
+        });
+        if let Some(fold) = fold.map(|fold| fold.id) {
+            self.screen.open(Page::Steps);
+            self.screen.choose_step(Some(fold));
+            if !self.screen.unfolded(fold) {
+                self.screen.unfold(fold);
+            }
+        }
     }
 
     /// The page of what a sync would send closes once the person said
@@ -1125,6 +1217,10 @@ impl Board {
                 self.new_chat_said(&lead, "", now);
             }
             Action::Team => self.screen.toggle(Page::Team),
+            Action::Map => {
+                self.screen.toggle(Page::Map);
+                self.screen.choose(0, 1);
+            }
             Action::Costs => self.screen.toggle(Page::Costs),
             Action::Observations => self.screen.toggle(Page::Observations),
             Action::Keys => self.screen.toggle(Page::Keys),
@@ -1716,6 +1812,7 @@ impl Board {
                     }
                 }
             }
+            Update::Finished(finished) => self.crew.finished_back(finished),
             Update::Kept(kept) => {
                 for spent in kept {
                     self.costs.add(spent);
@@ -1985,6 +2082,10 @@ mod tests {
 
     fn key(board: &mut Board, chord: &str) -> Vec<Request> {
         board.press(&Chord::parse(chord).unwrap(), None, 100)
+    }
+
+    fn letter(board: &mut Board, c: char) -> Vec<Request> {
+        board.press(&Chord::plain(&c.to_string()), Some(c), 100)
     }
 
     fn write(board: &mut Board, text: &str) {
@@ -2807,6 +2908,79 @@ mod tests {
     }
 
     #[test]
+    fn the_map_s_keys_read_write_to_stop_and_unfold_what_its_rows_hold() {
+        let mut board = Board::default();
+        for event in [
+            Event::Joined {
+                agent: "fix".into(),
+                model: "lab/sol".into(),
+                by: PERSON.into(),
+            },
+            Event::Joined {
+                agent: "fix/review".into(),
+                model: "lab/glm".into(),
+                by: "fix".into(),
+            },
+            Event::Working {
+                agent: "fix/review".into(),
+                prompt: "review".into(),
+            },
+            Event::JobStarted {
+                agent: "fix".into(),
+                id: 4,
+                line: "cargo test".into(),
+            },
+            Event::Joined {
+                agent: "fix/old".into(),
+                model: "lab/glm".into(),
+                by: "fix".into(),
+            },
+            Event::Working {
+                agent: "fix/old".into(),
+                prompt: "look".into(),
+            },
+            Event::Retired {
+                agent: "fix/old".into(),
+            },
+        ] {
+            board.update(Update::Crew(event));
+        }
+        board.screen_mut().talk_to("fix");
+        assert_eq!(board.act(Action::Map, 100), None);
+        assert_eq!(board.screen().page(), Some(&Page::Map));
+        // The chat's agent, the one at work, the one that finished a moment
+        // ago, the job.
+        assert_eq!(board.map_rows(), 4);
+        key(&mut board, "Down");
+        assert_eq!(
+            letter(&mut board, 's'),
+            [Request::Stop {
+                agent: "fix/review".into()
+            }]
+        );
+        key(&mut board, "End");
+        key(&mut board, "Down");
+        key(&mut board, "Down");
+        assert_eq!(letter(&mut board, 's'), [Request::StopJob { id: 4 }]);
+        letter(&mut board, 'f');
+        assert!(board.screen().finished_shown());
+        key(&mut board, "Up");
+        key(&mut board, "Up");
+        key(&mut board, "Up");
+        key(&mut board, "Down");
+        key(&mut board, "Enter");
+        assert_eq!(
+            board.screen().page(),
+            Some(&Page::Thread("fix/review".into()))
+        );
+        board.screen_mut().close_all();
+        board.act(Action::Map, 100);
+        letter(&mut board, 'w');
+        assert_eq!(board.screen().page(), None);
+        assert_eq!(board.screen().talking_to(), Some("fix"));
+    }
+
+    #[test]
     fn what_a_sync_would_send_is_read_on_its_page_and_answered_from_there() {
         let mut board = Board::default();
         board.update(Update::SyncAsk(SyncAsk {
@@ -2824,7 +2998,7 @@ mod tests {
         assert_eq!(board.screen().page(), None);
         assert_eq!(board.changes(), Some("diff --git a/x b/x\n+one\n"));
         // Opened again, it is read afresh; answered there, it closes.
-        assert_eq!(key(&mut board, "ctrl+g"), [Request::Changes]);
+        assert_eq!(key(&mut board, "ctrl+d"), [Request::Changes]);
         assert_eq!(board.changes(), None);
         assert_eq!(
             key(&mut board, "ctrl+y"),
@@ -2853,6 +3027,8 @@ mod tests {
             model: "openai/gpt-5-mini".into(),
             usage: iq_core::Usage::default(),
             cost: Some(iq_core::Usd(0.25)),
+            cache: None,
+            chat: None,
         }));
         let totals = board.costs().totals(0);
         assert_eq!(totals.len(), 1);

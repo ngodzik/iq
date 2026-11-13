@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::event::{Event, PERSON};
 use crate::extension::Extension;
-use crate::keep::{Keeper, ModelChoice, Saved};
+use crate::keep::{Aside, Keeper, ModelChoice, Saved, Shown};
 use crate::place::{Placed, Placer};
 use crate::review;
 use crate::rules::{self, RulesFile};
@@ -192,6 +192,12 @@ pub struct Settings {
     /// their work is about: none, and they keep the name they started
     /// with.
     pub namer: Option<ModelId>,
+    /// What a chat's turn may spend before the person is asked whether it
+    /// goes on, and each time it spends as much again; none never asks.
+    pub turn_ask: Option<Usd>,
+    /// The tokens an agent's calls read past which its old tool results
+    /// are set apart, and again each time they grow as much; 0 never.
+    pub light_from: u64,
     /// The only models an agent is started on or given, the person's and
     /// every agent's, as the person's settings list them: any other is
     /// refused, the agent told which there are. Empty: any the provider
@@ -218,6 +224,8 @@ impl Default for Settings {
             busy_wait: BUSY_WAIT,
             busy_most: BUSY_MOST,
             namer: None,
+            turn_ask: None,
+            light_from: LIGHT_FROM,
             allowed: Vec::new(),
             scratch_most: SCRATCH_MOST,
         }
@@ -294,6 +302,192 @@ struct Inner<M> {
     /// The models the provider lists, once read: an agent is started only
     /// on one of them, by its whole name.
     listed: Mutex<Vec<String>>,
+    /// What the person was shown of each agent beside its conversation,
+    /// with the number of its turn under way or last. Never locked before
+    /// the board.
+    aside: Mutex<HashMap<String, AsideLog>>,
+    /// Which chats wrote in each folder lately, and when; and the pairs
+    /// of chats the person was told wrote in the same one.
+    writers: Mutex<Writers>,
+    /// What each chat's turn spent so far, by its chat.
+    turns: Mutex<HashMap<String, TurnSpend>>,
+    /// Held while the person is asked whether a chat's turn goes on, so
+    /// that its agents ask once.
+    asking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// How often a job's latest lines are looked at, to be said when they
+/// changed.
+const JOB_FOLLOWED: Duration = Duration::from_millis(500);
+
+/// How many of a job's latest lines are said as it runs.
+const JOB_TAIL: usize = 10;
+
+/// The longest of a job's lines said as it runs.
+const JOB_LINE_CHARS: usize = 300;
+
+/// The last `most` lines of `text` that hold something, each cut; a line a
+/// carriage return rewrote, as a progress bar does, as it stands last.
+fn last_lines(text: &str, most: usize) -> Vec<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            line.rsplit('\r')
+                .find(|part| !part.trim().is_empty())
+                .unwrap_or("")
+        })
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| cut_to(line.trim_end(), JOB_LINE_CHARS))
+        .collect();
+    let from = lines.len().saturating_sub(most);
+    lines[from..].to_vec()
+}
+
+/// The most of a retired agent's last answer given to who writes to it.
+const RETIRED_ANSWER: usize = 4_000;
+
+/// The tools that write where their agent works, as far as iq can tell: a
+/// command may write too.
+const WRITERS: [&str; 3] = ["write_file", "edit_file", "run"];
+
+/// How long a chat that wrote in a folder counts as writing there.
+const LATELY: Duration = Duration::from_secs(30 * 60);
+
+/// Which chats wrote in each folder lately, and which pairs of chats the
+/// person was told of.
+#[derive(Default)]
+struct Writers {
+    lately: HashMap<PathBuf, HashMap<String, Instant>>,
+    told: std::collections::HashSet<(String, String)>,
+}
+
+/// Two chats, in the same order whichever comes first.
+fn pair_of(one: &str, other: &str) -> (String, String) {
+    if one <= other {
+        (one.to_owned(), other.to_owned())
+    } else {
+        (other.to_owned(), one.to_owned())
+    }
+}
+
+/// The tokens an agent's calls read past which its old tool results are
+/// set apart, unless the settings say otherwise.
+pub const LIGHT_FROM: u64 = 40_000;
+
+/// How many of an agent's latest tool results are never set apart.
+const LIGHT_KEPT: usize = 6;
+
+/// The shortest result set apart: one shorter costs less than its line.
+const LIGHT_LEAST: usize = 800;
+
+/// How the line that stands for a result set apart begins.
+const SET_APART: &str = "(iq: set apart to keep your conversation light:";
+
+/// What a tool call's result was, said in a line: the tool, what it was
+/// called on, and for a command the last line it wrote.
+fn what_it_was(name: &str, arguments: &str, output: &str) -> String {
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    let input = tools::summary(&args);
+    match name {
+        "read_file" => {
+            let from = args["offset"].as_u64().unwrap_or(1);
+            let lines = output.lines().count() as u64;
+            format!(
+                "read {input}, lines {from} to {}",
+                from + lines.saturating_sub(1)
+            )
+        }
+        "run" => {
+            let last = output
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty() && !line.starts_with('['))
+                .unwrap_or("");
+            format!("ran `{input}`: {}", cut_to(last.trim(), 120))
+        }
+        _ => format!("{name} {input}"),
+    }
+}
+
+/// What the person answers to go on with a turn past what it may spend.
+const GO_ON: &str = "Go on";
+
+/// What the person answers to stop it.
+const STOP_TURN: &str = "Stop this turn";
+
+/// What a chat's turn spent so far.
+#[derive(Default)]
+struct TurnSpend {
+    /// Its number, from 1, in this session.
+    number: u64,
+    /// What it spent, as far as prices are known.
+    total: Usd,
+    /// What each who spent in it spent: its agents, the reviewer, the
+    /// summaries.
+    by: BTreeMap<String, Spending>,
+    /// What it may spend before the person is asked again; none never.
+    ask_at: Option<Usd>,
+    /// Whether the person stopped it.
+    stopped: bool,
+}
+
+/// What one spent in a turn.
+#[derive(Default)]
+struct Spending {
+    model: String,
+    calls: u64,
+    spent: Usd,
+}
+
+impl TurnSpend {
+    /// What the person is asked once the turn of `chat` spent past what
+    /// it may: what each spent, on what, in how many calls, and the sum;
+    /// going on lets it spend `step` more.
+    fn question(&self, chat: &str, step: Usd) -> String {
+        let mut by: Vec<(&String, &Spending)> = self.by.iter().collect();
+        by.sort_by(|a, b| b.1.spent.0.total_cmp(&a.1.spent.0));
+        let detail: Vec<String> = by
+            .iter()
+            .map(|(who, spending)| {
+                let model = spending.model.rsplit('/').next().unwrap_or(&spending.model);
+                let calls = if spending.calls == 1 {
+                    "1 call".to_owned()
+                } else {
+                    format!("{} calls", spending.calls)
+                };
+                format!("{who} on {model}: {}, {calls}", spending.spent)
+            })
+            .collect();
+        format!(
+            "This turn of {chat}'s spent {}, past the {} it may before you are asked \
+             (turn_cost_ask). {}. Go on, until {}?",
+            self.total,
+            self.ask_at.unwrap_or_default(),
+            detail.join("; "),
+            self.total + step,
+        )
+    }
+}
+
+/// What was set aside of one agent, with where its conversation stands.
+#[derive(Default)]
+struct AsideLog {
+    /// Its turn under way, or its last.
+    turn: u64,
+    /// How many messages its conversation holds, as far as told.
+    messages: usize,
+    /// What was set aside, in order.
+    kept: Vec<Aside>,
+}
+
+/// A call to the provider that failed: why, in words, and what the
+/// provider said when it refused it.
+struct Failure {
+    said: String,
+    refusal: Option<iq_core::Refusal>,
+    /// Whether the provider stayed out of capacity through every try,
+    /// which `said` tells whole.
+    busy: bool,
 }
 
 /// The wakes an agent asked for: how many wait, and when it asked those of
@@ -364,6 +558,17 @@ struct Board {
     /// what an agent writes to an old one reaches it. A name given to an
     /// agent at work leads to the one it works under until its turn ends.
     aliases: HashMap<String, String>,
+    /// The agents retired, the latest last: done with their task, their
+    /// names free again.
+    retired: Vec<Retired>,
+}
+
+/// An agent retired: done with the task another gave it, it is off the
+/// board and its name free again. What writes to it by its name is told it
+/// finished, with its last answer.
+struct Retired {
+    name: String,
+    answer: String,
 }
 
 impl Board {
@@ -440,6 +645,24 @@ struct Member {
     prompt: Option<String>,
     /// Its last actions and how they ended, the latest last.
     done: VecDeque<String>,
+    /// What it wrote last in its turn under way, for the reviewer: its own
+    /// reason for the actions it calls after.
+    reason: Option<String>,
+    /// The calls to its model it made, over all its turns.
+    calls: u64,
+    /// What those cost, as far as their prices are known.
+    spent: Usd,
+    /// The team it works in, its first member first, which answers who
+    /// started the team; empty when it works alone.
+    team: Vec<String>,
+    /// Whether its answer reached who started it: done with its task.
+    answered: bool,
+    /// Whether what its conversation is measured against was said.
+    measured: bool,
+    /// The results of its tool calls set apart, whole, by their ids from 1.
+    set_apart: Vec<String>,
+    /// What its calls read when its old tool results were last set apart.
+    lightened: u64,
     /// The first message it has not read.
     read: usize,
     /// Its turn under way, when it works.
@@ -527,6 +750,10 @@ where
                 next_job: AtomicU64::new(1),
                 wakes: Mutex::new(HashMap::new()),
                 listed: Mutex::new(Vec::new()),
+                aside: Mutex::new(HashMap::new()),
+                writers: Mutex::new(Writers::default()),
+                turns: Mutex::new(HashMap::new()),
+                asking: Mutex::new(HashMap::new()),
                 posted: watch::Sender::new(0),
                 billed: Mutex::new(Usd(0.0)),
                 peer_wakes: Mutex::new(Vec::new()),
@@ -652,6 +879,13 @@ where
                     .then(|| member.place.gate.workspace().to_path_buf()),
                 context: member.context,
                 models_chosen: member.models_chosen.clone(),
+                calls: member.calls,
+                spent: member.spent,
+                set_apart: member.set_apart.clone(),
+                aside: lock(&self.inner.aside)
+                    .get(agent)
+                    .map(|log| log.kept.clone())
+                    .unwrap_or_default(),
                 messages,
             }
         };
@@ -716,6 +950,14 @@ where
                 written: saved.written,
                 prompt: None,
                 done: VecDeque::new(),
+                reason: None,
+                calls: saved.calls,
+                spent: saved.spent,
+                team: Vec::new(),
+                answered: false,
+                measured: false,
+                set_apart: saved.set_apart,
+                lightened: saved.context,
                 read,
                 turn: None,
                 turns: 0,
@@ -732,6 +974,17 @@ where
             },
         );
         drop(board);
+        let log = AsideLog {
+            turn: saved
+                .aside
+                .iter()
+                .map(|aside| aside.turn)
+                .max()
+                .unwrap_or(0),
+            messages: 0,
+            kept: saved.aside,
+        };
+        lock(&self.inner.aside).insert(name.clone(), log);
         self.report(Event::Joined {
             agent: name.clone(),
             model: model.to_string(),
@@ -1104,6 +1357,10 @@ where
             for image in images {
                 self.show(&name, image);
             }
+            // A chat the person starts begins its first turn.
+            if by == PERSON {
+                self.new_turn(&name);
+            }
             self.wake(&name, task);
         }
         name
@@ -1221,6 +1478,14 @@ where
                 written: (by == PERSON).then(now),
                 prompt: None,
                 done: VecDeque::new(),
+                reason: None,
+                calls: 0,
+                spent: Usd(0.0),
+                team: Vec::new(),
+                answered: false,
+                measured: false,
+                set_apart: Vec::new(),
+                lightened: 0,
                 read,
                 turn: None,
                 turns: 0,
@@ -1396,6 +1661,15 @@ where
             Placing::Given(Arc::clone(&place)),
             START_TEAM,
         );
+        // Each knows its team, which is done once its first answered.
+        {
+            let mut board = lock(&self.inner.board);
+            for name in &names {
+                if let Some(member) = board.members.get_mut(name) {
+                    member.team.clone_from(&names);
+                }
+            }
+        }
         if joined {
             self.wake(&lead, brief(0));
         }
@@ -1682,6 +1956,16 @@ where
     /// those it started, under the new name.
     fn moved(&self, agent: &str, new: &str) {
         lock(&self.inner.shown).remove(agent);
+        let mut aside = lock(&self.inner.aside);
+        if let Some(kept) = aside.remove(agent) {
+            aside.insert(new.to_owned(), kept);
+        }
+        drop(aside);
+        let mut wakes = lock(&self.inner.wakes);
+        if let Some(waiting) = wakes.remove(agent) {
+            wakes.insert(new.to_owned(), waiting);
+        }
+        drop(wakes);
         for team in lock(&self.inner.teams).iter_mut() {
             team.rename(agent, new);
         }
@@ -1916,6 +2200,17 @@ where
         let to = renamed.as_deref().unwrap_or(to);
         let wakes = {
             let mut board = lock(&self.inner.board);
+            if to != ALL
+                && to != PERSON
+                && !board.members.contains_key(to)
+                && let Some(retired) = board.retired.iter().rev().find(|r| r.name == to)
+            {
+                return Err(format!(
+                    "{to} finished its task and was retired: a message no longer reaches it. For \
+                     more, start a new agent, which may take its name. Its last answer:\n{}",
+                    cut_to(&retired.answer, RETIRED_ANSWER)
+                ));
+            }
             if to != ALL && to != PERSON && !board.members.contains_key(to) {
                 let names: Vec<&str> = board.members.keys().map(String::as_str).collect();
                 return Err(format!(
@@ -1966,9 +2261,24 @@ where
             (true, false, false) => false,
         };
         // Kept as the person writes, so that iq opens again on the chat
-        // they wrote to last.
+        // they wrote to last; a chat none of whose agents works begins a
+        // turn.
         if from == PERSON && to != ALL {
             self.keep(to);
+            let idle = {
+                let board = lock(&self.inner.board);
+                let chat = board.chat_of(to);
+                (
+                    chat.clone(),
+                    !board.members.iter().any(|(name, member)| {
+                        member.turn.as_ref().is_some_and(|turn| !turn.is_finished())
+                            && board.chat_of(name) == chat
+                    }),
+                )
+            };
+            if idle.1 {
+                self.new_turn(&idle.0);
+            }
         }
         self.inner.posted.send_modify(|count| *count += 1);
         self.report(Event::Posted {
@@ -2194,12 +2504,23 @@ where
             .get(posted_before..)
             .is_some_and(|new| new.iter().any(|m| m.from == name && m.to == by));
         let handled = self.after_turn(&name, &outcome);
+        let answered = by != PERSON && !handled && outcome.is_ok();
         if by != PERSON && !handled && !(wrote_back && outcome.is_ok()) {
             let text = match outcome {
                 Ok(text) => text,
-                Err(error) => format!("I stopped: {error}"),
+                // Told by iq: the agent that failed did not write it.
+                Err(error) => format!(
+                    "(iq: {name} stopped without answering: {error}. This is iq's account of \
+                     what happened, not {name}'s.)"
+                ),
             };
             let _ = self.post(&name, &by, text);
+        }
+        if answered {
+            if let Some(member) = lock(&self.inner.board).members.get_mut(&name) {
+                member.answered = true;
+            }
+            self.retire_done(&name);
         }
         // What the person wrote after its last look at the board.
         if self.person_waits(&name)
@@ -2207,6 +2528,305 @@ where
         {
             self.wake(&name, news);
         }
+    }
+
+    /// Retires `agent`, and its team with it, once done: the first of its
+    /// team (or itself, alone) answered who started it, and none of them
+    /// works, has a command running or a wake waiting, has a message it
+    /// did not read, was written to by the person, or started an agent
+    /// still on the board. Its starter may be done then too.
+    fn retire_done(&self, agent: &str) {
+        let (group, by) = {
+            let board = lock(&self.inner.board);
+            let Some(member) = board.members.get(agent) else {
+                return;
+            };
+            let group = if member.team.is_empty() {
+                vec![agent.to_owned()]
+            } else {
+                member.team.clone()
+            };
+            let Some(first) = board.members.get(&group[0]) else {
+                return;
+            };
+            if first.by == PERSON || !first.answered {
+                return;
+            }
+            let rests = |name: &String| {
+                board.members.get(name).is_some_and(|member| {
+                    member.turn.as_ref().is_none_or(JoinHandle::is_finished)
+                        && member.written.is_none()
+                        && !board.messages[member.read..]
+                            .iter()
+                            .any(|m| m.from != *name && (m.to == *name || m.to == ALL))
+                })
+            };
+            let starts_others = board
+                .members
+                .iter()
+                .any(|(name, member)| group.contains(&member.by) && !group.contains(name));
+            if starts_others || !group.iter().all(rests) {
+                return;
+            }
+            (group, first.by.clone())
+        };
+        let running = lock(&self.inner.jobs)
+            .values()
+            .any(|job| group.contains(&job.agent) && job.ended.is_none());
+        let waking = lock(&self.inner.wakes)
+            .iter()
+            .any(|(name, wakes)| group.contains(name) && wakes.waiting > 0);
+        if running || waking {
+            return;
+        }
+        for name in &group {
+            self.retire(name);
+        }
+        if by != PERSON {
+            self.retire_done(&by);
+        }
+    }
+
+    /// Takes `agent` off the board, done: its name free again, its chat
+    /// file kept apart, as long as its chat's.
+    fn retire(&self, agent: &str) {
+        {
+            let mut board = lock(&self.inner.board);
+            let Some(member) = board.members.remove(agent) else {
+                return;
+            };
+            let answer = member
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::Assistant {
+                        content: Some(text),
+                        ..
+                    } if !text.trim().is_empty() => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            board.aliases.retain(|_, to| to != agent);
+            board.retired.push(Retired {
+                name: agent.to_owned(),
+                answer,
+            });
+        }
+        if let Some(keeper) = lock(&self.inner.keeper).clone() {
+            keeper.retire(agent);
+        }
+        lock(&self.inner.aside).remove(agent);
+        lock(&self.inner.refused).remove(agent);
+        lock(&self.inner.wakes).remove(agent);
+        self.report(Event::Retired {
+            agent: agent.to_owned(),
+        });
+    }
+
+    /// Notes that `agent` wrote where it works, and tells the person, once
+    /// for two chats, when another chat of this session wrote there lately:
+    /// two chats in one checkout may undo each other's changes.
+    fn wrote(&self, agent: &str) {
+        let (chat, folder) = {
+            let board = lock(&self.inner.board);
+            let Some(member) = board.members.get(agent) else {
+                return;
+            };
+            (
+                board.chat_of(agent),
+                member.place.gate.workspace().to_path_buf(),
+            )
+        };
+        let now = Instant::now();
+        let mut writers = lock(&self.inner.writers);
+        let Writers { lately, told } = &mut *writers;
+        let wrote = lately.entry(folder.clone()).or_default();
+        wrote.retain(|_, at| now.duration_since(*at) < LATELY);
+        let others: Vec<(String, Duration)> = wrote
+            .iter()
+            .filter(|(other, _)| **other != chat)
+            .filter(|(other, _)| {
+                let pair = pair_of(&chat, other);
+                !told.contains(&pair)
+            })
+            .map(|(other, at)| (other.clone(), now.duration_since(*at)))
+            .collect();
+        wrote.insert(chat.clone(), now);
+        for (other, _) in &others {
+            told.insert(pair_of(&chat, other));
+        }
+        drop(writers);
+        for (other, ago) in others {
+            self.report(Event::Notice {
+                agent: chat.clone(),
+                text: format!(
+                    "the chat {other} wrote in {} {} ago, as this one does now: two chats in one \
+                     checkout may undo each other's changes. Let one finish first, or give the \
+                     next a worktree of its own (worktree = true)",
+                    folder.display(),
+                    lasted(ago),
+                ),
+            });
+        }
+    }
+
+    /// Reports the call of `agent`'s to `model` that `failed`, its turn
+    /// with it, with where it stood (its last call's size and `added`
+    /// since, what it spent until then), and gives what iq says of it: the
+    /// facts, to be told as iq's, not left to an agent to tell.
+    fn failed(&self, agent: &str, model: &ModelId, failed: Failure, added: &[Message]) -> String {
+        let (context, calls, spent) = lock(&self.inner.board)
+            .members
+            .get(agent)
+            .map_or((0, 0, Usd(0.0)), |member| {
+                (member.context, member.calls, member.spent)
+            });
+        // About four characters a token: what was added since the last
+        // call that answered, which said how much it read.
+        let added: usize = added
+            .iter()
+            .map(|message| serde_json::to_string(message).map_or(0, |text| text.len()))
+            .sum();
+        let context = context + u64::try_from(added / 4).unwrap_or(u64::MAX);
+        let (status, message) = match &failed.refusal {
+            Some(refusal) => (Some(refusal.status), refusal.message.clone()),
+            None => (None, failed.said.clone()),
+        };
+        let said = match &failed.refusal {
+            _ if failed.busy => failed.said.clone(),
+            Some(refusal) => format!(
+                "the provider refused its call to {model}, answering HTTP {}: \"{}\"",
+                refusal.status, refusal.message
+            ),
+            None => format!("its call to {model} failed: {}", failed.said),
+        };
+        self.report(Event::Failed {
+            agent: agent.to_owned(),
+            model: model.to_string(),
+            status,
+            message,
+            context,
+            calls,
+            spent,
+        });
+        let made = if calls == 1 {
+            "1 call".to_owned()
+        } else {
+            format!("{calls} calls")
+        };
+        format!(
+            "{said}. The call held about {} tokens; {agent} had made {made} before it, for {spent}",
+            TokenCount(context)
+        )
+    }
+
+    /// Says, once, what `agent`'s conversation on `model` is measured
+    /// against: where its price rises, the most it reads.
+    async fn measure(&self, agent: &str, model: &ModelId) {
+        let first = lock(&self.inner.board)
+            .members
+            .get_mut(agent)
+            .is_some_and(|member| !std::mem::replace(&mut member.measured, true));
+        if !first {
+            return;
+        }
+        let rises = self
+            .inner
+            .provider
+            .pricing(model)
+            .await
+            .and_then(|pricing| pricing.rises_at())
+            .map(|rises| rises.0);
+        let most = self.inner.provider.context_window(model).await;
+        self.report(Event::Window {
+            agent: agent.to_owned(),
+            rises,
+            most,
+        });
+    }
+
+    /// Stops the job `id`, as the person asks: its agent is woken with how
+    /// it ended.
+    pub fn stop_job(&self, id: u64) {
+        let stopped = {
+            let mut jobs = lock(&self.inner.jobs);
+            jobs.get_mut(&id).and_then(|job| {
+                let task = job.running.take()?;
+                task.abort();
+                Some((job.agent.clone(), job.line.clone()))
+            })
+        };
+        if let Some((agent, line)) = stopped {
+            self.job_ended(&agent, id, &line, "stopped by the person".to_owned());
+        }
+    }
+
+    /// Sets apart `agent`'s old tool results in `messages`, once its calls
+    /// read past what the settings say, and again each time they grew as
+    /// much: all but the latest few, and those long enough to matter, each
+    /// replaced by a line that says what it was and the id `reread` reads
+    /// it again under. At once rather than a few at each call, so that the
+    /// start of the conversation, which the provider caches, changes
+    /// seldom. Gives what the person is told of it, when it did.
+    fn lighten(&self, agent: &str, messages: &mut [Message]) -> Option<String> {
+        let step = self.inner.settings.light_from;
+        let mut board = lock(&self.inner.board);
+        let member = board.members.get_mut(agent)?;
+        if step == 0 || member.context < step || member.context < member.lightened + step {
+            return None;
+        }
+        let results: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| matches!(message, Message::Tool { .. }))
+            .map(|(at, _)| at)
+            .collect();
+        let older = &results[..results.len().saturating_sub(LIGHT_KEPT)];
+        let (mut count, mut chars) = (0, 0);
+        for &at in older {
+            let Message::Tool { call_id, content } = &messages[at] else {
+                continue;
+            };
+            if content.chars().count() < LIGHT_LEAST || content.starts_with(SET_APART) {
+                continue;
+            }
+            let call = messages[..at]
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::Assistant { tool_calls, .. } => {
+                        tool_calls.iter().find(|call| call.id == *call_id)
+                    }
+                    _ => None,
+                });
+            let what = call.map_or_else(
+                || "a tool's result".to_owned(),
+                |call| what_it_was(&call.name, &call.arguments, content),
+            );
+            member.set_apart.push(content.clone());
+            let id = member.set_apart.len();
+            let size = content.chars().count();
+            let line = format!(
+                "{SET_APART} {what}, {size} characters. `reread` with id {id} reads it again \
+                 whole.)"
+            );
+            count += 1;
+            chars += size;
+            if let Message::Tool { content, .. } = &mut messages[at] {
+                *content = line;
+            }
+        }
+        if count > 0 {
+            member.lightened = member.context;
+        }
+        (count > 0).then(|| {
+            format!(
+                "set apart {count} of its old tool results, about {} tokens, to keep its \
+                 conversation light: a line says what each was, and `reread` reads it again",
+                TokenCount(u64::try_from(chars / 4).unwrap_or(u64::MAX))
+            )
+        })
     }
 
     /// What `agent` on `model` is told of its conversation's size, once it
@@ -2245,7 +2865,7 @@ where
         &self,
         agent: &str,
         request: &ChatRequest,
-    ) -> Result<iq_core::ChatResponse, String> {
+    ) -> Result<iq_core::ChatResponse, Failure> {
         let settings = &self.inner.settings;
         let started = Instant::now();
         let mut wait = settings.busy_wait;
@@ -2264,18 +2884,27 @@ where
                 Err(error) => error,
             };
             let Some(busy) = self.inner.provider.busy(&error) else {
-                return Err(chain(&error));
+                return Err(Failure {
+                    said: chain(&error),
+                    refusal: self.inner.provider.refusal(&error),
+                    busy: false,
+                });
             };
             let said = cut_to(&chain(&error), BUSY_SAID);
             if tries >= settings.busy_tries {
-                return Err(format!(
-                    "the provider of {} stayed out of capacity for {}, through {} tries ({said}). \
+                let refusal = self.inner.provider.refusal(&error);
+                return Err(Failure {
+                    refusal,
+                    busy: true,
+                    said: format!(
+                        "the provider of {} stayed out of capacity for {}, through {} tries ({said}). \
                      The conversation is kept: write to the agent to try again later, or give \
                      the task to an agent on another model",
-                    request.model,
-                    lasted(started.elapsed()),
-                    tries + 1,
-                ));
+                        request.model,
+                        lasted(started.elapsed()),
+                        tries + 1,
+                    ),
+                });
             }
             tries += 1;
             let delay = busy
@@ -2318,7 +2947,13 @@ where
         prompt: String,
         number: u64,
     ) -> (Vec<Message>, Result<String, String>) {
+        // What the last call that answered read: all but the answer it
+        // gave, which is read from the next.
+        let mut counted = messages.len().saturating_sub(1);
         messages.push(Message::user(prompt));
+        if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
+            member.reason = None;
+        }
         let mut urged = false;
         for _ in 0..self.inner.settings.steps {
             if let Some(news) = self.unread(name) {
@@ -2326,6 +2961,12 @@ where
             }
             if let Some(note) = self.context_note(name, model).await {
                 messages.push(Message::user(note));
+            }
+            if let Some(said) = self.lighten(name, &mut messages) {
+                self.report(Event::Notice {
+                    agent: name.to_owned(),
+                    text: said,
+                });
             }
             // What it is shown: after its prompt or its tools' results.
             if let Some(images) = lock(&self.inner.images).remove(name) {
@@ -2347,10 +2988,19 @@ where
                 tools,
                 effort,
             };
+            self.set_length(name, messages.len());
+            if let Err(stopped) = self.within_turn(name).await {
+                return (messages, Err(stopped));
+            }
+            self.measure(name, model).await;
             let response = match self.ask_model(name, &request).await {
                 Ok(response) => response,
-                Err(error) => return (messages, Err(error)),
+                Err(failed) => {
+                    let said = self.failed(name, model, failed, &messages[counted..]);
+                    return (messages, Err(said));
+                }
             };
+            counted = messages.len();
             let cost = match response.cost {
                 Some(cost) => Some(cost),
                 None => self
@@ -2360,9 +3010,13 @@ where
                     .await
                     .map(|pricing| pricing.cost(&response.usage)),
             };
-            self.spent(name, model.as_str(), response.usage, cost);
+            self.spent(name, name, model.as_str(), &response, cost);
             if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
                 member.context = response.usage.input.0;
+                member.calls += 1;
+                if let Some(cost) = cost {
+                    member.spent += cost;
+                }
             }
             let said = response
                 .content
@@ -2390,6 +3044,11 @@ where
                 continue;
             }
             messages.push(response.to_message());
+            if let Some(text) = response.content.as_ref().filter(|t| !t.trim().is_empty())
+                && let Some(member) = lock(&self.inner.board).members.get_mut(name)
+            {
+                member.reason = Some(text.clone());
+            }
             if let Some(text) = response.content.as_ref().filter(|t| !t.trim().is_empty()) {
                 self.report(Event::TextStart {
                     agent: name.to_owned(),
@@ -2402,6 +3061,7 @@ where
             if response.tool_calls.is_empty() {
                 return (messages, Ok(response.content.unwrap_or_default()));
             }
+            self.set_length(name, messages.len());
             for call in &response.tool_calls {
                 let content = self.call(name, call).await;
                 messages.push(Message::Tool {
@@ -2409,6 +3069,7 @@ where
                     content,
                 });
             }
+            self.set_length(name, messages.len());
             // Its calls answered, the turn is kept as it stands.
             self.keep_turn(name, number, &messages);
         }
@@ -2434,6 +3095,9 @@ where
             Ok(output) => (output, true),
             Err(error) => (format!("Error: {error}"), false),
         };
+        if ok && WRITERS.contains(&call.name.as_str()) {
+            self.wrote(agent);
+        }
         if let Some(done) = review::done(&call.name, &input, &output, ok)
             && let Some(member) = lock(&self.inner.board).members.get_mut(agent)
         {
@@ -2599,6 +3263,19 @@ where
             "job" => {
                 let id = args.number("id").ok_or("`id` names the job")?;
                 Ok(self.job(agent, id, args.flag("stop")))
+            }
+            "reread" => {
+                let id = args.number("id").ok_or("`id` names the result")?;
+                lock(&self.inner.board)
+                    .members
+                    .get(agent)
+                    .and_then(|member| {
+                        member
+                            .set_apart
+                            .get(usize::try_from(id).ok()?.checked_sub(1)?)
+                            .cloned()
+                    })
+                    .ok_or_else(|| format!("no result was set apart under the id {id}"))
             }
             "wake_me" => {
                 let seconds = args.number("seconds").unwrap_or(60).clamp(10, 3600);
@@ -2891,10 +3568,40 @@ where
             id,
             line: line.clone(),
         });
+        self.follow_job(agent, id);
         format!(
             "Job {id} runs `{line}` in the background. `job` with id {id} reads its output so \
              far or stops it; you are woken when it ends."
         )
+    }
+
+    /// Says the latest lines the job `id` of `agent`'s wrote, as they
+    /// change, at most twice a second, until it ends.
+    fn follow_job(&self, agent: &str, id: u64) {
+        let crew = self.clone();
+        let agent = agent.to_owned();
+        tokio::spawn(async move {
+            let mut said: Vec<String> = Vec::new();
+            loop {
+                tokio::time::sleep(JOB_FOLLOWED).await;
+                let tail = {
+                    let jobs = lock(&crew.inner.jobs);
+                    match jobs.get(&id) {
+                        Some(job) if job.ended.is_none() => job.live.so_far(JOB_SHOWN),
+                        _ => return,
+                    }
+                };
+                let tail = last_lines(&tail, JOB_TAIL);
+                if tail != said {
+                    said.clone_from(&tail);
+                    crew.report(Event::JobOutput {
+                        agent: agent.clone(),
+                        id,
+                        tail,
+                    });
+                }
+            }
+        });
     }
 
     /// Writes down how the job `id` of `agent`'s ended, and wakes it with
@@ -2916,6 +3623,7 @@ where
             agent: agent.to_owned(),
             id,
             said: said.clone(),
+            output: last.clone(),
         });
         self.iq_says(
             agent,
@@ -2988,6 +3696,8 @@ where
         let name = agent.to_owned();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(seconds)).await;
+            // Under the name it has now, if it was given another.
+            let name = lock(&crew.inner.board).named(&name).unwrap_or(name);
             if let Some(wakes) = lock(&crew.inner.wakes).get_mut(&name) {
                 wakes.waiting = wakes.waiting.saturating_sub(1);
             }
@@ -3029,27 +3739,9 @@ where
     /// kept with what they asked of `agent`, so that the reviewer reads a
     /// "yes" with the question it answered.
     async fn ask_person(&self, agent: &str, question: String, choices: Vec<String>) -> String {
-        let id = self.inner.next_question.fetch_add(1, Ordering::Relaxed);
-        let (reply, answer) = oneshot::channel();
-        lock(&self.inner.choices).insert(id, reply);
-        self.report(Event::Choose {
-            id,
-            agent: agent.to_owned(),
-            question: question.clone(),
-            choices: choices.clone(),
-        });
-        let answer = tokio::time::timeout(self.inner.settings.patience, answer)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
-            .map(|a| a.trim().to_owned())
-            .filter(|a| !a.is_empty());
-        lock(&self.inner.choices).remove(&id);
-        self.report(Event::Chosen {
-            id,
-            answer: answer.clone(),
-        });
+        let answer = self
+            .choose_of(agent, question.clone(), choices.clone())
+            .await;
         match answer {
             Some(answer) => {
                 if let Some(member) = lock(&self.inner.board).members.get_mut(agent) {
@@ -3067,6 +3759,39 @@ where
                      needed to know."
                 .to_owned(),
         }
+    }
+
+    /// Asks the person, for `agent`, to choose among `choices` or answer in
+    /// their own words, and gives their answer; none when they gave none in
+    /// time.
+    async fn choose_of(
+        &self,
+        agent: &str,
+        question: String,
+        choices: Vec<String>,
+    ) -> Option<String> {
+        let id = self.inner.next_question.fetch_add(1, Ordering::Relaxed);
+        let (reply, answer) = oneshot::channel();
+        lock(&self.inner.choices).insert(id, reply);
+        self.report(Event::Choose {
+            id,
+            agent: agent.to_owned(),
+            question,
+            choices,
+        });
+        let answer = tokio::time::timeout(self.inner.settings.patience, answer)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .map(|a| a.trim().to_owned())
+            .filter(|a| !a.is_empty());
+        lock(&self.inner.choices).remove(&id);
+        self.report(Event::Chosen {
+            id,
+            answer: answer.clone(),
+        });
+        answer
     }
 
     /// Writes a refusal of `agent`'s action to the audit log; one that
@@ -3129,6 +3854,7 @@ where
                 asked: member.asked.clone(),
                 prompt: member.prompt.clone(),
                 done: member.done.iter().cloned().collect(),
+                reason: member.reason.clone(),
             })
             .unwrap_or_default();
         let prompt = review::prompt(&work, action, place, reason, does);
@@ -3152,7 +3878,10 @@ where
             tools: Vec::new(),
             effort: Some(self.inner.settings.reviewer_effort),
         };
-        let response = self.ask_model(agent, &request).await?;
+        let response = self
+            .ask_model(agent, &request)
+            .await
+            .map_err(|failed| failed.said)?;
         let cost = match response.cost {
             Some(cost) => Some(cost),
             None => self
@@ -3162,7 +3891,7 @@ where
                 .await
                 .map(|pricing| pricing.cost(&response.usage)),
         };
-        self.spent("reviewer", model.as_str(), response.usage, cost);
+        self.spent(agent, "reviewer", model.as_str(), &response, cost);
         let answer = response.content.unwrap_or_default();
         Ok(review::verdict(&answer))
     }
@@ -3182,23 +3911,287 @@ where
         self.inner.place.gate.set_reviewer_host(may);
     }
 
-    fn spent(&self, agent: &str, model: &str, usage: iq_core::Usage, cost: Option<Usd>) {
+    /// Reports a call of `agent`'s (or the reviewer's for it, as `who`)
+    /// to `model`, counted in its chat's turn.
+    fn spent(
+        &self,
+        agent: &str,
+        who: &str,
+        model: &str,
+        response: &iq_core::ChatResponse,
+        cost: Option<Usd>,
+    ) {
         if let Some(cost) = cost {
             *lock(&self.inner.billed) += cost;
         }
-        self.report(Event::Spent {
-            agent: agent.to_owned(),
+        let chat = lock(&self.inner.board).chat_of(agent);
+        let event = Event::Spent {
+            agent: who.to_owned(),
             model: model.to_owned(),
-            usage,
+            usage: response.usage,
             cost,
+            cache: response.cache,
+            chat: Some(chat),
+        };
+        self.count(&event);
+        self.report(event);
+    }
+
+    /// Counts a call that served a chat in its turn: one of the crew's, or
+    /// one made beside it, as the summaries of the agents' messages are.
+    pub fn count(&self, event: &Event) {
+        let Event::Spent {
+            agent,
+            model,
+            cost,
+            chat: Some(chat),
+            ..
+        } = event
+        else {
+            return;
+        };
+        let mut turns = lock(&self.inner.turns);
+        let turn = turns.entry(chat.clone()).or_default();
+        let spending = turn.by.entry(agent.clone()).or_default();
+        spending.model.clone_from(model);
+        spending.calls += 1;
+        if let Some(cost) = cost {
+            spending.spent += *cost;
+            turn.total += *cost;
+        }
+    }
+
+    /// Begins a turn of `chat`'s: the person wrote to it while none of its
+    /// agents worked. What it spends is counted from here, and the person
+    /// asked again once it reaches the settings' sum.
+    fn new_turn(&self, chat: &str) {
+        let number = {
+            let mut turns = lock(&self.inner.turns);
+            let turn = turns.entry(chat.to_owned()).or_default();
+            let number = turn.number + 1;
+            *turn = TurnSpend {
+                number,
+                ask_at: self.inner.settings.turn_ask,
+                ..TurnSpend::default()
+            };
+            number
+        };
+        self.report(Event::Turn {
+            chat: chat.to_owned(),
+            number,
+            ask_at: self.inner.settings.turn_ask,
         });
     }
 
+    /// Whether `agent` may call its model again in its chat's turn: past
+    /// what the settings let a turn spend, the person is asked first, once
+    /// for all the chat's agents, with what each spent. Gone on, they are
+    /// asked again once it spends as much more; stopped, every agent of
+    /// the chat stops at its next call, until the person writes again.
+    async fn within_turn(&self, agent: &str) -> Result<(), String> {
+        let Some(step) = self.inner.settings.turn_ask else {
+            return Ok(());
+        };
+        let chat = lock(&self.inner.board).chat_of(agent);
+        let asking = Arc::clone(lock(&self.inner.asking).entry(chat.clone()).or_default());
+        let _asking = asking.lock().await;
+        let (question, total) = {
+            let turns = lock(&self.inner.turns);
+            let Some(turn) = turns.get(&chat) else {
+                return Ok(());
+            };
+            if turn.stopped {
+                return Err(format!(
+                    "the person stopped this turn of {chat}'s once it spent {}",
+                    turn.total
+                ));
+            }
+            match turn.ask_at {
+                Some(at) if turn.total.0 >= at.0 => (turn.question(&chat, step), turn.total),
+                _ => return Ok(()),
+            }
+        };
+        let answer = self
+            .choose_of(
+                &chat,
+                question,
+                vec![GO_ON.to_owned(), STOP_TURN.to_owned()],
+            )
+            .await;
+        let go_on = answer
+            .as_deref()
+            .is_some_and(|said| said == GO_ON || said.to_lowercase().starts_with("go"));
+        let mut turns = lock(&self.inner.turns);
+        let turn = turns.entry(chat.clone()).or_default();
+        if go_on {
+            turn.ask_at = Some(total + step);
+            let said = Event::Turn {
+                chat: chat.clone(),
+                number: turn.number,
+                ask_at: turn.ask_at,
+            };
+            drop(turns);
+            self.report(said);
+            Ok(())
+        } else {
+            turn.stopped = true;
+            Err(format!(
+                "the person stopped this turn of {chat}'s once it spent {total}"
+            ))
+        }
+    }
+
     fn report(&self, mut event: Event) {
+        self.set_aside(&event);
         for (name, shown) in lock(&self.inner.shown).iter() {
             event.rename(name, shown);
         }
         (self.inner.report)(event);
+    }
+
+    /// Keeps what `event` shows the person of an agent beside its
+    /// conversation, to be kept with its chat: a notice, a question, an
+    /// action asked or answered for them, an error; and the answers to
+    /// those asked before. Counts its turns.
+    fn set_aside(&self, event: &Event) {
+        let mut aside = lock(&self.inner.aside);
+        let (agent, shown) = match event {
+            Event::Working { agent, .. } => {
+                aside.entry(agent.clone()).or_default().turn += 1;
+                return;
+            }
+            Event::Chosen { id, answer } => {
+                for log in aside.values_mut() {
+                    for kept in log.kept.iter_mut().rev() {
+                        if let Shown::Question {
+                            id: asked,
+                            answered,
+                            answer: given,
+                            ..
+                        } = &mut kept.shown
+                            && asked == id
+                        {
+                            *answered = true;
+                            given.clone_from(answer);
+                            return;
+                        }
+                    }
+                }
+                return;
+            }
+            Event::Answered { id, approved } => {
+                for log in aside.values_mut() {
+                    for kept in log.kept.iter_mut().rev() {
+                        if let Shown::Asked {
+                            id: asked,
+                            approved: given,
+                            ..
+                        } = &mut kept.shown
+                            && asked == id
+                        {
+                            *given = Some(*approved);
+                            return;
+                        }
+                    }
+                }
+                return;
+            }
+            Event::Notice { agent, text } => (agent, Shown::Notice { text: text.clone() }),
+            Event::Choose {
+                id,
+                agent,
+                question,
+                choices,
+            } => (
+                agent,
+                Shown::Question {
+                    id: *id,
+                    question: question.clone(),
+                    choices: choices.clone(),
+                    answered: false,
+                    answer: None,
+                },
+            ),
+            Event::Asked {
+                id,
+                agent,
+                action,
+                reason,
+                ..
+            } => (
+                agent,
+                Shown::Asked {
+                    id: *id,
+                    action: action.clone(),
+                    reason: reason.clone(),
+                    approved: None,
+                },
+            ),
+            Event::Reviewed {
+                agent,
+                action,
+                approved,
+                why,
+                ..
+            } => (
+                agent,
+                Shown::Reviewed {
+                    action: action.clone(),
+                    approved: *approved,
+                    why: why.clone(),
+                },
+            ),
+            Event::Failed {
+                agent,
+                model,
+                status,
+                message,
+                context,
+                calls,
+                spent,
+            } => (
+                agent,
+                Shown::Failed {
+                    model: model.clone(),
+                    status: *status,
+                    message: message.clone(),
+                    context: *context,
+                    calls: *calls,
+                    spent: *spent,
+                },
+            ),
+            Event::Done {
+                agent,
+                outcome: Err(text),
+            } => {
+                // A failed call was kept already, with what it said.
+                let log = aside.entry(agent.clone()).or_default();
+                if log.kept.last().is_some_and(|last| {
+                    last.turn == log.turn && matches!(last.shown, Shown::Failed { .. })
+                }) {
+                    return;
+                }
+                (agent, Shown::Error { text: text.clone() })
+            }
+            _ => return,
+        };
+        let log = aside.entry(agent.clone()).or_default();
+        let (turn, after) = (log.turn, log.messages);
+        log.kept.push(Aside {
+            at: now(),
+            turn,
+            after,
+            shown,
+        });
+    }
+
+    /// Says that `agent`'s conversation holds `messages` now, for what is
+    /// set aside next to stand after them.
+    fn set_length(&self, agent: &str, messages: usize) {
+        lock(&self.inner.aside)
+            .entry(agent.to_owned())
+            .or_default()
+            .messages = messages;
     }
 
     /// The standing instructions of one of iq's agents, working in
@@ -3617,6 +4610,7 @@ fn compacted(
         kept.push(Message::Assistant {
             content: Some(answer.clone()),
             tool_calls: Vec::new(),
+            reasoning_signature: None,
         });
     }
     kept
@@ -3843,6 +4837,15 @@ mod tests {
         assert!(wakes.ask(at).unwrap_err().contains("within the hour"));
         // An hour on, it may again.
         assert!(wakes.ask(at + Duration::from_secs(3600)).is_ok());
+    }
+
+    #[test]
+    fn a_job_s_latest_lines_are_those_that_hold_something_as_they_stand() {
+        let text = "build\n\n  10%\r  50%\r 100%\nok\n   \n";
+        assert_eq!(last_lines(text, 10), ["build", " 100%", "ok"]);
+        assert_eq!(last_lines(text, 2), [" 100%", "ok"]);
+        let long = "x".repeat(JOB_LINE_CHARS + 50);
+        assert_eq!(last_lines(&long, 1)[0].chars().count(), JOB_LINE_CHARS);
     }
 
     #[test]

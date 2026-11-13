@@ -121,6 +121,60 @@ pub(super) fn lines(seen: &Seen<'_>) -> (Vec<Line<'static>>, Option<usize>) {
                     ));
                 }
             }
+            // A job folded: what it does, how it ended; unfolded, its
+            // command whole and the end of its output.
+            Entry::Ran(ran) => {
+                let colour = if ran.said == "exit status 0" {
+                    p.ok
+                } else {
+                    p.warn
+                };
+                head.extend([
+                    Span::styled("⚙ ", p.fg(colour)),
+                    Span::styled(
+                        ran.agent.clone(),
+                        p.fg(agent_tint(seen.board, &ran.agent, p)),
+                    ),
+                    Span::styled(format!("  job {} · {}", ran.job, ran.said), p.fg(p.faint)),
+                ]);
+                lines.push(Line::from(head));
+                let indent = [Span::raw("    ")];
+                if whole {
+                    for line in ran.line.lines() {
+                        lines.extend(wrap(
+                            &[Span::styled(short(line), p.fg(p.text))],
+                            width,
+                            &indent,
+                            &indent,
+                        ));
+                    }
+                    if !ran.output.trim().is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            "    the end of its output:",
+                            p.fg(p.faint),
+                        )));
+                    }
+                    for line in ran
+                        .output
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .take(OUTPUT_LINES)
+                    {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", cut(&short(line), width.saturating_sub(4))),
+                            p.fg(p.dim),
+                        )));
+                    }
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "    {}",
+                            iq_ui::shell::few_words(&ran.line, width.saturating_sub(4))
+                        ),
+                        p.fg(p.dim),
+                    )));
+                }
+            }
         }
     }
     if entries.is_empty() {
@@ -151,6 +205,9 @@ mod tests {
             width: 80,
             images: false,
             summed,
+            motion: &crate::motion::Motion::default(),
+            labels: &|_| None,
+            writing: &|_| None,
         };
         let (lines, focus) = lines(&seen);
         (

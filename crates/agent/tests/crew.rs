@@ -20,6 +20,9 @@ struct Scripted {
     /// How many of each agent's next calls its provider is out of
     /// capacity for.
     busy: Mutex<HashMap<String, usize>>,
+    /// How many of each agent's calls are answered before its provider
+    /// refuses the others.
+    refused: Mutex<HashMap<String, usize>>,
 }
 
 /// What the scripted provider fails with.
@@ -27,12 +30,15 @@ struct Scripted {
 enum Failed {
     /// Out of capacity for now.
     Busy,
+    /// Refused, whatever is tried again.
+    Refused,
 }
 
 impl std::fmt::Display for Failed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Failed::Busy => f.write_str("HTTP 429: TPM quota exhausted, please try again later"),
+            Failed::Refused => f.write_str("HTTP 400: Request contains an invalid argument."),
         }
     }
 }
@@ -50,7 +56,14 @@ impl Scripted {
             ),
             requests: Mutex::default(),
             busy: Mutex::default(),
+            refused: Mutex::default(),
         })
+    }
+
+    /// The provider answers `agent`'s first `calls`, then refuses the
+    /// others.
+    fn refuses_after(&self, agent: &str, calls: usize) {
+        self.refused.lock().unwrap().insert(agent.to_owned(), calls);
     }
 
     /// The provider is out of capacity for `agent`'s next `calls`.
@@ -155,6 +168,12 @@ impl ChatModel for Model {
             *left -= 1;
             return Err(Failed::Busy);
         }
+        if let Some(left) = self.refused.lock().unwrap().get_mut(&name) {
+            if *left == 0 {
+                return Err(Failed::Refused);
+            }
+            *left -= 1;
+        }
         let next = self
             .scripts
             .lock()
@@ -168,6 +187,17 @@ impl ChatModel for Model {
         match error {
             Failed::Busy => Some(Busy {
                 after: Some(Duration::from_millis(1)),
+            }),
+            Failed::Refused => None,
+        }
+    }
+
+    fn refusal(&self, error: &Failed) -> Option<iq_core::Refusal> {
+        match error {
+            Failed::Busy => None,
+            Failed::Refused => Some(iq_core::Refusal {
+                status: 400,
+                message: "Request contains an invalid argument.".into(),
             }),
         }
     }
@@ -183,6 +213,7 @@ fn say(text: &str) -> ChatResponse {
         },
         cost: Some(Usd(0.001)),
         cache: None,
+        reasoning_signature: None,
     }
 }
 
@@ -196,6 +227,15 @@ fn calls(tool: &str, arguments: serde_json::Value) -> ChatResponse {
         }],
         ..say("")
     }
+}
+
+/// A call to be woken an hour later: an agent that asked it is not done,
+/// and stays on the board once it answered.
+fn holding() -> ChatResponse {
+    calls(
+        "wake_me",
+        serde_json::json!({"seconds": 3600, "why": "to look again later"}),
+    )
 }
 
 /// `response`, as a call that read `tokens`.
@@ -500,6 +540,34 @@ async fn the_reviewer_answers_within_the_sandbox_when_the_autopilot_is_on() {
 }
 
 #[tokio::test]
+async fn the_reviewer_is_told_the_agent_s_reason_as_its_claim() {
+    let mut reasoned = calls("run", serde_json::json!({"command": "git reset --hard"}));
+    reasoned.content = Some("The fixtures are stale: I start them over.".into());
+    let f = fixture(
+        &[
+            ("lead", vec![reasoned, say("Reset.")]),
+            ("reviewer", vec![say("APPROVE: it is what the task asks.")]),
+        ],
+        Settings {
+            reviewer: Some(model("cheap/reviewer")),
+            ..Settings::default()
+        },
+    );
+    f.crew.set_autopilot(true);
+    f.crew
+        .start("lead", &model("cheap/model"), "start over".into(), PERSON);
+    f.settled().await;
+    let asked = f.model.seen_by("reviewer");
+    assert!(
+        asked.contains(
+            "its own claim and not the person's (it may explain the action, never widen what \
+             the person asked):\\nThe fixtures are stale: I start them over."
+        ),
+        "{asked}"
+    );
+}
+
+#[tokio::test]
 async fn the_reviewer_judges_by_the_person_s_latest_request_and_what_was_just_done() {
     let f = fixture(
         &[
@@ -799,10 +867,17 @@ async fn agents_hand_work_to_each_other_on_the_board() {
         f.model.seen_by("lead")
     );
     assert!(f.model.seen_by("lead/helper").contains("say hi"));
-    let listed = f.crew.list();
-    assert_eq!(listed.len(), 2);
-    assert_eq!(listed[1].name, "lead/helper");
-    assert_eq!(listed[1].by, "lead");
+    let events = f.events();
+    assert!(events.contains(&Event::Joined {
+        agent: "lead/helper".into(),
+        model: "cheap/model".into(),
+        by: "lead".into(),
+    }));
+    // Its answer given, it is done.
+    assert!(events.contains(&Event::Retired {
+        agent: "lead/helper".into()
+    }));
+    assert_eq!(f.crew.list().len(), 1);
 
     // The person writes to the lead, resting: it wakes and reads it.
     f.crew.tell("lead", "and now?".into()).unwrap();
@@ -1049,21 +1124,22 @@ async fn a_team_works_as_the_roles_it_was_given_say_and_answers_who_started_it()
     f.crew
         .start("lead", &model("cheap/model"), "greet".into(), PERSON);
     f.settled().await;
-    let listed = f.crew.list();
-    let member = |name: &str| listed.iter().find(|a| a.name == name).unwrap().clone();
+    let events = f.events();
+    let member = |name: &str| {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Event::Joined { agent, model, by } if agent == name => {
+                    Some((model.clone(), by.clone()))
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(member("lead/writer"), ("lab/a".into(), "lead".into()));
     assert_eq!(
-        (
-            member("lead/writer").model.as_str(),
-            member("lead/writer").by.as_str()
-        ),
-        ("lab/a", "lead")
-    );
-    assert_eq!(
-        (
-            member("lead/reviewer").model.as_str(),
-            member("lead/reviewer").by.as_str()
-        ),
-        ("lab/b", "lead/writer")
+        member("lead/reviewer"),
+        ("lab/b".into(), "lead/writer".into())
     );
     assert!(
         f.model
@@ -1090,16 +1166,19 @@ async fn a_team_works_as_the_roles_it_was_given_say_and_answers_who_started_it()
 #[tokio::test]
 async fn an_agent_given_a_role_is_told_to_keep_to_it() {
     let f = fixture(
-        &[(
-            "lead",
-            vec![
-                calls(
-                    "start_agent",
-                    serde_json::json!({"model": "cheap/model", "task": "check", "role": "tests"}),
-                ),
-                say("Started."),
-            ],
-        )],
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"model": "cheap/model", "task": "check", "role": "tests"}),
+                    ),
+                    say("Started."),
+                ],
+            ),
+            ("lead/tests", vec![holding(), say("Checking later.")]),
+        ],
         Settings::default(),
     );
     f.crew.start(
@@ -1887,9 +1966,28 @@ async fn the_persons_agents_work_in_places_of_their_own_with_those_they_start() 
     }));
 }
 
-/// Keeps every chat given, as a file would.
+/// Keeps every chat given, as a file would, and the names of those
+/// retired.
 #[derive(Default)]
-struct Kept(Mutex<HashMap<String, iq_agent::Saved>>);
+struct Kept(Mutex<HashMap<String, iq_agent::Saved>>, Retired);
+
+/// The agents a keeper was told retired, in order.
+#[derive(Default)]
+struct Retired(Mutex<Vec<String>>);
+
+impl std::ops::Deref for Retired {
+    type Target = Mutex<Vec<String>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Kept {
+    fn retired(&self) -> &Retired {
+        &self.1
+    }
+}
 
 impl iq_agent::Keeper for Kept {
     fn keep(&self, chat: &iq_agent::Saved) {
@@ -1901,6 +1999,10 @@ impl iq_agent::Keeper for Kept {
 
     fn forget(&self, name: &str) {
         self.0.lock().unwrap().remove(name);
+    }
+
+    fn retire(&self, name: &str) {
+        self.1.lock().unwrap().push(name.to_owned());
     }
 }
 
@@ -1973,7 +2075,7 @@ async fn a_chat_renamed_goes_on_under_its_new_name_and_its_agents_follow_it() {
                     say("Started."),
                 ],
             ),
-            ("lead/helper", vec![say("Read.")]),
+            ("lead/helper", vec![holding(), say("Read.")]),
             ("login", vec![say("On it.")]),
         ],
         Settings::default(),
@@ -2097,6 +2199,15 @@ async fn a_chat_is_named_after_its_work_unless_the_person_named_it() {
                     say("On it."),
                 ],
             ),
+            // Under either name, as the chat is named before or after.
+            (
+                "pourriez-coder-partie/tests",
+                vec![holding(), say("Tested.")],
+            ),
+            (
+                "paiement-remboursements/tests",
+                vec![holding(), say("Tested.")],
+            ),
             (
                 "reviewer",
                 vec![say("Paiement-Remboursements\n"), say("other-name")],
@@ -2166,6 +2277,7 @@ async fn agents_are_named_after_their_chat_and_their_part() {
             (
                 "lead/2",
                 vec![
+                    holding(),
                     calls(
                         "start_agent",
                         serde_json::json!({"model": "cheap/model", "task": "four"}),
@@ -2173,6 +2285,11 @@ async fn agents_are_named_after_their_chat_and_their_part() {
                     say("Started too."),
                 ],
             ),
+            // None done, each keeps its name.
+            ("lead/3", vec![holding()]),
+            ("lead/4", vec![holding()]),
+            ("lead/the-front-end", vec![holding()]),
+            ("lead/the-front-end-2", vec![holding()]),
         ],
         Settings::default(),
     );
@@ -2374,9 +2491,9 @@ async fn a_provider_still_out_of_capacity_ends_the_turn_saying_what_to_do_and_ke
     );
     assert!(failed.contains("through 3 tries (HTTP 429"), "{failed}");
     assert!(
-        failed.ends_with(
+        failed.contains(
             "The conversation is kept: write to the agent to try again later, or give the task \
-             to an agent on another model"
+             to an agent on another model. The call held about"
         ),
         "{failed}"
     );
@@ -2443,6 +2560,419 @@ async fn an_image_read_or_attached_is_shown_to_the_model_with_its_next_call() {
 }
 
 #[tokio::test]
+async fn a_provider_s_refusal_is_kept_and_told_to_the_starter_as_iq_s_facts() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_agent",
+                        serde_json::json!({"role": "review", "model": "lab/quill", "task": "review the parser"}),
+                    ),
+                    say("Started."),
+                    say("The review stopped on the provider's refusal."),
+                ],
+            ),
+            (
+                "lead/review",
+                vec![calls("read_file", serde_json::json!({"path": "parser.rs"}))],
+            ),
+        ],
+        Settings::default(),
+    );
+    let kept = Arc::new(Kept::default());
+    f.crew
+        .set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
+    f.model.refuses_after("lead/review", 1);
+    f.crew
+        .start("lead", &model("cheap/model"), "review it".into(), PERSON);
+    f.settled().await;
+    let failed = f
+        .events()
+        .into_iter()
+        .find_map(|event| match event {
+            Event::Failed {
+                agent,
+                status,
+                message,
+                calls,
+                context,
+                ..
+            } => Some((agent, status, message, calls, context)),
+            _ => None,
+        })
+        .expect("the failure is reported");
+    assert_eq!(
+        (failed.0.as_str(), failed.1, failed.2.as_str(), failed.3),
+        (
+            "lead/review",
+            Some(400),
+            "Request contains an invalid argument.",
+            1
+        )
+    );
+    assert!(failed.4 >= 100, "about what its last call read, and more");
+    // The lead is told the facts as iq's.
+    let told = f.model.seen_by("lead");
+    assert!(
+        told.contains(
+            "(iq: lead/review stopped without answering: the provider refused its call to \
+             lab/quill, answering HTTP 400: \\\"Request contains an invalid argument.\\\". The call \
+             held about"
+        ),
+        "{told}"
+    );
+    assert!(
+        told.contains("lead/review had made 1 call before it, for $0.001."),
+        "{told}"
+    );
+    assert!(
+        told.contains("This is iq's account of what happened"),
+        "{told}"
+    );
+    // Kept with its chat, once.
+    let saved = kept.0.lock().unwrap()["lead/review"].clone();
+    assert_eq!(saved.aside.len(), 1, "{:?}", saved.aside);
+    assert!(matches!(
+        &saved.aside[0].shown,
+        iq_agent::Shown::Failed { status: Some(400), model, calls: 1, .. } if model == "lab/quill"
+    ));
+    assert_eq!((saved.calls, saved.spent), (1, Usd(0.001)));
+}
+
+#[tokio::test]
+async fn two_chats_writing_in_one_checkout_are_said_once() {
+    let write = |path: &str| {
+        calls(
+            "write_file",
+            serde_json::json!({"path": path, "content": "x\n"}),
+        )
+    };
+    let f = fixture(
+        &[
+            ("login", vec![write("login.txt"), say("Written.")]),
+            (
+                "build",
+                vec![
+                    write("build.txt"),
+                    say("Written."),
+                    write("again.txt"),
+                    say("Again."),
+                ],
+            ),
+        ],
+        Settings::default(),
+    );
+    f.crew
+        .start("login", &model("cheap/model"), "write it".into(), PERSON);
+    f.settled().await;
+    f.crew
+        .start("build", &model("cheap/model"), "write it".into(), PERSON);
+    f.settled().await;
+    f.crew.tell("build", "once more".into()).unwrap();
+    f.settled().await;
+    let said: Vec<(String, String)> = f
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Notice { agent, text } if text.contains("one checkout") => Some((agent, text)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said.len(), 1, "{said:#?}");
+    assert_eq!(said[0].0, "build");
+    assert!(
+        said[0].1.starts_with("the chat login wrote in "),
+        "{}",
+        said[0].1
+    );
+}
+
+#[tokio::test]
+async fn an_agent_done_with_its_task_is_retired_and_its_name_free_again() {
+    let review = || {
+        calls(
+            "start_agent",
+            serde_json::json!({"role": "review", "model": "lab/quill", "task": "review the parser"}),
+        )
+    };
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    review(),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 5})),
+                    calls(
+                        "send_message",
+                        serde_json::json!({"to": "lead/review", "text": "and its tests?"}),
+                    ),
+                    review(),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 5})),
+                    say("Both reviews are in."),
+                ],
+            ),
+            (
+                "lead/review",
+                vec![say("No issue found."), say("The tests pass.")],
+            ),
+        ],
+        Settings::default(),
+    );
+    let kept = Arc::new(Kept::default());
+    f.crew
+        .set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
+    f.crew
+        .start("lead", &model("cheap/model"), "review it".into(), PERSON);
+    f.settled().await;
+    let retired: Vec<String> = f
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Retired { agent } => Some(agent),
+            _ => None,
+        })
+        .collect();
+    // Each retired as it answered, the second under the same name.
+    assert_eq!(retired, ["lead/review", "lead/review"]);
+    assert!(
+        f.crew
+            .list()
+            .iter()
+            .all(|agent| agent.name != "lead/review")
+    );
+    let told = f.model.seen_by("lead");
+    assert!(
+        told.contains(
+            "lead/review finished its task and was retired: a message no longer reaches it. For \
+             more, start a new agent, which may take its name. Its last answer:\\nNo issue found."
+        ),
+        "{told}"
+    );
+    assert!(
+        told.contains("Message from lead/review: The tests pass."),
+        "{told}"
+    );
+    assert_eq!(
+        kept.retired().lock().unwrap().as_slice(),
+        ["lead/review", "lead/review"]
+    );
+}
+
+#[tokio::test]
+async fn a_team_rests_until_its_first_answered_then_retires_whole() {
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    calls(
+                        "start_team",
+                        serde_json::json!({
+                            "task": "Add a greeting.",
+                            "members": [
+                                {"role": "writer", "model": "lab/a", "does": "writes it, then has it reviewed"},
+                                {"role": "checker", "model": "lab/b", "does": "reads the diff"},
+                            ],
+                        }),
+                    ),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 5})),
+                    say("Greeted."),
+                ],
+            ),
+            (
+                "lead/writer",
+                vec![
+                    calls(
+                        "send_message",
+                        serde_json::json!({"to": "lead/checker", "text": "Read my change."}),
+                    ),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 5})),
+                    calls(
+                        "send_message",
+                        serde_json::json!({"to": "lead/checker", "text": "And now?"}),
+                    ),
+                    calls("wait_for_messages", serde_json::json!({"seconds": 5})),
+                    say("Written and read twice."),
+                ],
+            ),
+            ("lead/checker", vec![say("Fine."), say("Still fine.")]),
+        ],
+        Settings::default(),
+    );
+    f.crew
+        .start("lead", &model("cheap/model"), "greet".into(), PERSON);
+    f.settled().await;
+    // The checker answered its teammate twice: written to again, never
+    // told it finished.
+    let writer = f.model.seen_by("lead/writer");
+    assert!(
+        writer.contains("Message from lead/checker: Still fine."),
+        "{writer}"
+    );
+    assert!(!writer.contains("retired"), "{writer}");
+    let retired: Vec<String> = f
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Retired { agent } => Some(agent),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retired, ["lead/writer", "lead/checker"]);
+}
+
+/// Waits for the person to be asked to choose, and gives the question's
+/// number and text.
+async fn choice(f: &Fixture, after: usize) -> (u64, String) {
+    for _ in 0..300 {
+        if let Some(asked) = f
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Choose { id, question, .. } => Some((*id, question.clone())),
+                _ => None,
+            })
+            .nth(after)
+        {
+            return asked;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("nothing was asked: {:#?}", f.events());
+}
+
+#[tokio::test]
+async fn a_turn_past_what_it_may_spend_asks_the_person_once_and_goes_on_or_stops() {
+    let read = || calls("read_file", serde_json::json!({"path": "a.txt"}));
+    for go_on in [true, false] {
+        let f = fixture(
+            &[(
+                "lead",
+                vec![read(), read(), read(), say("Done."), say("Again.")],
+            )],
+            Settings {
+                turn_ask: Some(Usd(0.002)),
+                ..Settings::default()
+            },
+        );
+        f.crew
+            .start("lead", &model("cheap/model"), "read it".into(), PERSON);
+        let (id, question) = choice(&f, 0).await;
+        assert!(
+            question.starts_with(
+                "This turn of lead's spent $0.002, past the $0.002 it may before you are asked \
+                 (turn_cost_ask). lead on model: $0.002, 2 calls."
+            ),
+            "{question}"
+        );
+        assert!(question.ends_with("Go on, until $0.004?"), "{question}");
+        let answer = if go_on { "Go on" } else { "Stop this turn" };
+        f.crew.choose(id, Some(answer.into()));
+        f.settled().await;
+        let ended = f
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                Event::Done { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .unwrap();
+        let asked = f
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Event::Choose { .. }))
+            .count();
+        if go_on {
+            assert_eq!(ended, Ok("Done.".to_owned()));
+            assert_eq!(asked, 1);
+        } else {
+            assert_eq!(
+                ended,
+                Err("the person stopped this turn of lead's once it spent $0.002".to_owned())
+            );
+            // Written to again, it begins another turn, counted afresh.
+            f.crew.tell("lead", "go on now".into()).unwrap();
+            f.settled().await;
+            let turns: Vec<u64> = f
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Turn { number, .. } => Some(*number),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(turns, [1, 2]);
+            assert!(f.events().iter().any(|event| matches!(
+                event,
+                Event::Done { outcome: Ok(said), .. } if said == "Done."
+            )));
+        }
+    }
+}
+
+#[tokio::test]
+async fn old_tool_results_are_set_apart_at_once_and_recalled_whole() {
+    let read = || {
+        reading(
+            1_500,
+            calls("read_file", serde_json::json!({"path": "big.txt"})),
+        )
+    };
+    let mut script: Vec<ChatResponse> = (0..8).map(|_| read()).collect();
+    script.push(calls("reread", serde_json::json!({"id": 1})));
+    script.push(say("Read."));
+    let f = fixture(
+        &[("lead", script)],
+        Settings {
+            light_from: 1_000,
+            ..Settings::default()
+        },
+    );
+    let big: String = (1..=100)
+        .map(|n| format!("line {n} of the file\n"))
+        .collect();
+    std::fs::write(f.root.join("big.txt"), &big).unwrap();
+    f.crew
+        .start("lead", &model("cheap/model"), "read it".into(), PERSON);
+    f.settled().await;
+    let said: Vec<String> = f
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Notice { text, .. } if text.starts_with("set apart") => Some(text),
+            _ => None,
+        })
+        .collect();
+    // Once, as the seventh came, the oldest: the latest six kept whole;
+    // not again until what the calls read grew as much.
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].starts_with("set apart 1 of its old tool results"),
+        "{}",
+        said[0]
+    );
+    let last = f.model.requests_of("lead").last().unwrap().clone();
+    let results: Vec<&str> = last
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(results[0].starts_with(
+        "(iq: set apart to keep your conversation light: read big.txt, lines 1 to 100,"
+    ));
+    assert!(results[0].ends_with("`reread` with id 1 reads it again whole.)"));
+    assert!(results[1].contains("line 50 of the file"));
+    // Recalled whole.
+    assert!(results.last().unwrap().contains("line 99 of the file"));
+    assert!(!results.last().unwrap().starts_with("(iq:"));
+}
+
+#[tokio::test]
 async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
     let f = fixture(
         &[(
@@ -2457,6 +2987,9 @@ async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
         )],
         Settings::default(),
     );
+    let kept = Arc::new(Kept::default());
+    f.crew
+        .set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
     f.crew
         .start("lead", &model("cheap/model"), "deploy".into(), PERSON);
     let mut asked = None;
@@ -2474,6 +3007,25 @@ async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
     assert_eq!(choices, ["staging", "production"]);
     f.crew.choose(id, Some("staging".into()));
     f.settled().await;
+    // Kept with the chat, its answer with it.
+    let shown: Vec<iq_agent::Shown> = kept.0.lock().unwrap()["lead"]
+        .aside
+        .iter()
+        .map(|aside| aside.shown.clone())
+        .collect();
+    assert_eq!(
+        shown,
+        [iq_agent::Shown::Question {
+            id,
+            question: "Which environment?".into(),
+            choices: vec!["staging".into(), "production".into()],
+            answered: true,
+            answer: Some("staging".into()),
+        }]
+    );
+    let aside = &kept.0.lock().unwrap()["lead"].aside[0];
+    // In its first turn, after its call to ask.
+    assert_eq!((aside.turn, aside.after), (1, 3));
     assert!(
         f.model
             .seen_by("lead")

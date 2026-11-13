@@ -23,6 +23,7 @@ mod inline;
 mod keys;
 mod link;
 mod live;
+mod map;
 mod markdown;
 mod motion;
 mod pages;
@@ -38,7 +39,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use iq_core::Usd;
 use iq_ui::crew::Request;
 use iq_ui::{Board, Update};
 use ratatui::backend::CrosstermBackend;
@@ -402,15 +402,24 @@ impl Iq {
     /// Writes what the conversation gained, then draws the live part or
     /// the page.
     fn draw(&mut self, now: u64) -> io::Result<()> {
+        self.motion.tick();
         let screen = &mut self.screen;
         if screen.paged {
             let (board, p, history) = (&mut self.board, &self.p, &self.history);
             let images = screen.kitty.is_some();
             let mut body = Rect::default();
             let summed = |id: usize| history.summed(id);
+            let labels = |id: u64| history.job_label(id);
+            let writing = |agent: &str| history.partial(agent).map(str::to_owned);
+            let beside = pages::Beside {
+                summed: &summed,
+                motion: &self.motion,
+                labels: &labels,
+                writing: &writing,
+            };
             screen
                 .terminal
-                .draw(|frame| body = pages::draw(frame, board, p, now, images, &summed))?;
+                .draw(|frame| body = pages::draw(frame, board, p, now, images, &beside))?;
             return self.picture(body);
         }
         if screen.placed.is_some() {
@@ -630,6 +639,7 @@ impl Iq {
             let screen = &mut self.screen;
             Inline::clear_above(&mut screen.out, rows, rows)?;
             screen.inline = Inline::new(cols, rows);
+            screen.inline.began_above();
             let live = Live {
                 board: &self.board,
                 history: &self.history,
@@ -673,10 +683,7 @@ impl Iq {
             let lines = self.history.window(width, window.as_deref());
             screen.insert(self.history.take_images(), &lines)?;
         }
-        let mut billed = Usd(0.0);
-        for agent in self.board.crew().agents() {
-            billed += agent.billed;
-        }
+        let billed = self.board.crew().billed();
         let said = if billed.0 > 0.0 {
             format!("iq ends: {billed} billed to the provider.")
         } else {

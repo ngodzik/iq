@@ -2,6 +2,8 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(feature = "assay")]
+mod assay;
 mod chats;
 mod diagrams;
 mod journal;
@@ -50,6 +52,11 @@ struct Cli {
     /// `base_url`: Requesty's router when neither names one.
     #[arg(long, env = "IQ_BASE_URL", global = true)]
     base_url: Option<String>,
+
+    /// The models iq marks for the provider's cache itself, as the
+    /// settings' `cache_marks` say: Claude's unless they say otherwise.
+    #[arg(skip)]
+    cache_marks: Option<Vec<String>>,
 
     /// API key for that endpoint. Read from the environment so that it never
     /// lands in the shell history.
@@ -117,6 +124,14 @@ enum Command {
         #[arg(long)]
         host: bool,
     },
+    /// The assay, in a folder of its own: frozen exercises given to
+    /// candidate models, checked, then graded blind by one grader. Without
+    /// a command, what its folder holds.
+    #[cfg(feature = "assay")]
+    Assay {
+        #[command(subcommand)]
+        act: Option<assay::Act>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -138,14 +153,21 @@ fn main() -> Result<()> {
         _ => {}
     }
     let mut cli = Cli::parse();
+    // The assay reads its own settings and keeps its own folder, never
+    // iq's: it goes its way before iq's are read.
+    #[cfg(feature = "assay")]
+    if let Some(Command::Assay { act }) = &cli.command {
+        return assay::main(&cli, act.as_ref());
+    }
     // The provider's address: as the command line or the environment
     // names it, else the settings, else Requesty's router.
+    let read = home_folder()
+        .ok()
+        .and_then(|folder| Settings::load(&folder).ok());
     if cli.base_url.is_none() {
-        cli.base_url = home_folder()
-            .ok()
-            .and_then(|folder| Settings::load(&folder).ok())
-            .and_then(|settings| settings.base_url());
+        cli.base_url = read.as_ref().and_then(Settings::base_url);
     }
+    cli.cache_marks = read.as_ref().and_then(Settings::cache_marks);
     // In the terminal, what is logged would write over what iq draws: it
     // goes to iq's folder instead.
     let logged = cli
@@ -388,6 +410,22 @@ fn resume_chats(
             }
         }
     }
+    // Those retired, read only, with the chats that came back.
+    for found in chats.retired() {
+        let by = names
+            .get(&found.chat.by)
+            .cloned()
+            .unwrap_or_else(|| found.chat.by.clone());
+        let thread = iq_ui::crew::past_with(&found.chat.messages, &found.chat.aside);
+        let _ = tell.send(Update::Finished(iq_ui::crew::Finished {
+            agent: found.chat.name,
+            model: found.chat.model,
+            by,
+            task: found.chat.task,
+            worked: found.at,
+            thread,
+        }));
+    }
     for found in waiting {
         chats.forget(&found.chat.name);
         said.push(format!(
@@ -453,7 +491,7 @@ fn resume_one(
         }
         (None, _) => None,
     };
-    let thread = iq_ui::crew::past(&found.chat.messages);
+    let thread = iq_ui::crew::past_with(&found.chat.messages, &found.chat.aside);
     let (task, written, by) = (
         found.chat.task.clone(),
         found.chat.written,
@@ -678,9 +716,13 @@ fn synced(result: &Result<iq_sync::Outcome, iq_sync::SyncError>) -> iq_ui::Synce
 
 /// The provider's models, with its key when there is one.
 fn provider(cli: &Cli) -> OpenAiCompatible {
-    match &cli.api_key {
+    let provider = match &cli.api_key {
         Some(key) => OpenAiCompatible::new(cli.endpoint(), key),
         None => OpenAiCompatible::without_key(cli.endpoint()),
+    };
+    match &cli.cache_marks {
+        Some(marks) => provider.with_cache_marks(marks.clone()),
+        None => provider,
     }
 }
 
@@ -729,11 +771,11 @@ fn unlisted(endpoint: &str, in_use: &[(&str, String)], listed: &[String]) -> Vec
 }
 
 /// The models the settings put to use, each with the setting that names
-/// it: the lead's, the reviewer's and the observer's.
+/// it: the lead's, the autopilot's and the observer's.
 fn in_use(settings: &Settings, lead: &ModelId) -> Result<Vec<(&'static str, String)>> {
     let mut models = vec![("model", lead.to_string())];
     if let Some(reviewer) = settings.crew()?.reviewer {
-        models.push(("reviewer", reviewer.to_string()));
+        models.push(("autopilot_model", reviewer.to_string()));
     }
     models.push(("[observe] model", settings.observing()?.model.to_string()));
     if let Some(summarizer) = settings.summarizer()? {
@@ -770,6 +812,31 @@ fn keep(ledger: &Ledger, journal: &Journal, event: &Event) -> Option<iq_observe:
         ledger.bill(agent, model, *cost);
     }
     ended
+}
+
+/// Writes a call the provider refused or that could not reach it to iq's
+/// log, whole: what the conversation shows of it may be cut.
+fn failed(event: &Event) {
+    if let Event::Failed {
+        agent,
+        model,
+        status,
+        message,
+        context,
+        calls,
+        spent,
+    } = event
+    {
+        tracing::warn!(
+            agent,
+            model,
+            status = status.map(i64::from).unwrap_or(-1),
+            context,
+            calls,
+            spent = spent.0,
+            "a call to the provider failed: {message}"
+        );
+    }
 }
 
 /// The project iq works in, as its memory and its tasks are kept under.
@@ -1113,17 +1180,25 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
     let gate = settings_gate(&settings)?;
     // What sums up for the person what agents write to each other, when the
     // settings name a model for it: what it spends is counted as any call.
+    // The crew, once made, counts what the summaries spend in the turns of
+    // the chats they serve.
+    let counting: Arc<std::sync::OnceLock<Crew<OpenAiCompatible>>> =
+        Arc::new(std::sync::OnceLock::new());
     let summarize: Option<Arc<dyn iq_tui::Summarize>> = match settings.summarizer()? {
         Some(model) => {
             let costs: Report = {
                 let send = send.clone();
                 let ledger = Arc::clone(&ledger);
+                let counting = Arc::clone(&counting);
                 Arc::new(move |event: Event| {
                     if let Event::Spent {
                         agent, model, cost, ..
                     } = &event
                     {
                         ledger.bill(agent, model, *cost);
+                    }
+                    if let Some(crew) = counting.get() {
+                        crew.count(&event);
                     }
                     let _ = send.send(Update::Crew(event));
                 })
@@ -1179,6 +1254,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
             if let Event::Placed { agent, folder, .. } = &event {
                 plugins.placed(agent, folder);
             }
+            failed(&event);
             // What a chat's agents kept follows it as it is renamed.
             if let (Event::Renamed { from, to }, Some(scratch)) = (&event, &scratch) {
                 scratch::renamed(scratch, from, to);
@@ -1197,6 +1273,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
             }),
         )?;
         let crew = crew(cli, &settings, report, gate)?;
+        let _ = counting.set(crew.clone());
         crew.extend(Arc::new(servers.clone()));
         (crew, servers)
     };
@@ -1328,6 +1405,7 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     let _ = working.set_effort(&agent, effort);
                 }
                 Request::Stop { agent } => working.stop(&agent),
+                Request::StopJob { id } => working.stop_job(id),
                 Request::Rename { agent, name } => {
                     let said = match working.rename(&agent, &name) {
                         Ok(new) => format!("{agent} is named {new} now"),
@@ -1562,9 +1640,10 @@ fn left_over(settings: &Settings) -> Vec<String> {
     let assay = settings::data_folder(&home).join("assay");
     if assay.is_dir() {
         said.push(format!(
-            "{} is the store of the assay iq no longer has: it is synced no more, and the next \
-             sync takes it out of the repository, whose history keeps it. Move it out of iq's \
-             folder, or remove it.",
+            "{} is the store of an older iq's assay: it is synced no more, and the next sync \
+             takes it out of the repository, whose history keeps it. The assay, built with the \
+             `assay` feature, keeps a folder of its own (~/.local/share/iq-assay): move it \
+             there to keep its exercises, or remove it.",
             assay.display()
         ));
     }
@@ -1579,9 +1658,18 @@ fn left_over(settings: &Settings) -> Vec<String> {
 }
 
 /// What iq says at start of what the settings hold that it reads no more,
-/// for the person to change it.
+/// or under an old name, for the person to change it.
 fn retired(settings: &Settings) -> Vec<String> {
-    let mut said = Vec::new();
+    let mut said: Vec<String> = settings
+        .renamed()
+        .into_iter()
+        .map(|(old, new)| {
+            format!(
+                "~/.iq/settings.toml names `{old}`, now `{new}`: it is read under its old name \
+                 until the next release."
+            )
+        })
+        .collect();
     let retired = settings.retired();
     if !retired.is_empty() {
         said.push(format!(
@@ -1620,6 +1708,8 @@ async fn run(command: &Command, cli: &Cli) -> Result<()> {
     let (base_url, api_key) = (cli.endpoint(), cli.api_key.clone());
     match command {
         Command::Do { .. } => bail!("a task is handed to the crew"),
+        #[cfg(feature = "assay")]
+        Command::Assay { .. } => bail!("the assay runs apart"),
         Command::Models => {
             let provider = match api_key {
                 Some(key) => OpenAiCompatible::new(base_url, key),

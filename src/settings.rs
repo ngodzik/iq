@@ -4,12 +4,15 @@
 //! ```toml
 //! base_url = "https://router.requesty.ai/v1"  # the provider: another region's router, any OpenAI compatible endpoint
 //! model = "anthropic/claude-opus-5-5"    # the lead, which decides who does what
-//! reviewer = "anthropic/claude-haiku-5-5"  # answers for the person when the autopilot is on
+//! autopilot_model = "anthropic/claude-haiku-5-5"  # answers the gate for you when the autopilot is on (once `reviewer`, still read until the next release)
 //! allowed_models = ["anthropic/claude-opus-5-5", "anthropic/claude-haiku-5-5"]  # the only models iq starts, for you and every agent, by their whole names; any other is refused, the agent told which there are; unset, any the provider lists, by its whole name
-//! reviewer_effort = "low"                # how hard it thinks
+//! autopilot_effort = "low"               # how hard it thinks (once `reviewer_effort`)
 //! summarizer = "anthropic/claude-haiku-5-5"  # sums up in a few lines what agents write to each other, in the conversation; Ctrl-X gives it whole; unset, their first lines
+//! cache_marks = ["claude"]              # the models iq marks for the provider's cache itself, by a word of their names; the others are left to Requesty's auto_cache; add "gemini" to try it on Gemini (Vertex), and compare on the costs page what each model read from the cache
+//! turn_cost_ask = 1.0                    # dollars a chat's turn may spend (its agents, those they started, the autopilot, the summaries) before you are asked whether it goes on, then as much again each time; unset, never asked
 //! effort = "high"                        # how hard the models think; /effort changes an agent's
 //! context_every = 25000                  # tokens an agent's conversation grows between two words to it of its size; 0 never
+//! light_from = 40000                     # tokens an agent's calls read past which its old tool results (all but the latest six, the long ones) are set apart, each replaced by a line saying what it was, `reread` reading it again; again each time they grow as much, so that the provider's cache breaks seldom; 0 never
 //! autopilot = false
 //! autopilot_internet = true              # the reviewer also answers what only reaches the internet
 //! autopilot_host = true                  # the reviewer also answers what runs on the machine itself (containers, clusters, the forge), as your skill says; true once a skill is set
@@ -26,6 +29,8 @@
 //! scratch_mb = 500                       # most a chat's folder of scratch holds (~/.cache/iq/scratch), where its agents keep logs and snapshots outside the repository; past it, its oldest files go
 //! theme = "graphite"                     # or "ink"; "porcelain" for a light terminal; /theme
 //! steps = 5                              # an agent's latest steps (tools, what was allowed) shown as it works; once it writes again only their count, Ctrl-X unfolds them; 0 none
+//! job_lines = 3                          # a background job's latest lines shown under its line while it runs, cut to the screen's width; 0 none
+//! turn_view = "panes"                    # a turn of several agents shown as panes side by side at the top, or "strip": a few lines of its map below the conversation; Ctrl-G opens the whole map either way
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set; the project's .claude/skills are read after them, yours winning a name both hold
@@ -111,6 +116,10 @@ pub(crate) struct Settings {
     /// The provider's address, when not Requesty's router.
     base_url: Option<String>,
     model: Option<String>,
+    /// The model that answers the gate for the person when the autopilot
+    /// is on.
+    autopilot_model: Option<String>,
+    /// `autopilot_model`'s old name, read until the next release.
     reviewer: Option<String>,
     /// The only models iq starts, for the person and every agent; any the
     /// provider lists when empty.
@@ -121,7 +130,15 @@ pub(crate) struct Settings {
     /// The model that sums up what agents write to each other, for the
     /// person; none unless set.
     summarizer: Option<String>,
-    /// How hard the reviewer thinks; low unless set.
+    /// What a chat's turn may spend before the person is asked whether it
+    /// goes on, in dollars; never asked unless set.
+    turn_cost_ask: Option<f64>,
+    /// The models iq marks for the provider's cache itself, by words of
+    /// their names; Claude's unless set.
+    cache_marks: Option<Vec<String>>,
+    /// How hard the autopilot's model thinks; low unless set.
+    autopilot_effort: Option<Effort>,
+    /// `autopilot_effort`'s old name, read until the next release.
     reviewer_effort: Option<Effort>,
     effort: Option<Effort>,
     /// Seconds a command may run before it is stopped.
@@ -133,6 +150,9 @@ pub(crate) struct Settings {
     /// How many tokens an agent's conversation grows between two words to
     /// it of its size.
     context_every: Option<u64>,
+    /// The tokens an agent's calls read past which its old tool results
+    /// are set apart; 0 never.
+    light_from: Option<u64>,
     #[serde(default)]
     pub(crate) autopilot: bool,
     /// Whether the autopilot's reviewer also answers what only reaches the
@@ -169,6 +189,10 @@ pub(crate) struct Settings {
     theme: Option<String>,
     /// How many of an agent's latest steps show as it works.
     steps: Option<usize>,
+    /// How many of a job's latest lines show while it runs.
+    job_lines: Option<usize>,
+    /// What shows a turn of several agents: panes, or a strip of its map.
+    turn_view: Option<String>,
     /// The person's rules for every project, files of their home.
     rules: Option<Vec<String>>,
     /// The folders of the person's skills.
@@ -332,6 +356,11 @@ impl Settings {
         }
     }
 
+    /// The models iq marks for the provider's cache itself, as set.
+    pub(crate) fn cache_marks(&self) -> Option<Vec<String>> {
+        self.cache_marks.clone()
+    }
+
     /// The provider's address, as set.
     pub(crate) fn base_url(&self) -> Option<String> {
         self.base_url
@@ -344,6 +373,21 @@ impl Settings {
     /// The lead's model: as set, else Opus.
     pub(crate) fn lead(&self) -> Result<ModelId> {
         Ok(ModelId::new(self.model.as_deref().unwrap_or(LEAD))?)
+    }
+
+    /// The settings named by an old name, each with its new one: read
+    /// until the next release, the new name winning when both are set.
+    pub(crate) fn renamed(&self) -> Vec<(&'static str, &'static str)> {
+        [
+            (self.reviewer.is_some(), ("reviewer", "autopilot_model")),
+            (
+                self.reviewer_effort.is_some(),
+                ("reviewer_effort", "autopilot_effort"),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(set, names)| set.then_some(names))
+        .collect()
     }
 
     /// What the settings hold that iq reads no more.
@@ -522,7 +566,13 @@ impl Settings {
             Some(name) => name.parse()?,
             None => iq_ui::look::Theme::default(),
         };
-        Ok(iq_ui::look::Look::new(theme).showing(self.steps.unwrap_or(iq_ui::steps::SHOWN)))
+        Ok(iq_ui::look::Look::new(theme)
+            .showing(self.steps.unwrap_or(iq_ui::steps::SHOWN))
+            .with_job_lines(self.job_lines.unwrap_or(iq_ui::look::JOB_LINES))
+            .with_turn(match self.turn_view.as_deref() {
+                Some(turn) => turn.parse().map_err(anyhow::Error::msg)?,
+                None => iq_ui::look::TurnShown::Panes,
+            }))
     }
 
     /// The model that sums up what agents write to each other, when set.
@@ -669,11 +719,19 @@ impl Settings {
     /// What the crew starts with.
     pub(crate) fn crew(&self) -> Result<iq_agent::Settings> {
         Ok(iq_agent::Settings {
-            reviewer: Some(ModelId::new(self.reviewer.as_deref().unwrap_or(REVIEWER))?),
+            reviewer: Some(ModelId::new(
+                self.autopilot_model
+                    .as_deref()
+                    .or(self.reviewer.as_deref())
+                    .unwrap_or(REVIEWER),
+            )?),
             effort: self.effort,
             context_every: self.context_every.unwrap_or(iq_agent::CONTEXT_EVERY),
             refusals: self.autopilot_refusals.unwrap_or(iq_agent::REFUSALS),
-            reviewer_effort: self.reviewer_effort.unwrap_or(Effort::Low),
+            reviewer_effort: self
+                .autopilot_effort
+                .or(self.reviewer_effort)
+                .unwrap_or(Effort::Low),
             command_timeout: self
                 .command_timeout
                 .map_or(iq_agent::COMMAND_TIMEOUT, std::time::Duration::from_secs),
@@ -683,6 +741,11 @@ impl Settings {
             busy_tries: self.provider_retries.unwrap_or(iq_agent::BUSY_TRIES),
             // The cheap model that places the tasks names the chats.
             namer: Some(self.observing()?.model),
+            light_from: self.light_from.unwrap_or(iq_agent::LIGHT_FROM),
+            turn_ask: self
+                .turn_cost_ask
+                .filter(|dollars| *dollars > 0.0)
+                .map(iq_core::Usd),
             allowed: self.allowed_models()?,
             scratch_most: self
                 .scratch_mb
@@ -727,13 +790,13 @@ mod tests {
         let said = set
             .disallowed(&[
                 ("model", "lab/sage@eu".into()),
-                ("reviewer", "anthropic/claude-haiku-5-5".into()),
+                ("autopilot_model", "anthropic/claude-haiku-5-5".into()),
             ])
             .unwrap();
         assert_eq!(said.len(), 1);
         assert!(
             said[0].starts_with(
-                "allowed_models leaves out anthropic/claude-haiku-5-5, which iq uses for `reviewer`"
+                "allowed_models leaves out anthropic/claude-haiku-5-5, which iq uses for `autopilot_model`"
             ),
             "{}",
             said[0]
@@ -833,6 +896,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(older.retired(), RETIRED);
+    }
+
+    #[test]
+    fn the_autopilot_s_model_is_read_under_its_old_name_the_new_one_winning() {
+        let old: Settings =
+            toml::from_str("reviewer = \"lab/quill\"\nreviewer_effort = \"high\"").unwrap();
+        let crew = old.crew().unwrap();
+        assert_eq!(crew.reviewer.unwrap().as_str(), "lab/quill");
+        assert_eq!(crew.reviewer_effort, Effort::High);
+        assert_eq!(
+            old.renamed(),
+            [
+                ("reviewer", "autopilot_model"),
+                ("reviewer_effort", "autopilot_effort")
+            ]
+        );
+        let both: Settings = toml::from_str(
+            "reviewer = \"lab/quill\"\nautopilot_model = \"lab/sage\"\nautopilot_effort = \"medium\"",
+        )
+        .unwrap();
+        let crew = both.crew().unwrap();
+        assert_eq!(crew.reviewer.unwrap().as_str(), "lab/sage");
+        assert_eq!(crew.reviewer_effort, Effort::Medium);
+        assert_eq!(both.renamed(), [("reviewer", "autopilot_model")]);
+        assert!(Settings::default().renamed().is_empty());
     }
 
     #[test]

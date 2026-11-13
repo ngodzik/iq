@@ -53,6 +53,8 @@ where
         model: shown.clone(),
         usage: response.usage,
         cost,
+        cache: response.cache,
+        chat: None,
     });
     Ok(response.content.unwrap_or_default())
 }

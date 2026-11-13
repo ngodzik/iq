@@ -14,7 +14,8 @@ Three principles hold it together:
 
 - **Security is the foundation, not a layer.** Everything an agent does goes through one gate, and every command runs in the operating system's sandbox.
 - **Your skills say how the work is done.** iq ships no method of its own. Which team to start for a kind of work, with which roles and models, how its agents work together and review each other: you write it in your skills, and you find your own formula. iq makes it easy to follow: agents that start others, messages between them, a worktree per chat, every step in view.
-- **Every cost is in view.** Each call to a model says what it cost, summed by model, by kind of work and over time. iq never holds an agent back to save money: you see what it spends, and you decide, down to the only models iq may start, for you and every agent. Each choice of a model, yours or an agent's, is written down with who made it and how.
+- **Conversations kept light.** Past a size the settings give, an agent's old tool results (files read, test output) are set apart at once, each replaced by a line saying what it was, which the agent may read again whole; you see when it happens.
+- **Every cost is in view.** Each call to a model says what it cost, summed by model, by kind of work and over time, and while a turn runs, what each of its agents spent in it. iq never holds an agent back to save money: you see what it spends, and you decide, down to the only models iq may start, for you and every agent, and, when you set it, how much a turn may spend before you are asked whether it goes on. Each choice of a model, yours or an agent's, is written down with who made it and how.
 
 ## Security
 
@@ -34,7 +35,7 @@ By default, every question the gate asks comes to you. With the autopilot on, a 
 
 - it answers what stays within the sandbox and, when you let it, what only reaches the internet and what runs on the machine itself;
 - it follows a policy you write yourself, as one of your skills: read again at each decision, kept outside the project so that no command can rewrite it, and never shown to the agents it judges;
-- it sees the agent's task, your latest request and the agent's last actions, so that each decision rests on what is happening;
+- it sees the agent's task, your latest request and the agent's last actions, so that each decision rests on what is happening, and what the agent wrote just before, as its own claim, never as your word;
 - publishing, changing what others share, files outside the project and secrets are never its to allow, and after a few refusals in a row the agent's next action comes back to you.
 
 Rules and the reviewer only spare you questions: they widen nothing you did not allow.
@@ -77,6 +78,22 @@ cargo install --path .              # builds the iq binary into ~/.cargo/bin
 scripts/check.sh                    # formatting, lints, docs, tests, dependency audit
 git config core.hooksPath .githooks # run those checks before every commit
 ```
+
+## The assay
+
+An optional part of iq, built only when asked for, to try a new model on your own kind of work without a second copy of iq: frozen exercises are given to candidate models, each run in a folder of its own, checked by hidden tests a command runs, then graded blind by one grader, always the same so that grades compare, and summed into what each candidate does and costs. Like the rest, it may change or go at any time.
+
+```bash
+cargo install --path . --features assay
+iq assay                                   # what its folder holds: the exercises, where each stands, the results
+iq assay freeze <exercise>                 # freezes an exercise, once its check fails on start/ and passes on the reference
+iq assay run <exercise | kind | all> <candidates...> [--times N]   # runs, checks and grades them
+iq assay grade [<exercise | kind | all>]   # grades with the current grader what it has not graded yet
+```
+
+A candidate is a model of the provider, or a team: `pair: writer + reviewer`, `lead: lead + cheaper`, `debate: a + b`. A run or a grading says what it should cost and asks before anything is spent.
+
+The assay keeps a folder of its own, never iq's: `$XDG_DATA_HOME/iq-assay` (`~/.local/share/iq-assay` by default), or the one `IQ_ASSAY_HOME` names. Its `README.md` says how an exercise is written. Its settings are in `settings.toml` there: `grader` (needed to run and to grade), `grader_effort`, `candidates` (`models`, `teams`, or candidates by name), `effort` (the candidates'), `reference` (the model the others are measured against), `parallel` (runs at once) and `base_url`. A key it does not read is said and left aside. The provider's key comes from `REQUESTY_API_KEY`, as iq's does. Its audit log and the calls it was billed are kept in the same folder. The exercises and runs an older iq kept in `~/.local/share/iq/assay` are read as they are, once moved there.
 
 ## Data from others
 

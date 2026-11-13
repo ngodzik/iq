@@ -12,10 +12,12 @@ pub mod error;
 pub mod input;
 pub mod keys;
 pub mod look;
+pub mod map;
 pub mod named;
 pub mod observations;
 pub mod plugins;
 pub mod screen;
+pub mod shell;
 pub mod steps;
 
 pub use board::{
