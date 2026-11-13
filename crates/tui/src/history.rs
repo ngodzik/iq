@@ -515,6 +515,9 @@ pub(crate) struct History {
     /// The agents another started that the person wrote to: what they
     /// write until their turn ends is theirs to read.
     woken: HashSet<String>,
+    /// The model the turns of a thread written again answered on, as it
+    /// says: their heads name it rather than the chat's model now.
+    recalled_on: Option<String>,
 }
 
 impl History {
@@ -1045,6 +1048,14 @@ impl History {
             *told = (*told).max(last);
         }
         let mut fold: Option<usize> = None;
+        // The model of the first turn written, as the thread said before.
+        self.recalled_on = view.thread[..from]
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                iq_ui::crew::Entry::Model(model) => Some(model.clone()),
+                _ => None,
+            });
         for (at, entry) in view.thread.iter().enumerate().skip(from) {
             use iq_ui::crew::Entry;
             if let Some(begun) = board.steps().begun(agent, at) {
@@ -1151,6 +1162,14 @@ impl History {
                     }
                     self.set_speaker(None);
                 }
+                // The turns from here answered on another model: the next
+                // line of the agent's says so under a head of its own.
+                Entry::Model(model) => {
+                    if self.recalled_on.as_ref() != Some(model) {
+                        self.recalled_on = Some(model.clone());
+                        self.set_speaker(None);
+                    }
+                }
                 Entry::Tool { .. }
                 | Entry::Reviewed { .. }
                 | Entry::Asked { .. }
@@ -1159,6 +1178,7 @@ impl History {
             }
         }
         self.recalled_fold(agent, fold, board, p);
+        self.recalled_on = None;
         if recall.opening {
             let others = board.crew().chats().count().saturating_sub(1);
             let mut said = format!("you write to {agent}, the chat you wrote to last");
@@ -1390,7 +1410,7 @@ impl History {
         }
         let tint = agent_tint(board, agent, p);
         // In its chat's window: by its model, or its part and its model.
-        let (name, beside) = label(board, agent);
+        let (name, beside) = label_on(board, agent, self.recalled_on.as_deref());
         let beside = if beside.is_empty() {
             String::new()
         } else {
@@ -2087,10 +2107,16 @@ pub(crate) fn chat_of(board: &Board, agent: &str) -> Option<String> {
 /// nothing more: the chat's own agent by its model, one it started by its
 /// part; then what is said beside, its model and how hard it thinks.
 pub(crate) fn label(board: &Board, agent: &str) -> (String, String) {
+    label_on(board, agent, None)
+}
+
+/// The same, `agent` answering on `model` when given rather than on its
+/// own now, as one of its past turns did.
+fn label_on(board: &Board, agent: &str, model: Option<&str>) -> (String, String) {
     let Some(view) = board.crew().agent(agent) else {
         return (agent.to_owned(), String::new());
     };
-    let model = view.serving();
+    let model = model.unwrap_or_else(|| view.serving());
     let short = model.rsplit('/').next().unwrap_or(model).to_owned();
     let effort = view.effort.map(|e| e.as_str().to_owned());
     if view.by == PERSON {
@@ -2643,6 +2669,63 @@ mod tests {
         let loose = "Done:\r\n\r\n\r\n- the parser\r\n\r\n- its tests\r\n\r\n\r\n\r\n### Next\r\n\r\nThe docs.\r\n";
         let shown = rows(&[loose]);
         assert_eq!(shown[..expected.len()], expected, "{shown:#?}");
+    }
+
+    #[test]
+    fn a_chat_come_back_to_names_the_model_each_of_its_turns_answered_on() {
+        use iq_ui::crew::{Back, Entry};
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        crew(
+            &mut board,
+            &mut history,
+            Event::Joined {
+                agent: "fix".into(),
+                model: "lab/haiku".into(),
+                by: PERSON.into(),
+            },
+            &p,
+        );
+        history.back("fix");
+        let mut thread = Vec::new();
+        for (n, model) in [(1, "lab/sol"), (2, "lab/sol"), (3, "lab/haiku")] {
+            thread.push(Entry::Model(model.into()));
+            thread.push(Entry::Prompt(format!("Message from person: ask {n}")));
+            thread.push(Entry::Text(format!("answer {n}")));
+        }
+        board.update(Update::Back(Back {
+            agent: "fix".into(),
+            task: "ask 1".into(),
+            worked: iq_ui::now(),
+            written: Some(iq_ui::now()),
+            thread,
+        }));
+        let recall = board.take_recall().unwrap();
+        history.recall(&recall, &board, &p);
+        let lines: Vec<String> = history
+            .take(100, Some("fix"))
+            .iter()
+            .map(|line| line.to_string().trim_end().to_owned())
+            .filter(|line| line.starts_with('●') || line.starts_with("  answer"))
+            .collect();
+        // The chat as it is now, then each answer under the model that gave
+        // it.
+        assert_eq!(
+            lines,
+            [
+                "● haiku",
+                "● sol",
+                "  answer 1",
+                "● sol",
+                "  answer 2",
+                "● haiku",
+                "  answer 3"
+            ]
+        );
+        // Its turns from now are its model's.
+        let next = label(&board, "fix");
+        assert_eq!(next.0, "haiku");
     }
 
     #[test]

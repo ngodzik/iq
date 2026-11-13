@@ -169,8 +169,19 @@ pub(super) fn thread(seen: &Seen<'_>, agent: &str) -> Vec<Line<'static>> {
         Span::styled(agent.to_owned(), p.bold(tint)),
         Span::styled(format!("  {}", view.model), p.fg(p.faint)),
     ]));
+    // The model its turns answer on, said where it changes.
+    let mut on = view.model.clone();
     for entry in &view.thread {
         match entry {
+            Entry::Model(model) => {
+                if *model != on {
+                    lines.push(Line::from(Span::styled(
+                        format!("  on {model}"),
+                        p.fg(p.faint),
+                    )));
+                    on.clone_from(model);
+                }
+            }
             Entry::Prompt(text) => {
                 lines.push(Line::default());
                 lines.extend(wrap(

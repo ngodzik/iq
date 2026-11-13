@@ -156,7 +156,11 @@ impl Step {
                 answer: answer.clone(),
             },
             Kept::Notice(text) => Step::Notice { text: text.clone() },
-            Kept::Prompt(_) | Kept::Text(_) | Kept::Message { .. } | Kept::Done(_) => {
+            Kept::Prompt(_)
+            | Kept::Text(_)
+            | Kept::Message { .. }
+            | Kept::Done(_)
+            | Kept::Model(_) => {
                 return None;
             }
         })

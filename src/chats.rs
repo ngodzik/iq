@@ -268,6 +268,8 @@ mod tests {
             }],
             set_apart: vec!["the whole of an old result".to_owned()],
             messages: vec![Message::system("be brief"), Message::user("fix it")],
+            compacted_away: Vec::new(),
+            compacted_head: 0,
         }
     }
 

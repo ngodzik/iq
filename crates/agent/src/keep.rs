@@ -63,6 +63,19 @@ pub struct Saved {
     pub set_apart: Vec<String>,
     /// Its conversation, the standing instructions first.
     pub messages: Vec<Message>,
+    /// The messages its compactions replaced, whole and in order, without
+    /// the summaries they left: its thread comes back from them as it was
+    /// shown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compacted_away: Vec<Message>,
+    /// How many of its messages, after its standing instructions, its last
+    /// compaction wrote: its summary, and its last answer again.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub compacted_head: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 impl Saved {
@@ -76,6 +89,14 @@ impl Saved {
                 .models_chosen
                 .last()
                 .is_none_or(|choice| choice.how == SETTINGS_MODEL)
+    }
+
+    /// Its conversation as it went: what its compactions replaced, in
+    /// place of the summaries they left. What was set aside stands among
+    /// these messages.
+    #[must_use]
+    pub fn history(&self) -> Vec<Message> {
+        history(&self.messages, &self.compacted_away, self.compacted_head)
     }
 
     /// Moves the chat to `model`, which `by` chose as `how` says at `at`,
@@ -103,7 +124,8 @@ pub struct Aside {
     /// The turn of the agent's it came in: 0 before its first.
     pub turn: u64,
     /// How many messages its conversation held then: where it stands
-    /// among them, to a step.
+    /// among them, to a step, those its compactions replaced counted
+    /// ([`Saved::history`]).
     #[serde(default)]
     pub after: usize,
     /// What it was.
@@ -119,6 +141,11 @@ pub enum Shown {
     Notice {
         /// What.
         text: String,
+    },
+    /// The model its turns answer on from there.
+    Model {
+        /// Which.
+        model: String,
     },
     /// A question the agent asked the person, with its choices, and their
     /// answer once given.
@@ -189,6 +216,33 @@ pub struct ModelChoice {
     pub how: String,
     /// When, in seconds since 1970.
     pub at: u64,
+}
+
+/// A conversation, `messages`, as it went: its standing instructions,
+/// what its compactions replaced (`away`), then what it holds after the
+/// `head` messages its last compaction wrote.
+pub(crate) fn history(messages: &[Message], away: &[Message], head: usize) -> Vec<Message> {
+    if away.is_empty() {
+        return messages.to_vec();
+    }
+    let rest = messages.get(1 + head..).unwrap_or_default();
+    messages
+        .iter()
+        .take(1)
+        .chain(away)
+        .chain(rest)
+        .cloned()
+        .collect()
+}
+
+/// Where the place `at` among a conversation's messages stands in its
+/// [`history`], `away` messages replaced by the `head` its last compaction
+/// wrote: within those, just after what they replaced.
+pub(crate) fn placed(at: usize, away: usize, head: usize) -> usize {
+    if away == 0 {
+        return at;
+    }
+    (at.max(1 + head) + away).saturating_sub(head)
 }
 
 /// Takes off what the answers of `messages` carry of their model's

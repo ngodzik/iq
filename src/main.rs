@@ -429,7 +429,7 @@ fn resume_chats(
             .get(&found.chat.by)
             .cloned()
             .unwrap_or_else(|| found.chat.by.clone());
-        let thread = iq_ui::crew::past_with(&found.chat.messages, &found.chat.aside);
+        let thread = iq_ui::crew::past_with(&found.chat.history(), &found.chat.aside);
         let _ = tell.send(Update::Finished(iq_ui::crew::Finished {
             agent: found.chat.name,
             model: found.chat.model,
@@ -504,7 +504,7 @@ fn resume_one(
         }
         (None, _) => None,
     };
-    let thread = iq_ui::crew::past_with(&found.chat.messages, &found.chat.aside);
+    let thread = iq_ui::crew::past_with(&found.chat.history(), &found.chat.aside);
     let (task, written, by) = (
         found.chat.task.clone(),
         found.chat.written,

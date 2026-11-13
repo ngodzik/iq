@@ -1957,6 +1957,97 @@ async fn an_agent_is_told_its_conversation_grows_and_compacts_it_once_its_reques
 }
 
 #[tokio::test]
+async fn what_a_compaction_replaced_is_kept_and_the_chat_comes_back_as_it_was_shown() {
+    let compact = |summary: &str| calls("compact", serde_json::json!({ "summary": summary }));
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                calls("list_agents", serde_json::json!({})),
+                compact("Listed the agents."),
+                say("Done."),
+                compact("Listed them, then the tests."),
+                say("Tested."),
+                say("And now?"),
+            ],
+        )],
+        Settings::default(),
+    );
+    let kept = Arc::new(Kept::default());
+    f.crew
+        .set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
+    f.crew
+        .start("lead", &model("lab/sol"), "list them".into(), PERSON);
+    f.settled().await;
+    f.crew.set_model("lead", &model("lab/haiku")).unwrap();
+    f.crew.tell("lead", "now the tests".into()).unwrap();
+    f.settled().await;
+    f.crew.tell("lead", "and then?".into()).unwrap();
+    f.settled().await;
+    let saved = kept.0.lock().unwrap()["lead"].clone();
+    // Its conversation is its last summary; what both compactions replaced
+    // is kept, the first summary and its answer again left out.
+    let said = |messages: &[Message]| -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(text) => Some(format!("user: {}", text.lines().next().unwrap_or(""))),
+                Message::Assistant {
+                    content: Some(text),
+                    ..
+                } => Some(format!("answer: {text}")),
+                Message::Assistant { tool_calls, .. } => {
+                    Some(format!("call: {}", tool_calls[0].name))
+                }
+                Message::Tool { .. } => Some("result".into()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(saved.compacted_head, 2);
+    let history = saved.history();
+    assert_eq!(
+        said(&history),
+        [
+            "user: list them",
+            "call: list_agents",
+            "result",
+            "call: compact",
+            "result",
+            "answer: Done.",
+            "user: Message from person: now the tests",
+            "call: compact",
+            "result",
+            "answer: Tested.",
+            "user: Message from person: and then?",
+            "answer: And now?",
+        ]
+    );
+    // What was set aside stands where it came in the whole: the model of
+    // each turn before it, each compaction's notice after its answer.
+    let placed: Vec<(usize, String)> = saved
+        .aside
+        .iter()
+        .filter_map(|aside| match &aside.shown {
+            iq_agent::Shown::Model { model } => Some((aside.after, format!("on {model}"))),
+            iq_agent::Shown::Notice { text } if text.starts_with("compacted") => {
+                Some((aside.after, "compacted".into()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        placed,
+        [
+            (1, "on lab/sol".into()),
+            (7, "compacted".into()),
+            (7, "on lab/haiku".into()),
+            (11, "compacted".into()),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn an_agent_is_given_the_rules_for_the_files_it_touches_once() {
     let f = fixture(
         &[
@@ -2792,11 +2883,14 @@ async fn a_provider_s_refusal_is_kept_and_told_to_the_starter_as_iq_s_facts() {
         told.contains("This is iq's account of what happened"),
         "{told}"
     );
-    // Kept with its chat, once.
+    // Kept with its chat, once, after the model its turn answered on.
     let saved = kept.0.lock().unwrap()["lead/review"].clone();
-    assert_eq!(saved.aside.len(), 1, "{:?}", saved.aside);
+    assert_eq!(saved.aside.len(), 2, "{:?}", saved.aside);
+    assert!(
+        matches!(&saved.aside[0].shown, iq_agent::Shown::Model { model } if model == "lab/quill")
+    );
     assert!(matches!(
-        &saved.aside[0].shown,
+        &saved.aside[1].shown,
         iq_agent::Shown::Failed { status: Some(400), model, calls: 1, .. } if model == "lab/quill"
     ));
     assert_eq!((saved.calls, saved.spent), (1, Usd(0.001)));
@@ -3173,6 +3267,7 @@ async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
         .aside
         .iter()
         .map(|aside| aside.shown.clone())
+        .filter(|shown| !matches!(shown, iq_agent::Shown::Model { .. }))
         .collect();
     assert_eq!(
         shown,
@@ -3184,7 +3279,7 @@ async fn an_agent_asks_the_person_to_choose_and_reads_their_answer() {
             answer: Some("staging".into()),
         }]
     );
-    let aside = &kept.0.lock().unwrap()["lead"].aside[0];
+    let aside = &kept.0.lock().unwrap()["lead"].aside[1];
     // In its first turn, after its call to ask.
     assert_eq!((aside.turn, aside.after), (1, 3));
     assert!(

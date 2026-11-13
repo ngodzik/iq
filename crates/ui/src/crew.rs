@@ -179,6 +179,9 @@ pub enum Entry {
     },
     /// Something to know about how it works.
     Notice(String),
+    /// The model its turns answered on from here, as a chat of an earlier
+    /// session says.
+    Model(String),
     /// Its turn ended: its answer, or why it failed.
     Done(Result<String, String>),
     /// What it asked the person to choose, and what they answered.
@@ -450,6 +453,7 @@ fn set_aside(shown: &iq_agent::Shown) -> Entry {
     use iq_agent::Shown;
     match shown {
         Shown::Notice { text } => Entry::Notice(text.clone()),
+        Shown::Model { model } => Entry::Model(model.clone()),
         Shown::Question {
             question, answer, ..
         } => Entry::Chose {

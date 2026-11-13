@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::event::{Event, PERSON};
 use crate::extension::Extension;
-use crate::keep::{Aside, Keeper, ModelChoice, Saved, Shown, forget_reasoning};
+use crate::keep::{Aside, Keeper, ModelChoice, Saved, Shown, forget_reasoning, placed};
 use crate::place::{Placed, Placer};
 use crate::review;
 use crate::rules::{self, RulesFile};
@@ -479,6 +479,10 @@ struct AsideLog {
     turn: u64,
     /// How many messages its conversation holds, as far as told.
     messages: usize,
+    /// How many messages its compactions replaced, and how many its last
+    /// wrote: where its conversation stands in what it was.
+    away: usize,
+    head: usize,
     /// What was set aside, in order.
     kept: Vec<Aside>,
 }
@@ -709,6 +713,11 @@ struct Member {
     /// next turn: its model changed, and only the provider that signed it
     /// can check it.
     forget_reasoning: bool,
+    /// The messages its compactions replaced, in order.
+    compacted_away: Vec<Message>,
+    /// How many of its messages, after its standing instructions, its last
+    /// compaction wrote.
+    compacted_head: usize,
 }
 
 /// An agent of the crew, as listed.
@@ -905,6 +914,8 @@ where
                     .map(|log| log.kept.clone())
                     .unwrap_or_default(),
                 messages,
+                compacted_away: member.compacted_away.clone(),
+                compacted_head: member.compacted_head,
             }
         };
         keeper.keep(&saved);
@@ -954,6 +965,7 @@ where
         if messages.len() == 1 {
             messages.push(Message::user(saved.task.clone()));
         }
+        let length = messages.len();
         let read = board.messages.len();
         let own = !Arc::ptr_eq(&place, &self.inner.place);
         let workspace = place.gate.workspace().to_path_buf();
@@ -990,8 +1002,13 @@ where
                 chosen: false,
                 models_chosen: saved.models_chosen,
                 forget_reasoning: false,
+                compacted_away: saved.compacted_away,
+                compacted_head: saved.compacted_head,
             },
         );
+        let (away, head) = board.members.get(&name).map_or((0, 0), |member| {
+            (member.compacted_away.len(), member.compacted_head)
+        });
         drop(board);
         let log = AsideLog {
             turn: saved
@@ -1000,7 +1017,9 @@ where
                 .map(|aside| aside.turn)
                 .max()
                 .unwrap_or(0),
-            messages: 0,
+            messages: length,
+            away,
+            head,
             kept: saved.aside,
         };
         lock(&self.inner.aside).insert(name.clone(), log);
@@ -1524,6 +1543,8 @@ where
                     at: now(),
                 }],
                 forget_reasoning: false,
+                compacted_away: Vec::new(),
+                compacted_head: 0,
             },
         );
         drop(board);
@@ -2466,6 +2487,8 @@ where
         let Some((messages, model, by)) = taken else {
             return;
         };
+        self.set_length(&name, messages.len());
+        self.answers_on(&name, &model);
         let (messages, outcome) = self.own_turn(&name, &model, messages, prompt, number).await;
         let mut compacted_from = None;
         let mut board = lock(&self.inner.board);
@@ -2480,7 +2503,20 @@ where
                     // Its summary may not hold them: given again as it
                     // touches their files.
                     member.rules_given.clear();
-                    compacted(&messages, &member.task, &summary, outcome.as_ref().ok())
+                    // What it replaces is kept, but for what the last
+                    // compaction wrote, which this one sums up again.
+                    let replaced = messages
+                        .get(1 + member.compacted_head..)
+                        .unwrap_or_default();
+                    member.compacted_away.extend_from_slice(replaced);
+                    let kept = compacted(&messages, &member.task, &summary, outcome.as_ref().ok());
+                    member.compacted_head = kept.len().saturating_sub(1);
+                    if let Some(log) = lock(&self.inner.aside).get_mut(&name) {
+                        log.messages = kept.len();
+                        log.away = member.compacted_away.len();
+                        log.head = member.compacted_head;
+                    }
+                    kept
                 }
                 None => messages,
             };
@@ -4413,12 +4449,36 @@ where
             _ => return,
         };
         let log = aside.entry(agent.clone()).or_default();
-        let (turn, after) = (log.turn, log.messages);
+        let (turn, after) = (log.turn, placed(log.messages, log.away, log.head));
         log.kept.push(Aside {
             at: now(),
             turn,
             after,
             shown,
+        });
+    }
+
+    /// Sets aside the model `agent`'s turn about to begin answers on, when
+    /// it is not the one set aside last: its thread, as it comes back,
+    /// names the model of each turn.
+    fn answers_on(&self, agent: &str, model: &ModelId) {
+        let mut aside = lock(&self.inner.aside);
+        let log = aside.entry(agent.to_owned()).or_default();
+        let last = log.kept.iter().rev().find_map(|kept| match &kept.shown {
+            Shown::Model { model } => Some(model.as_str()),
+            _ => None,
+        });
+        if last == Some(model.as_str()) {
+            return;
+        }
+        let after = placed(log.messages, log.away, log.head);
+        log.kept.push(Aside {
+            at: now(),
+            turn: log.turn,
+            after,
+            shown: Shown::Model {
+                model: model.to_string(),
+            },
         });
     }
 
