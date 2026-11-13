@@ -798,14 +798,22 @@ impl Drop for Stopping {
         if let Some(group) = self.0.take()
             && group >= 2
         {
-            let _ = std::process::Command::new("kill")
-                .args(["-s", "KILL", "--", &format!("-{group}")])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            for signal in STOPPING {
+                let _ = std::process::Command::new("kill")
+                    .args(["-s", signal, "--", &format!("-{group}")])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
         }
     }
 }
+
+/// How a command's group is stopped: held still first, then killed. A
+/// group is signalled one process after another: killed at once, a shell
+/// whose child died before it could run its next line in between, such as
+/// one writing a file.
+const STOPPING: [&str; 2] = ["STOP", "KILL"];
 
 /// The variables of `env` a command on the machine itself gets: the
 /// person's own, as they would run it, but iq's, which are of no use to
@@ -860,12 +868,14 @@ async fn stop_group(group: u32) {
     if group < 2 {
         return;
     }
-    let _ = tokio::process::Command::new("kill")
-        .args(["-s", "KILL", "--", &format!("-{group}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+    for signal in STOPPING {
+        let _ = tokio::process::Command::new("kill")
+            .args(["-s", signal, "--", &format!("-{group}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
 }
 
 /// Whether a process of `group` still runs. A group below 2 names none.
