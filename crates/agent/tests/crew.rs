@@ -515,6 +515,8 @@ async fn the_skills_open_to_one_chat_for_a_turn_each_change_shown_and_asked_of_t
             .await
             .unwrap();
     };
+    let kept = Arc::new(Kept::default());
+    crew.set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
     crew.start("lead", &model("lab/m"), "hello".into(), PERSON);
     crew.start("other", &model("lab/m"), "hello".into(), PERSON);
     settled().await;
@@ -606,6 +608,19 @@ async fn the_skills_open_to_one_chat_for_a_turn_each_change_shown_and_asked_of_t
         Some(&Event::Skills { chat: None })
     );
     assert!(crew.open_skills("nobody", true).is_err());
+    // Said in the chat where it came: after the answer of the turn before.
+    let saved = kept.0.lock().unwrap()["lead"].clone();
+    let opened = saved
+        .aside
+        .iter()
+        .find(|aside| matches!(&aside.shown, iq_agent::Shown::Notice { text } if text.starts_with("your skills are open")))
+        .unwrap();
+    let answer = saved
+        .history()
+        .iter()
+        .position(|message| matches!(message, Message::Assistant { content: Some(text), .. } if text == "Ready."))
+        .unwrap();
+    assert_eq!(opened.after, answer + 1);
 }
 
 #[tokio::test]

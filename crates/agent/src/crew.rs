@@ -2553,15 +2553,16 @@ where
                     member.compacted_away.extend_from_slice(replaced);
                     let kept = compacted(&messages, &member.task, &summary, outcome.as_ref().ok());
                     member.compacted_head = kept.len().saturating_sub(1);
-                    if let Some(log) = lock(&self.inner.aside).get_mut(&name) {
-                        log.messages = kept.len();
-                        log.away = member.compacted_away.len();
-                        log.head = member.compacted_head;
-                    }
                     kept
                 }
                 None => messages,
             };
+            // What is set aside from now stands after its answer.
+            if let Some(log) = lock(&self.inner.aside).get_mut(&name) {
+                log.messages = member.messages.len();
+                log.away = member.compacted_away.len();
+                log.head = member.compacted_head;
+            }
             // It rests from now: what is posted to it wakes it.
             member.turn = None;
             renamed.clone_from(&member.renaming);
