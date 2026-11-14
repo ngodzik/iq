@@ -138,6 +138,9 @@ const NAMED_IN_MESSAGE: &str = "named in the message";
 /// The same, when it is the settings' lead.
 const SETTINGS_MODEL: &str = iq_agent::SETTINGS_MODEL;
 
+/// A cell of the screen: its column and its row.
+type Cell = (u16, u16);
+
 /// What the person is notified of as a turn of theirs ends.
 const DONE_ALERT: &str = "Turn done";
 
@@ -243,6 +246,9 @@ pub struct Board {
     /// Whether the person asked to be notified once a turn of theirs ends
     /// or a question waits.
     notify: bool,
+    /// Where the mouse was pressed in the conversation iq draws, while it
+    /// is, and where it was moved to last once it moved: a selection.
+    pressed: Option<(Cell, Option<Cell>)>,
     /// The notifications waiting for the terminal to send them.
     alerts: Vec<&'static str>,
 }
@@ -300,6 +306,14 @@ pub enum Reading {
     Answer(isize),
     /// The person reads no more: the mark goes, and what was found.
     Leave,
+    /// A selection begins at the cell at this column and row: the mouse
+    /// was pressed there, then moved.
+    Select(u16, u16),
+    /// The selection reaches the cell at this column and row, the
+    /// conversation scrolled a row when it is at its top or bottom edge.
+    Stretch(u16, u16),
+    /// The selection is done, the mouse let go: what it holds is copied.
+    Selected,
 }
 
 /// The image a paste is, when it is the path of one alone: a file dropped
@@ -371,6 +385,57 @@ impl Board {
             clicked: false,
             notify: false,
             alerts: Vec::new(),
+            pressed: None,
+        }
+    }
+
+    /// The mouse was pressed on the cell at `column` and `row`: a click
+    /// once it comes up where it was, a selection once it moves.
+    pub fn mouse_down(&mut self, column: u16, row: u16) {
+        self.pressed = Some(((column, row), None));
+    }
+
+    /// The mouse, pressed, moved to the cell at `column` and `row`: in the
+    /// conversation iq draws, a selection from where it was pressed.
+    pub fn mouse_drag(&mut self, column: u16, row: u16) {
+        let Some((start, moved)) = self.pressed else {
+            return;
+        };
+        if !self.drawn() || moved.is_none() && (column, row) == start {
+            return;
+        }
+        if moved.is_none() {
+            self.readings.push(Reading::Select(start.0, start.1));
+        }
+        self.pressed = Some((start, Some((column, row))));
+        self.readings.push(Reading::Stretch(column, row));
+    }
+
+    /// The mouse came up on the cell at `column` and `row`: the selection
+    /// made is copied, or, where it did not move, a click.
+    pub fn mouse_up(&mut self, column: u16, row: u16) {
+        match self.pressed.take() {
+            Some((_, Some(_))) => {
+                self.readings.push(Reading::Stretch(column, row));
+                self.readings.push(Reading::Selected);
+            }
+            Some((start, None)) => self.click(start.0, start.1),
+            None => {}
+        }
+    }
+
+    /// Where the mouse is held while it selects, for the conversation to
+    /// scroll on its own as it stays at its edge.
+    #[must_use]
+    pub fn selecting(&self) -> Option<(u16, u16)> {
+        self.pressed.and_then(|(_, moved)| moved)
+    }
+
+    /// The mouse stays where it is while it selects: the conversation
+    /// scrolls on at its edge.
+    pub fn select_on(&mut self) {
+        if let Some((column, row)) = self.selecting() {
+            self.readings.push(Reading::Stretch(column, row));
         }
     }
 
@@ -2139,6 +2204,33 @@ mod tests {
         board.scroll(-3);
         key(&mut board, "PageUp");
         assert!(board.take_readings().is_empty());
+    }
+
+    #[test]
+    fn a_press_let_go_where_it_was_clicks_and_one_dragged_selects() {
+        let look = Look::default().with_conversation(crate::look::Conversation::Drawn);
+        let mut board = Board::new(Keymap::default(), look);
+        board.mouse_down(4, 9);
+        board.mouse_drag(4, 9);
+        board.mouse_up(4, 9);
+        assert_eq!(board.take_readings(), [Reading::Click(4, 9)]);
+        board.mouse_down(4, 9);
+        board.mouse_drag(7, 10);
+        assert_eq!(board.selecting(), Some((7, 10)));
+        // Held still at an edge, the same cell again.
+        board.select_on();
+        board.mouse_up(8, 10);
+        assert_eq!(
+            board.take_readings(),
+            [
+                Reading::Select(4, 9),
+                Reading::Stretch(7, 10),
+                Reading::Stretch(7, 10),
+                Reading::Stretch(8, 10),
+                Reading::Selected
+            ]
+        );
+        assert_eq!(board.selecting(), None);
     }
 
     #[test]

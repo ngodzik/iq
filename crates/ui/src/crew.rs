@@ -442,17 +442,34 @@ fn entries(message: &Message, returned: &std::collections::HashMap<&str, &str>) 
 #[must_use]
 pub fn past_with(messages: &[Message], aside: &[iq_agent::Aside]) -> Vec<Entry> {
     let returned = returned(messages);
-    let mut thread = Vec::new();
-    let mut aside = aside.iter().peekable();
-    for at in 0..=messages.len() {
-        while let Some(shown) = aside.next_if(|shown| shown.after <= at) {
+    let len = messages.len();
+    // What stands past the messages kept was set aside before a
+    // compaction that kept nothing of what it replaced, when something set
+    // aside after it stands among them: it comes first. What truly came
+    // last stays at the end, below the last answer.
+    let within = aside.iter().rposition(|shown| shown.after <= len);
+    let (mut first, mut placed, mut last) = (Vec::new(), Vec::new(), Vec::new());
+    for (at, shown) in aside.iter().enumerate() {
+        if shown.after <= len {
+            placed.push(shown);
+        } else if within.is_some_and(|within| at < within) {
+            first.push(shown);
+        } else {
+            last.push(shown);
+        }
+    }
+    placed.sort_by_key(|shown| shown.after);
+    let mut thread: Vec<Entry> = first.iter().map(|shown| set_aside(&shown.shown)).collect();
+    let mut placed = placed.into_iter().peekable();
+    for at in 0..=len {
+        while let Some(shown) = placed.next_if(|shown| shown.after <= at) {
             thread.push(set_aside(&shown.shown));
         }
         if let Some(message) = messages.get(at) {
             thread.extend(entries(message, &returned));
         }
     }
-    thread.extend(aside.map(|shown| set_aside(&shown.shown)));
+    thread.extend(last.iter().map(|shown| set_aside(&shown.shown)));
     thread
 }
 
@@ -1333,6 +1350,47 @@ mod tests {
                 Entry::Done(Err(
                     "lab/quill answered HTTP 400: Request contains an invalid argument.".into()
                 )),
+            ]
+        );
+    }
+
+    #[test]
+    fn what_a_compaction_left_standing_past_the_messages_comes_first_not_below_the_answer() {
+        // Compacted before compactions kept what they replaced: its
+        // conversation is its summary, then its last turn.
+        let kept = [
+            Message::system("You are lead"),
+            Message::user("the summary"),
+            Message::user("and now?"),
+            Message::Assistant {
+                content: Some("Done.".into()),
+                tool_calls: Vec::new(),
+                reasoning_signature: None,
+            },
+        ];
+        let notice = |after: usize, text: &str| iq_agent::Aside {
+            at: 1,
+            turn: 1,
+            after,
+            shown: iq_agent::Shown::Notice { text: text.into() },
+        };
+        let thread = past_with(
+            &kept,
+            &[
+                notice(40, "an old step"),
+                notice(3, "on the last turn"),
+                notice(9, "truly the last"),
+            ],
+        );
+        assert_eq!(
+            thread,
+            [
+                Entry::Notice("an old step".into()),
+                Entry::Prompt("the summary".into()),
+                Entry::Prompt("and now?".into()),
+                Entry::Notice("on the last turn".into()),
+                Entry::Text("Done.".into()),
+                Entry::Notice("truly the last".into()),
             ]
         );
     }

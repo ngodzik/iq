@@ -34,7 +34,7 @@
 //! job_lines = 3                          # a background job's latest lines shown under its line while it runs, cut to the screen's width; 0 none
 //! turn_view = "panes"                    # a turn of several agents shown as panes side by side at the top, or "strip": a few lines of its map below the conversation; Ctrl-G opens the whole map either way
 //! diagrams_folded = false                # a diagram shown as one line, unfolded in place with the down arrow while it is the last thing written
-//! conversation = "scrollback"            # the conversation written into the terminal's scrollback, or "drawn": drawn by iq on the terminal's other screen, the mouse taken, a click unfolding what is folded in place and enlarging a diagram, Shift and drag selecting; it stays out of the scrollback once iq ends
+//! conversation = "drawn"                # read no more, so that older settings load: iq draws the conversation on the terminal's other screen, the mouse taken, a click unfolding what is folded in place and enlarging a diagram, a drag selecting and copying through the terminal's clipboard (OSC 52), Shift and drag the terminal's own selection; it stays out of the scrollback once iq ends
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set; the project's .claude/skills are read after them, yours winning a name both hold
@@ -116,7 +116,14 @@ const CHAT_KEEP_DAYS: u64 = 30;
 
 /// What the settings once held and iq reads no more, since it works with
 /// the provider's models alone and lets the lead decide.
-const RETIRED: [&str; 5] = ["budget", "steward", "[limits]", "[assay]", "[route]"];
+const RETIRED: [&str; 6] = [
+    "budget",
+    "steward",
+    "[limits]",
+    "[assay]",
+    "[route]",
+    "conversation",
+];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -421,6 +428,7 @@ impl Settings {
             self.limits.is_some(),
             self.assay.is_some(),
             self.route.is_some(),
+            self.conversation.is_some(),
         ]
         .into_iter()
         .zip(RETIRED)
@@ -603,10 +611,10 @@ impl Settings {
                 None => iq_ui::look::TurnShown::Panes,
             })
             .with_diagrams_folded(self.diagrams_folded.unwrap_or(false))
-            .with_conversation(match self.conversation.as_deref() {
-                Some(conversation) => conversation.parse().map_err(anyhow::Error::msg)?,
-                None => iq_ui::look::Conversation::Scrollback,
-            }))
+            // One way only: iq draws the conversation and selects in it
+            // itself. The setting is still read, so that older settings
+            // load.
+            .with_conversation(iq_ui::look::Conversation::Drawn))
     }
 
     /// The model that sums up what agents write to each other, when set.
@@ -966,7 +974,7 @@ mod tests {
         assert!(wrong.look().is_err());
         // Older settings still open, what iq reads no more said.
         let older: Settings = toml::from_str(
-            "budget = 2.0\nsteward = true\n[limits]\nrequesty_month = 20.0\n[assay]\ngrader = \"x/y\"\n[route]\noff = true",
+            "budget = 2.0\nsteward = true\nconversation = \"scrollback\"\n[limits]\nrequesty_month = 20.0\n[assay]\ngrader = \"x/y\"\n[route]\noff = true",
         )
         .unwrap();
         assert_eq!(older.retired(), RETIRED);
