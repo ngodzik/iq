@@ -119,6 +119,10 @@ A plugin is a program of its own, apart from iq's binary, which iq starts only w
 - `# Examples` for non-trivial functions
 - Comments explain WHY, not what the name already says
 
+## Releases
+
+A version is released by a tag `vX.Y.Z` equal to the workspace's version in `Cargo.toml`, pushed once `CHANGELOG.md` has a section `## X.Y.Z (date)` saying what changed since the last tag. `.github/workflows/release.yml` refuses a tag that disagrees with the manifest, makes the release from that section and attaches the binaries for Linux and macOS, each with its checksum. The version is also what iq's calls say they come from (`User-Agent: iq/<version>`).
+
 ## Commands
 
 ```bash

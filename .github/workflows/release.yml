@@ -1,0 +1,87 @@
+name: Release
+
+# A tag such as v0.1.0 makes a release: its notes are that version's section
+# of CHANGELOG.md, and it carries the binary built for Linux and macOS, the
+# systems iq's sandbox is written for, with a checksum for each. It is a full
+# release, not a pre-release, so that GitHub shows it as the latest on the
+# repository's page; the 0.x version and the notes already say iq is an
+# experiment. As in CI, only GitHub's own actions run, each pinned to the
+# commit of its release, and Rust comes from rustup.
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create:
+    name: Create the release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The tag and the manifest state the version in two places, and two
+      # places drift: a binary would say one version (its user agent among
+      # them) and its release another.
+      - name: The tag is the manifest's version
+        run: |
+          declared=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          echo "Cargo.toml says $declared, the tag is $GITHUB_REF_NAME"
+          if [ "v$declared" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME is not the version Cargo.toml declares, $declared"
+            exit 1
+          fi
+      - name: Notes from the changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '/^## /{p = ($2 == v)} p' CHANGELOG.md | tail -n +2 > notes.md
+          test -s notes.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" --title "iq $GITHUB_REF_NAME" --notes-file notes.md --latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: create
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest Ubuntu GitHub still runs, rather than the latest: a
+          # binary needs at least the glibc it was linked against, and 22.04's
+          # is old enough for most distributions in use.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          name="iq-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/iq README.md LICENSE CHANGELOG.md "$name"/
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Attach to the release
+        run: |
+          name="iq-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256"
+        env:
+          GH_TOKEN: ${{ github.token }}
