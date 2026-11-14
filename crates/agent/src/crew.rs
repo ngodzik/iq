@@ -5154,9 +5154,10 @@ const TITLE_CHARS: usize = 24;
 const NAMING: &str = "You name a chat of a coding harness after what its work is about, from the \
     first request the person wrote in it, which follows. Answer with two or three words in the \
     request's own language, lower case, joined by dashes, that name its subject (the feature, the \
-    module, the bug), not the way it is asked: for \"could you code the payment part of the \
-    invoice module so that a refund can be made?\", payment-refunds. The name alone, nothing \
-    else.";
+    module, the bug), not the way it is asked: never a verb of asking (can, could, want, need) \
+    nor a politeness (please, thanks, hello), in any language. For \"could you code the payment \
+    part of the invoice module so that a refund can be made?\", payment-refunds; for \"hi, can \
+    you please review pull request 482?\", pr-482-review. The name alone, nothing else.";
 
 /// The name a namer's `answer` gives a chat, as the board writes names;
 /// none when it gives none.

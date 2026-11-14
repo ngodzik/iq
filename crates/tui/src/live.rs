@@ -472,8 +472,11 @@ impl Live<'_> {
             Span::styled(turn.total.to_string(), p.fg(p.text)),
         ];
         for spent in by {
+            // The chat's own agent is the chat: its name, made of its first
+            // request, says nothing more here.
             let who = match spent.who.as_str() {
                 "reviewer" => "autopilot".to_owned(),
+                who if who == window => "chat".to_owned(),
                 who => part(who),
             };
             spans.push(Span::styled(" · ", p.fg(p.faint)));
@@ -1115,9 +1118,13 @@ impl Live<'_> {
                         Span::styled(format!(" {model} "), p.fg(p.faint)),
                     ]),
                     Line::from(Span::styled(spent, p.fg(p.faint))),
-                    // The chat is named after its work: its first request
-                    // says nothing the next one needs.
-                    format!("Write to {agent}…"),
+                    // The person's own chat is the chat, whatever it is
+                    // named; an agent it started goes by its name.
+                    if view.is_some_and(|view| view.by == iq_agent::PERSON) {
+                        "Write to the chat…".to_owned()
+                    } else {
+                        format!("Write to {agent}…")
+                    },
                 )
             }
             Talk::New(chat) => {
@@ -1652,8 +1659,14 @@ mod tests {
             .unwrap_or_else(|| panic!("{rows:#?}"));
         assert_eq!(
             line.trim_end(),
-            "  $ turn 3 $0.77 · fix $0.71 · review $0.04 · autopilot $0.02"
+            "  $ turn 3 $0.77 · chat $0.71 · review $0.04 · autopilot $0.02"
         );
+        // Where the person writes, their chat is the chat; an agent it
+        // started goes by its name.
+        assert!(rows.iter().any(|row| row.contains("Write to the chat…")));
+        board.screen_mut().talk_to("fix/review");
+        let rows = drawn(&board, &history, 100);
+        assert!(rows.iter().any(|row| row.contains("Write to fix/review…")));
     }
 
     #[test]
