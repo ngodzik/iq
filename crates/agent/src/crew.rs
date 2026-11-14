@@ -2654,8 +2654,8 @@ where
             }
             self.retire_done(&name);
         }
-        // What the person wrote after its last look at the board.
-        if self.person_waits(&name)
+        // What was written to it after its last look at the board.
+        if self.woken_by_unread(&name)
             && let Some(news) = self.unread(&name)
         {
             self.wake(&name, news);
@@ -3108,14 +3108,34 @@ where
         }
     }
 
-    /// Whether the person wrote to `agent` since it last read the board.
-    fn person_waits(&self, agent: &str) -> bool {
-        let board = lock(&self.inner.board);
-        board.members.get(agent).is_some_and(|member| {
-            board.messages[member.read..]
+    /// Whether what was written to `agent` since it last read the board
+    /// wakes it as its turn ends: the person's message, iq's, or that of an
+    /// agent it started or one retired since, at once; a peer's at work
+    /// while the two do not wake each other too often. Posted during its
+    /// last call, it would wait unread until something else woke it, and
+    /// be lost with the board were iq started again.
+    fn woken_by_unread(&self, agent: &str) -> bool {
+        let (direct, peer) = {
+            let board = lock(&self.inner.board);
+            let Some(member) = board.members.get(agent) else {
+                return false;
+            };
+            let unread: Vec<&Posted> = board.messages[member.read..]
                 .iter()
-                .any(|m| m.from == PERSON && (m.to == agent || m.to == ALL))
-        })
+                .filter(|m| (m.to == agent || m.to == ALL) && m.from != agent)
+                .collect();
+            // A writer gone from the board wakes nobody in turn.
+            let peer_of = |m: &Posted| {
+                board
+                    .members
+                    .get(&m.from)
+                    .is_some_and(|writer| writer.by != agent)
+            };
+            let direct = unread.iter().any(|m| !peer_of(m));
+            let peer = unread.iter().find(|m| peer_of(m)).map(|m| m.from.clone());
+            (direct, peer)
+        };
+        direct || peer.is_some_and(|from| self.peer_may_wake(&from, agent))
     }
 
     /// A turn of one of iq's agents: its model called with its tools until
