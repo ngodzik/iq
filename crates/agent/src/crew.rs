@@ -758,6 +758,9 @@ struct Member {
     forget_reasoning: bool,
     /// Whether it was told the person's skills are open to it.
     skills_told: bool,
+    /// The names of the tools its last call offered: offered others, its
+    /// answers' reasoning, signed with those it was offered, goes.
+    offered: Vec<String>,
     /// The messages its compactions replaced, in order.
     compacted_away: Vec<Message>,
     /// How many of its messages, after its standing instructions, its last
@@ -1004,7 +1007,15 @@ where
             Message::system(self.instructions(&name, &saved.by, saved.role.as_deref(), &place));
         let mut messages = saved.messages;
         match messages.first_mut() {
-            Some(first @ Message::System(_)) => *first = instructions,
+            Some(first @ Message::System(_)) => {
+                // Written otherwise (the person's rules, a skill, its
+                // place), they unseal the reasoning its answers carry,
+                // which a provider checks against all that came before.
+                if *first != instructions {
+                    forget_reasoning(&mut messages);
+                }
+                messages[0] = instructions;
+            }
             _ => messages.insert(0, instructions),
         }
         if messages.len() == 1 {
@@ -1048,6 +1059,7 @@ where
                 models_chosen: saved.models_chosen,
                 forget_reasoning: false,
                 skills_told: false,
+                offered: Vec::new(),
                 compacted_away: saved.compacted_away,
                 compacted_head: saved.compacted_head,
             },
@@ -1590,6 +1602,7 @@ where
                 }],
                 forget_reasoning: false,
                 skills_told: false,
+                offered: Vec::new(),
                 compacted_away: Vec::new(),
                 compacted_head: 0,
             },
@@ -2888,6 +2901,7 @@ where
             .collect();
         let older = &results[..results.len().saturating_sub(LIGHT_KEPT)];
         let (mut count, mut chars) = (0, 0);
+        let mut first = None;
         for &at in older {
             let Message::Tool { call_id, content } = &messages[at] else {
                 continue;
@@ -2917,9 +2931,15 @@ where
             );
             count += 1;
             chars += size;
+            first.get_or_insert(at);
             if let Message::Tool { content, .. } = &mut messages[at] {
                 *content = line;
             }
+        }
+        // The answers after the first result changed carry a reasoning
+        // signed with what it was: a provider would refuse it.
+        if let Some(first) = first {
+            forget_reasoning(&mut messages[first..]);
         }
         if count > 0 {
             member.lightened = member.context;
@@ -3064,7 +3084,9 @@ where
         // The turns before this one, whose reasoning may be another
         // model's.
         let earlier = messages.len();
-        let mut forgotten = false;
+        // How far a refused signature took the reasoning off: the earlier
+        // turns', then all of it.
+        let mut forgotten = 0;
         messages.push(Message::user(prompt));
         if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
             member.reason = None;
@@ -3100,6 +3122,15 @@ where
             // agent asked for it.
             let mut tools = tools::work();
             tools.extend(self.tools_for(name));
+            // Other tools offered, the reasoning signed with the others
+            // goes: a provider checks it against them.
+            let names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
+            if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
+                if !member.offered.is_empty() && member.offered != names {
+                    forget_reasoning(&mut messages);
+                }
+                member.offered = names;
+            }
             let request = ChatRequest {
                 model: model.clone(),
                 messages: messages.clone(),
@@ -3113,18 +3144,28 @@ where
             self.measure(name, model).await;
             let response = match self.ask_model(name, &request).await {
                 Ok(response) => response,
-                // A signature its provider cannot check, written as another
-                // model answered: the call goes again once without them.
+                // A signature its provider cannot check, for a change iq
+                // could not foresee: the call goes again without the
+                // reasoning of the earlier turns, then without any.
                 Err(failed)
-                    if !forgotten
-                        && signature_refused(&failed)
-                        && forget_reasoning(&mut messages[..earlier]) =>
+                    if forgotten < 2 && signature_refused(&failed) && {
+                        let mut forgot = false;
+                        while forgotten < 2 && !forgot {
+                            let upto = if forgotten == 0 {
+                                earlier
+                            } else {
+                                messages.len()
+                            };
+                            forgotten += 1;
+                            forgot = forget_reasoning(&mut messages[..upto]);
+                        }
+                        forgot
+                    } =>
                 {
-                    forgotten = true;
                     self.report(Event::Notice {
                         agent: name.to_owned(),
-                        text: "its provider refused the reasoning its earlier answers carry, \
-                               signed for another model: it is called again without it"
+                        text: "its provider could not check the reasoning its earlier answers \
+                               carry: they go on without it"
                             .into(),
                     });
                     continue;
