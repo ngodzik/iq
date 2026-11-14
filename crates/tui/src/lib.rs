@@ -36,6 +36,7 @@ mod tty;
 mod wrap;
 
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -138,6 +139,7 @@ pub fn run(
         relayout: false,
         kitty: graphics::detect(|name| std::env::var(name).ok()),
         sent: HashSet::new(),
+        erased: Vec::new(),
     };
     let depth = Depth::detect();
     let p = Palette::new(board.look().theme(), depth);
@@ -193,6 +195,10 @@ struct Screen {
     kitty: Option<Kitty>,
     /// The images it was sent since the screen was last wiped.
     sent: HashSet<u32>,
+    /// What each row of the screen showed when its end was last erased, in
+    /// the conversation iq draws: a row erased again although unchanged is
+    /// written again, and a terminal drops a selection made on it.
+    erased: Vec<Option<u64>>,
 }
 
 impl Screen {
@@ -200,6 +206,7 @@ impl Screen {
     /// terminal is made anew rather than resized: resized narrower,
     /// ratatui clears the whole screen and moves what it draws to its top.
     fn refit(&mut self, area: Rect) -> io::Result<()> {
+        self.erased.clear();
         for y in area.top()..area.bottom() {
             queue!(self.out, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
         }
@@ -226,6 +233,7 @@ impl Screen {
         )?;
         self.inline = Inline::new(cols, rows);
         self.sent.clear();
+        self.erased.clear();
         Ok(())
     }
 
@@ -254,6 +262,42 @@ fn cell() -> (u16, u16) {
             (size.width / size.columns, size.height / size.rows)
         }
     })
+}
+
+/// The rows of the conversation iq draws whose end is erased, from `head`
+/// on, each with where its text ends and its background: those whose
+/// width, background or text (`ends`) changed since `erased` says they
+/// were erased last, on a screen `rows` tall and `cols` wide. What it
+/// says of the rows that are not the conversation's any more is
+/// forgotten.
+fn to_erase(
+    erased: &mut Vec<Option<u64>>,
+    rows: u16,
+    head: u16,
+    ends: &[(u16, Option<Color>, u64)],
+    cols: u16,
+) -> Vec<(u16, u16, Option<Color>)> {
+    erased.resize(usize::from(rows), None);
+    let conversation = usize::from(head)..usize::from(head).saturating_add(ends.len());
+    for (at, kept) in erased.iter_mut().enumerate() {
+        if !conversation.contains(&at) {
+            *kept = None;
+        }
+    }
+    let mut erase = Vec::new();
+    for (row, &(width, ground, shows)) in (head..).zip(ends) {
+        let Some(kept) = erased.get_mut(usize::from(row)) else {
+            continue;
+        };
+        if *kept == Some(shows) {
+            continue;
+        }
+        *kept = Some(shows);
+        if width < cols {
+            erase.push((row, width, ground));
+        }
+    }
+    erase
 }
 
 /// The escape that sets the background to `color`, or to the terminal's
@@ -643,11 +687,18 @@ impl Iq {
             p: &self.p,
             now,
         };
-        let ends: Vec<(u16, Option<Color>)> = (0..usize::from(room))
+        let ends: Vec<(u16, Option<Color>, u64)> = (0..usize::from(room))
             .map(|row| {
-                let width = shown.lines.get(row).map_or(0, Line::width);
+                let line = shown.lines.get(row);
+                let width = line.map_or(0, Line::width);
                 let ground = shown.grounds.get(row).copied().flatten();
-                (u16::try_from(width).unwrap_or(u16::MAX), ground)
+                let mut shows = std::collections::hash_map::DefaultHasher::new();
+                (line, ground).hash(&mut shows);
+                (
+                    u16::try_from(width).unwrap_or(u16::MAX),
+                    ground,
+                    shows.finish(),
+                )
             })
             .collect();
         let motion = &mut self.motion;
@@ -659,12 +710,11 @@ impl Iq {
         })?;
         // Past its text, each row of the conversation is left empty rather
         // than filled with spaces, in the mark's colour on what it marks:
-        // a selection in the terminal takes neither.
-        for (row, (width, ground)) in (head..).zip(ends) {
-            if width < cols {
-                queue!(screen.out, MoveTo(width, row))?;
-                write!(screen.out, "{}\x1b[K", background(ground))?;
-            }
+        // a selection in the terminal takes neither. Only a row that
+        // changed is erased again, as its text was written again.
+        for (row, width, ground) in to_erase(&mut screen.erased, rows, head, &ends, cols) {
+            queue!(screen.out, MoveTo(width, row))?;
+            write!(screen.out, "{}\x1b[K", background(ground))?;
         }
         write!(screen.out, "\x1b[0m")?;
         if let Some((x, y)) = caret {
@@ -847,5 +897,37 @@ impl Iq {
         screen.insert(self.history.take_images(), &lines)?;
         screen.inline.leave(&mut screen.out)?;
         screen.out.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_row_of_the_conversation_is_erased_again_only_once_it_changed() {
+        let mut erased = Vec::new();
+        let marked = Some(Color::Rgb(1, 2, 3));
+        let ends = [(10, None, 1), (80, None, 2), (4, marked, 3)];
+        // Drawn first: every row shorter than the screen.
+        assert_eq!(
+            to_erase(&mut erased, 6, 1, &ends, 80),
+            [(1, 10, None), (3, 4, marked)]
+        );
+        // Drawn again unchanged, as the clock ticks: none, so that a
+        // selection the terminal made on them holds.
+        assert!(to_erase(&mut erased, 6, 1, &ends, 80).is_empty());
+        // A row changed, its text or its mark: that one.
+        let changed = [(10, None, 1), (80, None, 2), (4, None, 4)];
+        assert_eq!(to_erase(&mut erased, 6, 1, &changed, 80), [(3, 4, None)]);
+        // The conversation lower by a row: what it shows there now is
+        // erased, and a row given back and taken again is erased too.
+        assert_eq!(
+            to_erase(&mut erased, 6, 2, &changed, 80),
+            [(2, 10, None), (4, 4, None)]
+        );
+        // Forgotten, as the screen is wiped: all of it again.
+        erased.clear();
+        assert_eq!(to_erase(&mut erased, 6, 2, &changed, 80).len(), 2);
     }
 }
