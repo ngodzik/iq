@@ -3739,18 +3739,22 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("Not this")));
         // The turn's strip says each in a line, summed up, and the summary
         // is the page's too.
-        for _ in 0..200 {
-            if history.summed(2).is_some() {
+        // Each summary is made on a thread of its own.
+        let said = |history: &History| -> Vec<String> {
+            history
+                .chatter("lead")
+                .0
+                .iter()
+                .map(|chatted| chatted.said())
+                .collect()
+        };
+        for _ in 0..400 {
+            if said(&history).iter().all(|line| line.contains("asks")) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let said: Vec<String> = history
-            .chatter("lead")
-            .0
-            .iter()
-            .map(|chatted| chatted.said())
-            .collect();
+        let said = said(&history);
         assert_eq!(
             said,
             [
