@@ -40,6 +40,9 @@ pub enum Action {
     /// The person's skills open to the agents of the chat written to until
     /// its turn ends, or shut.
     Skills,
+    /// A notification of the system's once a turn of the person's ends or
+    /// a question waits, until a turn of theirs ends; or none.
+    Notify,
     /// Allows what an agent asks, the oldest question first.
     Allow,
     /// Refuses it.
@@ -59,7 +62,7 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order the list of shortcuts gives them.
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 18] = [
         Action::Switch,
         Action::NewChat,
         Action::Team,
@@ -70,6 +73,7 @@ impl Action {
         Action::Autopilot,
         Action::Internet,
         Action::Skills,
+        Action::Notify,
         Action::Allow,
         Action::Refuse,
         Action::Changes,
@@ -93,6 +97,7 @@ impl Action {
             Action::Autopilot => "autopilot",
             Action::Internet => "internet",
             Action::Skills => "skills",
+            Action::Notify => "notify",
             Action::Allow => "allow",
             Action::Refuse => "refuse",
             Action::Changes => "changes",
@@ -119,6 +124,9 @@ impl Action {
             Action::Skills => {
                 "your skills open to the agents of this chat until its turn ends; again shuts them"
             }
+            Action::Notify => {
+                "a notification when a turn of yours ends or a question waits; again, none"
+            }
             Action::Allow => "allow what an agent asks",
             Action::Refuse => "refuse it",
             Action::Changes => "what a sync would send, line by line",
@@ -144,6 +152,8 @@ impl Action {
             // B for the brief the skills are; a terminal multiplexer may
             // keep it, `/skills` does the same.
             Action::Skills => "ctrl+b",
+            // P for ping: free in the text the person writes.
+            Action::Notify => "ctrl+p",
             Action::Allow => "ctrl+y",
             Action::Refuse => "ctrl+r",
             Action::Changes => "ctrl+d",

@@ -18,8 +18,9 @@ const SUMMARIZER: &str = "summaries";
 
 /// What the summarizer's model is told.
 const SUMMING: &str = "You sum up for a person what one agent of a coding harness wrote to \
-    another, so that they follow the work without reading it all. In at most three short lines: \
-    what is asked or answered, and what matters in it (a decision, a file, a number, what failed). \
+    another, so that they follow the work without reading it all. In one line of fifteen words at \
+    most: what is asked or answered, and what matters in it (a decision, a file, a number, what \
+    failed). \
     Write in the message's own language, plainly, with no preamble and no heading. The message \
     follows, after who wrote it to whom.";
 

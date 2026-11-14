@@ -138,6 +138,12 @@ const NAMED_IN_MESSAGE: &str = "named in the message";
 /// The same, when it is the settings' lead.
 const SETTINGS_MODEL: &str = iq_agent::SETTINGS_MODEL;
 
+/// What the person is notified of as a turn of theirs ends.
+const DONE_ALERT: &str = "Turn done";
+
+/// What they are notified of as a question waits for them.
+const WAITING_ALERT: &str = "Waiting for you";
+
 /// How many of the person's chats the switcher shows at once.
 pub const SWITCH_ROWS: usize = 5;
 
@@ -234,6 +240,11 @@ pub struct Board {
     /// draws with a click: a letter is then what they start writing,
     /// never a key.
     clicked: bool,
+    /// Whether the person asked to be notified once a turn of theirs ends
+    /// or a question waits.
+    notify: bool,
+    /// The notifications waiting for the terminal to send them.
+    alerts: Vec<&'static str>,
 }
 
 /// A link the person points at in the conversation iq draws, the mouse
@@ -358,7 +369,22 @@ impl Board {
             pointed: None,
             listed: false,
             clicked: false,
+            notify: false,
+            alerts: Vec::new(),
         }
+    }
+
+    /// Whether the person asked to be notified once a turn of theirs ends
+    /// or a question waits.
+    #[must_use]
+    pub fn notifying(&self) -> bool {
+        self.notify
+    }
+
+    /// The notifications to send since the terminal last took them: what
+    /// happened, never anything of the work, as a screen may be shared.
+    pub fn take_alerts(&mut self) -> Vec<&'static str> {
+        std::mem::take(&mut self.alerts)
     }
 
     /// Whether the person reads the conversation iq draws, the arrows
@@ -1391,6 +1417,16 @@ impl Board {
                 let open = self.crew.skills() != Some(chat.as_str());
                 return Some(Request::Skills { agent, open });
             }
+            Action::Notify => {
+                self.notify = !self.notify;
+                let said = if self.notify {
+                    "You are notified when a turn of yours ends or a question waits, until a \
+                     turn of yours ends"
+                } else {
+                    "No notification"
+                };
+                self.screen.notice(said, now);
+            }
             Action::Allow | Action::Refuse => {
                 // The agents' questions first: they hold work.
                 if let Some(id) = self.crew.questions().first().map(|q| q.id) {
@@ -1945,7 +1981,28 @@ impl Board {
                     }
                     _ => {}
                 }
+                let asked = matches!(event, Event::Asked { .. } | Event::Choose { .. });
+                let done = match &event {
+                    Event::Done { agent, .. } => self.crew.chat_of(agent),
+                    _ => None,
+                };
                 self.crew.event(event);
+                if self.notify {
+                    if asked {
+                        self.alerts.push(WAITING_ALERT);
+                    }
+                    // A turn of the person's chat ends once none of its
+                    // agents works: said, and nothing more is.
+                    let chat_rests = done.is_some_and(|chat| {
+                        !self.crew.agents().iter().any(|agent| {
+                            agent.working && self.crew.chat_of(&agent.name).as_ref() == Some(&chat)
+                        })
+                    });
+                    if chat_rests {
+                        self.alerts.push(DONE_ALERT);
+                        self.notify = false;
+                    }
+                }
             }
             Update::Back(back) => {
                 let agent = back.agent.clone();
@@ -2082,6 +2139,53 @@ mod tests {
         board.scroll(-3);
         key(&mut board, "PageUp");
         assert!(board.take_readings().is_empty());
+    }
+
+    #[test]
+    fn notifications_come_once_asked_and_say_nothing_of_the_work() {
+        let mut board = Board::default();
+        joined(&mut board, "lead", PERSON);
+        joined(&mut board, "lead/tests", "lead");
+        let asked = || {
+            Update::Crew(Event::Asked {
+                id: 1,
+                agent: "lead".into(),
+                action: "run `git push` to the secret project".into(),
+                reason: "it publishes".into(),
+                widens: true,
+                preview: None,
+            })
+        };
+        let working = |agent: &str| {
+            Update::Crew(Event::Working {
+                agent: agent.into(),
+                prompt: "go".into(),
+            })
+        };
+        let done = |agent: &str| {
+            Update::Crew(Event::Done {
+                agent: agent.into(),
+                outcome: Ok("pushed the secret project".into()),
+            })
+        };
+        // Not asked, none.
+        board.update(asked());
+        assert!(board.take_alerts().is_empty());
+        key(&mut board, "ctrl+p");
+        assert!(board.notifying());
+        // A question, then the turn's end once nothing of the chat works,
+        // in words of iq's own.
+        board.update(asked());
+        board.update(working("lead"));
+        board.update(working("lead/tests"));
+        board.update(done("lead/tests"));
+        assert_eq!(board.take_alerts(), ["Waiting for you"]);
+        board.update(done("lead"));
+        assert_eq!(board.take_alerts(), ["Turn done"]);
+        // Then none, until asked again.
+        assert!(!board.notifying());
+        board.update(asked());
+        assert!(board.take_alerts().is_empty());
     }
 
     #[test]

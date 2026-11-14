@@ -39,6 +39,41 @@ use crate::wrap::{cut, fit, wrap};
 /// sums it up.
 const MESSAGE_LINES: usize = 4;
 
+/// How many of the latest messages between a chat's agents its turn's
+/// strip shows, one line each.
+pub(crate) const CHATTER_SHOWN: usize = 10;
+
+/// What one agent wrote to another in a chat's turn, kept out of its
+/// conversation: the turn's strip shows the latest, the steps' page all.
+#[derive(Debug, Clone)]
+pub(crate) struct Chatted {
+    /// Its writer.
+    pub(crate) from: String,
+    /// Its reader.
+    pub(crate) to: String,
+    /// What it wrote, whole.
+    text: String,
+    /// Its summary, when a model sums messages up and it is long.
+    summary: Option<Arc<Summary>>,
+}
+
+impl Chatted {
+    /// What it says in a line: its summary once made, else its first line.
+    pub(crate) fn said(&self) -> String {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.text())
+            .unwrap_or_else(|| {
+                self.text
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned()
+            })
+    }
+}
+
 /// The longest line of a message written, in characters: a paragraph
 /// written as one line is cut there.
 const LINE_CHARS: usize = 200;
@@ -165,14 +200,6 @@ pub(crate) enum Block {
         label: Label,
         tail: Vec<Span<'static>>,
     },
-    /// A message between agents summed up, under `indent`, in `style`; its
-    /// first lines, `instead`, until it is, or when it cannot be.
-    Summed {
-        summary: Arc<Summary>,
-        instead: Vec<Para>,
-        indent: String,
-        style: Style,
-    },
 }
 
 /// Whose turn a head begins.
@@ -227,15 +254,6 @@ impl Block {
                     .to_owned()
             }
             Block::Change { diff, .. } => diff.clone(),
-            Block::Summed {
-                summary, instead, ..
-            } => summary.text().unwrap_or_else(|| {
-                instead
-                    .iter()
-                    .map(|para| spans(&para.body))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }),
             Block::Entry { blocks, .. } => blocks
                 .iter()
                 .map(Block::written)
@@ -279,7 +297,6 @@ impl Block {
         match self {
             Block::Diagram { diagram, .. } => diagram.drawing(),
             Block::Entry { blocks, .. } => blocks.iter().any(Block::drawing),
-            Block::Summed { summary, .. } => summary.making(),
             Block::Job { label, .. } => label.making(),
             Block::Para(_)
             | Block::Change { .. }
@@ -353,25 +370,6 @@ impl Block {
                 }
                 lines
             }
-            Block::Summed {
-                summary,
-                instead,
-                indent,
-                style,
-            } => match summary.text() {
-                Some(said) => said
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .flat_map(|line| {
-                        let at = [Span::raw(indent.clone())];
-                        wrap(&[Span::styled(line.to_owned(), *style)], width, &at, &at)
-                    })
-                    .collect(),
-                None => instead
-                    .iter()
-                    .flat_map(|para| wrap(&para.body, width, &para.first, &para.rest))
-                    .collect(),
-            },
             Block::Diagram {
                 diagram,
                 code,
@@ -515,6 +513,9 @@ pub(crate) struct History {
     /// The agents another started that the person wrote to: what they
     /// write until their turn ends is theirs to read.
     woken: HashSet<String>,
+    /// The latest messages between each chat's agents in its turn, and
+    /// how many there were in all, with the turn's number.
+    chatter: HashMap<String, (u64, usize, VecDeque<Chatted>)>,
     /// The model the turns of a thread written again answered on, as it
     /// says: their heads name it rather than the chat's model now.
     recalled_on: Option<String>,
@@ -660,18 +661,8 @@ impl History {
                 }
                 let by = board.crew().agent(agent).map(|a| a.by.clone());
                 match by {
-                    Some(by) if by != PERSON => {
-                        self.header(agent, board, p);
-                        let id = board
-                            .steps()
-                            .latest_said()
-                            .filter(|said| said.task && said.to == *agent)
-                            .map(|said| said.id);
-                        let mut head = vec![Span::styled("↳ its task", p.fg(p.info))];
-                        head.extend(numbered(id, p));
-                        self.push(Para::indented("  ", head));
-                        self.message(&by, agent, prompt, id, p);
-                    }
+                    // A task between agents stays out of the conversation.
+                    Some(by) if by != PERSON => self.chatted(&by, agent, prompt, board),
                     _ => self.person(prompt, agent, board, p),
                 }
             }
@@ -758,25 +749,11 @@ impl History {
                     let out = markdown.flush(p);
                     self.write(from, out, board, p);
                 } else {
+                    // Between agents: out of the conversation, which keeps
+                    // the person's question and its answer.
                     self.finish(from, board, p);
                     self.folds(from, board, p);
-                    self.set_speaker(None);
-                    let (writer, reader) =
-                        (self.shown_name(board, from), self.shown_name(board, to));
-                    let id = board
-                        .steps()
-                        .latest_said()
-                        .filter(|said| !said.task && said.from == *from && said.to == *to)
-                        .map(|said| said.id);
-                    let mut head = vec![
-                        Span::styled("✉ ", p.fg(p.info)),
-                        Span::styled(writer, p.fg(agent_tint(board, from, p))),
-                        Span::styled(" → ", p.fg(p.faint)),
-                        Span::styled(reader, p.fg(agent_tint(board, to, p))),
-                    ];
-                    head.extend(numbered(id, p));
-                    self.push(Para::indented("  ", head));
-                    self.message(from, to, text, id, p);
+                    self.chatted(from, to, text, board);
                 }
             }
             Event::Done { agent, outcome } => {
@@ -787,6 +764,9 @@ impl History {
                 let turn = self.turns.remove(agent);
                 match outcome {
                     Ok(_) => {
+                        if let Some(digest) = self.turn_digest(agent, board, p) {
+                            self.push(digest);
+                        }
                         let mut said = String::new();
                         if let Some(turn) = turn {
                             said.push_str(&seconds(turn.since.elapsed().as_secs()));
@@ -896,10 +876,14 @@ impl History {
             }
             // Its turn's end says it, with the facts; the agents line
             // counts those retired.
-            Event::Failed { .. }
-            | Event::Retired { .. }
-            | Event::Turn { .. }
-            | Event::Window { .. } => {}
+            // A chat's new turn begins with none of its messages.
+            Event::Turn { chat, number, .. } => {
+                let kept = self.chatter.entry(chat.clone()).or_default();
+                if kept.0 != *number {
+                    *kept = (*number, 0, VecDeque::new());
+                }
+            }
+            Event::Failed { .. } | Event::Retired { .. } | Event::Window { .. } => {}
             Event::Placed {
                 agent,
                 said: Some(said),
@@ -1260,35 +1244,117 @@ impl History {
         }
     }
 
-    /// What `from` wrote to `to`, numbered `id` on the steps' page, under
-    /// its head: whole when it is short; else summed up, when a model sums
-    /// messages up, what comes after it waiting a little for it; else its
-    /// first lines.
-    fn message(&mut self, from: &str, to: &str, text: &str, id: Option<usize>, p: &Palette) {
-        const INDENT: &str = "    ";
-        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        let short = lines.len() <= MESSAGE_LINES
-            && lines.iter().all(|line| line.chars().count() <= LINE_CHARS);
-        let said = match (&self.summarizer.0, id) {
-            (Some(summarize), Some(id)) if !short => {
-                let summary = Summary::new(from, to, text, Arc::clone(summarize));
-                self.summaries.insert(id, Arc::clone(&summary));
-                vec![Block::Summed {
-                    summary,
-                    instead: first_lines(text, INDENT, p, MESSAGE_LINES),
-                    indent: INDENT.to_owned(),
-                    style: p.fg(p.dim),
-                }]
-            }
-            _ => first_lines(text, INDENT, p, MESSAGE_LINES)
-                .into_iter()
-                .map(Block::Para)
-                .collect(),
+    /// Keeps what `from` wrote to `to`, both agents of the chat written in,
+    /// for its turn's strip, summed up when a model sums messages up and it
+    /// is long: the summary is the steps' page's too.
+    fn chatted(&mut self, from: &str, to: &str, text: &str, board: &Board) {
+        let Some(chat) = self.at.clone() else {
+            return;
         };
-        match id {
-            Some(id) => self.push_block(Block::Entry { id, blocks: said }),
-            None => said.into_iter().for_each(|block| self.push_block(block)),
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let short = lines.len() <= 1 && lines.iter().all(|line| line.chars().count() <= LINE_CHARS);
+        let summary = self
+            .summarizer
+            .0
+            .as_ref()
+            .filter(|_| !short)
+            .map(|summarize| Summary::new(from, to, text, Arc::clone(summarize)));
+        if let (Some(summary), Some(said)) = (&summary, board.steps().latest_said())
+            && said.from == from
+            && said.to == to
+        {
+            self.summaries.insert(said.id, Arc::clone(summary));
         }
+        let kept = self.chatter.entry(chat).or_default();
+        kept.1 += 1;
+        kept.2.push_back(Chatted {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            text: text.to_owned(),
+            summary,
+        });
+        while kept.2.len() > CHATTER_SHOWN {
+            kept.2.pop_front();
+        }
+    }
+
+    /// The latest messages between `chat`'s agents in its turn, oldest
+    /// first, and how many came before them.
+    pub(crate) fn chatter(&self, chat: &str) -> (Vec<&Chatted>, usize) {
+        self.chatter
+            .get(chat)
+            .map_or((Vec::new(), 0), |(_, all, kept)| {
+                (kept.iter().collect(), all.saturating_sub(kept.len()))
+            })
+    }
+
+    /// The line that sums up the turn of the person's chat `agent` leads,
+    /// as it ends, when other agents worked in it: who, on which models,
+    /// what they wrote each other, the calls, the cost, and where every
+    /// step is.
+    fn turn_digest(&self, agent: &str, board: &Board, p: &Palette) -> Option<Para> {
+        if board
+            .crew()
+            .agent(agent)
+            .is_none_or(|view| view.by != PERSON)
+        {
+            return None;
+        }
+        let turn = board.crew().turn(agent)?;
+        let others: Vec<&iq_ui::crew::TurnSpending> = turn
+            .by
+            .iter()
+            .filter(|spent| spent.who != agent && spent.who.contains('/'))
+            .collect();
+        let messages = self.chatter.get(agent).map_or(0, |(_, all, _)| *all);
+        if others.is_empty() && messages == 0 {
+            return None;
+        }
+        let mut models: Vec<(String, usize)> = Vec::new();
+        for spent in &others {
+            let short = spent
+                .model
+                .rsplit('/')
+                .next()
+                .unwrap_or(&spent.model)
+                .to_owned();
+            match models.iter_mut().find(|(model, _)| *model == short) {
+                Some((_, count)) => *count += 1,
+                None => models.push((short, 1)),
+            }
+        }
+        let plural = |count: usize, one: &str| {
+            if count == 1 {
+                format!("1 {one}")
+            } else {
+                format!("{count} {one}s")
+            }
+        };
+        let mut said = plural(others.len(), "agent");
+        if !models.is_empty() {
+            let on: Vec<String> = models
+                .iter()
+                .map(|(model, count)| format!("{count} on {model}"))
+                .collect();
+            said.push_str(&format!(" ({})", on.join(", ")));
+        }
+        let calls: u64 = turn.by.iter().map(|spent| spent.calls).sum();
+        said.push_str(&format!(
+            " · {} · {} · {}",
+            plural(messages, "message"),
+            plural(usize::try_from(calls).unwrap_or(usize::MAX), "call"),
+            turn.total
+        ));
+        if let Some(chord) = board.keys().chord(Action::Steps) {
+            said.push_str(&format!(" · {chord} every step"));
+        }
+        Some(Para::indented(
+            "  ",
+            vec![
+                Span::styled("⋯ ", p.fg(p.faint)),
+                Span::styled(said, p.fg(p.faint)),
+            ],
+        ))
     }
 
     /// Whether `agent`'s text goes in its pane rather than its chat's
@@ -2048,13 +2114,6 @@ fn change(path: &str, diff: &str, p: &Palette) -> Block {
         faint: p.fg(p.faint),
         diff: diff.to_owned(),
     }
-}
-
-/// The number a message has on the steps' page, as its head ends: the
-/// way to it whole.
-fn numbered(id: Option<usize>, p: &Palette) -> Vec<Span<'static>> {
-    id.map(|id| vec![Span::styled(format!("  #{id}"), p.fg(p.faint))])
-        .unwrap_or_default()
 }
 
 /// The agent `event` is of, when it is of one.
@@ -3346,7 +3405,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_between_agents_are_written_short_and_to_the_person_whole() {
+    fn messages_between_agents_stay_out_of_the_conversation_and_to_the_person_are_whole() {
         let p = Palette::new(Theme::Ink, Depth::True);
         let mut board = Board::default();
         let mut history = History::default();
@@ -3401,13 +3460,8 @@ mod tests {
             lines,
             [
                 // In the chat's window, its own agent goes by its model;
-                // a message by its number on the steps' page too.
+                // what it wrote its helper is the turn's strip's.
                 "◦ helper joins, on m, started by m",
-                "  ✉ m → helper  #1",
-                "    1",
-                "    2",
-                "    3",
-                "    4 …",
                 "",
                 "● helper  m",
                 "  ✉ to you",
@@ -3415,6 +3469,15 @@ mod tests {
                 "",
                 "› @helper thanks",
             ]
+        );
+        let (chatter, before) = history.chatter("lead");
+        assert_eq!(before, 0);
+        assert_eq!(
+            chatter
+                .iter()
+                .map(|chatted| (chatted.from.as_str(), chatted.to.as_str(), chatted.said()))
+                .collect::<Vec<_>>(),
+            [("lead", "helper", "1".to_owned())]
         );
     }
 
@@ -3669,22 +3732,36 @@ mod tests {
         }
         let lines = settled(&mut history, "lead");
         let at = |line: &str| lines.iter().position(|l| l == line);
-        assert!(at("  ↳ its task  #1").is_some(), "{lines:#?}");
-        assert!(
-            at("    lead asks lead/tests for 6 lines").is_some(),
-            "{lines:#?}"
-        );
-        // Each by its name in the chat's window: its part, and the lead its
-        // model.
-        assert!(at("  ✉ tests → m  #2").is_some(), "{lines:#?}");
-        assert!(
-            at("    lead/tests asks lead for 1 lines").is_some(),
-            "{lines:#?}"
-        );
+        // The task and the message stay out of the conversation.
+        assert!(!lines.iter().any(|l| l.contains("asks")), "{lines:#?}");
         assert!(at("  Docs too.").is_some(), "{lines:#?}");
         assert!(!lines.iter().any(|l| l.contains("Reading the module")));
         assert!(!lines.iter().any(|l| l.contains("Not this")));
-        // Its summary is the page's too.
+        // The turn's strip says each in a line, summed up, and the summary
+        // is the page's too.
+        // Each summary is made on a thread of its own.
+        let said = |history: &History| -> Vec<String> {
+            history
+                .chatter("lead")
+                .0
+                .iter()
+                .map(|chatted| chatted.said())
+                .collect()
+        };
+        for _ in 0..400 {
+            if said(&history).iter().all(|line| line.contains("asks")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let said = said(&history);
+        assert_eq!(
+            said,
+            [
+                "lead asks lead/tests for 6 lines",
+                "lead/tests asks lead for 1 lines"
+            ]
+        );
         assert_eq!(
             history.summed(2).as_deref(),
             Some("lead/tests asks lead for 1 lines")
@@ -3692,7 +3769,82 @@ mod tests {
     }
 
     #[test]
-    fn without_a_model_to_sum_up_a_message_its_first_lines_are_cut() {
+    fn a_turn_of_several_agents_ends_with_a_line_that_sums_it_up() {
+        let p = Palette::new(Theme::Ink, Depth::True);
+        let mut board = Board::default();
+        let mut history = History::default();
+        let joined = |agent: &str, model: &str, by: &str| Event::Joined {
+            agent: agent.into(),
+            model: model.into(),
+            by: by.into(),
+        };
+        let spent = |agent: &str, model: &str| Event::Spent {
+            agent: agent.into(),
+            model: model.into(),
+            usage: iq_core::Usage::default(),
+            cost: Some(iq_core::Usd(0.1)),
+            cache: None,
+            chat: Some("lead".into()),
+        };
+        let posted = |from: &str, to: &str| Event::Posted {
+            from: from.into(),
+            to: to.into(),
+            text: "the work".into(),
+        };
+        for event in [
+            joined("lead", "lab/opus", PERSON),
+            Event::Turn {
+                chat: "lead".into(),
+                number: 1,
+                ask_at: None,
+            },
+            Event::Working {
+                agent: "lead".into(),
+                prompt: "fix the parser".into(),
+            },
+            joined("lead/tests", "lab/haiku", "lead"),
+            joined("lead/docs", "lab/haiku", "lead"),
+            spent("lead", "lab/opus"),
+            spent("lead/tests", "lab/haiku"),
+            spent("lead/docs", "lab/haiku"),
+            spent("lead", "lab/opus"),
+            posted("lead", "lead/tests"),
+            posted("lead/tests", "lead"),
+            Event::Text {
+                agent: "lead".into(),
+                text: "Fixed.\n".into(),
+            },
+            Event::Done {
+                agent: "lead".into(),
+                outcome: Ok("Fixed.".into()),
+            },
+        ] {
+            crew(&mut board, &mut history, event, &p);
+        }
+        let lines = settled(&mut history, "lead");
+        assert!(
+            lines.contains(
+                &"  ⋯ 2 agents (2 on haiku) · 2 messages · 4 calls · $0.40 · Ctrl-X every step"
+                    .to_owned()
+            ),
+            "{lines:#?}"
+        );
+        // Its next turn starts with no message.
+        crew(
+            &mut board,
+            &mut history,
+            Event::Turn {
+                chat: "lead".into(),
+                number: 2,
+                ask_at: None,
+            },
+            &p,
+        );
+        assert!(history.chatter("lead").0.is_empty());
+    }
+
+    #[test]
+    fn without_a_model_to_sum_up_a_message_its_first_line_says_it() {
         let p = Palette::new(Theme::Ink, Depth::True);
         let mut board = Board::default();
         let mut history = History::default();
@@ -3719,9 +3871,9 @@ mod tests {
             &p,
         );
         let lines = settled(&mut history, "lead");
-        let kept: usize = lines.iter().map(|l| l.matches('x').count()).sum();
-        assert!(kept < LINE_CHARS, "{lines:#?}");
-        assert!(lines.iter().any(|l| l.ends_with('…')), "{lines:#?}");
-        assert!(lines.contains(&"    the rest".to_owned()), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("xxx")), "{lines:#?}");
+        // Its first line says it in the strip.
+        let (chatter, _) = history.chatter("lead");
+        assert_eq!(chatter[0].said(), "x".repeat(500));
     }
 }

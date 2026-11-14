@@ -69,6 +69,11 @@ const PEER_SPAN: Duration = Duration::from_secs(10 * 60);
 /// started still work.
 const WAIT_LOOK: Duration = Duration::from_secs(1);
 
+/// How long the board stays quiet before an agent waiting for all those it
+/// started is given their answers: one rests just before its answer is
+/// posted.
+const WAIT_QUIET: Duration = Duration::from_millis(300);
+
 /// How many crews this program made: each numbers its questions apart
 /// from the others', so that an answer reaches the crew that asked when
 /// one window shows several.
@@ -2491,6 +2496,54 @@ where
         }
     }
 
+    /// Waits until none of the agents `agent` started works, or one asks
+    /// it something it has not read, ten minutes at most, then gives all
+    /// that was written to it at once: one call, where waking at each
+    /// message would read its whole conversation again each time.
+    async fn wait_all(&self, agent: &str) -> String {
+        let mut posted = self.inner.posted.subscribe();
+        let on = self.at_work_by(agent);
+        if !on.is_empty() {
+            self.report(Event::Waiting {
+                agent: agent.to_owned(),
+                on,
+            });
+        }
+        let most = tokio::time::Instant::now() + Duration::from_secs(tools::WAIT_MOST);
+        loop {
+            posted.borrow_and_update();
+            let asked = lock(&self.inner.raised)
+                .get(agent)
+                .is_some_and(|raised| !raised.is_empty())
+                && self.has_unread(agent);
+            let now = tokio::time::Instant::now();
+            if asked || !self.started_at_work(agent) || now >= most {
+                break;
+            }
+            let _ = tokio::time::timeout_at(most.min(now + WAIT_LOOK), posted.changed()).await;
+        }
+        // The answers of those who just rested, posted a moment after.
+        while tokio::time::Instant::now() < most
+            && matches!(
+                tokio::time::timeout(WAIT_QUIET, posted.changed()).await,
+                Ok(Ok(()))
+            )
+        {}
+        let working = self.at_work_by(agent);
+        match (self.unread(agent), working.is_empty()) {
+            (Some(news), _) => news,
+            (None, true) => {
+                "The agents you started are done, and wrote nothing more to you.".to_owned()
+            }
+            (None, false) => format!(
+                "No message came in {} seconds, and {} still work. End your turn: their answers \
+                 will wake you.",
+                tools::WAIT_MOST,
+                working.join(", ")
+            ),
+        }
+    }
+
     /// Whether an agent `agent` started works.
     fn started_at_work(&self, agent: &str) -> bool {
         !self.at_work_by(agent).is_empty()
@@ -2654,8 +2707,8 @@ where
             }
             self.retire_done(&name);
         }
-        // What the person wrote after its last look at the board.
-        if self.person_waits(&name)
+        // What was written to it after its last look at the board.
+        if self.woken_by_unread(&name)
             && let Some(news) = self.unread(&name)
         {
             self.wake(&name, news);
@@ -3108,14 +3161,34 @@ where
         }
     }
 
-    /// Whether the person wrote to `agent` since it last read the board.
-    fn person_waits(&self, agent: &str) -> bool {
-        let board = lock(&self.inner.board);
-        board.members.get(agent).is_some_and(|member| {
-            board.messages[member.read..]
+    /// Whether what was written to `agent` since it last read the board
+    /// wakes it as its turn ends: the person's message, iq's, or that of an
+    /// agent it started or one retired since, at once; a peer's at work
+    /// while the two do not wake each other too often. Posted during its
+    /// last call, it would wait unread until something else woke it, and
+    /// be lost with the board were iq started again.
+    fn woken_by_unread(&self, agent: &str) -> bool {
+        let (direct, peer) = {
+            let board = lock(&self.inner.board);
+            let Some(member) = board.members.get(agent) else {
+                return false;
+            };
+            let unread: Vec<&Posted> = board.messages[member.read..]
                 .iter()
-                .any(|m| m.from == PERSON && (m.to == agent || m.to == ALL))
-        })
+                .filter(|m| (m.to == agent || m.to == ALL) && m.from != agent)
+                .collect();
+            // A writer gone from the board wakes nobody in turn.
+            let peer_of = |m: &Posted| {
+                board
+                    .members
+                    .get(&m.from)
+                    .is_some_and(|writer| writer.by != agent)
+            };
+            let direct = unread.iter().any(|m| !peer_of(m));
+            let peer = unread.iter().find(|m| peer_of(m)).map(|m| m.from.clone());
+            (direct, peer)
+        };
+        direct || peer.is_some_and(|from| self.peer_may_wake(&from, agent))
     }
 
     /// A turn of one of iq's agents: its model called with its tools until
@@ -3561,6 +3634,9 @@ where
                 Ok("Sent.".into())
             }
             "wait_for_messages" => {
+                if args.flag("until_done") {
+                    return Ok(self.wait_all(agent).await);
+                }
                 let seconds = args
                     .number("seconds")
                     .unwrap_or(tools::WAIT_SECONDS)
