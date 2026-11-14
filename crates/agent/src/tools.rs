@@ -249,14 +249,18 @@ pub fn board() -> Vec<ToolSpec> {
             name: "wait_for_messages".into(),
             description: "Gives the messages written to you since you last read them, waiting \
                           up to `seconds` (30 by default) for one when there is none, and while \
-                          agents you started work, until one of them writes. Ending your turn \
-                          is the cheaper wait: an agent you started wakes you with its answer, \
-                          and each call made to wait again reads your whole conversation."
+                          agents you started work, until one of them writes. With `until_done`, \
+                          waits until none of the agents you started works, or one asks you \
+                          something, ten minutes at most, and gives all they wrote at once: the \
+                          wait for several agents. Ending your turn is the cheaper wait for one: \
+                          it wakes you with its answer, and each call made to wait again reads \
+                          your whole conversation."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "seconds": {"type": "integer"},
+                    "until_done": {"type": "boolean", "description": "Wait until none of the agents you started works."},
                 },
             }),
         },

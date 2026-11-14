@@ -69,6 +69,11 @@ const PEER_SPAN: Duration = Duration::from_secs(10 * 60);
 /// started still work.
 const WAIT_LOOK: Duration = Duration::from_secs(1);
 
+/// How long the board stays quiet before an agent waiting for all those it
+/// started is given their answers: one rests just before its answer is
+/// posted.
+const WAIT_QUIET: Duration = Duration::from_millis(300);
+
 /// How many crews this program made: each numbers its questions apart
 /// from the others', so that an answer reaches the crew that asked when
 /// one window shows several.
@@ -2491,6 +2496,54 @@ where
         }
     }
 
+    /// Waits until none of the agents `agent` started works, or one asks
+    /// it something it has not read, ten minutes at most, then gives all
+    /// that was written to it at once: one call, where waking at each
+    /// message would read its whole conversation again each time.
+    async fn wait_all(&self, agent: &str) -> String {
+        let mut posted = self.inner.posted.subscribe();
+        let on = self.at_work_by(agent);
+        if !on.is_empty() {
+            self.report(Event::Waiting {
+                agent: agent.to_owned(),
+                on,
+            });
+        }
+        let most = tokio::time::Instant::now() + Duration::from_secs(tools::WAIT_MOST);
+        loop {
+            posted.borrow_and_update();
+            let asked = lock(&self.inner.raised)
+                .get(agent)
+                .is_some_and(|raised| !raised.is_empty())
+                && self.has_unread(agent);
+            let now = tokio::time::Instant::now();
+            if asked || !self.started_at_work(agent) || now >= most {
+                break;
+            }
+            let _ = tokio::time::timeout_at(most.min(now + WAIT_LOOK), posted.changed()).await;
+        }
+        // The answers of those who just rested, posted a moment after.
+        while tokio::time::Instant::now() < most
+            && matches!(
+                tokio::time::timeout(WAIT_QUIET, posted.changed()).await,
+                Ok(Ok(()))
+            )
+        {}
+        let working = self.at_work_by(agent);
+        match (self.unread(agent), working.is_empty()) {
+            (Some(news), _) => news,
+            (None, true) => {
+                "The agents you started are done, and wrote nothing more to you.".to_owned()
+            }
+            (None, false) => format!(
+                "No message came in {} seconds, and {} still work. End your turn: their answers \
+                 will wake you.",
+                tools::WAIT_MOST,
+                working.join(", ")
+            ),
+        }
+    }
+
     /// Whether an agent `agent` started works.
     fn started_at_work(&self, agent: &str) -> bool {
         !self.at_work_by(agent).is_empty()
@@ -3581,6 +3634,9 @@ where
                 Ok("Sent.".into())
             }
             "wait_for_messages" => {
+                if args.flag("until_done") {
+                    return Ok(self.wait_all(agent).await);
+                }
                 let seconds = args
                     .number("seconds")
                     .unwrap_or(tools::WAIT_SECONDS)

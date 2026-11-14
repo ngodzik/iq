@@ -2080,6 +2080,55 @@ async fn a_model_too_slow_hands_the_call_to_its_backup() {
 }
 
 #[tokio::test]
+async fn waiting_until_done_gives_every_agent_s_answer_in_one_call() {
+    let start = |role: &str, model: &str| {
+        calls(
+            "start_agent",
+            serde_json::json!({"role": role, "model": model, "task": "help"}),
+        )
+    };
+    let f = fixture(
+        &[
+            (
+                "lead",
+                vec![
+                    start("first", "lab/quick"),
+                    start("second", "lab/slower"),
+                    calls("wait_for_messages", serde_json::json!({"until_done": true})),
+                    say("Both answered."),
+                ],
+            ),
+            ("lead/first", vec![say("First done.")]),
+            ("lead/second", vec![say("Second done.")]),
+        ],
+        Settings::default(),
+    );
+    let slow = [
+        ("lab/quick", Duration::from_millis(50)),
+        ("lab/slower", Duration::from_millis(400)),
+    ];
+    f.model
+        .slow_models
+        .lock()
+        .unwrap()
+        .extend(slow.map(|(model, time)| (model.to_owned(), time)));
+    f.crew.start("lead", &model("lab/m"), "go".into(), PERSON);
+    f.settled().await;
+    // One wait, both answers in it.
+    let requests = f.model.requests_of("lead");
+    assert_eq!(requests.len(), 4, "{:#?}", f.events());
+    let after = format!("{:?}", requests[3].messages);
+    assert!(
+        after.contains("First done.") && after.contains("Second done."),
+        "{after}"
+    );
+    assert!(f.events().contains(&Event::Done {
+        agent: "lead".into(),
+        outcome: Ok("Both answered.".into())
+    }));
+}
+
+#[tokio::test]
 async fn a_message_sent_during_an_agent_s_last_call_wakes_it_once_its_turn_ends() {
     let f = fixture(
         &[
