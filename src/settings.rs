@@ -22,6 +22,7 @@
 //! command_timeout = 600                  # seconds a command may run before it is stopped
 //! command_quiet = 180                    # seconds a command may write nothing before it is stopped: one waiting for a login, or an answer at a terminal
 //! provider_retries = 6                   # times a call is sent again while its provider is out of capacity (a quota, an overload), waiting as it asks, longer each time; 0 never
+//! backup_after = 180                     # seconds a call to a model with a backup left waits for its answer before it goes to the backup; one out of capacity goes at once
 //! worktree = false                       # true: each chat you start works in a worktree of its own, on a branch iq/<chat>, its path under where you write; your checkout is left as it is
 //! worktree_from = "HEAD"                 # what a worktree starts from: your checkout's commit, or a branch such as "origin/main"
 //! worktree_copy = [".env"]               # files of your checkout git does not keep, copied into a worktree as it is made, where it has their folder, never over one; a name alone is looked for in every folder
@@ -37,9 +38,13 @@
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set; the project's .claude/skills are read after them, yours winning a name both hold
+//! lead_skills = ["teams"]                # a few short skills given whole to the lead of each chat you start, read every call; the others, and all of them for the agents it starts, read on demand
 //! claude_memory = true                   # the notes kept of the project under ~/.claude read beside iq's own
 //! plugins = ["name"]                     # programs of their own iq starts and speaks with: iq-name for name, found on the PATH, run on your machine as you
 //! mermaid = "auto"                       # Mermaid diagrams drawn as images in Kitty, by mmdr (cargo install mermaid-rs-renderer) run in the sandbox, dark, on the terminal's own background; or a command with {input} and {output}, and {look} for iq's look; off unless set
+//!
+//! [backups]                              # the models a call goes to in turn when its model gives no answer in time or is out of capacity, never when it is refused: best the same model in another region, as your provider names it, so that the cache and the reasoning are lost once at most
+//! "anthropic/claude-opus-5-5" = ["anthropic/claude-opus-5-5@eu"]
 //!
 //! [keys]                                 # any shortcut moved, "" for none; Ctrl-S lists them
 //! costs = "ctrl+o"
@@ -74,7 +79,7 @@
 //! auto = false                           # true: what changes is sent without asking, and said; else iq asks first
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -150,6 +155,11 @@ pub(crate) struct Settings {
     command_quiet: Option<u64>,
     /// Times a call is sent again while its provider is out of capacity.
     provider_retries: Option<u32>,
+    /// Seconds a call to a model with a backup left waits for its answer.
+    backup_after: Option<u64>,
+    /// The models a call goes to in turn, by its model.
+    #[serde(default)]
+    backups: BTreeMap<String, Vec<String>>,
     /// How many tokens an agent's conversation grows between two words to
     /// it of its size.
     context_every: Option<u64>,
@@ -207,6 +217,9 @@ pub(crate) struct Settings {
     rules: Option<Vec<String>>,
     /// The folders of the person's skills.
     skills: Option<Vec<String>>,
+    /// The skills given whole to the leads of the person's chats.
+    #[serde(default)]
+    pub(crate) lead_skills: Vec<String>,
     /// Whether the notes kept of the project under `~/.claude` are read
     /// beside iq's.
     claude_memory: Option<bool>,
@@ -635,6 +648,25 @@ impl Settings {
             .collect())
     }
 
+    /// The models a call goes to in turn, by its model, as `[backups]`
+    /// names them.
+    ///
+    /// # Errors
+    ///
+    /// One is no model's name.
+    pub(crate) fn backups(&self) -> Result<HashMap<ModelId, Vec<ModelId>>> {
+        self.backups
+            .iter()
+            .map(|(model, backups)| {
+                let backups = backups
+                    .iter()
+                    .map(|backup| ModelId::new(backup.trim()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((ModelId::new(model.trim())?, backups))
+            })
+            .collect()
+    }
+
     /// What a worktree starts from: as set, else `HEAD`.
     pub(crate) fn worktree_from(&self) -> &str {
         self.worktree_from.as_deref().map_or("HEAD", str::trim)
@@ -761,6 +793,10 @@ impl Settings {
                 .command_quiet
                 .map_or(iq_agent::COMMAND_QUIET, std::time::Duration::from_secs),
             busy_tries: self.provider_retries.unwrap_or(iq_agent::BUSY_TRIES),
+            backups: self.backups()?,
+            backup_after: self
+                .backup_after
+                .map_or(iq_agent::BACKUP_AFTER, std::time::Duration::from_secs),
             // The cheap model that places the tasks names the chats.
             namer: Some(self.observing()?.model),
             light_from: self.light_from.unwrap_or(iq_agent::LIGHT_FROM),
@@ -861,6 +897,17 @@ mod tests {
         assert_eq!(set.crew().unwrap().compact_at, None);
         let under: Settings = toml::from_str("compact_at = 100000").unwrap();
         assert_eq!(under.crew().unwrap().compact_at, Some(100_000));
+        // Backups, by the model a call goes to first.
+        let backed: Settings =
+            toml::from_str("backup_after = 60\n[backups]\n\"lab/main\" = [\"lab/main@eu\"]")
+                .unwrap();
+        let crew = backed.crew().unwrap();
+        assert_eq!(crew.backup_after, std::time::Duration::from_secs(60));
+        assert_eq!(
+            crew.backups[&ModelId::new("lab/main").unwrap()],
+            [ModelId::new("lab/main@eu").unwrap()]
+        );
+        assert_eq!(set.crew().unwrap().backup_after, iq_agent::BACKUP_AFTER);
         assert!(set.autopilot && set.internet);
         assert!(!set.worktree);
         assert_eq!(set.worktree_from(), "HEAD");

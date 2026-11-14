@@ -57,6 +57,10 @@ impl fmt::Debug for OpenAiCompatible {
     }
 }
 
+/// What iq's calls say they come from: a provider's view of them names
+/// iq rather than no client at all.
+const USER_AGENT: &str = concat!("iq/", env!("CARGO_PKG_VERSION"));
+
 impl OpenAiCompatible {
     /// A provider at `base_url`, authenticated with `api_key` as a bearer token.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
@@ -70,8 +74,13 @@ impl OpenAiCompatible {
     }
 
     fn with_key(base_url: impl Into<String>, api_key: Option<String>) -> Self {
+        // A client that cannot be built so is one that names nothing.
+        let http = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .build()
+            .unwrap_or_default();
         Self {
-            http: reqwest::Client::new(),
+            http,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key,
             known: Arc::new(Mutex::new(None)),
@@ -781,6 +790,37 @@ mod tests {
                 "role": "user",
                 "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0K"}}]
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_says_it_comes_from_iq() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let heard = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"data":[]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            String::from_utf8_lossy(&request).to_lowercase()
+        });
+        let provider = OpenAiCompatible::new(format!("http://{address}"), "k");
+        assert!(provider.list().await.unwrap().is_empty());
+        let request = heard.join().unwrap();
+        assert!(
+            request.contains(&format!("user-agent: iq/{}", env!("CARGO_PKG_VERSION"))),
+            "{request}"
         );
     }
 

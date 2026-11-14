@@ -26,6 +26,10 @@ struct Scripted {
     /// Whether the provider refuses a call that sends a reasoning back, as
     /// one refuses another's signature.
     refuses_signed: Mutex<bool>,
+    /// The models whose provider is out of capacity, whoever calls them.
+    busy_models: Mutex<Vec<String>>,
+    /// How long the models that answer slowly take.
+    slow_models: Mutex<HashMap<String, Duration>>,
 }
 
 /// What the scripted provider fails with.
@@ -67,6 +71,8 @@ impl Scripted {
             busy: Mutex::default(),
             refused: Mutex::default(),
             refuses_signed: Mutex::default(),
+            busy_models: Mutex::default(),
+            slow_models: Mutex::default(),
         })
     }
 
@@ -187,6 +193,14 @@ impl ChatModel for Model {
         if *self.refuses_signed.lock().unwrap() && signed(request) {
             return Err(Failed::Signed);
         }
+        let model = request.model.to_string();
+        if self.busy_models.lock().unwrap().contains(&model) {
+            return Err(Failed::Busy);
+        }
+        let slow = self.slow_models.lock().unwrap().get(&model).copied();
+        if let Some(slow) = slow {
+            tokio::time::sleep(slow).await;
+        }
         let next = self
             .scripts
             .lock()
@@ -231,6 +245,14 @@ fn signed(request: &ChatRequest) -> bool {
             }
         )
     })
+}
+
+/// `response`, given with a reasoning its provider signed.
+fn signing(response: ChatResponse) -> ChatResponse {
+    ChatResponse {
+        reasoning_signature: Some(serde_json::json!("c2lnbmVk")),
+        ..response
+    }
 }
 
 /// `text`, said with a reasoning its provider signed.
@@ -1833,7 +1855,7 @@ async fn a_reasoning_another_provider_cannot_check_is_left_out_and_the_call_made
     );
     assert!(events.iter().any(|event| matches!(
         event,
-        Event::Notice { text, .. } if text.starts_with("its provider refused the reasoning")
+        Event::Notice { text, .. } if text.starts_with("its provider could not check the reasoning")
     )));
     // Once left out, it is sent no more.
     let requests = f.model.requests_of("lead");
@@ -1842,6 +1864,219 @@ async fn a_reasoning_another_provider_cannot_check_is_left_out_and_the_call_made
     f.crew.tell("lead", "and after?".into()).unwrap();
     f.settled().await;
     assert_eq!(f.model.requests_of("lead").len(), 4);
+}
+
+#[tokio::test]
+async fn a_signature_refused_with_no_earlier_turn_to_blame_goes_with_all_the_reasoning() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                signing(calls("list_agents", serde_json::json!({}))),
+                say("Done."),
+            ],
+        )],
+        Settings::default(),
+    );
+    *f.model.refuses_signed.lock().unwrap() = true;
+    f.crew.start("lead", &model("lab/m"), "go".into(), PERSON);
+    f.settled().await;
+    assert!(f.events().contains(&Event::Done {
+        agent: "lead".into(),
+        outcome: Ok("Done.".into())
+    }));
+    let requests = f.model.requests_of("lead");
+    assert_eq!(requests.len(), 3);
+    assert!(signed(&requests[1]) && !signed(&requests[2]));
+}
+
+#[tokio::test]
+async fn results_set_apart_take_off_the_reasoning_signed_after_them() {
+    let f = fixture(
+        &[(
+            "lead",
+            (0..8)
+                .map(|_| {
+                    signing(reading(
+                        2_000,
+                        calls("read_file", serde_json::json!({"path": "long.txt"})),
+                    ))
+                })
+                .chain([say("Read.")])
+                .collect(),
+        )],
+        Settings {
+            light_from: 1_000,
+            ..Settings::default()
+        },
+    );
+    std::fs::write(f.root.join("long.txt"), "a line of text\n".repeat(80)).unwrap();
+    f.crew.start("lead", &model("lab/m"), "read".into(), PERSON);
+    f.settled().await;
+    let requests = f.model.requests_of("lead");
+    let last = requests.last().unwrap();
+    assert!(format!("{:?}", last.messages).contains("set apart to keep your conversation light"));
+    // The answer before the first result set apart keeps its reasoning,
+    // those after it go without, and one given since was signed with the
+    // results as they are now.
+    let signed: Vec<bool> = last
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant {
+                reasoning_signature,
+                ..
+            } => Some(reasoning_signature.is_some()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        signed,
+        [true, false, false, false, false, false, false, true]
+    );
+}
+
+#[tokio::test]
+async fn other_tools_offered_take_off_the_reasoning_signed_with_the_others() {
+    let f = fixture(
+        &[("lead", vec![reasoned("First."), say("Second.")])],
+        Settings::default(),
+    );
+    f.crew.start("lead", &model("lab/m"), "go".into(), PERSON);
+    f.settled().await;
+    f.crew.extend(Arc::new(ForLeads));
+    f.crew.tell("lead", "and then?".into()).unwrap();
+    f.settled().await;
+    let requests = f.model.requests_of("lead");
+    assert_eq!(requests.len(), 2);
+    assert!(!signed(&requests[1]));
+}
+
+#[tokio::test]
+async fn a_chat_resumed_under_other_instructions_sends_its_reasoning_back_no_more() {
+    let f = fixture(&[("lead", vec![reasoned("First.")])], Settings::default());
+    let kept = Arc::new(Kept::default());
+    f.crew
+        .set_keeper(Some(Arc::clone(&kept) as Arc<dyn iq_agent::Keeper>));
+    f.crew.start("lead", &model("lab/m"), "go".into(), PERSON);
+    f.settled().await;
+    let saved = kept.0.lock().unwrap()["lead"].clone();
+    // In the same place, its instructions the same: its reasoning goes back.
+    let scripted = Scripted::new(&[("lead", vec![say("Again.")])]);
+    let same = Crew::new(
+        Model(Arc::clone(&scripted)),
+        Gate::builder(&f.root).build().unwrap(),
+        Helper::new("/nonexistent", Vec::<String>::new()),
+        Settings::default(),
+        Arc::new(|_| {}),
+    );
+    same.resume(saved.clone(), None).unwrap();
+    same.tell("lead", "and then?".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), same.settled())
+        .await
+        .unwrap();
+    assert!(signed(scripted.requests_of("lead").last().unwrap()));
+    // Elsewhere, its instructions written otherwise: it goes without.
+    let again = fixture(&[("lead", vec![say("Again.")])], Settings::default());
+    again.crew.resume(saved, None).unwrap();
+    again.crew.tell("lead", "and then?".into()).unwrap();
+    again.settled().await;
+    let last = again.model.requests_of("lead").pop().unwrap();
+    assert!(!signed(&last));
+    assert!(format!("{:?}", last.messages).contains("First."));
+}
+
+/// The settings with `primary`'s backups.
+fn with_backups(primary: &str, backups: &[&str]) -> Settings {
+    Settings {
+        backups: [(model(primary), backups.iter().map(|b| model(b)).collect())].into(),
+        backup_after: Duration::from_millis(200),
+        busy_wait: Duration::from_millis(1),
+        ..Settings::default()
+    }
+}
+
+#[tokio::test]
+async fn a_model_out_of_capacity_hands_the_call_to_its_backup_at_once() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                signing(calls("list_agents", serde_json::json!({}))),
+                say("Done."),
+            ],
+        )],
+        with_backups("lab/main", &["lab/main@eu", "lab/other"]),
+    );
+    f.model.busy_models.lock().unwrap().push("lab/main".into());
+    f.crew
+        .start("lead", &model("lab/main"), "go".into(), PERSON);
+    f.settled().await;
+    // Once, without the tries, then the backup for the rest of the turn.
+    assert_eq!(
+        f.model.models_of("lead"),
+        ["lab/main", "lab/main@eu", "lab/main@eu"]
+    );
+    assert!(f.events().contains(&Event::Done {
+        agent: "lead".into(),
+        outcome: Ok("Done.".into())
+    }));
+    let said: Vec<String> = f
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            Event::Notice { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        said.iter()
+            .any(|text| text.starts_with("lab/main is out of capacity")
+                && text.ends_with("the call goes to lab/main@eu, its backup")),
+        "{said:#?}"
+    );
+    // What it answered is billed to the model that answered.
+    assert!(f.events().iter().any(|event| matches!(
+        event,
+        Event::Spent { model, .. } if model == "lab/main@eu"
+    )));
+    // Its next turn begins on its own model again.
+    f.model.busy_models.lock().unwrap().clear();
+    f.crew.tell("lead", "and then?".into()).unwrap();
+    f.settled().await;
+    assert_eq!(f.model.models_of("lead").last().unwrap(), "lab/main");
+}
+
+#[tokio::test]
+async fn a_model_too_slow_hands_the_call_to_its_backup() {
+    let f = fixture(
+        &[("lead", vec![say("Done.")])],
+        with_backups("lab/main", &["lab/main@eu"]),
+    );
+    f.model
+        .slow_models
+        .lock()
+        .unwrap()
+        .insert("lab/main".into(), Duration::from_secs(5));
+    f.crew
+        .start("lead", &model("lab/main"), "go".into(), PERSON);
+    f.settled().await;
+    assert_eq!(f.model.models_of("lead"), ["lab/main", "lab/main@eu"]);
+    assert!(f.events().iter().any(|event| matches!(
+        event,
+        Event::Notice { text, .. } if text.starts_with("lab/main gave no answer within")
+    )));
+    // The last backup is waited for as long as it takes, and a refusal
+    // goes to none.
+    let g = fixture(
+        &[("lead", vec![say("Done.")])],
+        with_backups("lab/main", &["lab/main@eu"]),
+    );
+    g.model.refuses_after("lead", 0);
+    g.crew
+        .start("lead", &model("lab/main"), "go".into(), PERSON);
+    g.settled().await;
+    assert_eq!(g.model.models_of("lead"), ["lab/main"]);
 }
 
 #[tokio::test]
