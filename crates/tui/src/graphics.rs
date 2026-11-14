@@ -30,6 +30,11 @@ pub(crate) fn detect(var: impl Fn(&str) -> Option<String>) -> Option<Kitty> {
 /// The character Kitty shows an image under.
 const PLACEHOLDER: char = '\u{10EEEE}';
 
+/// Whether `c` is part of the cells an image shows under, not text.
+pub(crate) fn image_cell(c: char) -> bool {
+    c == PLACEHOLDER || DIACRITICS.contains(&c)
+}
+
 /// The marks after a placeholder that say its row and column in the image:
 /// the first marks the first, and so on. Kitty's own list,
 /// `rowcolumn-diacritics.txt`.

@@ -70,7 +70,17 @@ pub(crate) struct View {
     pointer: Option<(u16, u16)>,
     /// The links of what is marked, listed for the person to choose one.
     listing: Option<Listing>,
+    /// The conversation's height, as last drawn.
+    height: usize,
+    /// What the person selects with the mouse: where it began and where it
+    /// reaches, each the number of a block, a row in it and a column, so
+    /// that it holds as the conversation scrolls.
+    selection: Option<(Point, Point)>,
 }
+
+/// A cell of the conversation, where it is whatever shows: the number of
+/// the block, the row in it and the column.
+type Point = (usize, usize, u16);
 
 /// What a row of the conversation shows, or the mark is on: a block, by
 /// its number, or the mark after an agent's answer taller than the room,
@@ -603,7 +613,50 @@ impl View {
                     }
                     None => {}
                 },
+                Reading::Select(column, row) => {
+                    self.selection = self
+                        .place_at(&laid, height, *row)
+                        .filter(|_| self.zoom.is_none())
+                        .map(|(number, inner)| {
+                            ((number, inner, *column), (number, inner, *column))
+                        });
+                }
+                Reading::Stretch(column, row) => {
+                    if self.selection.is_none() {
+                        continue;
+                    }
+                    // Held at an edge, the conversation scrolls a row.
+                    let (top, bottom) = (self.from, self.from + height as u16 - 1);
+                    let row = if *row <= top {
+                        self.scroll(&laid, height, -1);
+                        top
+                    } else if *row >= bottom {
+                        self.scroll(&laid, height, 1);
+                        bottom
+                    } else {
+                        *row
+                    };
+                    if let (Some((start, _)), Some((number, inner))) =
+                        (self.selection, self.place_at(&laid, height, row))
+                    {
+                        self.selection = Some((start, (number, inner, *column)));
+                    }
+                }
+                Reading::Selected => {
+                    if let Some((a, b)) = self.selection
+                        && a != b
+                    {
+                        let text = selected(&laid, ordered(&laid, a, b));
+                        let lines = text.lines().count().max(1);
+                        said = Some(format!(
+                            "copied {lines} line{}",
+                            if lines == 1 { "" } else { "s" }
+                        ));
+                        copied = Some(text);
+                    }
+                }
                 Reading::Click(column, row) => {
+                    self.selection = None;
                     let shown = usize::from(row.saturating_sub(self.from));
                     let clicked = (*row >= self.from)
                         .then(|| self.rows.get(shown).copied().flatten())
@@ -684,6 +737,7 @@ impl View {
                 Reading::Leave => {
                     self.mark = None;
                     self.found = None;
+                    self.selection = None;
                 }
             }
         }
@@ -735,8 +789,29 @@ impl View {
             }
         }
         self.from = area.from;
+        self.height = height;
         for line in &mut shown.lines {
             trimmed(line);
+        }
+        // What is selected, reversed, as a terminal shows its own.
+        if let Some((a, b)) = self
+            .selection
+            .filter(|(a, b)| a != b && self.zoom.is_none())
+        {
+            let (start, end) = ordered(&laid, a, b);
+            let (first, last) = ((laid.at(start.0), start.1), (laid.at(end.0), end.1));
+            for (row, line) in (self.from..).zip(shown.lines.iter_mut()) {
+                let Some((number, inner)) = self.place_at(&laid, height, row) else {
+                    continue;
+                };
+                let here = (laid.at(number), inner);
+                if here < first || here > last {
+                    continue;
+                }
+                let from = if here == first { start.2 } else { 0 };
+                let to = if here == last { end.2 } else { u16::MAX };
+                reversed(line, usize::from(from), usize::from(to));
+            }
         }
         let ground = p.color(p.ground.mix(p.accent, MARKED));
         shown.grounds = self
@@ -780,6 +855,35 @@ impl View {
                 })
             });
         shown
+    }
+
+    /// Whether the screen's `row` is the conversation's top or bottom edge,
+    /// or past it: a selection held there scrolls it.
+    pub(crate) fn at_edge(&self, row: u16) -> bool {
+        self.height > 0
+            && (row <= self.from || usize::from(row) + 1 >= usize::from(self.from) + self.height)
+    }
+
+    /// The block, by its number, and the row in it that the screen's `row`
+    /// shows, the view as it now stands; none past the conversation.
+    fn place_at(&self, laid: &Laid<'_>, height: usize, row: u16) -> Option<(usize, usize)> {
+        let mut down = usize::from(row.checked_sub(self.from)?);
+        if down >= height {
+            return None;
+        }
+        let (mut at, mut inner) = self.top_now(laid, height);
+        loop {
+            let rows = laid.rows(at);
+            if inner + down < rows {
+                return Some((laid.number(at), inner + down));
+            }
+            down -= rows.saturating_sub(inner);
+            inner = 0;
+            at += 1;
+            if at >= laid.len() {
+                return None;
+            }
+        }
     }
 
     /// The mouse is now over the cell at `column` and `row` of the screen.
@@ -1111,6 +1215,110 @@ impl View {
     }
 }
 
+/// `a` and `b`, the first in the conversation first.
+fn ordered(laid: &Laid<'_>, a: Point, b: Point) -> (Point, Point) {
+    let key = |point: Point| (laid.at(point.0), point.1, point.2);
+    if key(a) <= key(b) { (a, b) } else { (b, a) }
+}
+
+/// What the selection from `start` to `end` holds, as text: without the
+/// images, the rows' padding nor the conversation's own indent.
+fn selected(laid: &Laid<'_>, (start, end): (Point, Point)) -> String {
+    let (first, last) = (laid.at(start.0), laid.at(end.0));
+    // Each row whole, with the columns the selection takes of it.
+    let mut rows: Vec<(String, usize, usize)> = Vec::new();
+    for at in first..=last.min(laid.len().saturating_sub(1)) {
+        let lines = laid.lines(at, &mut Vec::new());
+        let from = if at == first { start.1 } else { 0 };
+        let to = if at == last { end.1 } else { usize::MAX };
+        for (inner, line) in lines.iter().enumerate() {
+            if inner < from || inner > to {
+                continue;
+            }
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .chars()
+                .filter(|c| !crate::graphics::image_cell(*c))
+                .collect();
+            let left = if at == first && inner == start.1 {
+                start.2
+            } else {
+                0
+            };
+            let right = if at == last && inner == end.1 {
+                end.2
+            } else {
+                u16::MAX
+            };
+            rows.push((text, usize::from(left), usize::from(right)));
+        }
+    }
+    // The conversation's own indent, as its rows whole say it.
+    let indent = rows
+        .iter()
+        .filter(|(text, ..)| !text.trim().is_empty())
+        .map(|(text, ..)| text.len() - text.trim_start_matches(' ').len())
+        .min()
+        .unwrap_or(0);
+    rows.iter()
+        .map(|(text, left, right)| {
+            columns(text, (*left).max(indent), *right)
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The characters of `text` from column `from` to column `to`, both in.
+fn columns(text: &str, from: usize, to: usize) -> String {
+    let mut column = 0;
+    let mut kept = String::new();
+    for c in text.chars() {
+        if column >= from && column <= to {
+            kept.push(c);
+        }
+        column += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+    }
+    kept
+}
+
+/// `line` reversed from column `from` to column `to`, both in, as a
+/// terminal shows what it selects.
+fn reversed(line: &mut Line<'static>, from: usize, to: usize) {
+    let mut column = 0;
+    let mut spans = Vec::new();
+    for span in line.spans.drain(..) {
+        let mut parts: [String; 3] = Default::default();
+        for c in span.content.chars() {
+            let part = if column < from {
+                0
+            } else if column <= to {
+                1
+            } else {
+                2
+            };
+            parts[part].push(c);
+            column += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        }
+        for (part, text) in parts.into_iter().enumerate() {
+            if text.is_empty() {
+                continue;
+            }
+            let style = if part == 1 {
+                span.style.add_modifier(Modifier::REVERSED)
+            } else {
+                span.style
+            };
+            spans.push(Span::styled(text, style));
+        }
+    }
+    line.spans = spans;
+}
+
 /// The links `line` shows, by their columns, their addresses taken off
 /// their spans' background, which the terminal would paint.
 fn unlinked(line: &mut Line<'static>) -> Vec<Link> {
@@ -1282,6 +1490,83 @@ mod tests {
         // Back down to the end, it follows it again.
         let end = shown(&history, &board, &[Reading::Scroll(500)]);
         assert_eq!(end[end.len() - 2], "  line 21");
+    }
+
+    #[test]
+    fn a_drag_selects_shown_reversed_and_copies_the_text_alone() {
+        let (p, mut board, mut history) = joined();
+        said(&mut board, &mut history, &p, "one\n\ntwo  \n\nthree\n");
+        let _ = history.take(60, Some("lead"));
+        let mut view = View::default();
+        let first = rows(&view.shown(&history, &board, &p, Some("lead"), area(10), &[]));
+        let row = |text: &str| 2 + first.iter().position(|r| r == text).unwrap() as u16;
+        let (one, three) = (row("  one"), row("  three"));
+        // From the o of one to the e of three.
+        let shown = view.shown(
+            &history,
+            &board,
+            &p,
+            Some("lead"),
+            area(10),
+            &[
+                Reading::Select(2, one),
+                Reading::Stretch(6, three),
+                Reading::Selected,
+            ],
+        );
+        // Without the conversation's indent nor any padding.
+        assert_eq!(shown.copied.as_deref(), Some("one\n\ntwo\n\nthree"));
+        assert_eq!(shown.said.as_deref(), Some("copied 5 lines"));
+        let at = usize::from(one - 2);
+        let reversed: String = shown.lines[at]
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(reversed, "one");
+        // A click puts it away.
+        let shown = view.shown(
+            &history,
+            &board,
+            &p,
+            Some("lead"),
+            area(10),
+            &[Reading::Click(0, 0)],
+        );
+        assert!(
+            shown
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| !span.style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    #[test]
+    fn a_selection_held_at_the_edge_scrolls_the_conversation_and_holds() {
+        let (p, mut board, mut history) = joined();
+        let lines: String = (1..=20).map(|n| format!("line {n}\n\n")).collect();
+        said(&mut board, &mut history, &p, &lines);
+        let _ = history.take(60, Some("lead"));
+        let mut view = View::default();
+        let mut shown = |readings: &[Reading]| {
+            view.shown(&history, &board, &p, Some("lead"), area(5), readings)
+        };
+        let up = rows(&shown(&[Reading::Page(-2)]));
+        let middle = 2 + up.iter().position(|r| r.starts_with("  line")).unwrap() as u16 + 2;
+        let line_at = |shown: &[String], row: u16| shown[usize::from(row - 2)].clone();
+        let from = line_at(&up, middle);
+        // Held at the top edge, a row at a time.
+        // Begun past the end of a row, which it holds whole.
+        let _ = shown(&[Reading::Select(59, middle), Reading::Stretch(2, 2)]);
+        let held = shown(&[Reading::Stretch(2, 2), Reading::Stretch(2, 2)]);
+        let top = rows(&held)[0].clone();
+        assert_ne!(top, up[0], "it scrolled");
+        let copied = shown(&[Reading::Selected]).copied.unwrap();
+        // From the top shown now to where it began, as long as it holds.
+        assert!(copied.ends_with(from.trim()), "{copied:?}");
+        assert!(copied.lines().count() > 3, "{copied:?}");
     }
 
     #[test]

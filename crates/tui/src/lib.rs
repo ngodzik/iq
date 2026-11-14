@@ -82,6 +82,10 @@ const CLOCK: Duration = Duration::from_secs(1);
 /// click that brought the person back to iq's window.
 const FOCUSING: Duration = Duration::from_millis(500);
 
+/// How often the conversation scrolls a row while a selection is held at
+/// its top or bottom edge, the mouse still.
+const EDGE_SCROLL: Duration = Duration::from_millis(60);
+
 /// Runs iq in the terminal until the person quits or iq is asked to stop:
 /// `board` as the settings made it, what `feed` brings, what the person
 /// asks of the crew sent on `requests`, the diagrams agents write drawn by
@@ -739,7 +743,19 @@ impl Iq {
     /// what shows: the mouse moving changes it only as it comes over a
     /// link or leaves one.
     fn keys(&mut self, wait: Duration) -> io::Result<bool> {
+        // A selection held at the conversation's edge scrolls it on its own.
+        let edge = self.board.selecting().is_some_and(|(_, row)| {
+            self.screen
+                .drawn
+                .as_ref()
+                .is_some_and(|view| view.at_edge(row))
+        });
+        let wait = if edge { wait.min(EDGE_SCROLL) } else { wait };
         match self.screen.tty.wait(wait) {
+            Wait::Nothing if edge => {
+                self.board.select_on();
+                return Ok(true);
+            }
             Wait::Nothing => return Ok(false),
             Wait::Gone => {
                 // Its window closed: nobody is there to answer, and the
@@ -791,8 +807,16 @@ impl Iq {
                             .take()
                             .is_some_and(|at| at.elapsed() < FOCUSING);
                         if !focusing {
-                            self.board.click(mouse.column, mouse.row);
+                            self.board.mouse_down(mouse.column, mouse.row);
                         }
+                    }
+                    // A drag selects in the conversation iq draws; a press
+                    // let go where it was is a click.
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        self.board.mouse_drag(mouse.column, mouse.row);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        self.board.mouse_up(mouse.column, mouse.row);
                     }
                     _ => {}
                 },
