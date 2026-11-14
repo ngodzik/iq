@@ -339,7 +339,8 @@ fn crew(
         .with_claude(claude);
     crew.extend(Arc::new(memory));
     // And the skills the person wrote for them.
-    let mut skills = iq_memory::Skills::new(settings.skill_folders(&home, &workspace));
+    let mut skills = iq_memory::Skills::new(settings.skill_folders(&home, &workspace))
+        .with_lead(settings.lead_skills.iter().cloned());
     if let Some(name) = &settings.autopilot_skill {
         skills = skills.with_reviewer(name, &workspace);
     }

@@ -37,6 +37,7 @@
 //! rules = ["~/.iq/AGENTS.md"]           # your rules for every project, given to the agents you start; unless set, this one, else ~/.claude/CLAUDE.md
 //! autopilot_skill = "local-review"     # a skill of yours the reviewer follows, kept outside the workspace, read again at each decision, never shown to the agents
 //! skills = ["~/.iq/skills"]              # folders of your skills (a folder with its SKILL.md, or a .md file); this one unless set; the project's .claude/skills are read after them, yours winning a name both hold
+//! lead_skills = ["teams"]                # a few short skills given whole to the lead of each chat you start, read every call; the others, and all of them for the agents it starts, read on demand
 //! claude_memory = true                   # the notes kept of the project under ~/.claude read beside iq's own
 //! plugins = ["name"]                     # programs of their own iq starts and speaks with: iq-name for name, found on the PATH, run on your machine as you
 //! mermaid = "auto"                       # Mermaid diagrams drawn as images in Kitty, by mmdr (cargo install mermaid-rs-renderer) run in the sandbox, dark, on the terminal's own background; or a command with {input} and {output}, and {look} for iq's look; off unless set
@@ -207,6 +208,9 @@ pub(crate) struct Settings {
     rules: Option<Vec<String>>,
     /// The folders of the person's skills.
     skills: Option<Vec<String>>,
+    /// The skills given whole to the leads of the person's chats.
+    #[serde(default)]
+    pub(crate) lead_skills: Vec<String>,
     /// Whether the notes kept of the project under `~/.claude` are read
     /// beside iq's.
     claude_memory: Option<bool>,

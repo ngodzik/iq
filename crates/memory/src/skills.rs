@@ -27,6 +27,8 @@ const SKILL_MOST: usize = 40_000;
 pub struct Skills {
     folders: Vec<PathBuf>,
     reviewer: Option<(String, PathBuf)>,
+    /// The skills given whole to the leads of the person's chats.
+    lead: Vec<String>,
 }
 
 /// One skill, as listed.
@@ -48,7 +50,45 @@ impl Skills {
         Self {
             folders,
             reviewer: None,
+            lead: Vec::new(),
         }
+    }
+
+    /// Gives the skills named `names` whole to the leads of the person's
+    /// chats, in their instructions: a few short ones a lead uses often,
+    /// which a cheap one would read wrong or not at all. The others, and
+    /// every skill for the agents a chat starts, are read on demand.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use iq_memory::Skills;
+    /// let skills = Skills::new(vec!["/home/person/.iq/skills".into()])
+    ///     .with_lead(["teams"]);
+    /// ```
+    #[must_use]
+    pub fn with_lead(mut self, names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.lead = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// What the lead of a chat of the person's is given whole, after what
+    /// every agent is told; `None` when the settings give none.
+    fn given_whole(&self) -> Option<String> {
+        if self.lead.is_empty() {
+            return None;
+        }
+        let mut out = "The skills the person gives you whole, as you lead their chat: follow                        them without reading them again."
+            .to_owned();
+        for name in &self.lead {
+            match self.read(name) {
+                Ok(text) => out.push_str(&format!("\n\n{text}")),
+                Err(why) => out.push_str(&format!(
+                    "\n\n({name}, which the settings give whole, is not: {why}.)"
+                )),
+            }
+        }
+        Some(out)
     }
 
     /// Selects the skill used for permission reviews, reloaded at each decision.
@@ -247,8 +287,14 @@ where
         }]
     }
 
-    fn instructions(&self, _agent: &str) -> Option<String> {
-        self.told()
+    fn instructions(&self, agent: &str) -> Option<String> {
+        let told = self.told()?;
+        // The person's chats alone: an agent another started is named
+        // after its chat.
+        match self.given_whole().filter(|_| !agent.contains('/')) {
+            Some(whole) => Some(format!("{told}\n\n{whole}")),
+            None => Some(told),
+        }
     }
 
     fn review_instructions(&self) -> Result<Option<String>, String> {
@@ -284,6 +330,36 @@ mod tests {
         assert_eq!(tools[0].name, "skill");
         let told = <Skills as Extension<()>>::instructions(&skills, "fix/writer").unwrap();
         assert!(told.contains("code-work: how code is written"), "{told}");
+    }
+
+    #[test]
+    fn the_lead_skills_are_given_whole_to_the_person_s_chats_only() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("teams.md"),
+            "---\nname: teams\ndescription: which team for which work\n---\nFor code, a writer and its reviewer.",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("deploy.md"), "Staging first.").unwrap();
+        let skills = Skills::new(vec![home.path().into()]).with_lead(["teams", "missing"]);
+        let lead = <Skills as Extension<()>>::instructions(&skills, "fix").unwrap();
+        assert!(
+            lead.contains("For code, a writer and its reviewer."),
+            "{lead}"
+        );
+        assert!(
+            lead.contains("(missing, which the settings give whole, is not: no skill is named"),
+            "{lead}"
+        );
+        // The others are read on demand.
+        assert!(!lead.contains("Staging first."), "{lead}");
+        // An agent a chat started is told which there are, as before.
+        let started = <Skills as Extension<()>>::instructions(&skills, "fix/writer").unwrap();
+        assert!(
+            started.contains("- teams: which team for which work"),
+            "{started}"
+        );
+        assert!(!started.contains("For code, a writer"), "{started}");
     }
 
     #[test]
