@@ -27,6 +27,7 @@ mod live;
 mod map;
 mod markdown;
 mod motion;
+mod notify;
 mod pages;
 mod summary;
 mod table;
@@ -302,6 +303,10 @@ impl Iq {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return Ok(()),
                 }
+            }
+            // Sent even with iq in front: the person may be away from it.
+            for alert in self.board.take_alerts() {
+                notify::notify(alert);
             }
             for post in self.board.take_posts() {
                 self.motion.posted(&post);

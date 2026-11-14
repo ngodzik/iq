@@ -1280,6 +1280,19 @@ impl Live<'_> {
             left.push(Span::styled(format!(" · {shuts} shuts"), p.fg(p.bad)));
             left.push(sep());
         }
+        if self.board.notifying() {
+            let stops = self
+                .board
+                .keys()
+                .chord(Action::Notify)
+                .map(|chord| format!(" · {chord} stops"))
+                .unwrap_or_default();
+            left.push(Span::styled(
+                format!("🔔 notify at the turn's end{stops}"),
+                p.fg(p.info),
+            ));
+            left.push(sep());
+        }
         if crew.autopilot() {
             left.push(Span::styled("⏵⏵ autopilot", p.fg(p.accent)));
         } else {
