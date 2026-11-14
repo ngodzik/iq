@@ -26,6 +26,10 @@ struct Scripted {
     /// Whether the provider refuses a call that sends a reasoning back, as
     /// one refuses another's signature.
     refuses_signed: Mutex<bool>,
+    /// The models whose provider is out of capacity, whoever calls them.
+    busy_models: Mutex<Vec<String>>,
+    /// How long the models that answer slowly take.
+    slow_models: Mutex<HashMap<String, Duration>>,
 }
 
 /// What the scripted provider fails with.
@@ -67,6 +71,8 @@ impl Scripted {
             busy: Mutex::default(),
             refused: Mutex::default(),
             refuses_signed: Mutex::default(),
+            busy_models: Mutex::default(),
+            slow_models: Mutex::default(),
         })
     }
 
@@ -186,6 +192,14 @@ impl ChatModel for Model {
         }
         if *self.refuses_signed.lock().unwrap() && signed(request) {
             return Err(Failed::Signed);
+        }
+        let model = request.model.to_string();
+        if self.busy_models.lock().unwrap().contains(&model) {
+            return Err(Failed::Busy);
+        }
+        let slow = self.slow_models.lock().unwrap().get(&model).copied();
+        if let Some(slow) = slow {
+            tokio::time::sleep(slow).await;
         }
         let next = self
             .scripts
@@ -1970,6 +1984,99 @@ async fn a_chat_resumed_under_other_instructions_sends_its_reasoning_back_no_mor
     let last = again.model.requests_of("lead").pop().unwrap();
     assert!(!signed(&last));
     assert!(format!("{:?}", last.messages).contains("First."));
+}
+
+/// The settings with `primary`'s backups.
+fn with_backups(primary: &str, backups: &[&str]) -> Settings {
+    Settings {
+        backups: [(model(primary), backups.iter().map(|b| model(b)).collect())].into(),
+        backup_after: Duration::from_millis(200),
+        busy_wait: Duration::from_millis(1),
+        ..Settings::default()
+    }
+}
+
+#[tokio::test]
+async fn a_model_out_of_capacity_hands_the_call_to_its_backup_at_once() {
+    let f = fixture(
+        &[(
+            "lead",
+            vec![
+                signing(calls("list_agents", serde_json::json!({}))),
+                say("Done."),
+            ],
+        )],
+        with_backups("lab/main", &["lab/main@eu", "lab/other"]),
+    );
+    f.model.busy_models.lock().unwrap().push("lab/main".into());
+    f.crew
+        .start("lead", &model("lab/main"), "go".into(), PERSON);
+    f.settled().await;
+    // Once, without the tries, then the backup for the rest of the turn.
+    assert_eq!(
+        f.model.models_of("lead"),
+        ["lab/main", "lab/main@eu", "lab/main@eu"]
+    );
+    assert!(f.events().contains(&Event::Done {
+        agent: "lead".into(),
+        outcome: Ok("Done.".into())
+    }));
+    let said: Vec<String> = f
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            Event::Notice { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        said.iter()
+            .any(|text| text.starts_with("lab/main is out of capacity")
+                && text.ends_with("the call goes to lab/main@eu, its backup")),
+        "{said:#?}"
+    );
+    // What it answered is billed to the model that answered.
+    assert!(f.events().iter().any(|event| matches!(
+        event,
+        Event::Spent { model, .. } if model == "lab/main@eu"
+    )));
+    // Its next turn begins on its own model again.
+    f.model.busy_models.lock().unwrap().clear();
+    f.crew.tell("lead", "and then?".into()).unwrap();
+    f.settled().await;
+    assert_eq!(f.model.models_of("lead").last().unwrap(), "lab/main");
+}
+
+#[tokio::test]
+async fn a_model_too_slow_hands_the_call_to_its_backup() {
+    let f = fixture(
+        &[("lead", vec![say("Done.")])],
+        with_backups("lab/main", &["lab/main@eu"]),
+    );
+    f.model
+        .slow_models
+        .lock()
+        .unwrap()
+        .insert("lab/main".into(), Duration::from_secs(5));
+    f.crew
+        .start("lead", &model("lab/main"), "go".into(), PERSON);
+    f.settled().await;
+    assert_eq!(f.model.models_of("lead"), ["lab/main", "lab/main@eu"]);
+    assert!(f.events().iter().any(|event| matches!(
+        event,
+        Event::Notice { text, .. } if text.starts_with("lab/main gave no answer within")
+    )));
+    // The last backup is waited for as long as it takes, and a refusal
+    // goes to none.
+    let g = fixture(
+        &[("lead", vec![say("Done.")])],
+        with_backups("lab/main", &["lab/main@eu"]),
+    );
+    g.model.refuses_after("lead", 0);
+    g.crew
+        .start("lead", &model("lab/main"), "go".into(), PERSON);
+    g.settled().await;
+    assert_eq!(g.model.models_of("lead"), ["lab/main"]);
 }
 
 #[tokio::test]

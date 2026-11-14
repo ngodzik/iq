@@ -766,6 +766,13 @@ fn in_use(settings: &Settings, lead: &ModelId) -> Result<Vec<(&'static str, Stri
     if let Some(summarizer) = settings.summarizer()? {
         models.push(("summarizer", summarizer.to_string()));
     }
+    for backups in settings.backups()?.into_values() {
+        models.extend(
+            backups
+                .into_iter()
+                .map(|backup| ("[backups]", backup.to_string())),
+        );
+    }
     Ok(models)
 }
 

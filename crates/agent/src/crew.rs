@@ -118,6 +118,10 @@ pub const BUSY_WAIT: Duration = Duration::from_secs(10);
 /// The longest one wait lasts, whatever the provider asks.
 pub const BUSY_MOST: Duration = Duration::from_secs(300);
 
+/// How long a call to a model with a backup left waits for its answer,
+/// unless the settings say: past it, the call goes to the backup.
+pub const BACKUP_AFTER: Duration = Duration::from_secs(180);
+
 /// How long a command may write nothing before it is stopped, unless the
 /// settings say: one waiting for a login in a browser, or for an answer at
 /// a terminal it does not have, would hold its agent until its time ran
@@ -193,6 +197,13 @@ pub struct Settings {
     pub busy_wait: Duration,
     /// The longest one wait lasts, whatever the provider asks.
     pub busy_most: Duration,
+    /// The models a call to a model goes to in turn when it gets no answer
+    /// in time or its provider is out of capacity, by that model: best the
+    /// same model in another region, so that the cache and the reasoning
+    /// are lost once at most. A refusal goes to none.
+    pub backups: HashMap<ModelId, Vec<ModelId>>,
+    /// How long a call to a model with a backup left waits for its answer.
+    pub backup_after: Duration,
     /// The model of the provider that names the person's chats after what
     /// their work is about: none, and they keep the name they started
     /// with.
@@ -229,6 +240,8 @@ impl Default for Settings {
             busy_tries: BUSY_TRIES,
             busy_wait: BUSY_WAIT,
             busy_most: BUSY_MOST,
+            backups: HashMap::new(),
+            backup_after: BACKUP_AFTER,
             namer: None,
             turn_ask: None,
             light_from: LIGHT_FROM,
@@ -501,6 +514,9 @@ struct Failure {
     /// Whether the provider stayed out of capacity through every try,
     /// which `said` tells whole.
     busy: bool,
+    /// Whether the call may go to its model's next backup: it got no
+    /// answer in time, or its provider is out of capacity.
+    hand_over: bool,
 }
 
 /// The wakes an agent asked for: how many wait, and when it asked those of
@@ -2996,13 +3012,35 @@ where
         &self,
         agent: &str,
         request: &ChatRequest,
+        backup: bool,
     ) -> Result<iq_core::ChatResponse, Failure> {
         let settings = &self.inner.settings;
         let started = Instant::now();
         let mut wait = settings.busy_wait;
         let mut tries = 0;
         loop {
-            let error = match self.inner.provider.complete(request).await {
+            // With a backup left, a call waits only so long.
+            let answer = if backup {
+                let after = settings.backup_after;
+                match tokio::time::timeout(after, self.inner.provider.complete(request)).await {
+                    Ok(answer) => answer,
+                    Err(_) => {
+                        return Err(Failure {
+                            said: format!(
+                                "{} gave no answer within {}",
+                                request.model,
+                                lasted(after)
+                            ),
+                            refusal: None,
+                            busy: false,
+                            hand_over: true,
+                        });
+                    }
+                }
+            } else {
+                self.inner.provider.complete(request).await
+            };
+            let error = match answer {
                 Ok(response) => {
                     if tries > 0 {
                         self.report(Event::Notice {
@@ -3019,14 +3057,26 @@ where
                     said: chain(&error),
                     refusal: self.inner.provider.refusal(&error),
                     busy: false,
+                    hand_over: false,
                 });
             };
             let said = cut_to(&chain(&error), BUSY_SAID);
+            // Out of capacity, it goes to its backup at once rather than
+            // waiting through the tries.
+            if backup {
+                return Err(Failure {
+                    said: format!("{} is out of capacity ({said})", request.model),
+                    refusal: self.inner.provider.refusal(&error),
+                    busy: true,
+                    hand_over: true,
+                });
+            }
             if tries >= settings.busy_tries {
                 let refusal = self.inner.provider.refusal(&error);
                 return Err(Failure {
                     refusal,
                     busy: true,
+                    hand_over: false,
                     said: format!(
                         "the provider of {} stayed out of capacity for {}, through {} tries ({said}). \
                      The conversation is kept: write to the agent to try again later, or give \
@@ -3087,12 +3137,29 @@ where
         // How far a refused signature took the reasoning off: the earlier
         // turns', then all of it.
         let mut forgotten = 0;
+        // The model each call goes to: the agent's, then its backups in
+        // turn, for the rest of the turn.
+        let backups = self
+            .inner
+            .settings
+            .backups
+            .get(model)
+            .cloned()
+            .unwrap_or_default();
+        let mut next_backup = 0;
+        let mut current = model.clone();
         messages.push(Message::user(prompt));
         if let Some(member) = lock(&self.inner.board).members.get_mut(name) {
             member.reason = None;
         }
         let mut urged = false;
         for step in 0..self.inner.settings.steps {
+            let model = &current;
+            // The next backup the person allows, when one is left.
+            let backup = backups[next_backup..]
+                .iter()
+                .position(|backup| self.refused_model(backup).is_none())
+                .map(|at| next_backup + at);
             if let Some(news) = self.unread(name) {
                 messages.push(Message::user(news));
             }
@@ -3142,7 +3209,7 @@ where
                 return (messages, Err(stopped));
             }
             self.measure(name, model).await;
-            let response = match self.ask_model(name, &request).await {
+            let response = match self.ask_model(name, &request, backup.is_some()).await {
                 Ok(response) => response,
                 // A signature its provider cannot check, for a change iq
                 // could not foresee: the call goes again without the
@@ -3171,6 +3238,20 @@ where
                     continue;
                 }
                 Err(failed) => {
+                    if failed.hand_over
+                        && let Some(at) = backup
+                    {
+                        next_backup = at + 1;
+                        let to = backups[at].clone();
+                        self.report(Event::Notice {
+                            agent: name.to_owned(),
+                            text: format!("{}: the call goes to {to}, its backup", failed.said),
+                        });
+                        // Another model reads none of its reasoning.
+                        forget_reasoning(&mut messages);
+                        current = to;
+                        continue;
+                    }
                     let said = self.failed(name, model, failed, &messages[counted..]);
                     return (messages, Err(said));
                 }
@@ -4436,7 +4517,7 @@ where
             effort: Some(self.inner.settings.reviewer_effort),
         };
         let response = self
-            .ask_model(agent, &request)
+            .ask_model(agent, &request, false)
             .await
             .map_err(|failed| failed.said)?;
         let cost = match response.cost {
