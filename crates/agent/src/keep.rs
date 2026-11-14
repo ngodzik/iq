@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::PERSON;
 
 /// How a chat came to run on the model the settings name for the person's
-/// chats: chosen by none, it follows them as they change.
+/// chats, as it started or came back.
 pub const SETTINGS_MODEL: &str = "the settings' model";
 
 /// An agent and its conversation, as kept.
@@ -79,16 +79,12 @@ fn is_zero(count: &usize) -> bool {
 }
 
 impl Saved {
-    /// Whether the chat runs on the model the settings name, as the person
-    /// started it: they chose none for it, and it follows the settings as
-    /// they change.
+    /// Whether the chat comes back on the settings' lead and effort: the
+    /// person leads it. A model or an effort they chose for it lasts until
+    /// iq starts again.
     #[must_use]
     pub fn follows_settings(&self) -> bool {
         self.by == PERSON
-            && self
-                .models_chosen
-                .last()
-                .is_none_or(|choice| choice.how == SETTINGS_MODEL)
     }
 
     /// Its conversation as it went: what its compactions replaced, in

@@ -197,19 +197,31 @@ impl Keeper for Chats {
     }
 }
 
-/// Moves `chat` to `lead`, the settings' lead, at `at`, when it follows
-/// the settings and runs on another: the person changed their lead since.
-/// Returns what the person is told of it.
-pub(crate) fn on_the_lead(chat: &mut Saved, lead: &str, at: u64) -> Option<String> {
-    if !chat.follows_settings() || chat.model == lead {
-        return None;
+/// Puts `chat`, one the person leads, back on `lead`, the settings' lead,
+/// at `at`, and on the settings' effort: a model or an effort chosen for
+/// it lasted until iq started again, and the person may have changed the
+/// settings since. Returns what the person is told of it.
+pub(crate) fn on_the_lead(chat: &mut Saved, lead: &str, at: u64) -> Vec<String> {
+    let mut said = Vec::new();
+    if !chat.follows_settings() {
+        return said;
     }
-    let was = chat.model.clone();
-    chat.move_to(lead, iq_agent::PERSON, iq_agent::SETTINGS_MODEL, at);
-    Some(format!(
-        "{} answers on {lead}, the settings' lead, from its next turn (it was on {was})",
-        chat.name
-    ))
+    if chat.model != lead {
+        let was = chat.model.clone();
+        chat.move_to(lead, iq_agent::PERSON, iq_agent::SETTINGS_MODEL, at);
+        said.push(format!(
+            "{} answers on {lead}, the settings' lead, from its next turn (it was on {was})",
+            chat.name
+        ));
+    }
+    if let Some(was) = chat.effort.take() {
+        said.push(format!(
+            "{} thinks as the settings say from its next turn (it thought {})",
+            chat.name,
+            was.as_str()
+        ));
+    }
+    said
 }
 
 /// Where the agents retired are kept, under a project's chats.
@@ -274,20 +286,23 @@ mod tests {
     }
 
     #[test]
-    fn a_chat_on_the_settings_model_follows_them_and_one_chosen_stays() {
+    fn a_chat_the_person_leads_comes_back_on_the_settings_lead() {
+        // Its model chosen with /new, its effort with /effort.
         let mut chat = saved("fix");
-        chat.models_chosen[0].how = iq_agent::SETTINGS_MODEL.to_owned();
+        chat.effort = Some(iq_core::Effort::High);
         chat.messages.push(Message::Assistant {
             content: Some("Fixed.".into()),
             tool_calls: Vec::new(),
             reasoning_signature: Some(serde_json::json!("c2lnbmVk")),
         });
         assert_eq!(
-            on_the_lead(&mut chat, "lab/haiku", 9).as_deref(),
-            Some(
-                "fix answers on lab/haiku, the settings' lead, from its next turn (it was on lab/model)"
-            )
+            on_the_lead(&mut chat, "lab/haiku", 9),
+            [
+                "fix answers on lab/haiku, the settings' lead, from its next turn (it was on lab/model)",
+                "fix thinks as the settings say from its next turn (it thought high)"
+            ]
         );
+        assert_eq!(chat.effort, None);
         assert_eq!(chat.model, "lab/haiku");
         let last = chat.models_chosen.last().unwrap();
         assert_eq!((last.how.as_str(), last.at), (iq_agent::SETTINGS_MODEL, 9));
@@ -299,21 +314,15 @@ mod tests {
                 ..
             }
         )));
-        // On the lead, and once it was moved, it stays.
-        assert_eq!(on_the_lead(&mut chat, "lab/haiku", 10), None);
+        // On the lead, nothing more is said.
+        assert!(on_the_lead(&mut chat, "lab/haiku", 10).is_empty());
         assert_eq!(chat.models_chosen.len(), 2);
-        // A model the person chose for it stays, as does an agent's.
-        let mut chosen = saved("chosen");
-        chosen.models_chosen[0].how = "/model".to_owned();
-        assert_eq!(on_the_lead(&mut chosen, "lab/haiku", 9), None);
+        // The agents a lead started keep what it chose for them.
         let mut started = saved("lead/tests");
         started.by = "lead".to_owned();
-        started.models_chosen.clear();
-        assert_eq!(on_the_lead(&mut started, "lab/haiku", 9), None);
-        // One kept before choices were, the settings'.
-        let mut older = saved("older");
-        older.models_chosen.clear();
-        assert!(on_the_lead(&mut older, "lab/haiku", 9).is_some());
+        started.effort = Some(iq_core::Effort::Low);
+        assert!(on_the_lead(&mut started, "lab/haiku", 9).is_empty());
+        assert_eq!(started.effort, Some(iq_core::Effort::Low));
     }
 
     #[test]
