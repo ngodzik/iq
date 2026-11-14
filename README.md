@@ -71,7 +71,7 @@ iq --help
 
 ## Building
 
-iq runs on Linux and macOS, the systems its sandbox is written for.
+iq runs on Linux and macOS, the systems its sandbox is written for. Each [release](https://github.com/ngodzik/iq/releases) carries the binary built for Linux (x86_64) and macOS (Apple Silicon), with its checksum; its notes say what it needs to run, and `CHANGELOG.md` what changed. To build it from the source instead:
 
 ```bash
 cargo install --path .              # builds the iq binary into ~/.cargo/bin
