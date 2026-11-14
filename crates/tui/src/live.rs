@@ -182,6 +182,33 @@ impl Live<'_> {
                 width,
             ));
         }
+        // What the agents wrote each other, out of the conversation: the
+        // latest, a line each, the earlier counted.
+        let (chatter, before) = self.history.chatter(&chat);
+        if before > 0 {
+            lines.push(fit(
+                vec![Span::styled(format!("   ✉ {before} before"), p.fg(p.faint))],
+                width,
+            ));
+        }
+        for chatted in chatter {
+            lines.push(fit(
+                vec![
+                    Span::styled("   ✉ ", p.fg(p.info)),
+                    Span::styled(
+                        label(self.board, &chatted.from).0,
+                        p.fg(agent_tint(self.board, &chatted.from, p)),
+                    ),
+                    Span::styled(" → ", p.fg(p.faint)),
+                    Span::styled(
+                        label(self.board, &chatted.to).0,
+                        p.fg(agent_tint(self.board, &chatted.to, p)),
+                    ),
+                    Span::styled(format!("  {}", chatted.said()), p.fg(p.dim)),
+                ],
+                width,
+            ));
+        }
         Some(Part::Lines(lines))
     }
 
@@ -1603,6 +1630,58 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("◦ "))
         );
+    }
+
+    #[test]
+    fn the_strip_shows_the_latest_messages_between_agents_a_line_each() {
+        let p = Palette::new(Theme::Graphite, Depth::True);
+        let look = iq_ui::look::Look::default().with_turn(TurnShown::Strip);
+        let mut board = Board::new(iq_ui::keys::Keymap::default(), look);
+        let mut history = History::default();
+        for event in [
+            Event::Joined {
+                agent: "fix".into(),
+                model: "lab/opus".into(),
+                by: PERSON.into(),
+            },
+            Event::Joined {
+                agent: "fix/tests".into(),
+                model: "lab/haiku".into(),
+                by: "fix".into(),
+            },
+            Event::Working {
+                agent: "fix/tests".into(),
+                prompt: "write the tests".into(),
+            },
+        ] {
+            crew(&mut board, &mut history, event, &p);
+        }
+        for n in 0..12 {
+            crew(
+                &mut board,
+                &mut history,
+                Event::Posted {
+                    from: "fix/tests".into(),
+                    to: "fix".into(),
+                    text: format!("note {n}\nmore"),
+                },
+                &p,
+            );
+        }
+        board.screen_mut().talk_to("fix");
+        let rows = drawn(&board, &history, 100);
+        // The task and the eleven earlier ones counted, the latest ten
+        // shown.
+        assert!(
+            rows.iter().any(|row| row.trim() == "✉ 3 before"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.trim() == "✉ tests → opus  note 11"),
+            "{rows:#?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("note 1 ")), "{rows:#?}");
     }
 
     #[test]
