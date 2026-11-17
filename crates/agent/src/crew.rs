@@ -779,6 +779,9 @@ struct Member {
     forget_reasoning: bool,
     /// Whether it was told the person's skills are open to it.
     skills_told: bool,
+    /// Where its answer goes as its turn ends, rather than to the agent
+    /// that started it: what started it waits for it there.
+    answering: Option<oneshot::Sender<Result<String, String>>>,
     /// The names of the tools its last call offered: offered others, its
     /// answers' reasoning, signed with those it was offered, goes.
     offered: Vec<String>,
@@ -1080,6 +1083,7 @@ where
                 models_chosen: saved.models_chosen,
                 forget_reasoning: false,
                 skills_told: false,
+                answering: None,
                 offered: Vec::new(),
                 compacted_away: saved.compacted_away,
                 compacted_head: saved.compacted_head,
@@ -1483,6 +1487,100 @@ where
         name
     }
 
+    /// Starts an agent for `by`, named after its chat and `name`, on
+    /// `model` with `task`, thinking with `effort` (as the settings say
+    /// when `None`), and gives back its answer as its turn ends, rather
+    /// than posting it to `by`; it is retired then. What runs a procedure
+    /// step by step waits so for each step, its starter woken by none of
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// It could not be started (a model the person does not allow, no
+    /// place for it), or its turn failed, as said.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ask_agent(
+        &self,
+        by: &str,
+        name: &str,
+        model: &ModelId,
+        task: String,
+        role: Option<String>,
+        effort: Option<Effort>,
+        how: &str,
+    ) -> Result<String, String> {
+        let name = agent_name(&lock(&self.inner.board), by, name, &[]);
+        let (name, joined) = self.join(
+            &name,
+            model,
+            task.clone(),
+            by,
+            role,
+            effort,
+            true,
+            Placing::Given(self.place_of(by)),
+            how,
+        );
+        if !joined {
+            return Err(format!("{name} could not be started on {model}"));
+        }
+        let (answer, answered) = oneshot::channel();
+        if let Some(member) = lock(&self.inner.board).members.get_mut(&name) {
+            member.answering = Some(answer);
+        }
+        self.wake(&name, task);
+        answered
+            .await
+            .unwrap_or_else(|_| Err(format!("{name} was stopped before it answered")))
+    }
+
+    /// Runs the command `line` for `agent`, in its place, as one it asked
+    /// for: judged by the gate, asked of whoever answers for the person
+    /// when the gate asks, with the internet when `network`, on the
+    /// machine itself when `host`. Gives its output, with how it ended,
+    /// and whether it succeeded.
+    ///
+    /// # Errors
+    ///
+    /// The gate denied it, it was refused, or it could not be run.
+    pub async fn run_command(
+        &self,
+        agent: &str,
+        line: String,
+        network: bool,
+        host: bool,
+    ) -> Result<(String, bool), String> {
+        let folder = self.place_of(agent).gate.workspace().to_path_buf();
+        let permit = self
+            .act(
+                agent,
+                Action::Run {
+                    line,
+                    folder,
+                    network,
+                    host,
+                },
+            )
+            .await?;
+        self.run(agent, permit, OWN_ASK).await
+    }
+
+    /// The folder of scratch of `agent`'s chat, which its commands read and
+    /// write, when the gate keeps one.
+    #[must_use]
+    pub fn scratch_of(&self, agent: &str) -> Option<PathBuf> {
+        let root = self.place_of(agent).gate.scratch()?.to_path_buf();
+        Some(root.join(lock(&self.inner.board).chat_of(agent)))
+    }
+
+    /// Says `text` of `agent`, in its chat, as iq's notices are said.
+    pub fn notice(&self, agent: &str, text: String) {
+        self.report(Event::Notice {
+            agent: agent.to_owned(),
+            text,
+        });
+    }
+
     /// Shows the image `bytes` of `path`, a `mime` image, to `agent` after
     /// this step's results, and says so; one larger than a model is shown
     /// is not, and it is told why.
@@ -1623,6 +1721,7 @@ where
                 }],
                 forget_reasoning: false,
                 skills_told: false,
+                answering: None,
                 offered: Vec::new(),
                 compacted_away: Vec::new(),
                 compacted_head: 0,
@@ -2688,6 +2787,20 @@ where
             .messages
             .get(posted_before..)
             .is_some_and(|new| new.iter().any(|m| m.from == name && m.to == by));
+        // Started for an answer given back to what started it: given there,
+        // never posted, and its work is over.
+        let answering = lock(&self.inner.board)
+            .members
+            .get_mut(&name)
+            .and_then(|member| member.answering.take());
+        if let Some(answering) = answering {
+            let _ = answering.send(outcome);
+            if let Some(member) = lock(&self.inner.board).members.get_mut(&name) {
+                member.answered = true;
+            }
+            self.retire_done(&name);
+            return;
+        }
         let handled = self.after_turn(&name, &outcome);
         let answered = by != PERSON && !handled && outcome.is_ok();
         if by != PERSON && !handled && !(wrote_back && outcome.is_ok()) {

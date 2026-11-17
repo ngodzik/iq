@@ -42,6 +42,17 @@ pub struct Skill {
     pub file: PathBuf,
 }
 
+impl Skill {
+    /// The folder it is kept in with its other files, a playbook's among
+    /// them, when it has one of its own: none for a skill that is a file.
+    #[must_use]
+    pub fn folder(&self) -> Option<PathBuf> {
+        (self.file.file_name()? == SKILL_FILE)
+            .then(|| self.file.parent().map(Path::to_path_buf))
+            .flatten()
+    }
+}
+
 impl Skills {
     /// The skills kept in `folders`, the first folder's winning where two
     /// hold a skill of the same name.

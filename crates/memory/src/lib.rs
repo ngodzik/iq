@@ -23,6 +23,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod playbook;
 mod skills;
 
 use std::path::{Path, PathBuf};
@@ -31,6 +32,7 @@ use iq_agent::{Called, Crew, Extension};
 use iq_core::ToolSpec;
 use serde_json::{Value, json};
 
+pub use playbook::{Found, Playbook, Playbooks, Step};
 pub use skills::{Skill, Skills};
 
 /// The file of the notes under `~/.claude` that lists them, which is not one.

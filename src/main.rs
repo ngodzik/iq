@@ -344,6 +344,8 @@ fn crew(
     if let Some(name) = &settings.autopilot_skill {
         skills = skills.with_reviewer(name, &workspace);
     }
+    // And the playbooks beside them, which iq runs itself for the leads.
+    crew.extend(Arc::new(iq_memory::Playbooks::new(skills.clone())));
     crew.extend(Arc::new(skills));
     // And the web, read with tools of iq's own, judged by the gate.
     crew.extend(Arc::new(iq_web::Web::new(settings.search()?)));

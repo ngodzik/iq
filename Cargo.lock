@@ -1057,9 +1057,11 @@ dependencies = [
  "iq-agent",
  "iq-core",
  "iq-gate",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]

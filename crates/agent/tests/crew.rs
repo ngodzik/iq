@@ -2129,6 +2129,65 @@ async fn waiting_until_done_gives_every_agent_s_answer_in_one_call() {
 }
 
 #[tokio::test]
+async fn an_agent_started_for_an_answer_gives_it_back_and_wakes_nobody() {
+    let f = fixture(
+        &[
+            ("lead", vec![say("Ready.")]),
+            ("lead/judge", vec![say("The change holds.")]),
+        ],
+        Settings::default(),
+    );
+    f.crew.start("lead", &model("lab/m"), "go".into(), PERSON);
+    f.settled().await;
+    let answer = f
+        .crew
+        .ask_agent(
+            "lead",
+            "judge",
+            &model("lab/strong"),
+            "Judge the change.".into(),
+            None,
+            Some(iq_core::Effort::High),
+            "the playbook review",
+        )
+        .await;
+    assert_eq!(answer.as_deref(), Ok("The change holds."));
+    f.settled().await;
+    // On the model and the effort asked for.
+    let asked = f.model.requests_of("lead/judge");
+    assert_eq!(asked[0].model.as_str(), "lab/strong");
+    assert_eq!(asked[0].effort, Some(iq_core::Effort::High));
+    // Its answer went to what asked for it, not to the lead, which stays
+    // at rest; and it is retired.
+    assert_eq!(f.model.requests_of("lead").len(), 1);
+    assert!(!f.model.seen_by("lead").contains("The change holds."));
+    assert!(f.crew.list().iter().all(|agent| agent.name != "lead/judge"));
+    // A model the person does not allow is not started.
+    let g = fixture(
+        &[("lead", vec![say("Ready.")])],
+        Settings {
+            allowed: vec![model("lab/m")],
+            ..Settings::default()
+        },
+    );
+    g.crew.start("lead", &model("lab/m"), "go".into(), PERSON);
+    g.settled().await;
+    let refused = g
+        .crew
+        .ask_agent(
+            "lead",
+            "judge",
+            &model("lab/other"),
+            "x".into(),
+            None,
+            None,
+            "test",
+        )
+        .await;
+    assert!(refused.is_err());
+}
+
+#[tokio::test]
 async fn a_message_sent_during_an_agent_s_last_call_wakes_it_once_its_turn_ends() {
     let f = fixture(
         &[
