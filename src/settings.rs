@@ -65,6 +65,7 @@
 //! effort = "medium"
 //! every = 7                              # days after which iq says, as it starts, that one is due; 0 never
 //! part_kb = 100                          # most of the account read in one call: past it, read in parts, each in a call of its own, a last one given what each showed
+//! conversations = true                   # what the agents and you said in each chat since, and the tools they called, given too, what the tools gave cut to its start and end: costlier, it shows what the gate cannot (an agent following what it read, code that leaks a secret); false, the gate's account alone
 //!
 //! [mcp.tracker]                          # an MCP server, by a name of yours: its tools offered to the agents as tracker__<tool>
 //! url = "https://mcp.example.com/mcp"    # over HTTP; when it asks for OAuth, you consent in the browser, its grant kept in ~/.iq/mcp-auth
@@ -286,6 +287,8 @@ struct AuditFile {
     every: Option<u64>,
     /// The most of the account read in one call, in kilobytes.
     part_kb: Option<u64>,
+    /// Whether what was said in the chats is read too.
+    conversations: Option<bool>,
 }
 
 /// How the audits are set.
@@ -301,6 +304,8 @@ pub(crate) struct Auditing {
     /// The most of the account read in one call, in bytes: past it, in
     /// parts.
     pub(crate) part: usize,
+    /// Whether what was said in the chats since is read too.
+    pub(crate) conversations: bool,
 }
 
 /// Days after which an audit is due, unless the settings say.
@@ -784,7 +789,8 @@ impl Settings {
     /// How the audits are set: the model that reads what the agents did
     /// (as set, else `lead`), how hard it thinks (medium unless set), the
     /// days after which one is due, the most of the account read in one
-    /// call.
+    /// call, and whether what was said in the chats is read too (unless
+    /// set not).
     pub(crate) fn auditing(&self, lead: &ModelId) -> Result<Auditing> {
         let model = match self.audit.model.as_deref().map(str::trim) {
             None | Some("") => lead.clone(),
@@ -800,6 +806,7 @@ impl Settings {
             effort: self.audit.effort.unwrap_or(Effort::Medium),
             every: self.audit.every.unwrap_or(AUDIT_EVERY),
             part: usize::try_from(kb.saturating_mul(1_000)).unwrap_or(usize::MAX),
+            conversations: self.audit.conversations.unwrap_or(true),
         })
     }
 

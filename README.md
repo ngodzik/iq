@@ -38,7 +38,7 @@ By default, every question the gate asks comes to you. With the autopilot on, a 
 - it sees the agent's task, your latest request and the agent's last actions, so that each decision rests on what is happening, and what the agent wrote just before, as its own claim, never as your word;
 - publishing, changing what others share, files outside the project and secrets are never its to allow, and after a few refusals in a row the agent's next action comes back to you.
 
-Rules and the reviewer only spare you questions: they widen nothing you did not allow. What they let through can be read again: on your word, a model of yours reads what the agents did since the last audit, everything the gate judged whoever let it through, and says what looks risky and what would help; it acts on nothing.
+Rules and the reviewer only spare you questions: they widen nothing you did not allow. What they let through can be read again: on your word, a model of yours reads what the agents did since the last audit, everything the gate judged whoever let it through and what was said in the chats, and says what looks risky and what would help; it acts on nothing.
 
 ## Rules, skills, notes and sync
 
