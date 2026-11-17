@@ -65,6 +65,7 @@
 //! effort = "medium"
 //! every = 7                              # days after which iq says, as it starts, that one is due; 0 never
 //! part_kb = 100                          # most of the account read in one call: past it, read in parts, each in a call of its own, a last one given what each showed
+//! skill = "audit"                        # a skill of yours that says what the audit looks for and how it is written, in place of iq's own (security, then improvements), read again at each audit, kept outside the workspace and never shown to the agents; unset, iq's own
 //! conversations = true                   # what the agents and you said in each chat since, and the tools they called, given too, what the tools gave cut to its start and end: costlier, it shows what the gate cannot (an agent following what it read, code that leaks a secret); false, the gate's account alone
 //!
 //! [mcp.tracker]                          # an MCP server, by a name of yours: its tools offered to the agents as tracker__<tool>
@@ -289,6 +290,8 @@ struct AuditFile {
     part_kb: Option<u64>,
     /// Whether what was said in the chats is read too.
     conversations: Option<bool>,
+    /// The skill of the person's that says what the audit looks for.
+    skill: Option<String>,
 }
 
 /// How the audits are set.
@@ -306,6 +309,9 @@ pub(crate) struct Auditing {
     pub(crate) part: usize,
     /// Whether what was said in the chats since is read too.
     pub(crate) conversations: bool,
+    /// The skill of the person's that says what the audit looks for, by
+    /// its name; iq's own when none.
+    pub(crate) skill: Option<String>,
 }
 
 /// Days after which an audit is due, unless the settings say.
@@ -807,7 +813,18 @@ impl Settings {
             every: self.audit.every.unwrap_or(AUDIT_EVERY),
             part: usize::try_from(kb.saturating_mul(1_000)).unwrap_or(usize::MAX),
             conversations: self.audit.conversations.unwrap_or(true),
+            skill: self.audit_skill().map(str::to_owned),
         })
+    }
+
+    /// The skill of the person's that says what an audit looks for, kept
+    /// from the agents; none unless set.
+    pub(crate) fn audit_skill(&self) -> Option<&str> {
+        self.audit
+            .skill
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
     }
 
     /// Whether what changes is sent without asking the person.

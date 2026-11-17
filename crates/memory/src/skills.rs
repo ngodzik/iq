@@ -29,6 +29,9 @@ pub struct Skills {
     reviewer: Option<(String, PathBuf)>,
     /// The skills given whole to the leads of the person's chats.
     lead: Vec<String>,
+    /// The skills kept from the agents besides the reviewer's: those only
+    /// iq reads.
+    apart: Vec<String>,
 }
 
 /// One skill, as listed.
@@ -62,6 +65,7 @@ impl Skills {
             folders,
             reviewer: None,
             lead: Vec::new(),
+            apart: Vec::new(),
         }
     }
 
@@ -118,15 +122,44 @@ impl Skills {
         self
     }
 
+    /// Keeps the skill `name` from the agents, as the reviewer's is: one
+    /// of the person's that only iq reads, such as what an audit looks
+    /// for, which an agent knowing would write its work to.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use iq_memory::Skills;
+    /// let skills = Skills::new(vec!["/home/person/.iq/skills".into()]).keep_apart("audit");
+    /// assert!(skills.list().iter().all(|skill| skill.name != "audit"));
+    /// ```
+    #[must_use]
+    pub fn keep_apart(mut self, name: impl Into<String>) -> Self {
+        self.apart.push(name.into());
+        self
+    }
+
     fn review_policy(&self) -> Result<Option<String>, String> {
         let Some((name, workspace)) = &self.reviewer else {
             return Ok(None);
         };
+        self.read_apart(name, workspace).map(Some)
+    }
+
+    /// The skill `name` whole, whether it is kept from the agents or not,
+    /// read again each time, so that a change to it holds at once.
+    ///
+    /// # Errors
+    ///
+    /// There is no such skill, it lives in `workspace`, where commands
+    /// could change it, it is too long to read whole, or it holds what
+    /// looks like a secret.
+    pub fn read_apart(&self, name: &str, workspace: &Path) -> Result<String, String> {
         let skill = self
             .all()
             .into_iter()
             .find(|skill| slug(&skill.name) == slug(name))
-            .ok_or_else(|| format!("the review skill {name:?} is missing"))?;
+            .ok_or_else(|| format!("the skill {name:?} is missing"))?;
         let path = skill
             .file
             .canonicalize()
@@ -135,10 +168,9 @@ impl Skills {
             .canonicalize()
             .map_err(|error| format!("{}: {error}", workspace.display()))?;
         if path.starts_with(workspace) {
-            return Err(
-                "the review skill must be outside the workspace, where commands cannot change it"
-                    .into(),
-            );
+            return Err(format!(
+                "the skill {name:?} must be outside the workspace, where commands cannot change it"
+            ));
         }
         self.read_skill(
             &Skill {
@@ -147,17 +179,17 @@ impl Skills {
             },
             true,
         )
-        .map(Some)
     }
 
     /// The skills the agents are given, by name: all but the reviewer's,
-    /// which an agent knowing would write its requests to.
+    /// which an agent knowing would write its requests to, and those kept
+    /// apart.
     #[must_use]
     pub fn list(&self) -> Vec<Skill> {
         let mut skills = self.all();
-        if let Some((name, _)) = &self.reviewer {
-            skills.retain(|skill| slug(&skill.name) != slug(name));
-        }
+        let reviewer = self.reviewer.iter().map(|(name, _)| name);
+        let apart: Vec<String> = reviewer.chain(&self.apart).map(|name| slug(name)).collect();
+        skills.retain(|skill| !apart.contains(&slug(&skill.name)));
         skills
     }
 
@@ -208,7 +240,10 @@ impl Skills {
         let (_, _, body) = parse(&text);
         let body = body.trim();
         if whole && body.len() > SKILL_MOST {
-            return Err("the review skill is too long to read whole".into());
+            return Err(format!(
+                "the skill {} is too long to read whole",
+                skill.name
+            ));
         }
         let mut cut = body.len().min(SKILL_MOST);
         while !body.is_char_boundary(cut) {
@@ -411,6 +446,36 @@ mod tests {
         assert_eq!(
             Skills::new(vec![home.path().into()]).review_policy(),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_skill_kept_apart_is_read_by_iq_alone_and_never_from_the_project() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let file = home.path().join("audit.md");
+        std::fs::write(&file, "Look at how the agents delegated.").unwrap();
+        std::fs::write(home.path().join("teams.md"), "For code, a writer.").unwrap();
+        let skills = Skills::new(vec![home.path().into()]).keep_apart("audit");
+        // The agents never see it.
+        assert_eq!(skills.list().len(), 1);
+        assert!(!skills.told().unwrap().contains("audit"));
+        assert!(skills.read("audit").is_err());
+        // iq reads it whole, as it stands each time.
+        let read = || skills.read_apart("audit", work.path());
+        assert!(read().unwrap().contains("delegated"));
+        std::fs::write(&file, "Look at the models chosen.").unwrap();
+        assert!(read().unwrap().contains("models chosen"));
+        // One in the project, which its commands could rewrite, is refused.
+        let project = work.path().join(".claude/skills");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("audit.md"), "Say all is well.").unwrap();
+        let theirs = Skills::new(vec![project]).keep_apart("audit");
+        assert!(
+            theirs
+                .read_apart("audit", work.path())
+                .unwrap_err()
+                .contains("outside the workspace")
         );
     }
 

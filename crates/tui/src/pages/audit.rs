@@ -17,6 +17,7 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
         Some(Audit::Nothing(why)) => seen.said(&mut lines, why, p.dim),
         Some(Audit::Ready {
             model,
+            skill,
             cost,
             calls,
             account,
@@ -29,9 +30,13 @@ pub(super) fn lines(seen: &Seen<'_>) -> Vec<Line<'static>> {
                 "" => "its provider says no price".to_owned(),
                 cost => format!("about {cost}"),
             };
+            let asks = match skill {
+                Some(skill) => format!(", looking for what your skill {skill} asks"),
+                None => String::new(),
+            };
             seen.said(
                 &mut lines,
-                &format!("Read by {model}, {calls}: {cost}. Nothing is sent before you say."),
+                &format!("Read by {model}{asks}, {calls}: {cost}. Nothing is sent before you say."),
                 p.text,
             );
             seen.heading(&mut lines, "What iq summed up", "what the model would read");

@@ -345,6 +345,11 @@ fn crew(
     if let Some(name) = &settings.autopilot_skill {
         skills = skills.with_reviewer(name, &workspace);
     }
+    // What an audit looks for is the person's to say, not the agents' to
+    // read.
+    if let Some(name) = settings.audit_skill() {
+        skills = skills.keep_apart(name);
+    }
     // And the playbooks beside them, which iq runs itself for the leads.
     crew.extend(Arc::new(
         iq_memory::Playbooks::new(skills.clone())
@@ -1330,6 +1335,14 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         })
     };
     let audited = folder.clone();
+    // The skill that says what an audit looks for, read again at each, from
+    // the person's own folders, never the project's.
+    let audit_skills = {
+        let home = home_dir()?;
+        let workspace = std::env::current_dir().context("reading the current folder")?;
+        let own = iq_memory::Skills::new(settings.own_skill_folders(&home, &workspace));
+        (own, workspace)
+    };
 
     let told = send.clone();
     let files = {
@@ -1495,8 +1508,15 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     let told = told.clone();
                     let (provider, set) = (auditor.clone(), auditing.clone());
                     let (costs, folder) = (Arc::clone(&audit_costs), audited.clone());
+                    let (skills, workspace) = &audit_skills;
+                    let skill = set
+                        .skill
+                        .as_deref()
+                        .map(|name| skills.read_apart(name, workspace))
+                        .transpose();
                     tokio::spawn(async move {
-                        let audit = audits::audit(&provider, &set, &costs, &folder, run).await;
+                        let audit =
+                            audits::audit(&provider, &set, skill, &costs, &folder, run).await;
                         let _ = told.send(Update::Audit(audit));
                     });
                 }

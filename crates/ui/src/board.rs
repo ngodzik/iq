@@ -138,6 +138,9 @@ pub enum Audit {
     Ready {
         /// The model that would read it.
         model: String,
+        /// The person's skill that says what it looks for, by its name;
+        /// iq's own when none.
+        skill: Option<String>,
         /// What it should cost, as the provider prices the model; empty
         /// when it says no price.
         cost: String,
@@ -3627,6 +3630,7 @@ mod tests {
         assert_eq!(board.audit(), None);
         let ready = Audit::Ready {
             model: "lab/m".into(),
+            skill: None,
             cost: "$0.12".into(),
             calls: 1,
             account: "3 actions judged by the gate.".into(),
