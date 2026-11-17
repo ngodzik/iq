@@ -609,7 +609,8 @@ impl Gate {
 
     /// Approves an action that was asked. A reviewer may approve only what
     /// stays within the sandbox, and what only reaches the internet when
-    /// the person lets it.
+    /// the person lets it; what the person declared ahead of time, what
+    /// runs on the machine or reaches the internet, never more.
     pub fn approve(&self, pending: Pending, by: Approver) -> Result<Permit, GateError> {
         let reviewable = match pending.scope {
             Scope::Sandbox => true,
@@ -617,7 +618,12 @@ impl Gate {
             Scope::Host => self.reviewer_host(),
             Scope::Beyond => false,
         };
-        if by == Approver::Reviewer && !reviewable {
+        let widens = match by {
+            Approver::Person => false,
+            Approver::Reviewer => !reviewable,
+            Approver::Declared => pending.scope == Scope::Beyond,
+        };
+        if widens {
             return Err(GateError::Widens);
         }
         if let Some(audit) = &self.audit {
@@ -1211,6 +1217,35 @@ mod tests {
         };
         assert_eq!(away.scope(), Scope::Beyond);
         assert_eq!(asked("git reset --hard", false).scope(), Scope::Sandbox);
+    }
+
+    #[test]
+    fn what_the_person_declared_runs_on_the_machine_but_never_publishes() {
+        let f = fixture("");
+        // Their playbook's step says it runs on the machine: given, written
+        // down as declared, the reviewer left out of it.
+        let Judged::Asked { pending, .. } = run_on(&f, "./context.py 123", false, true) else {
+            panic!("a command on the machine is asked");
+        };
+        assert_eq!(pending.scope(), Scope::Host);
+        let permit = f.gate.approve(pending, Approver::Declared).unwrap();
+        assert!(matches!(permit.action(), Action::Run { host: true, .. }));
+        let log = std::fs::read_to_string(f.root.join("audit.log")).unwrap();
+        assert!(log.contains("\"declared\""), "{log}");
+        // What changes what others share still waits for the person.
+        let Judged::Asked { pending, .. } = run_on(&f, "git push", false, true) else {
+            panic!("publishing is asked");
+        };
+        assert_eq!(pending.scope(), Scope::Beyond);
+        assert!(matches!(
+            f.gate.approve(pending, Approver::Declared),
+            Err(GateError::Widens)
+        ));
+        // And what the gate denies, nobody declares.
+        assert!(matches!(
+            run_on(&f, "sudo make install", false, true),
+            Judged::Denied { .. }
+        ));
     }
 
     #[test]

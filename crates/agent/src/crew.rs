@@ -1565,6 +1565,56 @@ where
         self.run(agent, permit, OWN_ASK).await
     }
 
+    /// Runs the command `line` for `agent` as [`Self::run_command`] does,
+    /// the person having declared it themselves, in a playbook of their
+    /// own whose step says it runs on the machine (`host`) or reaches the
+    /// internet (`network`): what the gate would ask for that is given at
+    /// once (`Approver::Declared`, so written to the audit log), never
+    /// more. What changes what others share, a file outside the workspace
+    /// or a secret is still asked of the person; what the gate denies
+    /// stays denied. `declared` says where, for the person's notice.
+    ///
+    /// # Errors
+    ///
+    /// The gate denied it, the person refused what it still asked, or it
+    /// could not be run.
+    pub async fn run_declared(
+        &self,
+        agent: &str,
+        line: String,
+        network: bool,
+        host: bool,
+        declared: &str,
+    ) -> Result<(String, bool), String> {
+        let gate = self.place_of(agent).gate.clone();
+        let folder = gate.workspace().to_path_buf();
+        let action = Action::Run {
+            line,
+            folder,
+            network,
+            host,
+        };
+        let permit = match gate.judge(action).map_err(|e| chain(&e))? {
+            Judged::Allowed(permit) => permit,
+            Judged::Denied { reason } => return Err(refusal("the gate", &reason, false)),
+            Judged::Asked { pending, .. } if pending.scope() != Scope::Beyond => {
+                let place = match pending.scope() {
+                    Scope::Host => "on the machine",
+                    Scope::Internet => "with the internet",
+                    _ => "in the sandbox",
+                };
+                self.report(Event::Notice {
+                    agent: agent.to_owned(),
+                    text: format!("{declared} runs {place}, as the person's playbook says"),
+                });
+                gate.approve(pending, Approver::Declared)
+                    .map_err(|e| chain(&e))?
+            }
+            Judged::Asked { reason, pending } => self.ask(agent, reason, pending, None).await?,
+        };
+        self.run(agent, permit, OWN_ASK).await
+    }
+
     /// The folder of scratch of `agent`'s chat, which its commands read and
     /// write, when the gate keeps one.
     #[must_use]

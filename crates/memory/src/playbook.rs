@@ -87,6 +87,10 @@ pub struct Step {
     /// brief.
     #[serde(default)]
     pub gets: Vec<String>,
+    /// The person's skills its agents are given whole, after their brief
+    /// and before what earlier steps gave.
+    #[serde(default)]
+    pub skills: Vec<String>,
     /// An earlier step listing parts, a line each: one agent per part.
     #[serde(default)]
     pub each: Option<String>,
@@ -238,14 +242,16 @@ fn chosen(
 
 /// What runs a playbook's steps: the crew, or what stands for it in a test.
 pub(crate) trait Hands: Send + Sync {
-    /// Runs the command `line` for `lead`, as the lead's own: its output
-    /// and whether it succeeded.
+    /// Runs the command `line` for `lead`, as the lead's own, or, when
+    /// `declared` says where, as the person declared it in a playbook of
+    /// their own: its output and whether it succeeded.
     fn command(
         &self,
         lead: &str,
         line: String,
         internet: bool,
         host: bool,
+        declared: Option<&str>,
     ) -> impl Future<Output = Result<(String, bool), String>> + Send;
 
     /// Starts an agent `name` for `lead` on `model` with `task`, and gives
@@ -274,8 +280,15 @@ where
         line: String,
         internet: bool,
         host: bool,
+        declared: Option<&str>,
     ) -> Result<(String, bool), String> {
-        self.run_command(lead, line, internet, host).await
+        match declared {
+            Some(declared) => {
+                self.run_declared(lead, line, internet, host, declared)
+                    .await
+            }
+            None => self.run_command(lead, line, internet, host).await,
+        }
     }
 
     async fn agent(
@@ -297,23 +310,38 @@ where
     }
 }
 
-/// Runs `playbook`, the playbook of the skill `skill`, whose files are in
-/// `home`, for `lead` with `args`, through `hands`: each step in turn, what
-/// each gave written in `home` as `<step>.txt`. Gives the last step's
+/// A playbook as it runs.
+pub(crate) struct Book<'a> {
+    /// The name of its skill.
+    pub(crate) skill: &'a str,
+    pub(crate) playbook: &'a Playbook,
+    /// Its skill's folder, where its files are as the person wrote them.
+    pub(crate) folder: &'a Path,
+    /// A copy of those files, which commands in the sandbox read, where
+    /// what each step gave is kept.
+    pub(crate) home: &'a Path,
+    /// Whether the person wrote it in a folder of skills of their own,
+    /// rather than a project's: what its steps declare is then theirs.
+    pub(crate) own: bool,
+}
+
+/// Runs `book` for `lead` with `args`, through `hands`: each step in turn,
+/// what each gave written in its copy's folder as `<step>.txt`, the
+/// person's skills a step names read with `skill`. Gives the last step's
 /// answer.
 ///
 /// # Errors
 ///
 /// An argument is missing or unknown, or a step failed: what the steps
-/// before it gave stays in `home`.
+/// before it gave stays in the copy's folder.
 pub(crate) async fn play(
     hands: &impl Hands,
     lead: &str,
-    skill: &str,
-    playbook: &Playbook,
-    home: &Path,
+    book: &Book<'_>,
     args: &HashMap<String, String>,
+    skill_text: &(dyn Fn(&str) -> Result<String, String> + Sync),
 ) -> Result<String, String> {
+    let (skill, playbook, home) = (book.skill, book.playbook, book.home);
     for name in &playbook.args {
         if !args.contains_key(name) {
             return Err(format!("the playbook {skill} needs the argument {name}"));
@@ -357,8 +385,15 @@ pub(crate) async fn play(
         let given = match (&step.run, &step.model) {
             (Some(run), _) => {
                 hands.say(lead, format!("playbook {skill}: {}", step.name));
-                let line = command_line(run, args, &gave, home)?;
-                let (output, ok) = hands.command(lead, line, step.internet, step.host).await?;
+                // On the machine, the script is the person's own file, which
+                // nothing in the sandbox may change, rather than its copy.
+                let files = if step.host { book.folder } else { home };
+                let line = command_line(run, args, &gave, home, files)?;
+                let declared = (book.own && (step.host || step.internet))
+                    .then(|| format!("the step {} of the playbook {skill}", step.name));
+                let (output, ok) = hands
+                    .command(lead, line, step.internet, step.host, declared.as_deref())
+                    .await?;
                 if !ok {
                     return Err(stopped(skill, &step.name, home, &output));
                 }
@@ -383,6 +418,14 @@ pub(crate) async fn play(
                         effort.map_or(String::new(), |e| format!(" at {}", e.as_str()))
                     ),
                 );
+                // The person's skills it names, whole: one that is none
+                // stops it before the step.
+                let skills: Vec<(String, String)> = step
+                    .skills
+                    .iter()
+                    .map(|name| skill_text(name).map(|text| (name.clone(), text)))
+                    .collect::<Result<_, _>>()
+                    .map_err(refuse)?;
                 let brief_file = home.join(step.brief.as_deref().unwrap_or_default());
                 let brief = std::fs::read_to_string(&brief_file)
                     .map_err(|e| format!("{}: {e}", brief_file.display()))?;
@@ -403,7 +446,8 @@ pub(crate) async fn play(
                 let mut answers: Vec<String> = Vec::new();
                 for (chunk, group) in parts.chunks(at_once).enumerate() {
                     let asked = group.iter().enumerate().map(|(at, part)| {
-                        let task = briefed(&brief, args, part.as_deref(), &step.gets, &gave);
+                        let task =
+                            briefed(&brief, args, part.as_deref(), &skills, &step.gets, &gave);
                         let name = if step.each.is_some() {
                             format!("{}-{}", step.name, chunk * at_once + at + 1)
                         } else {
@@ -484,6 +528,7 @@ fn command_line(
     args: &HashMap<String, String>,
     gave: &HashMap<String, String>,
     home: &Path,
+    files: &Path,
 ) -> Result<String, String> {
     let mut line = String::new();
     let mut rest = run;
@@ -510,7 +555,7 @@ fn command_line(
         } else if gave.contains_key(name) {
             home.join(format!("{name}.txt")).display().to_string()
         } else if name == "playbook" {
-            home.display().to_string()
+            files.display().to_string()
         } else {
             return Err(format!(
                 "{{{name}}} in `{run}` is no argument, no step before it, nor `playbook`"
@@ -526,8 +571,8 @@ fn command_line(
         .next()
         .unwrap_or_default()
         .to_owned();
-    if !first.is_empty() && !first.contains('/') && home.join(&first).is_file() {
-        let path = quoted(&home.join(&first).display().to_string());
+    if !first.is_empty() && !first.contains('/') && files.join(&first).is_file() {
+        let path = quoted(&files.join(&first).display().to_string());
         line = line.replacen(&first, &path, 1);
     }
     Ok(line)
@@ -544,6 +589,7 @@ fn briefed(
     brief: &str,
     args: &HashMap<String, String>,
     part: Option<&str>,
+    skills: &[(String, String)],
     gets: &[String],
     gave: &HashMap<String, String>,
 ) -> String {
@@ -553,6 +599,11 @@ fn briefed(
     }
     if let Some(part) = part {
         task = task.replace("{part}", part);
+    }
+    for (name, text) in skills {
+        task.push_str(&format!(
+            "\n\n## The skill {name}, as the person wrote it, to follow\n\n{text}"
+        ));
     }
     for got in gets {
         match gave.get(got) {
@@ -592,13 +643,40 @@ pub type Found = Result<(Playbook, PathBuf), String>;
 #[derive(Debug, Clone)]
 pub struct Playbooks {
     skills: Skills,
+    /// The folders of the person's own skills, outside any project: what
+    /// a playbook written there declares, the person declared.
+    own: Vec<PathBuf>,
 }
 
 impl Playbooks {
     /// The playbooks beside `skills`.
     #[must_use]
     pub fn new(skills: Skills) -> Self {
-        Self { skills }
+        Self {
+            skills,
+            own: Vec::new(),
+        }
+    }
+
+    /// The same, `folders` being the person's own folders of skills: a
+    /// step of a playbook written there that says it runs on the machine
+    /// or reaches the internet runs so without being asked, as the person
+    /// said it does. A project's playbooks are asked as any command.
+    #[must_use]
+    pub fn with_own(mut self, folders: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.own = folders
+            .into_iter()
+            .map(|folder| folder.canonicalize().unwrap_or(folder))
+            .collect();
+        self
+    }
+
+    /// Whether `folder`, a skill's, is in one of the person's own folders.
+    fn owns(&self, folder: &Path) -> bool {
+        let folder = folder
+            .canonicalize()
+            .unwrap_or_else(|_| folder.to_path_buf());
+        self.own.iter().any(|own| folder.starts_with(own))
     }
 
     /// The skills that have a playbook, with it, and the folder its files
@@ -701,6 +779,7 @@ where
 
     fn call(&self, crew: Crew<M>, agent: String, name: String, args: Value) -> Called {
         let found = self.found();
+        let me = self.clone();
         Box::pin(async move {
             if name != "playbook" || !Self::serves(&agent) {
                 return Err(format!("no tool named {name:?} is offered to {agent}"));
@@ -736,7 +815,15 @@ where
                 .join("playbooks")
                 .join(format!("{}-{stamp}", slug(&skill.name)));
             copied(&folder, &home)?;
-            play(&crew, &agent, &skill.name, &playbook, &home, &given).await
+            let book = Book {
+                skill: &skill.name,
+                playbook: &playbook,
+                folder: &folder,
+                home: &home,
+                own: me.owns(&folder),
+            };
+            let skill_text = |name: &str| me.skills.read(name);
+            play(&crew, &agent, &book, &given, &skill_text).await
         })
     }
 }
@@ -764,8 +851,10 @@ mod tests {
             line: String,
             _internet: bool,
             _host: bool,
+            declared: Option<&str>,
         ) -> Result<(String, bool), String> {
-            self.asked.lock().unwrap().push(format!("run {line}"));
+            let how = declared.map_or(String::new(), |declared| format!("({declared}) "));
+            self.asked.lock().unwrap().push(format!("run {how}{line}"));
             let ok = self.failing.is_none_or(|word| !line.contains(word));
             if let Some((word, printed)) = self.prints
                 && line.contains(word)
@@ -793,6 +882,33 @@ mod tests {
         }
 
         fn say(&self, _lead: &str, _text: String) {}
+    }
+
+    /// The person's skills a step may name, as the tests have them.
+    fn skill_text(name: &str) -> Result<String, String> {
+        match name {
+            "docs" => Ok("docs: how a page is written\n\nWrite plainly.".into()),
+            other => Err(format!("no skill is named {other:?}")),
+        }
+    }
+
+    /// Runs `playbook`, the skill review's, its files in `home`, through
+    /// `hands`, the person's own when `own`.
+    async fn played(
+        hands: &Fake,
+        playbook: &Playbook,
+        home: &Path,
+        args: &HashMap<String, String>,
+        own: bool,
+    ) -> Result<String, String> {
+        let book = Book {
+            skill: "review",
+            playbook,
+            folder: home,
+            home,
+            own,
+        };
+        play(hands, "lead", &book, args, &skill_text).await
     }
 
     fn playbook(text: &str) -> Result<Playbook, String> {
@@ -847,13 +963,12 @@ mod tests {
             ..Fake::default()
         };
         let fake = printing("effort: high\nrisky: no\nmodel: lab/strong\nsome text: around it");
-        let answer = play(
+        let answer = played(
             &fake,
-            "lead",
-            "review",
             &book("{context.effort}"),
             home.path(),
             &HashMap::new(),
+            false,
         )
         .await
         .unwrap();
@@ -874,13 +989,12 @@ mod tests {
         );
         // Risky: it runs.
         let risky = printing("effort: medium\nrisky: yes\nmodel: lab/mid");
-        play(
+        played(
             &risky,
-            "lead",
-            "review",
             &book("{context.effort}"),
             home.path(),
             &HashMap::new(),
+            false,
         )
         .await
         .unwrap();
@@ -901,13 +1015,12 @@ mod tests {
             ),
         ] {
             let fake = printing(printed);
-            let why = play(
+            let why = played(
                 &fake,
-                "lead",
-                "review",
                 &book("{context.effort}"),
                 home.path(),
                 &HashMap::new(),
+                false,
             )
             .await
             .unwrap_err();
@@ -943,6 +1056,7 @@ mod tests {
             &args,
             &gave,
             home.path(),
+            home.path(),
         )
         .unwrap();
         let script = home.path().join("logs.py").display().to_string();
@@ -951,7 +1065,7 @@ mod tests {
             line,
             format!("'{script}' '42; rm -rf ~ '\\''x'\\''' '{logs}' ${{HOME}} {{a,b}}")
         );
-        assert!(command_line("x {nothing}", &args, &gave, home.path()).is_err());
+        assert!(command_line("x {nothing}", &args, &gave, home.path(), home.path()).is_err());
     }
 
     #[tokio::test]
@@ -972,7 +1086,7 @@ mod tests {
         .unwrap();
         let fake = Fake::default();
         let args: HashMap<String, String> = [("change".to_owned(), "7".to_owned())].into();
-        let answer = play(&fake, "lead", "review", &book, home.path(), &args)
+        let answer = played(&fake, &book, home.path(), &args, false)
             .await
             .unwrap();
         assert!(answer.contains("its last, judge, gave"), "{answer}");
@@ -1004,7 +1118,7 @@ mod tests {
         assert!(home.path().join("readers.txt").is_file());
         // An argument missing, or a step failing, stops it.
         assert!(
-            play(&fake, "lead", "review", &book, home.path(), &HashMap::new())
+            played(&fake, &book, home.path(), &HashMap::new(), false)
                 .await
                 .is_err()
         );
@@ -1012,10 +1126,80 @@ mod tests {
             failing: Some("split"),
             ..Fake::default()
         };
-        let why = play(&failing, "lead", "review", &book, home.path(), &args)
+        let why = played(&failing, &book, home.path(), &args, false)
             .await
             .unwrap_err();
         assert!(why.contains("stopped at its step parts"), "{why}");
         assert_eq!(failing.asked.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_person_s_own_playbook_declares_what_its_steps_reach_and_gives_them_skills() {
+        let folder = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for at in [folder.path(), home.path()] {
+            std::fs::write(at.join("context.py"), "print()").unwrap();
+            std::fs::write(at.join("write.md"), "Write the page.").unwrap();
+        }
+        let book = playbook(
+            "[[step]]\nname = \"context\"\nrun = \"context.py\"\nhost = true\n\
+             [[step]]\nname = \"local\"\nrun = \"context.py\"\n\
+             [[step]]\nname = \"writer\"\nmodel = \"lab/strong\"\nbrief = \"write.md\"\nskills = [\"docs\"]\ngets = [\"context\"]",
+        )
+        .unwrap();
+        let run = |own: bool| {
+            let book = &book;
+            let (folder, home) = (folder.path(), home.path());
+            async move {
+                let fake = Fake::default();
+                let ran = Book {
+                    skill: "review",
+                    playbook: book,
+                    folder,
+                    home,
+                    own,
+                };
+                play(&fake, "lead", &ran, &HashMap::new(), &skill_text)
+                    .await
+                    .unwrap();
+                fake.asked.into_inner().unwrap()
+            }
+        };
+        let asked = run(true).await;
+        // On the machine, the person's own script, declared as theirs;
+        // in the sandbox, its copy, judged as any.
+        let script = |at: &Path| format!("'{}'", at.join("context.py").display());
+        assert_eq!(
+            asked[0],
+            format!(
+                "run (the step context of the playbook review) {}",
+                script(folder.path())
+            )
+        );
+        assert_eq!(asked[1], format!("run {}", script(home.path())));
+        // The skill it names, whole, after the brief and before what the
+        // steps before gave.
+        let writer = &asked[2];
+        let skill = writer.find("## The skill docs").unwrap();
+        assert!(writer[..skill].contains("Write the page."), "{writer}");
+        assert!(writer[skill..].contains("Write plainly."), "{writer}");
+        assert!(
+            writer[skill..].contains("## What the step context gave"),
+            "{writer}"
+        );
+        // A project's playbook declares nothing: its steps are asked.
+        let asked = run(false).await;
+        assert_eq!(asked[0], format!("run {}", script(folder.path())));
+        // A skill that is none stops it before the step.
+        let missing = playbook(
+            "[[step]]\nname = \"writer\"\nmodel = \"lab/m\"\nbrief = \"write.md\"\nskills = [\"notes\"]",
+        )
+        .unwrap();
+        let fake = Fake::default();
+        let why = played(&fake, &missing, home.path(), &HashMap::new(), true)
+            .await
+            .unwrap_err();
+        assert!(why.contains("no skill is named \"notes\""), "{why}");
+        assert!(fake.asked.lock().unwrap().is_empty());
     }
 }

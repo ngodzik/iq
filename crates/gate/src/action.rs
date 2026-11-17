@@ -149,4 +149,9 @@ pub enum Approver {
     /// A model reviewing for them, which may approve only what stays within
     /// the sandbox.
     Reviewer,
+    /// The person ahead of time, in what they wrote themselves: a step of
+    /// a playbook of their own that says it runs on the machine or reaches
+    /// the internet. It gives that, never more: what changes what others
+    /// share, a file outside the workspace, a secret, still wait for them.
+    Declared,
 }
