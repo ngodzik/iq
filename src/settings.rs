@@ -60,6 +60,12 @@
 //! commands = ["pytest"]
 //! words = ["django"]
 //!
+//! [audit]                                # /audit: what the agents did since the last audit (all the gate judged, counted by what let it through: the gate, your rules, you, the autopilot, your playbooks; what went beyond the sandbox, was refused or denied, a line each; the tasks), summed up by iq, then read by a model that says what looks risky and what would help, its cost said before it runs; each report kept in ~/.iq/audits
+//! model = "anthropic/claude-opus-5-5"    # the lead's unless set
+//! effort = "medium"
+//! every = 7                              # days after which iq says, as it starts, that one is due; 0 never
+//! part_kb = 100                          # most of the account read in one call: past it, read in parts, each in a call of its own, a last one given what each showed
+//!
 //! [mcp.tracker]                          # an MCP server, by a name of yours: its tools offered to the agents as tracker__<tool>
 //! url = "https://mcp.example.com/mcp"    # over HTTP; when it asks for OAuth, you consent in the browser, its grant kept in ~/.iq/mcp-auth
 //! headers = { Authorization = "TRACKER_AUTHORIZATION" }  # or headers sent, each value read from the variable it names; then OAuth is never asked
@@ -248,6 +254,9 @@ pub(crate) struct Settings {
     /// What the work goes to.
     #[serde(default)]
     observe: ObserveFile,
+    /// The audits of what the agents did.
+    #[serde(default)]
+    audit: AuditFile,
     /// The MCP servers, by the names the person gives them.
     #[serde(default)]
     mcp: BTreeMap<String, McpFile>,
@@ -264,6 +273,44 @@ pub(crate) struct Settings {
     #[serde(default)]
     route: Option<toml::Value>,
 }
+
+/// The audits as the settings write them.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditFile {
+    /// The model that reads what the agents did; the lead's unless set.
+    model: Option<String>,
+    /// How hard it thinks.
+    effort: Option<Effort>,
+    /// Days after which iq says, as it starts, that an audit is due.
+    every: Option<u64>,
+    /// The most of the account read in one call, in kilobytes.
+    part_kb: Option<u64>,
+}
+
+/// How the audits are set.
+#[derive(Debug, Clone)]
+pub(crate) struct Auditing {
+    /// The model that reads what the agents did.
+    pub(crate) model: ModelId,
+    /// How hard it thinks.
+    pub(crate) effort: Effort,
+    /// Days after which iq says, as it starts, that an audit is due; 0
+    /// never.
+    pub(crate) every: u64,
+    /// The most of the account read in one call, in bytes: past it, in
+    /// parts.
+    pub(crate) part: usize,
+}
+
+/// Days after which an audit is due, unless the settings say.
+const AUDIT_EVERY: u64 = 7;
+
+/// The most of an audit's account read in one call, in kilobytes, unless
+/// the settings say; and the least they may say, so that a part holds
+/// something.
+const AUDIT_PART_KB: u64 = 100;
+const AUDIT_PART_LEAST_KB: u64 = 10;
 
 /// The observations as the settings write them.
 #[derive(Debug, Default, Deserialize)]
@@ -731,6 +778,28 @@ impl Settings {
             model,
             every: self.observe.every.unwrap_or(OBSERVE_EVERY).clamp(1, 50),
             categories: self.categories(),
+        })
+    }
+
+    /// How the audits are set: the model that reads what the agents did
+    /// (as set, else `lead`), how hard it thinks (medium unless set), the
+    /// days after which one is due, the most of the account read in one
+    /// call.
+    pub(crate) fn auditing(&self, lead: &ModelId) -> Result<Auditing> {
+        let model = match self.audit.model.as_deref().map(str::trim) {
+            None | Some("") => lead.clone(),
+            Some(model) => ModelId::new(model)?,
+        };
+        let kb = self
+            .audit
+            .part_kb
+            .unwrap_or(AUDIT_PART_KB)
+            .max(AUDIT_PART_LEAST_KB);
+        Ok(Auditing {
+            model,
+            effort: self.audit.effort.unwrap_or(Effort::Medium),
+            every: self.audit.every.unwrap_or(AUDIT_EVERY),
+            part: usize::try_from(kb.saturating_mul(1_000)).unwrap_or(usize::MAX),
         })
     }
 

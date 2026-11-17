@@ -121,6 +121,12 @@ pub enum Request {
     /// Read what a sync would send, line by line, for the page that shows
     /// it.
     Changes,
+    /// Sum up what the agents did since the last audit, with what having
+    /// it read should cost; or have the audit's model read it.
+    Audit {
+        /// Whether the model reads it now.
+        run: bool,
+    },
     /// Run a plugin's command.
     Plugin {
         /// The plugin.

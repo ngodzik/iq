@@ -18,7 +18,7 @@ pub struct Spec {
 }
 
 /// Every command, in the order the list gives them.
-pub const COMMANDS: [Spec; 21] = [
+pub const COMMANDS: [Spec; 22] = [
     Spec {
         name: "new",
         args: "[model]",
@@ -63,6 +63,11 @@ pub const COMMANDS: [Spec; 21] = [
         name: "observations",
         args: "",
         what: "what the work went to, over time",
+    },
+    Spec {
+        name: "audit",
+        args: "",
+        what: "what the agents did since the last audit, read by a model of yours: what looks risky, what would help; its cost said before it runs",
     },
     Spec {
         name: "keys",
@@ -165,6 +170,8 @@ pub enum Command {
     Costs,
     /// The observations' page.
     Observations,
+    /// An audit of what the agents did since the last.
+    Audit,
     /// The shortcuts and the commands.
     Keys,
     /// The autopilot on or off.
@@ -261,6 +268,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "team" | "agents" | "chats" => bare(Command::Team),
         "costs" | "cost" => bare(Command::Costs),
         "observations" | "work" => bare(Command::Observations),
+        "audit" => bare(Command::Audit),
         "keys" | "help" => bare(Command::Keys),
         "autopilot" => bare(Command::Autopilot),
         "internet" => bare(Command::Internet),

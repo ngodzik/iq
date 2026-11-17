@@ -3,6 +3,7 @@
 //! question when one waits, the page's lines scrolled as the person reads
 //! them, and the keys it takes at its foot.
 
+mod audit;
 mod changes;
 mod costs;
 mod keys;
@@ -74,6 +75,36 @@ impl Seen<'_> {
         lines.push(Line::from(spans));
     }
 
+    /// `text`, Markdown, drawn within `width` columns after `indent`; a
+    /// diagram as its source, since images are the conversation's.
+    pub(crate) fn markdown(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        text: &str,
+        width: usize,
+        indent: &[Span<'static>],
+    ) {
+        use crate::markdown::{Markdown, Out, code};
+        let p = self.p;
+        let mut markdown = Markdown::default();
+        let mut out = Vec::new();
+        for line in text.lines() {
+            out.extend(markdown.line(line, p));
+        }
+        out.extend(markdown.flush(p));
+        for out in out {
+            match out {
+                Out::Line(styled) => lines.extend(drawn(styled, width, indent)),
+                Out::Table(table) => lines.extend(table.lines(width, indent)),
+                Out::Diagram(source) => {
+                    for styled in code("mermaid", &source, p) {
+                        lines.extend(drawn(styled, width, indent));
+                    }
+                }
+            }
+        }
+    }
+
     /// A line of text in passing, folded to the page.
     pub(crate) fn said(&self, lines: &mut Vec<Line<'static>>, text: &str, tint: crate::theme::Rgb) {
         let p = self.p;
@@ -84,6 +115,17 @@ impl Seen<'_> {
             &[Span::raw(" ")],
         ));
     }
+}
+
+/// A line of Markdown drawn within `width` columns after `indent`.
+fn drawn(
+    styled: crate::markdown::Styled,
+    width: usize,
+    indent: &[Span<'static>],
+) -> Vec<Line<'static>> {
+    let first: Vec<Span<'static>> = indent.iter().cloned().chain(styled.first).collect();
+    let rest: Vec<Span<'static>> = indent.iter().cloned().chain(styled.rest).collect();
+    crate::wrap::wrap(&styled.body, width, &first, &rest)
 }
 
 /// The page's lines, the keys it takes, and the line it is to show when
@@ -111,6 +153,7 @@ fn content(page: &Page, seen: &Seen<'_>) -> (Vec<Line<'static>>, String, Option<
             "↑↓ choose · Enter its thread, or the job whole · w write to it · s stop it · f those finished",
         ),
         Page::Changes => return (changes::lines(seen), changes::foot(seen), None),
+        Page::Audit => return (audit::lines(seen), audit::foot(seen), None),
         Page::Steps => (Vec::new(), ""),
     };
     (lines, foot.to_owned(), None)

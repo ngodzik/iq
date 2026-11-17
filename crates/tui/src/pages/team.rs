@@ -10,7 +10,6 @@ use ratatui::text::{Line, Span};
 
 use super::Seen;
 use crate::history::{agent_tint, short};
-use crate::markdown::{Markdown, Out, code};
 use crate::wrap::{cut, wrap};
 
 /// The chats, one a line, what tells them apart under each.
@@ -191,35 +190,7 @@ pub(super) fn thread(seen: &Seen<'_>, agent: &str) -> Vec<Line<'static>> {
                     &[Span::raw("   ")],
                 ));
             }
-            Entry::Text(text) => {
-                let mut markdown = Markdown::default();
-                let mut out = Vec::new();
-                for line in text.lines() {
-                    out.extend(markdown.line(line, p));
-                }
-                out.extend(markdown.flush(p));
-                // A page shows a diagram as its source: images are the
-                // conversation's.
-                let styled = out.into_iter().flat_map(|out| match out {
-                    Out::Line(styled) => vec![Ok(styled)],
-                    Out::Table(table) => vec![Err(table)],
-                    Out::Diagram(source) => {
-                        code("mermaid", &source, p).into_iter().map(Ok).collect()
-                    }
-                });
-                for styled in styled {
-                    match styled {
-                        Ok(styled) => {
-                            let first: Vec<Span<'static>> =
-                                indent.iter().cloned().chain(styled.first).collect();
-                            let rest: Vec<Span<'static>> =
-                                indent.iter().cloned().chain(styled.rest).collect();
-                            lines.extend(wrap(&styled.body, width, &first, &rest));
-                        }
-                        Err(table) => lines.extend(table.lines(width, &indent)),
-                    }
-                }
-            }
+            Entry::Text(text) => seen.markdown(&mut lines, text, width, &indent),
             Entry::Tool {
                 name,
                 input,

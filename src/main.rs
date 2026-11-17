@@ -4,6 +4,7 @@
 
 #[cfg(feature = "assay")]
 mod assay;
+mod audits;
 mod chats;
 mod diagrams;
 mod journal;
@@ -1308,6 +1309,28 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
         });
     }
 
+    // The audit's model, and where what it spends goes: counted as any
+    // call. iq says as it starts when one is due.
+    let auditing = settings.auditing(&lead)?;
+    if let Some(due) = audits::Audits::new(&folder).due(auditing.every, iq_ui::now()) {
+        let _ = send.send(Update::Said(due));
+    }
+    let auditor = provider(cli);
+    let audit_costs: Report = {
+        let send = send.clone();
+        let ledger = Arc::clone(&ledger);
+        Arc::new(move |event: Event| {
+            if let Event::Spent {
+                agent, model, cost, ..
+            } = &event
+            {
+                ledger.bill(agent, model, *cost);
+            }
+            let _ = send.send(Update::Crew(event));
+        })
+    };
+    let audited = folder.clone();
+
     let told = send.clone();
     let files = {
         let journal = journal.file().to_path_buf();
@@ -1468,6 +1491,15 @@ fn session(runtime: &tokio::runtime::Runtime, cli: &Cli) -> Result<()> {
                     chat,
                     folder,
                 } => asking.command(&plugin, command, args, chat, folder),
+                Request::Audit { run } => {
+                    let told = told.clone();
+                    let (provider, set) = (auditor.clone(), auditing.clone());
+                    let (costs, folder) = (Arc::clone(&audit_costs), audited.clone());
+                    tokio::spawn(async move {
+                        let audit = audits::audit(&provider, &set, &costs, &folder, run).await;
+                        let _ = told.send(Update::Audit(audit));
+                    });
+                }
                 Request::Mcp => {
                     let status = serving.status();
                     if status.is_empty() {

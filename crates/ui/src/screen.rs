@@ -56,6 +56,9 @@ pub enum Page {
     Keys,
     /// What a sync would send, line by line.
     Changes,
+    /// An audit of what the agents did since the last: what iq summed up,
+    /// then what the audit's model said of it.
+    Audit,
     /// Every step the agents took, fold by fold, and what they wrote to
     /// each other, the latest last.
     Steps,
@@ -74,6 +77,7 @@ impl Page {
             Page::Observations => "Observations".to_owned(),
             Page::Keys => "Keys and commands".to_owned(),
             Page::Changes => "What a sync would send".to_owned(),
+            Page::Audit => "Audit".to_owned(),
             Page::Steps => "Steps and messages".to_owned(),
             Page::Map => "The turn".to_owned(),
         }

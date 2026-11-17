@@ -73,6 +73,8 @@ pub enum Update {
     /// What a sync would send, line by line, as the page that shows it
     /// asked; empty where nothing would be sent.
     Changes(String),
+    /// An audit of what the agents did, as it goes.
+    Audit(Audit),
     /// The provider's models, as it lists them: what the person may name.
     Models(Vec<String>),
     /// Something iq says to the person in passing, in the conversation.
@@ -126,6 +128,39 @@ pub struct SyncAsk {
     /// Those files, said for the person to decide on: the person's own by
     /// name, the rest counted by folder.
     pub said: String,
+}
+
+/// An audit of what the agents did since the last, as its page shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Audit {
+    /// What iq summed up, for the person to say whether the model reads
+    /// it.
+    Ready {
+        /// The model that would read it.
+        model: String,
+        /// What it should cost, as the provider prices the model; empty
+        /// when it says no price.
+        cost: String,
+        /// In how many calls: one, or one a part and a last one.
+        calls: usize,
+        /// What iq summed up.
+        account: String,
+    },
+    /// Read by the model, its report not back yet.
+    Reading {
+        /// The model.
+        model: String,
+    },
+    /// What the model said.
+    Read {
+        /// Its report, Markdown.
+        report: String,
+        /// The file that keeps it.
+        file: String,
+    },
+    /// Why there is no audit: nothing was done since the last, or the
+    /// model failed.
+    Nothing(String),
 }
 
 /// The most of the provider's models a command being written is offered.
@@ -192,6 +227,8 @@ pub struct Board {
     sync_ask: Option<SyncAsk>,
     /// What a sync would send, line by line, once read for its page.
     changes: Option<String>,
+    /// The audit the page shows, as it goes.
+    audit: Option<Audit>,
     /// What the agents did between their lines of text.
     steps: crate::steps::Steps,
     /// How the work is looked at.
@@ -363,6 +400,7 @@ impl Board {
             synced: None,
             sync_ask: None,
             changes: None,
+            audit: None,
             steps: crate::steps::Steps::default(),
             lens: crate::observations::Lens::default(),
             models: Vec::new(),
@@ -1344,7 +1382,7 @@ impl Board {
             }
             Page::Map => return self.map_key(key, letter),
             Page::Thread(_) if key == "Left" => self.screen.close(),
-            Page::Thread(_) | Page::Keys | Page::Changes | Page::Steps => {}
+            Page::Thread(_) | Page::Keys | Page::Changes | Page::Steps | Page::Audit => {}
         }
         Vec::new()
     }
@@ -1491,6 +1529,19 @@ impl Board {
                     "No notification"
                 };
                 self.screen.notice(said, now);
+            }
+            // On its page, what the audit asks is what is answered.
+            Action::Allow | Action::Refuse if self.audit_asked() => {
+                if action == Action::Refuse {
+                    self.audit = None;
+                    self.screen.close();
+                    return None;
+                }
+                if let Some(Audit::Ready { model, .. }) = &self.audit {
+                    let model = model.clone();
+                    self.audit = Some(Audit::Reading { model });
+                }
+                return Some(Request::Audit { run: true });
             }
             Action::Allow | Action::Refuse => {
                 // The agents' questions first: they hold work.
@@ -1738,6 +1789,11 @@ impl Board {
             Command::Team => open(self, Page::Team),
             Command::Costs => open(self, Page::Costs),
             Command::Observations => open(self, Page::Observations),
+            Command::Audit => {
+                self.audit = None;
+                self.screen.open(Page::Audit);
+                return vec![Request::Audit { run: false }];
+            }
             Command::Keys => open(self, Page::Keys),
             Command::Autopilot => return self.act(Action::Autopilot, now).into_iter().collect(),
             Command::Internet => return self.act(Action::Internet, now).into_iter().collect(),
@@ -1966,6 +2022,18 @@ impl Board {
         self.changes.as_deref()
     }
 
+    /// The audit its page shows, as it goes; none until iq sums it up.
+    #[must_use]
+    pub fn audit(&self) -> Option<&Audit> {
+        self.audit.as_ref()
+    }
+
+    /// Whether the audit's page waits for the person to say whether its
+    /// model reads it.
+    fn audit_asked(&self) -> bool {
+        self.screen.page() == Some(&Page::Audit) && matches!(self.audit, Some(Audit::Ready { .. }))
+    }
+
     /// What the agents did between their lines of text, fold by fold.
     #[must_use]
     pub fn steps(&self) -> &crate::steps::Steps {
@@ -2112,6 +2180,7 @@ impl Board {
             }
             Update::SyncAsk(ask) => self.sync_ask = Some(ask),
             Update::Changes(changes) => self.changes = Some(changes),
+            Update::Audit(audit) => self.audit = Some(audit),
             Update::Models(models) => self.models = models,
             // The conversation is the terminal's: the board keeps nothing.
             Update::Said(_) => {}
@@ -3545,6 +3614,44 @@ mod tests {
             said: "sent 1 file".into(),
         }));
         assert_eq!(board.changes(), None);
+    }
+
+    #[test]
+    fn an_audit_says_what_it_would_cost_and_is_read_only_once_the_person_says() {
+        let mut board = Board::default();
+        assert_eq!(
+            board.run(Command::Audit, 100),
+            [Request::Audit { run: false }]
+        );
+        assert_eq!(board.screen().page(), Some(&Page::Audit));
+        assert_eq!(board.audit(), None);
+        let ready = Audit::Ready {
+            model: "lab/m".into(),
+            cost: "$0.12".into(),
+            calls: 1,
+            account: "3 actions judged by the gate.".into(),
+        };
+        board.update(Update::Audit(ready.clone()));
+        // Said yes on its page: the model reads it.
+        assert_eq!(key(&mut board, "ctrl+y"), [Request::Audit { run: true }]);
+        assert_eq!(
+            board.audit(),
+            Some(&Audit::Reading {
+                model: "lab/m".into()
+            })
+        );
+        // Read, the key answers nothing more there.
+        board.update(Update::Audit(Audit::Read {
+            report: "## Security\n\nNothing.".into(),
+            file: "/a.md".into(),
+        }));
+        assert!(key(&mut board, "ctrl+y").is_empty());
+        // Said no: nothing is read, and the page closes.
+        board.run(Command::Audit, 100);
+        board.update(Update::Audit(ready));
+        assert!(key(&mut board, "ctrl+r").is_empty());
+        assert_eq!(board.screen().page(), None);
+        assert_eq!(board.audit(), None);
     }
 
     #[test]
