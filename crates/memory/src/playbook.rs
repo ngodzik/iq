@@ -66,12 +66,19 @@ pub struct Step {
     /// Whether its command runs on the machine itself, outside the sandbox.
     #[serde(default)]
     pub host: bool,
-    /// The model its agents run on.
+    /// The model its agents run on: `{step.name}` the value an earlier
+    /// command step printed as `name: value`, so that a script chooses it,
+    /// never a model.
     #[serde(default)]
     pub model: Option<String>,
-    /// How hard they think; as the settings say when none.
+    /// How hard they think, as the settings say when none: a value an
+    /// earlier command step printed, as for `model`.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Whether it runs: a value an earlier command step printed, `true`,
+    /// `yes` or `1` to run it, `false`, `no`, `0` or nothing to skip it.
+    #[serde(default)]
+    pub when: Option<String>,
     /// The file of the playbook's folder its agents are given as their
     /// task: `{arg}` an argument, `{part}` the part of one of several.
     #[serde(default)]
@@ -114,6 +121,7 @@ impl Playbook {
             return Err("a playbook has steps: [[step]]".into());
         }
         let mut before: Vec<&str> = Vec::new();
+        let mut commands: Vec<&str> = Vec::new();
         for step in &self.steps {
             let name = step.name.as_str();
             if name.is_empty() || before.contains(&name) || self.args.iter().any(|a| a == name) {
@@ -121,14 +129,31 @@ impl Playbook {
                     "a step is named {name:?}, as none or another is: each its own"
                 ));
             }
+            // What a script printed chooses, never what a model wrote.
+            for field in [&step.model, &step.effort, &step.when]
+                .into_iter()
+                .flatten()
+            {
+                for (from, _) in references(field) {
+                    if !commands.contains(&from.as_str()) {
+                        return Err(format!(
+                            "step {name} takes a value of {from:?}, which is no command step \
+                             before it"
+                        ));
+                    }
+                }
+            }
             match (&step.run, &step.model) {
                 (Some(_), None) => {}
                 (None, Some(model)) => {
-                    ModelId::new(model.as_str()).map_err(|e| format!("step {name}: {e}"))?;
+                    if references(model).is_empty() {
+                        ModelId::new(model.as_str()).map_err(|e| format!("step {name}: {e}"))?;
+                    }
                     if step.brief.is_none() {
                         return Err(format!("step {name} runs agents: it needs a brief"));
                     }
-                    if let Some(effort) = &step.effort {
+                    if let Some(effort) = step.effort.as_ref().filter(|e| references(e).is_empty())
+                    {
                         effort
                             .parse::<Effort>()
                             .map_err(|e| format!("step {name}: {e}"))?;
@@ -148,9 +173,67 @@ impl Playbook {
                 }
             }
             before.push(name);
+            if step.run.is_some() {
+                commands.push(name);
+            }
         }
         Ok(self)
     }
+}
+
+/// The values `{step.name}` in `field` stands for, by their step and name.
+fn references(field: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut rest = field;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            break;
+        };
+        if let Some((step, name)) = after[..close].split_once('.') {
+            found.push((step.trim().to_owned(), name.trim().to_owned()));
+        }
+        rest = &after[close + 1..];
+    }
+    found
+}
+
+/// The values a command step printed, `name: value` a line, the last of a
+/// name winning.
+fn printed(output: &str) -> HashMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.trim().split_once(':')?;
+            let named = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            named.then(|| (name.to_owned(), value.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// `field`, each `{step.name}` in it the value that command step printed.
+///
+/// # Errors
+///
+/// A step it names printed no such value.
+fn chosen(
+    field: &str,
+    values: &HashMap<String, HashMap<String, String>>,
+) -> Result<String, String> {
+    let mut filled = field.to_owned();
+    for (step, name) in references(field) {
+        let value = values
+            .get(&step)
+            .and_then(|printed| printed.get(&name))
+            .ok_or_else(|| {
+                format!("the step {step} printed no `{name}: …`, which {field} takes")
+            })?;
+        filled = filled.replace(&format!("{{{step}.{name}}}"), value);
+    }
+    Ok(filled)
 }
 
 /// What runs a playbook's steps: the crew, or what stands for it in a test.
@@ -244,25 +327,62 @@ pub(crate) async fn play(
     }
     let how = format!("the playbook {skill}");
     let mut gave: HashMap<String, String> = HashMap::new();
+    let mut values: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut last = String::new();
     for step in &playbook.steps {
-        hands.say(lead, format!("playbook {skill}: {}", step.name));
+        // Whether it runs, and on what, as a script chose: what it did not
+        // say, or said that is none, stops the playbook before the step.
+        let refuse = |why: String| stopped(skill, &step.name, home, &why);
+        if let Some(when) = &step.when {
+            let said = chosen(when, &values).map_err(refuse)?;
+            match said.trim().to_lowercase().as_str() {
+                "true" | "yes" | "1" => {}
+                "false" | "no" | "0" | "" => {
+                    hands.say(
+                        lead,
+                        format!("playbook {skill}: {} skipped, as {when} says", step.name),
+                    );
+                    let file = home.join(format!("{}.txt", step.name));
+                    std::fs::write(&file, "").map_err(|e| format!("{}: {e}", file.display()))?;
+                    gave.insert(step.name.clone(), String::new());
+                    continue;
+                }
+                other => {
+                    return Err(refuse(format!(
+                        "{when} is {other:?}, which says neither to run it nor to skip it"
+                    )));
+                }
+            }
+        }
         let given = match (&step.run, &step.model) {
             (Some(run), _) => {
+                hands.say(lead, format!("playbook {skill}: {}", step.name));
                 let line = command_line(run, args, &gave, home)?;
                 let (output, ok) = hands.command(lead, line, step.internet, step.host).await?;
                 if !ok {
                     return Err(stopped(skill, &step.name, home, &output));
                 }
+                values.insert(step.name.clone(), printed(&output));
                 output
             }
             (None, Some(model)) => {
-                let model = ModelId::new(model.as_str()).map_err(|e| e.to_string())?;
+                let model = chosen(model, &values)
+                    .and_then(|model| ModelId::new(model.as_str()).map_err(|e| e.to_string()))
+                    .map_err(refuse)?;
                 let effort = step
                     .effort
                     .as_deref()
-                    .map(str::parse::<Effort>)
-                    .transpose()?;
+                    .map(|effort| chosen(effort, &values).and_then(|e| e.parse::<Effort>()))
+                    .transpose()
+                    .map_err(refuse)?;
+                hands.say(
+                    lead,
+                    format!(
+                        "playbook {skill}: {} on {model}{}",
+                        step.name,
+                        effort.map_or(String::new(), |e| format!(" at {}", e.as_str()))
+                    ),
+                );
                 let brief_file = home.join(step.brief.as_deref().unwrap_or_default());
                 let brief = std::fs::read_to_string(&brief_file)
                     .map_err(|e| format!("{}: {e}", brief_file.display()))?;
@@ -435,11 +555,17 @@ fn briefed(
         task = task.replace("{part}", part);
     }
     for got in gets {
-        if let Some(given) = gave.get(got) {
-            task.push_str(&format!(
+        match gave.get(got) {
+            Some(given) if given.trim().is_empty() => {
+                task.push_str(&format!(
+                    "\n\n## The step {got} gave nothing, or was skipped"
+                ));
+            }
+            Some(given) => task.push_str(&format!(
                 "\n\n## What the step {got} gave\n\n{}",
                 cut(given, GIVEN_MOST)
-            ));
+            )),
+            None => {}
         }
     }
     task
@@ -626,6 +752,9 @@ mod tests {
     struct Fake {
         asked: Mutex<Vec<String>>,
         failing: Option<&'static str>,
+        /// What a command whose line holds the word prints, in place of
+        /// the parts it lists by default.
+        prints: Option<(&'static str, &'static str)>,
     }
 
     impl Hands for Fake {
@@ -638,6 +767,11 @@ mod tests {
         ) -> Result<(String, bool), String> {
             self.asked.lock().unwrap().push(format!("run {line}"));
             let ok = self.failing.is_none_or(|word| !line.contains(word));
+            if let Some((word, printed)) = self.prints
+                && line.contains(word)
+            {
+                return Ok((format!("{printed}\n[exit status 0]"), ok));
+            }
             Ok((format!("part one\npart two\n(from {line})"), ok))
         }
 
@@ -693,6 +827,108 @@ mod tests {
         }
         // A key no playbook knows is said, rather than left aside.
         assert!(playbook("[[step]]\nname = \"a\"\nrun = \"x\"\nmodels = \"m\"").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_script_chooses_a_step_s_effort_and_whether_it_runs_never_a_model() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("judge.md"), "Judge.").unwrap();
+        std::fs::write(home.path().join("deep.md"), "Look deeper.").unwrap();
+        let book = |effort: &str| {
+            playbook(&format!(
+                "[[step]]\nname = \"context\"\nrun = \"context.py\"\n\
+                 [[step]]\nname = \"deep\"\nmodel = \"lab/strong\"\nbrief = \"deep.md\"\nwhen = \"{{context.risky}}\"\n\
+                 [[step]]\nname = \"judge\"\nmodel = \"{{context.model}}\"\neffort = \"{effort}\"\nbrief = \"judge.md\"\ngets = [\"deep\"]"
+            ))
+            .unwrap()
+        };
+        let printing = |printed: &'static str| Fake {
+            prints: Some(("context", printed)),
+            ..Fake::default()
+        };
+        let fake = printing("effort: high\nrisky: no\nmodel: lab/strong\nsome text: around it");
+        let answer = play(
+            &fake,
+            "lead",
+            "review",
+            &book("{context.effort}"),
+            home.path(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(answer.ends_with("judge answered"), "{answer}");
+        let asked = fake.asked.lock().unwrap().clone();
+        // Not risky: the deep look skipped; the judge at high, on the model
+        // the script named.
+        assert_eq!(asked.len(), 2, "{asked:#?}");
+        assert!(
+            asked[1].starts_with("judge on lab/strong (high, the playbook review): Judge."),
+            "{}",
+            asked[1]
+        );
+        assert!(
+            asked[1].contains("The step deep gave nothing, or was skipped"),
+            "{}",
+            asked[1]
+        );
+        // Risky: it runs.
+        let risky = printing("effort: medium\nrisky: yes\nmodel: lab/mid");
+        play(
+            &risky,
+            "lead",
+            "review",
+            &book("{context.effort}"),
+            home.path(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        let asked = risky.asked.lock().unwrap().clone();
+        assert!(asked[1].starts_with("deep on lab/strong"), "{asked:#?}");
+        assert!(
+            asked[2].starts_with("judge on lab/mid (medium"),
+            "{asked:#?}"
+        );
+        // A value not printed, or one that is no effort, stops it before
+        // the step.
+        for (printed, said) in [
+            ("risky: no\nmodel: lab/m", "printed no `effort: …`"),
+            ("effort: extreme\nrisky: no\nmodel: lab/m", "extreme"),
+            (
+                "effort: high\nrisky: maybe\nmodel: lab/m",
+                "neither to run it nor to skip it",
+            ),
+        ] {
+            let fake = printing(printed);
+            let why = play(
+                &fake,
+                "lead",
+                "review",
+                &book("{context.effort}"),
+                home.path(),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(why.contains(said), "{printed}: {why}");
+            assert_eq!(fake.asked.lock().unwrap().len(), 1, "{printed}");
+        }
+        // Only a command step chooses: never what a model wrote.
+        let from_a_model = playbook(
+            "[[step]]\nname = \"scout\"\nmodel = \"lab/m\"\nbrief = \"x.md\"\n\
+             [[step]]\nname = \"judge\"\nmodel = \"lab/m\"\neffort = \"{scout.effort}\"\nbrief = \"x.md\"",
+        );
+        assert!(
+            from_a_model
+                .unwrap_err()
+                .contains("no command step before it")
+        );
+        assert!(
+            playbook("[[step]]\nname = \"a\"\nrun = \"x\"\nwhen = \"{later.go}\"")
+                .unwrap_err()
+                .contains("no command step before it")
+        );
     }
 
     #[test]
